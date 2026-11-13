@@ -1,7 +1,9 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use std::time::Instant;
 use vf_core::{StateStore, VeriForgeConfig, scan_repository};
+use vf_graph::analyze_codebase;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -23,7 +25,7 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Scan a repository for multi-file business-logic & security flaws (Phase 1+2)
+    /// Scan a repository using Tree-sitter AST & O(V+E) Guard-Set Lattice
     Scan {
         #[arg(default_value = ".")]
         path: PathBuf,
@@ -70,37 +72,45 @@ fn main() -> Result<()> {
             }
         }
         Commands::Scan { path, json } => {
+            let t0 = Instant::now();
             let cfg = VeriForgeConfig::load_from_dir(&path)?;
             let summary = scan_repository(&path, &cfg)?;
             let mut store = StateStore::open(&path)?;
             let (delta, _) = store.sync_files(&summary.files)?;
+            let graph_res = analyze_codebase(&summary.files, &cfg)?;
+            let total_ms = t0.elapsed().as_millis();
+
             if json {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
                         "ok": true,
-                        "phase": "phase-0-core-indexed",
-                        "source_files": summary.source_files_hashed,
-                        "elapsed_ms": summary.elapsed_ms,
+                        "elapsed_ms": total_ms,
                         "delta": delta,
-                        "modules": [
-                            vf_graph::graph_engine_ready(),
-                            vf_sandbox::sandbox_engine_ready(),
-                            vf_tui::tui_ready(),
-                            vf_report::report_ready(),
-                            vf_ai::ai_patcher_ready(),
-                        ]
+                        "graph": graph_res,
                     }))?
                 );
             } else {
                 println!(
-                    "Indexed {} source files in {}ms (+{} modified, {} cached).",
-                    summary.source_files_hashed,
-                    summary.elapsed_ms,
-                    delta.added_or_modified,
-                    delta.unchanged_cached
+                    "VeriForge Scan | {} files ({} symbols, {} edges, {} routes) | {}ms",
+                    graph_res.parsed_files,
+                    graph_res.symbol_count,
+                    graph_res.edge_count,
+                    graph_res.route_entries,
+                    total_ms
                 );
-                println!("Next: Phase 1 (vf-graph Tree-sitter + Guard-Set Lattice) will attach to this index.");
+                if graph_res.findings.is_empty() {
+                    println!("  [OK] No unguarded entry-to-sink paths detected.");
+                } else {
+                    println!("  [!] {} unguarded multi-file flow(s) detected:", graph_res.findings.len());
+                    for f in &graph_res.findings {
+                        println!("\n  [{}] {} ({}) -> {}", f.severity, f.id, f.rule_id, f.title);
+                        println!("      Entry: {}", f.entry_route);
+                        for (i, hop) in f.witness_path.iter().enumerate() {
+                            println!("      [{}] {}:{}  {}", i + 1, hop.file, hop.line, hop.symbol);
+                        }
+                    }
+                }
             }
         }
     }
