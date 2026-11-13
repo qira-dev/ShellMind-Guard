@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -13,6 +14,13 @@ pub struct SandboxGuard {
 
 impl Drop for SandboxGuard {
     fn drop(&mut self) {
+        let pid = self.child.id();
+        // Reap the entire process group first so no grandchild holds the port
+        let _ = Command::new("/bin/kill")
+            .args(["-9", &format!("-{}", pid)])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -23,7 +31,7 @@ pub fn has_bwrap() -> bool {
 }
 
 /// Spawns a local target server inside an unprivileged Bubblewrap (`bwrap`) namespace
-/// with read-only project bind, ephemeral `/tmp`, and isolated loopback networking.
+/// with read-only project bind, ephemeral `/tmp`, process-group reaper, and isolated loopback.
 pub async fn spawn_sandboxed_server(
     project_root: &Path,
     boot_cmd: &str,
@@ -34,6 +42,7 @@ pub async fn spawn_sandboxed_server(
 
     let child = if use_bwrap {
         let mut cmd = Command::new("/usr/bin/bwrap");
+        cmd.process_group(0);
         cmd.args([
             "--unshare-pid",
             "--unshare-ipc",
@@ -55,7 +64,6 @@ pub async fn spawn_sandboxed_server(
         if Path::new("/etc").exists() {
             cmd.args(["--ro-bind", "/etc", "/etc"]);
         }
-        // Bind home .local/bin or nvm if node/cargo lives there (read-only)
         if let Ok(home) = std::env::var("HOME") {
             let local_bin = format!("{}/.local", home);
             if Path::new(&local_bin).exists() {
@@ -89,7 +97,8 @@ pub async fn spawn_sandboxed_server(
         cmd.spawn().context("Failed to spawn bwrap sandbox")?
     } else {
         let mut cmd = Command::new("/bin/sh");
-        cmd.args(["-c", boot_cmd])
+        cmd.process_group(0)
+            .args(["-c", boot_cmd])
             .current_dir(&abs_root)
             .env("PORT", port.to_string())
             .env("NODE_ENV", "test")
@@ -115,7 +124,7 @@ pub async fn spawn_sandboxed_server(
         if Instant::now() >= deadline {
             anyhow::bail!("Timed out waiting for sandboxed server on 127.0.0.1:{}", port);
         }
-        sleep(Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(40)).await;
     }
 
     Ok(guard)

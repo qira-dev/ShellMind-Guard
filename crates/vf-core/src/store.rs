@@ -1,6 +1,6 @@
 use crate::scanner::IndexedFile;
 use anyhow::Result;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -13,6 +13,17 @@ pub struct DeltaStats {
     pub added_or_modified: usize,
     pub unchanged_cached: usize,
     pub removed: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredFinding {
+    pub id: String,
+    pub scan_id: i64,
+    pub rule_id: String,
+    pub severity: String,
+    pub status: String,
+    pub trace_json: String,
+    pub poc_cmd: String,
 }
 
 pub struct StateStore {
@@ -47,6 +58,13 @@ impl StateStore {
                 mtime_ns INTEGER NOT NULL,
                 size_bytes INTEGER NOT NULL,
                 last_scan_id INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS ast_cache (
+                rel_path TEXT PRIMARY KEY,
+                blake3_hash TEXT NOT NULL,
+                config_hash TEXT NOT NULL,
+                ast_json TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS symbols (
@@ -100,7 +118,13 @@ impl StateStore {
         let mut existing: HashMap<String, (i64, String)> = HashMap::new();
         {
             let mut stmt = tx.prepare("SELECT id, rel_path, blake3_hash FROM files")?;
-            let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?;
             for row in rows {
                 let (id, rel_path, hash) = row?;
                 existing.insert(rel_path, (id, hash));
@@ -149,6 +173,10 @@ impl StateStore {
             "DELETE FROM files WHERE last_scan_id != ?1",
             params![scan_id],
         )?;
+        tx.execute(
+            "DELETE FROM ast_cache WHERE rel_path NOT IN (SELECT rel_path FROM files)",
+            [],
+        )?;
 
         tx.execute(
             "UPDATE scans SET modified_files = ?1 WHERE id = ?2",
@@ -167,13 +195,61 @@ impl StateStore {
         Ok((stats, changed_files))
     }
 
+    /// Loads cached per-file AST JSON blobs keyed by `rel_path` where `blake3_hash` and `config_hash` match.
+    pub fn load_ast_cache(&self, config_hash: &str) -> Result<HashMap<String, (String, String)>> {
+        let mut map = HashMap::new();
+        let mut stmt = self.conn.prepare(
+            "SELECT rel_path, blake3_hash, ast_json FROM ast_cache WHERE config_hash = ?1",
+        )?;
+        let rows = stmt.query_map(params![config_hash], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (rel_path, blake3_hash, ast_json) = row?;
+            map.insert(rel_path, (blake3_hash, ast_json));
+        }
+        Ok(map)
+    }
+
+    /// Persists newly parsed per-file AST JSON summaries into the Two-Phase SQLite cache.
+    pub fn save_ast_cache(
+        &mut self,
+        config_hash: &str,
+        entries: &[(String, String, String)],
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO ast_cache (rel_path, blake3_hash, config_hash, ast_json)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(rel_path) DO UPDATE SET
+                   blake3_hash = excluded.blake3_hash,
+                   config_hash = excluded.config_hash,
+                   ast_json = excluded.ast_json",
+            )?;
+            for (rel_path, blake3_hash, ast_json) in entries {
+                stmt.execute(params![rel_path, blake3_hash, config_hash, ast_json])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn save_findings(
         &mut self,
         scan_id: i64,
         rows: &[(&str, &str, &str, &str, &str, &str)],
     ) -> Result<()> {
         let tx = self.conn.transaction()?;
-        tx.execute("DELETE FROM findings WHERE scan_id = ?1", params![scan_id])?;
+        tx.execute("DELETE FROM findings", [])?;
+        tx.execute("DELETE FROM findings_fts", [])?;
         {
             let mut ins = tx.prepare(
                 "INSERT OR REPLACE INTO findings (id, scan_id, rule_id, severity, status, trace_json, poc_cmd)
@@ -190,6 +266,27 @@ impl StateStore {
         tx.commit()?;
         Ok(())
     }
+
+    pub fn get_finding(&self, finding_id: &str) -> Result<Option<StoredFinding>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, scan_id, rule_id, severity, status, trace_json, poc_cmd
+             FROM findings WHERE id = ?1",
+        )?;
+        let res = stmt
+            .query_row(params![finding_id], |r| {
+                Ok(StoredFinding {
+                    id: r.get(0)?,
+                    scan_id: r.get(1)?,
+                    rule_id: r.get(2)?,
+                    severity: r.get(3)?,
+                    status: r.get(4)?,
+                    trace_json: r.get(5)?,
+                    poc_cmd: r.get(6)?,
+                })
+            })
+            .optional()?;
+        Ok(res)
+    }
 }
 
 #[cfg(test)]
@@ -199,7 +296,7 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn test_delta_cache_skips_unchanged() {
+    fn test_delta_cache_and_ast_cache() {
         let tmp = std::env::temp_dir().join("vf_core_test_delta");
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
@@ -216,6 +313,19 @@ mod tests {
         let (d1, c1) = store.sync_files(std::slice::from_ref(&f1)).unwrap();
         assert_eq!(d1.added_or_modified, 1);
         assert_eq!(c1.len(), 1);
+
+        store
+            .save_ast_cache(
+                "cfg1",
+                &[(
+                    "src/app.ts".into(),
+                    "abc123".into(),
+                    "{\"rel_path\":\"src/app.ts\",\"imports\":[],\"symbols\":[]}".into(),
+                )],
+            )
+            .unwrap();
+        let loaded = store.load_ast_cache("cfg1").unwrap();
+        assert_eq!(loaded.get("src/app.ts").unwrap().0, "abc123");
 
         let (d2, c2) = store.sync_files(&[f1]).unwrap();
         assert_eq!(d2.added_or_modified, 0);

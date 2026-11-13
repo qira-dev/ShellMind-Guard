@@ -169,7 +169,7 @@ pub async fn verify_concurrency_invariant(
         entry_route: finding.entry_route.clone(),
         status,
         evidence,
-        replay_cmd: format!("veriforge verify --route '{}' --sync-race {}", finding.entry_route, concurrency),
+        replay_cmd: format!("veriforge replay {} --sync-race {}", finding.id, concurrency),
     })
 }
 

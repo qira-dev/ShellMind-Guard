@@ -15,6 +15,7 @@ use std::fs;
 use std::io::{self, Stdout};
 use std::path::Path;
 use std::time::Duration;
+use vf_ai::build_minimal_patch_prompt;
 use vf_graph::GraphAnalysisResult;
 use vf_report::{to_html_graph, to_sarif_json};
 use vf_sandbox::{VerificationStatus, VerifiedFinding};
@@ -90,7 +91,10 @@ pub fn run_tui(
             let header = Paragraph::new(Line::from(vec![
                 Span::styled(
                     " VeriForge ",
-                    Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(format!(
                     " Target: {}  |  Files: {}  |  Scan: {}ms  |  ",
@@ -187,13 +191,22 @@ pub fn run_tui(
             f.render_widget(detail, body_chunks[1]);
 
             if show_logs {
-                let log_lines: Vec<Line> = logs.iter().rev().take(5).rev().map(|l| Line::from(l.as_str())).collect();
-                let log_box = Paragraph::new(log_lines)
-                    .block(Block::default().borders(Borders::ALL).title("[L] Logs (q: quit | g: HTML | s: SARIF)"));
+                let log_lines: Vec<Line> = logs
+                    .iter()
+                    .rev()
+                    .take(5)
+                    .rev()
+                    .map(|l| Line::from(l.as_str()))
+                    .collect();
+                let log_box = Paragraph::new(log_lines).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("[L] Logs (Enter: Replay | p: Patch | g: HTML | s: SARIF | q: Quit)"),
+                );
                 f.render_widget(log_box, root_chunks[2]);
             } else {
                 let footer = Paragraph::new(
-                    " [Up/Down] Select  |  [g] Export HTML Graph  |  [s] Export SARIF  |  [L] Logs  |  [q] Quit ",
+                    " [Up/Down] Select | [Enter] Replay | [p] AI Patch | [g] HTML | [s] SARIF | [L] Logs | [q] Quit ",
                 )
                 .block(Block::default().borders(Borders::ALL).title("Actions"));
                 f.render_widget(footer, root_chunks[2]);
@@ -201,54 +214,81 @@ pub fn run_tui(
         })?;
 
         if event::poll(Duration::from_millis(120))?
-            && let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => break,
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        if !graph.findings.is_empty() {
-                            selected = (selected + 1) % graph.findings.len();
-                        }
-                    }
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        if !graph.findings.is_empty() {
-                            selected = if selected == 0 {
-                                graph.findings.len() - 1
-                            } else {
-                                selected - 1
-                            };
-                        }
-                    }
-                    KeyCode::Char('L') | KeyCode::Char('l') => {
-                        show_logs = !show_logs;
-                    }
-                    KeyCode::Char('g') => {
-                        let out = project_root.join(".veriforge").join("report.html");
-                        let _ = fs::create_dir_all(project_root.join(".veriforge"));
-                        let html = to_html_graph(
-                            &project_root.display().to_string(),
-                            graph,
-                            verified,
-                        );
-                        if fs::write(&out, html).is_ok() {
-                            logs.push(format!("Exported HTML graph -> {}", out.display()));
-                            show_logs = true;
-                        }
-                    }
-                    KeyCode::Char('s') => {
-                        let out = project_root.join(".veriforge").join("report.sarif");
-                        let _ = fs::create_dir_all(project_root.join(".veriforge"));
-                        let sarif = to_sarif_json(&graph.findings, verified);
-                        if fs::write(&out, sarif).is_ok() {
-                            logs.push(format!("Exported SARIF 2.1.0 -> {}", out.display()));
-                            show_logs = true;
-                        }
-                    }
-                    _ => {}
-                }
+            && let Event::Key(key) = event::read()?
+        {
+            if key.kind != KeyEventKind::Press {
+                continue;
             }
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => break,
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if !graph.findings.is_empty() {
+                        selected = (selected + 1) % graph.findings.len();
+                    }
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if !graph.findings.is_empty() {
+                        selected = if selected == 0 {
+                            graph.findings.len() - 1
+                        } else {
+                            selected - 1
+                        };
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(cur) = graph.findings.get(selected) {
+                        logs.push(format!(
+                            "Replay command ready: veriforge replay {} {}",
+                            cur.id,
+                            project_root.display()
+                        ));
+                        show_logs = true;
+                    }
+                }
+                KeyCode::Char('p') => {
+                    if let Some(cur) = graph.findings.get(selected) {
+                        let v_opt = ver_map.get(cur.id.as_str()).copied();
+                        if let Ok(prompt) = build_minimal_patch_prompt(project_root, cur, v_opt) {
+                            let out = project_root
+                                .join(".veriforge")
+                                .join(format!("patch_{}.prompt.txt", cur.id));
+                            let _ = fs::create_dir_all(project_root.join(".veriforge"));
+                            if fs::write(&out, &prompt).is_ok() {
+                                logs.push(format!(
+                                    "Saved minimal patch context ({} B) -> {}",
+                                    prompt.len(),
+                                    out.display()
+                                ));
+                                show_logs = true;
+                            }
+                        }
+                    }
+                }
+                KeyCode::Char('L') | KeyCode::Char('l') => {
+                    show_logs = !show_logs;
+                }
+                KeyCode::Char('g') => {
+                    let out = project_root.join(".veriforge").join("report.html");
+                    let _ = fs::create_dir_all(project_root.join(".veriforge"));
+                    let html =
+                        to_html_graph(&project_root.display().to_string(), graph, verified);
+                    if fs::write(&out, html).is_ok() {
+                        logs.push(format!("Exported HTML graph -> {}", out.display()));
+                        show_logs = true;
+                    }
+                }
+                KeyCode::Char('s') => {
+                    let out = project_root.join(".veriforge").join("report.sarif");
+                    let _ = fs::create_dir_all(project_root.join(".veriforge"));
+                    let sarif = to_sarif_json(&graph.findings, verified);
+                    if fs::write(&out, sarif).is_ok() {
+                        logs.push(format!("Exported SARIF 2.1.0 -> {}", out.display()));
+                        show_logs = true;
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     Ok(())

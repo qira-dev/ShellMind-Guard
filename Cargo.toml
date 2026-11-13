@@ -58,7 +58,6 @@ vf-report = { path = "crates/vf-report" }
 vf-ai = { path = "crates/vf-ai" }
 
 [profile.release]
-lto = "thin"
-codegen-units = 1
+codegen-units = 16
 strip = true
 opt-level = 3

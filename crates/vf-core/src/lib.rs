@@ -4,4 +4,4 @@ pub mod store;
 
 pub use config::VeriForgeConfig;
 pub use scanner::{IndexedFile, Language, ScanSummary, scan_repository};
-pub use store::{DeltaStats, StateStore};
+pub use store::{DeltaStats, StateStore, StoredFinding};

@@ -188,7 +188,8 @@ pub fn solve_guard_lattice(summaries: &[FileAstSummary]) -> GraphAnalysisResult 
             }
     }
 
-    // Deduplicate findings on the same (entry_route, rule_id), keeping the deepest witness chain
+    // Deduplicate findings on the same (entry_route, rule_id), keeping the deepest witness chain,
+    // and assign 100% deterministic sequential IDs sorted by (entry_route, rule_id).
     let mut best_by_key: HashMap<(String, String), LatticeFinding> = HashMap::new();
     for f in findings {
         let key = (f.entry_route.clone(), f.rule_id.clone());
@@ -200,7 +201,18 @@ pub fn solve_guard_lattice(summaries: &[FileAstSummary]) -> GraphAnalysisResult 
         }
     }
     let mut deduped: Vec<LatticeFinding> = best_by_key.into_values().collect();
-    deduped.sort_by(|a, b| a.id.cmp(&b.id));
+    deduped.sort_by(|a, b| {
+        a.entry_route
+            .cmp(&b.entry_route)
+            .then_with(|| a.rule_id.cmp(&b.rule_id))
+    });
+    for (i, item) in deduped.iter_mut().enumerate() {
+        let prefix = match item.missing_guard {
+            GuardKind::Auth => "VF-AUTH",
+            GuardKind::TxLock => "VF-RACE",
+        };
+        item.id = format!("{}-{:03}", prefix, i + 1);
+    }
 
     GraphAnalysisResult {
         parsed_files: summaries.len(),
