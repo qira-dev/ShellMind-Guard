@@ -139,19 +139,17 @@ fn main() -> Result<ExitCode> {
                 .unwrap_or_default();
 
             if let Some(sarif_path) = sarif {
-                if let Some(parent) = sarif_path.parent() {
-                    if !parent.as_os_str().is_empty() {
+                if let Some(parent) = sarif_path.parent()
+                    && !parent.as_os_str().is_empty() {
                         fs::create_dir_all(parent)?;
                     }
-                }
                 fs::write(&sarif_path, to_sarif_json(&graph_res.findings, &verified_list))?;
             }
             if let Some(html_path) = html {
-                if let Some(parent) = html_path.parent() {
-                    if !parent.as_os_str().is_empty() {
+                if let Some(parent) = html_path.parent()
+                    && !parent.as_os_str().is_empty() {
                         fs::create_dir_all(parent)?;
                     }
-                }
                 fs::write(
                     &html_path,
                     to_html_graph(&path.display().to_string(), &graph_res, &verified_list),

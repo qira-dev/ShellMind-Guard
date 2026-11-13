@@ -113,16 +113,35 @@ fn node_text<'a>(node: Node, src: &'a [u8]) -> &'a str {
     node.utf8_text(src).unwrap_or("")
 }
 
+fn find_line_comment_start(line: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    for i in 0..bytes.len().saturating_sub(1) {
+        if bytes[i] == b'/' && bytes[i + 1] == b'/' {
+            // Ignore URLs like https:// or http://
+            if i > 0 && bytes[i - 1] == b':' {
+                continue;
+            }
+            return Some(i);
+        }
+    }
+    None
+}
+
 fn strip_comments(src: &str) -> String {
     let mut out = String::with_capacity(src.len());
     for line in src.lines() {
-        let trimmed = if let Some(idx) = line.find("//") {
+        let trimmed = if let Some(idx) = find_line_comment_start(line) {
             &line[..idx]
         } else {
             line
         };
         let trimmed = if let Some(idx) = trimmed.find('#') {
-            &trimmed[..idx]
+            // Preserve Rust #[attr] lines, strip Python # comments
+            if trimmed[idx..].starts_with("#[") {
+                trimmed
+            } else {
+                &trimmed[..idx]
+            }
         } else {
             trimmed
         };
@@ -184,8 +203,8 @@ fn classify_sink(name: &str, body: &str) -> Option<SinkKind> {
 }
 
 fn collect_calls(node: Node, src: &[u8], calls: &mut Vec<String>) {
-    if node.kind() == "call_expression" || node.kind() == "call" {
-        if let Some(func) = node.child_by_field_name("function") {
+    if (node.kind() == "call_expression" || node.kind() == "call")
+        && let Some(func) = node.child_by_field_name("function") {
             let txt = node_text(func, src).trim();
             let short = txt.rsplit('.').next().unwrap_or(txt);
             let short = short.rsplit("::").next().unwrap_or(short);
@@ -193,7 +212,6 @@ fn collect_calls(node: Node, src: &[u8], calls: &mut Vec<String>) {
                 calls.push(short.to_string());
             }
         }
-    }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         collect_calls(child, src, calls);
@@ -231,8 +249,8 @@ fn extract_node(
     }
 
     // 2. Express / Router HTTP Route entries: app.post('/path', ...handlers)
-    if (lang == Language::TypeScript || lang == Language::JavaScript) && kind == "call_expression" {
-        if let Some(func) = node.child_by_field_name("function") {
+    if (lang == Language::TypeScript || lang == Language::JavaScript) && kind == "call_expression"
+        && let Some(func) = node.child_by_field_name("function") {
             let ftxt = node_text(func, src);
             let method = ftxt.rsplit('.').next().unwrap_or("");
             if matches!(method, "get" | "post" | "put" | "patch" | "delete")
@@ -277,14 +295,13 @@ fn extract_node(
                 return;
             }
         }
-    }
 
     // 3. Function / Method declarations (TS/JS, Rust, Python)
     if matches!(
         kind,
         "function_declaration" | "method_definition" | "function_item" | "function_definition"
-    ) {
-        if let Some(name_node) = node.child_by_field_name("name") {
+    )
+        && let Some(name_node) = node.child_by_field_name("name") {
             let name = node_text(name_node, src).trim().to_string();
             let body = node_text(node, src);
             let mut calls = Vec::new();
@@ -310,15 +327,14 @@ fn extract_node(
             });
             return;
         }
-    }
 
     // Arrow functions assigned to const/let: const foo = async (...) => { ... }
-    if kind == "variable_declarator" {
-        if let (Some(name_node), Some(val_node)) = (
+    if kind == "variable_declarator"
+        && let (Some(name_node), Some(val_node)) = (
             node.child_by_field_name("name"),
             node.child_by_field_name("value"),
-        ) {
-            if matches!(val_node.kind(), "arrow_function" | "function_expression") {
+        )
+            && matches!(val_node.kind(), "arrow_function" | "function_expression") {
                 let name = node_text(name_node, src).trim().to_string();
                 let body = node_text(val_node, src);
                 let mut calls = Vec::new();
@@ -344,8 +360,6 @@ fn extract_node(
                 });
                 return;
             }
-        }
-    }
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -377,4 +391,21 @@ pub fn resolve_import_target(from_file: &str, spec: &str, known_files: &HashSet<
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_strip_comments_preserves_urls_and_strips_for_update_comment() {
+        let code = r#"
+            const url = "https://api.stripe.com/v1/charges"; // FOR UPDATE
+            // requireAuth()
+        "#;
+        let cleaned = strip_comments(code);
+        assert!(cleaned.contains("https://api.stripe.com/v1/charges"));
+        assert!(!cleaned.contains("FOR UPDATE"));
+        assert!(!cleaned.contains("requireAuth"));
+    }
 }

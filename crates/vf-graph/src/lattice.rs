@@ -74,11 +74,10 @@ pub fn solve_guard_lattice(summaries: &[FileAstSummary]) -> GraphAnalysisResult 
                     if src_idx != dst_idx {
                         graph.update_edge(src_idx, dst_idx, ());
                     }
-                } else if let Some(target_file) = imported_targets.get(callee) {
-                    if let Some(&dst_idx) = file_symbol_map.get(&(target_file.clone(), callee.clone())) {
+                } else if let Some(target_file) = imported_targets.get(callee)
+                    && let Some(&dst_idx) = file_symbol_map.get(&(target_file.clone(), callee.clone())) {
                         graph.update_edge(src_idx, dst_idx, ());
                     }
-                }
             }
         }
     }
@@ -154,8 +153,8 @@ pub fn solve_guard_lattice(summaries: &[FileAstSummary]) -> GraphAnalysisResult 
         let active_guards = &guard_out[vi];
 
         // Check Auth Guard requirement
-        if !active_guards.contains(&GuardKind::Auth) {
-            if let Some((entry_name, witness)) = extract_unguarded_witness(&graph, idx, GuardKind::Auth) {
+        if !active_guards.contains(&GuardKind::Auth)
+            && let Some((entry_name, witness)) = extract_unguarded_witness(&graph, idx, GuardKind::Auth) {
                 findings.push(LatticeFinding {
                     id: format!("VF-AUTH-{:03}", seq),
                     rule_id: "VF-AUTH-001".into(),
@@ -169,13 +168,11 @@ pub fn solve_guard_lattice(summaries: &[FileAstSummary]) -> GraphAnalysisResult 
                 });
                 seq += 1;
             }
-        }
 
         // Check Transaction/Lock Guard requirement on Payment & Balance sinks
         if matches!(sink_kind, SinkKind::PaymentMutation | SinkKind::BalanceUpdate)
             && !active_guards.contains(&GuardKind::TxLock)
-        {
-            if let Some((entry_name, witness)) = extract_unguarded_witness(&graph, idx, GuardKind::TxLock) {
+            && let Some((entry_name, witness)) = extract_unguarded_witness(&graph, idx, GuardKind::TxLock) {
                 findings.push(LatticeFinding {
                     id: format!("VF-RACE-{:03}", seq),
                     rule_id: "VF-RACE-001".into(),
@@ -189,7 +186,6 @@ pub fn solve_guard_lattice(summaries: &[FileAstSummary]) -> GraphAnalysisResult 
                 });
                 seq += 1;
             }
-        }
     }
 
     // Deduplicate findings on the same (entry_route, rule_id), keeping the deepest witness chain

@@ -200,8 +200,8 @@ pub fn run_tui(
             }
         })?;
 
-        if event::poll(Duration::from_millis(120))? {
-            if let Event::Key(key) = event::read()? {
+        if event::poll(Duration::from_millis(120))?
+            && let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
@@ -249,7 +249,6 @@ pub fn run_tui(
                     _ => {}
                 }
             }
-        }
     }
 
     Ok(())

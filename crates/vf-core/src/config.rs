@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VeriForgeConfig {
     #[serde(default)]
     pub guards: GuardConfig,
@@ -90,16 +90,6 @@ impl Default for ScanConfig {
             ],
             max_threads: default_max_threads(),
             max_file_bytes: default_max_file_bytes(),
-        }
-    }
-}
-
-impl Default for VeriForgeConfig {
-    fn default() -> Self {
-        Self {
-            guards: GuardConfig::default(),
-            scan: ScanConfig::default(),
-            sandbox: SandboxConfig::default(),
         }
     }
 }

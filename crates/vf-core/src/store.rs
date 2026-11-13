@@ -166,4 +166,62 @@ impl StateStore {
         };
         Ok((stats, changed_files))
     }
+
+    pub fn save_findings(
+        &mut self,
+        scan_id: i64,
+        rows: &[(&str, &str, &str, &str, &str, &str)],
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM findings WHERE scan_id = ?1", params![scan_id])?;
+        {
+            let mut ins = tx.prepare(
+                "INSERT OR REPLACE INTO findings (id, scan_id, rule_id, severity, status, trace_json, poc_cmd)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?;
+            let mut fts = tx.prepare(
+                "INSERT INTO findings_fts (id, rule_id, trace_json, poc_cmd) VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for (id, rule_id, severity, status, trace_json, poc_cmd) in rows {
+                ins.execute(params![id, scan_id, rule_id, severity, status, trace_json, poc_cmd])?;
+                fts.execute(params![id, rule_id, trace_json, poc_cmd])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scanner::Language;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_delta_cache_skips_unchanged() {
+        let tmp = std::env::temp_dir().join("vf_core_test_delta");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        let mut store = StateStore::open(&tmp).unwrap();
+        let f1 = IndexedFile {
+            rel_path: "src/app.ts".into(),
+            abs_path: PathBuf::from("src/app.ts"),
+            language: Language::TypeScript,
+            blake3_hash: "abc123".into(),
+            mtime_ns: 1,
+            size_bytes: 10,
+        };
+        let (d1, c1) = store.sync_files(std::slice::from_ref(&f1)).unwrap();
+        assert_eq!(d1.added_or_modified, 1);
+        assert_eq!(c1.len(), 1);
+
+        let (d2, c2) = store.sync_files(&[f1]).unwrap();
+        assert_eq!(d2.added_or_modified, 0);
+        assert_eq!(d2.unchanged_cached, 1);
+        assert!(c2.is_empty());
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
 }
