@@ -1,0 +1,14 @@
+# VeriForge Project Configuration (.veriforge.toml)
+
+[guards]
+auth_guards = ["requireAuth", "authenticate", "verifyJwt", "withAuth", "requireAdmin"]
+lock_guards = ["withTransaction", "FOR UPDATE", "acquireLock", "idempotencyKey"]
+
+[scan]
+ignore_paths = ["node_modules", "target", "dist", "build", ".next", ".veriforge"]
+max_threads = 3
+max_file_bytes = 2097152
+
+[sandbox]
+# boot_cmd = "npm run start"
+# base_url = "http://127.0.0.1:3000"
