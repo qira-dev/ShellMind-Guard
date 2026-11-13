@@ -192,12 +192,26 @@ pub fn solve_guard_lattice(summaries: &[FileAstSummary]) -> GraphAnalysisResult 
         }
     }
 
+    // Deduplicate findings on the same (entry_route, rule_id), keeping the deepest witness chain
+    let mut best_by_key: HashMap<(String, String), LatticeFinding> = HashMap::new();
+    for f in findings {
+        let key = (f.entry_route.clone(), f.rule_id.clone());
+        match best_by_key.get(&key) {
+            Some(prev) if prev.witness_path.len() >= f.witness_path.len() => {}
+            _ => {
+                best_by_key.insert(key, f);
+            }
+        }
+    }
+    let mut deduped: Vec<LatticeFinding> = best_by_key.into_values().collect();
+    deduped.sort_by(|a, b| a.id.cmp(&b.id));
+
     GraphAnalysisResult {
         parsed_files: summaries.len(),
         symbol_count: graph.node_count(),
         edge_count: graph.edge_count(),
         route_entries,
-        findings,
+        findings: deduped,
     }
 }
 
