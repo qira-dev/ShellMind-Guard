@@ -379,13 +379,13 @@ mod tests {
             "MCP scan must return SQLi finding: {}",
             text
         );
-        let fid = findings
+        let sqli_obj = findings
             .iter()
             .find(|f| f["rule_id"] == "VF-SQLI-001")
-            .unwrap()["id"]
-            .as_str()
-            .unwrap()
-            .to_string();
+            .unwrap();
+        assert_eq!(sqli_obj["file"], "src/app.ts");
+        assert_eq!(sqli_obj["line"], 1);
+        let fid = sqli_obj["id"].as_str().unwrap().to_string();
 
         let explain_req = json!({
             "jsonrpc": "2.0",

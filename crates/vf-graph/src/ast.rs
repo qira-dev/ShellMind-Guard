@@ -2168,5 +2168,20 @@ export async function loadProfile(id: string) {
                 >= 2,
             "Must flag empty catch and console-only catch as VF-FE-ERR"
         );
+
+        let safe_tagged = r#"
+function runSafeTagged(req: any) {
+    const id = req.params.id;
+    return prisma.$queryRaw`SELECT * FROM users WHERE id = ${id}`;
+}
+"#;
+        let safe_ast = parse_inline_file("safe.ts", safe_tagged, &cfg);
+        assert!(
+            safe_ast
+                .symbols
+                .iter()
+                .all(|s| s.local_taint_hits.is_empty()),
+            "prisma.$queryRaw tagged template must NOT trigger VF-SQLI-001"
+        );
     }
 }

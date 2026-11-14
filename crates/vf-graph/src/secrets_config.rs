@@ -164,6 +164,11 @@ fn docker_user_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"(?i)^\s*USER\s+(\S+)").expect("valid docker user re"))
 }
 
+fn docker_from_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?i)^\s*FROM\s+(\S+)").expect("valid docker from re"))
+}
+
 pub fn shannon_entropy(s: &str) -> f64 {
     if s.is_empty() {
         return 0.0;
@@ -353,7 +358,8 @@ pub fn scan_secrets_and_config(rel_path: &str, content: &str) -> Vec<LocalStatic
     let mut cors_origin_lines: Vec<usize> = Vec::new();
     let mut cors_cred_lines: Vec<usize> = Vec::new();
 
-    // Track Dockerfile USER instructions
+    // Track Dockerfile FROM / USER instructions
+    let mut docker_from_line: Option<usize> = None;
     let mut docker_root_lines: Vec<usize> = Vec::new();
     let mut docker_last_non_root_line: Option<usize> = None;
 
@@ -513,12 +519,13 @@ pub fn scan_secrets_and_config(rel_path: &str, content: &str) -> Vec<LocalStatic
         if line
             .to_ascii_lowercase()
             .contains("access-control-allow-origin")
+            && !line.contains("`Access-Control-Allow-Origin")
             && cors_header_wildcard_re().is_match(line)
         {
             findings.push(make_cfg_finding(
                 "VF-CFG-CORS",
                 "HIGH",
-                "Wildcard CORS header (`Access-Control-Allow-Origin: *`) allows arbitrary origins"
+                "Wildcard CORS header (Access-Control-Allow-Origin set to wildcard) allows arbitrary origins"
                     .into(),
                 rel_path,
                 ln,
@@ -552,6 +559,8 @@ pub fn scan_secrets_and_config(rel_path: &str, content: &str) -> Vec<LocalStatic
 
         if (line.to_ascii_lowercase().contains("httponly")
             || line.to_ascii_lowercase().contains("secure"))
+            && !line.contains("`httpOnly")
+            && !line.contains("`secure")
             && insecure_cookie_re().is_match(line)
             && has_context_keyword(
                 &lines,
@@ -572,7 +581,7 @@ pub fn scan_secrets_and_config(rel_path: &str, content: &str) -> Vec<LocalStatic
             findings.push(make_cfg_finding(
                 "VF-CFG-COOKIE",
                 "MEDIUM",
-                "Insecure session/auth cookie flag (`httpOnly: false` or `secure: false`)".into(),
+                "Insecure session/auth cookie flag (httpOnly or secure disabled)".into(),
                 rel_path,
                 ln,
                 "Set `httpOnly: true`, `secure: true`, and `sameSite: 'lax' | 'strict'` on session and authentication cookies.",
@@ -655,12 +664,22 @@ pub fn scan_secrets_and_config(rel_path: &str, content: &str) -> Vec<LocalStatic
             ));
         }
 
-        if is_docker && let Some(cap) = docker_user_re().captures(line) {
-            let user = cap[1].trim().to_ascii_lowercase();
-            if user == "root" || user == "0" || user.starts_with("root:") {
-                docker_root_lines.push(ln);
-            } else {
-                docker_last_non_root_line = Some(ln);
+        if is_docker {
+            if let Some(cap) = docker_from_re().captures(line) {
+                let img = cap[1].trim().to_ascii_lowercase();
+                if img != "scratch" && !img.ends_with(":nonroot") && !img.ends_with("-nonroot") {
+                    docker_from_line = Some(ln);
+                } else {
+                    docker_from_line = None;
+                }
+            }
+            if let Some(cap) = docker_user_re().captures(line) {
+                let user = cap[1].trim().to_ascii_lowercase();
+                if user == "root" || user == "0" || user.starts_with("root:") {
+                    docker_root_lines.push(ln);
+                } else {
+                    docker_last_non_root_line = Some(ln);
+                }
             }
         }
     }
@@ -682,7 +701,8 @@ pub fn scan_secrets_and_config(rel_path: &str, content: &str) -> Vec<LocalStatic
         }
     }
 
-    // Emit VF-CFG-DOCKER if Dockerfile sets `USER root` without dropping to a non-root USER afterwards
+    // Emit VF-CFG-DOCKER if Dockerfile sets `USER root` without dropping to a non-root USER afterwards,
+    // or if Dockerfile has a non-scratch `FROM` stage without any non-root `USER` instruction.
     if let Some(&root_ln) = docker_root_lines.last() {
         let dropped_after = docker_last_non_root_line.is_some_and(|non_root| non_root > root_ln);
         if !dropped_after {
@@ -695,6 +715,17 @@ pub fn scan_secrets_and_config(rel_path: &str, content: &str) -> Vec<LocalStatic
                 "Add a non-root user (`RUN useradd ...` / `adduser ...`) and switch to it with `USER appuser` before `CMD`/`ENTRYPOINT`.",
             ));
         }
+    } else if docker_last_non_root_line.is_none()
+        && let Some(from_ln) = docker_from_line
+    {
+        findings.push(make_cfg_finding(
+            "VF-CFG-DOCKER",
+            "MEDIUM",
+            "Dockerfile is missing a non-root `USER` instruction (defaults to root)".into(),
+            rel_path,
+            from_ln,
+            "Add a non-root user (`RUN useradd ...` / `adduser ...`) and switch to it with `USER appuser` before `CMD`/`ENTRYPOINT`.",
+        ));
     }
 
     findings
@@ -880,6 +911,16 @@ const pwHash = crypto.createHash('md5').update(password).digest('hex');
         let unsafe_docker = "FROM node:20\nUSER root\nCMD [\"node\"]\n";
         let dhits = scan_secrets_and_config("Dockerfile", unsafe_docker);
         assert!(dhits.iter().any(|h| h.rule_id == "VF-CFG-DOCKER"));
+
+        let missing_user_docker = "FROM node:20\nCMD [\"node\", \"server.js\"]\n";
+        let mhits = scan_secrets_and_config("Dockerfile", missing_user_docker);
+        assert!(mhits.iter().any(|h| h.rule_id == "VF-CFG-DOCKER"));
+
+        let self_src = include_str!("secrets_config.rs");
+        assert!(
+            scan_secrets_and_config("crates/vf-graph/src/secrets_config.rs", self_src).is_empty(),
+            "secrets_config.rs must not trigger false positives on itself"
+        );
 
         let debug_py = "DEBUG = True\n";
         assert!(

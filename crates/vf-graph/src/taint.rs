@@ -418,13 +418,40 @@ fn stmt_taint_status(
     }
 }
 
+fn is_safe_sql_tagged_template(node: Node, src: &[u8]) -> bool {
+    if let Some(func) = node.child_by_field_name("function") {
+        let ftxt = node_text(func, src).trim();
+        if !ftxt.contains("Unsafe")
+            && (ftxt.ends_with("$queryRaw")
+                || ftxt.ends_with("$executeRaw")
+                || ftxt == "sql"
+                || ftxt.ends_with(".sql"))
+            && let Some(args) = node.child_by_field_name("arguments")
+            && args.kind() == "template_string"
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn has_dynamic_sql_interpolation(node: Node, src: &[u8]) -> bool {
     let k = node.kind();
     let txt = node_text(node, src);
     if !sql_verb_re().is_match(txt) {
         return false;
     }
+    if (k == "call_expression" || k == "tagged_template_expression")
+        && is_safe_sql_tagged_template(node, src)
+    {
+        return false;
+    }
     if k == "template_string" && txt.contains("${") {
+        if let Some(p) = node.parent()
+            && is_safe_sql_tagged_template(p, src)
+        {
+            return false;
+        }
         return true;
     }
     if (k == "call_expression" || k == "call")
@@ -438,7 +465,15 @@ fn has_dynamic_sql_interpolation(node: Node, src: &[u8]) -> bool {
     if k == "macro_invocation" && txt.starts_with("format!") {
         return true;
     }
-    if k == "string" && txt.contains('{') && (txt.starts_with("f\"") || txt.starts_with("f'")) {
+    if matches!(k, "string" | "concatenated_string")
+        && txt.contains('{')
+        && (txt.starts_with("f\"")
+            || txt.starts_with("f'")
+            || txt.starts_with("F\"")
+            || txt.starts_with("F'")
+            || txt.starts_with("fr\"")
+            || txt.starts_with("rf\""))
+    {
         return true;
     }
     if matches!(k, "binary_expression" | "binary_operator")

@@ -1500,6 +1500,8 @@ mod tests {
                 rule_id: "VF-RACE-001".into(),
                 severity: "CRITICAL".into(),
                 title: "Missing tx lock".into(),
+                file: "src/db/queries.ts".into(),
+                line: 1,
                 status: "PROVEN".into(),
                 entry_route: "POST /api/v1/checkout/withdraw".into(),
                 sink_kind: SinkKind::BalanceUpdate,

@@ -655,7 +655,11 @@ fn audit_requirements_txt(rel_path: &str, content: &str) -> Vec<LocalStaticFindi
         if pkg_only.is_empty() {
             continue;
         }
-        if let Some((_, ver_part)) = spec.split_once("==") {
+        if let Some((_, ver_part)) = spec
+            .split_once("==")
+            .or_else(|| spec.split_once("~="))
+            .or_else(|| spec.split_once("<="))
+        {
             let ver = ver_part.trim();
             if is_floating_version(ver) {
                 out.push(make_dep_finding(
@@ -676,6 +680,7 @@ fn audit_requirements_txt(rel_path: &str, content: &str) -> Vec<LocalStaticFindi
                 ln,
                 format!("Pin `{}` to an exact version (`package==X.Y.Z`).", pkg_only),
             ));
+            check_advisory(Ecosystem::PyPi, pkg_only, "", rel_path, ln, &mut out);
         } else if !spec.contains(">=") && !spec.contains("~=") && !spec.contains("<=") {
             out.push(make_dep_finding(
                 "MEDIUM",
@@ -690,6 +695,7 @@ fn audit_requirements_txt(rel_path: &str, content: &str) -> Vec<LocalStaticFindi
                     pkg_only, pkg_only
                 ),
             ));
+            check_advisory(Ecosystem::PyPi, pkg_only, "", rel_path, ln, &mut out);
         }
     }
     out

@@ -143,6 +143,8 @@ mod tests {
             rule_id: "VF-RACE-001".into(),
             severity: "CRITICAL".into(),
             title: "Missing tx lock".into(),
+            file: "src/routes/checkout.ts".into(),
+            line: 8,
             status: "PROVEN".into(),
             entry_route: "POST /api/v1/checkout/withdraw".into(),
             sink_kind: SinkKind::BalanceUpdate,

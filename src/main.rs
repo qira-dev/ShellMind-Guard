@@ -528,12 +528,19 @@ fn main() -> Result<ExitCode> {
                 }
             }
 
-            if ci
-                && verified_list
+            if ci {
+                let has_proven = verified_list
                     .iter()
-                    .any(|v| v.status == VerificationStatus::Proven)
-            {
-                return Ok(ExitCode::from(2));
+                    .any(|v| v.status == VerificationStatus::Proven);
+                let has_static_high_or_crit = outcome.sandbox.is_none()
+                    && outcome
+                        .graph
+                        .findings
+                        .iter()
+                        .any(|f| f.severity == "CRITICAL" || f.severity == "HIGH");
+                if has_proven || has_static_high_or_crit {
+                    return Ok(ExitCode::from(2));
+                }
             }
         }
         Commands::Replay {

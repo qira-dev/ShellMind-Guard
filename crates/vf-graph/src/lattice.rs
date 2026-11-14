@@ -20,6 +20,10 @@ pub struct LatticeFinding {
     pub rule_id: String,
     pub severity: String,
     pub title: String,
+    #[serde(default)]
+    pub file: String,
+    #[serde(default)]
+    pub line: usize,
     pub status: String,
     pub entry_route: String,
     pub sink_kind: SinkKind,
@@ -321,6 +325,8 @@ pub fn solve_guard_lattice_with_public(
                         rule_id: "VF-AUTH-001".into(),
                         severity: "HIGH".into(),
                         title: format!("Unauthenticated path to {:?} in `{}`", sink_kind, sym.name),
+                        file: String::new(),
+                        line: 0,
                         status: "SUSPECT_UNGUARDED".into(),
                         entry_route: entry_name,
                         sink_kind,
@@ -347,6 +353,8 @@ pub fn solve_guard_lattice_with_public(
                             "Missing transaction/lock guard before `{}` (Double-Spend Risk)",
                             sym.name
                         ),
+                        file: String::new(),
+                        line: 0,
                         status: "SUSPECT_UNGUARDED".into(),
                         entry_route: entry_name,
                         sink_kind,
@@ -386,6 +394,8 @@ pub fn solve_guard_lattice_with_public(
                     rule_id: hit.rule_id.clone(),
                     severity: hit.severity.clone(),
                     title: hit.title.clone(),
+                    file: hit.rel_path.clone(),
+                    line: hit.line,
                     status: "SUSPECT_UNGUARDED".into(),
                     entry_route,
                     sink_kind: hit.sink_kind,
@@ -415,6 +425,8 @@ pub fn solve_guard_lattice_with_public(
                             rule_id: hit.rule_id.clone(),
                             severity: hit.severity.clone(),
                             title: hit.title.clone(),
+                            file: hit.rel_path.clone(),
+                            line: hit.line,
                             status: "SUSPECT_UNGUARDED".into(),
                             entry_route,
                             sink_kind: hit.sink_kind,
@@ -452,6 +464,8 @@ pub fn solve_guard_lattice_with_public(
                         "Potential IDOR: authenticated resource query in `{}` lacks ownership filter",
                         sym.name
                     ),
+                    file: String::new(),
+                    line: 0,
                     status: "SUSPECT_UNGUARDED".into(),
                     entry_route: entry_name,
                     sink_kind: SinkKind::IdorDbAccess,
@@ -550,6 +564,8 @@ pub fn solve_guard_lattice_with_public(
                             "Frontend `{}` call to `{}` has no matching backend route handler",
                             call.method, call.raw_path
                         ),
+                        file: call.rel_path.clone(),
+                        line: call.line,
                         status: "SUSPECT_UNGUARDED".into(),
                         entry_route: format!("{} {}", call.method, call.raw_path),
                         sink_kind: SinkKind::FrontendContract,
@@ -619,6 +635,18 @@ pub fn solve_guard_lattice_with_public(
 
     let mut tier1_counts: HashMap<&'static str, usize> = HashMap::new();
     for (i, item) in deduped.iter_mut().enumerate() {
+        if let Some(primary) = item
+            .witness_path
+            .last()
+            .or_else(|| item.witness_path.first())
+        {
+            if item.file.is_empty() {
+                item.file = primary.file.clone();
+            }
+            if item.line == 0 {
+                item.line = primary.line;
+            }
+        }
         let prefix = prefix_for_guard(item.missing_guard);
         if matches!(item.missing_guard, GuardKind::Auth | GuardKind::TxLock) {
             item.id = format!("{}-{:03}", prefix, i + 1);
@@ -660,6 +688,8 @@ fn insert_static_finding(
         rule_id: sf.rule_id.clone(),
         severity: sf.severity.clone(),
         title: sf.title.clone(),
+        file: sf.rel_path.clone(),
+        line: sf.line,
         status: "SUSPECT_UNGUARDED".into(),
         entry_route,
         sink_kind: sf.sink_kind,

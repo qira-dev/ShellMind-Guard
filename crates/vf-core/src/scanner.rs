@@ -110,6 +110,7 @@ pub fn scan_repository(root: &Path, cfg: &VeriForgeConfig) -> Result<ScanSummary
         .collect();
 
     let mut candidate_paths: Vec<(PathBuf, String, Language)> = Vec::new();
+    let root_for_filter = canon_root.clone();
 
     let walker = WalkBuilder::new(&canon_root)
         .hidden(false)
@@ -124,7 +125,20 @@ pub fn scan_repository(root: &Path, cfg: &VeriForgeConfig) -> Result<ScanSummary
             {
                 return false;
             }
-            !ignore_set.iter().any(|ig| ig == name.as_ref())
+            if ignore_set.iter().any(|ig| ig == name.as_ref()) {
+                return false;
+            }
+            if let Ok(rel) = entry.path().strip_prefix(&root_for_filter) {
+                let rel_norm = rel.to_string_lossy().replace('\\', "/");
+                if ignore_set.iter().any(|ig| {
+                    let clean = ig.trim_matches('/');
+                    !clean.is_empty()
+                        && (rel_norm == clean || rel_norm.starts_with(&format!("{}/", clean)))
+                }) {
+                    return false;
+                }
+            }
+            true
         })
         .build();
 
@@ -142,7 +156,11 @@ pub fn scan_repository(root: &Path, cfg: &VeriForgeConfig) -> Result<ScanSummary
             || fname.ends_with(".spec.tsx")
             || fname.ends_with(".test.js")
             || fname.ends_with(".spec.js")
+            || fname.ends_with(".test.jsx")
+            || fname.ends_with(".spec.jsx")
             || fname.ends_with("_test.rs")
+            || fname.ends_with("_test.py")
+            || (fname.starts_with("test_") && fname.ends_with(".py"))
         {
             skipped.fetch_add(1, Ordering::Relaxed);
             continue;
