@@ -137,7 +137,24 @@ Measured on a 4-Core Linux workstation (Ubuntu Wayland, 15 GiB RAM, NVMe SSD, 12
 
 ## Quickstart
 
-### 1. Build & Install from Source
+### 1. One-Command Install (No Rust Toolchain Required)
+
+**Linux & macOS:**
+```bash
+curl -fsSL https://raw.githubusercontent.com/qira-dev/ShellMind-Guard/main/install.sh | bash
+```
+
+**Windows (PowerShell):**
+```powershell
+irm https://raw.githubusercontent.com/qira-dev/ShellMind-Guard/main/install.ps1 | iex
+```
+
+**Load as an AI Coding Plugin (Claude Code / MCP + Skills + Commit Hook):**
+```bash
+claude --plugin-dir /path/to/ShellMind-Guard
+```
+
+### 2. Build & Install from Source
 
 ```bash
 git clone https://github.com/qira-dev/ShellMind-Guard.git

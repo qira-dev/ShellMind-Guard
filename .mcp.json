@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "shellmind-guard": {
+      "command": "shellmind-guard",
+      "args": ["mcp"]
+    }
+  }
+}
