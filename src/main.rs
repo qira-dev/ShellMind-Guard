@@ -9,7 +9,9 @@ use vf_ai::build_minimal_patch_prompt;
 use vf_core::{StateStore, VeriForgeConfig, scan_repository};
 use vf_graph::{LatticeFinding, analyze_codebase_cached};
 use vf_report::{to_html_graph, to_sarif_json};
-use vf_sandbox::{VerificationStatus, VerifiedFinding, verify_findings_in_sandbox};
+use vf_sandbox::{
+    VerificationStatus, VerifiedFinding, verify_finding_blocking, verify_findings_in_sandbox,
+};
 use vf_tui::run_tui;
 
 #[derive(Parser, Debug)]
@@ -84,6 +86,14 @@ enum Commands {
         sync_race: usize,
         #[arg(long)]
         unsafe_host_fallback: bool,
+    },
+    /// Internal probe executed inside `--unshare-net` Bubblewrap namespace
+    #[command(name = "__probe-netns", hide = true)]
+    ProbeNetns {
+        #[arg(long)]
+        port: u16,
+        #[arg(long, default_value_t = 10)]
+        sync_race: usize,
     },
 }
 
@@ -443,6 +453,12 @@ fn main() -> Result<ExitCode> {
             )?;
             let total_ms = t0.elapsed().as_millis();
             run_tui(&path, &graph_res, &verified_list, total_ms)?;
+        }
+        Commands::ProbeNetns { port, sync_race } => {
+            let finding_json = std::env::var("VF_FINDING_JSON")?;
+            let finding: LatticeFinding = serde_json::from_str(&finding_json)?;
+            let res = verify_finding_blocking(port, &finding, sync_race)?;
+            println!("{}", serde_json::to_string(&res)?);
         }
     }
 

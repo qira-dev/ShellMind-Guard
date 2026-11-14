@@ -1,3 +1,4 @@
+use crate::verifier::VerifiedFinding;
 use anyhow::{Context, Result};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -6,6 +7,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::time::sleep;
+use vf_graph::LatticeFinding;
 
 static ACTIVE_SANDBOX_PGID: AtomicI32 = AtomicI32::new(0);
 
@@ -52,11 +54,127 @@ pub fn has_bwrap() -> bool {
     Path::new("/usr/bin/bwrap").exists()
 }
 
-/// Spawns a local target server inside an unprivileged Bubblewrap (`bwrap`) namespace
-/// with `--clearenv`, read-only project bind, ephemeral `/tmp`, 1 GiB virtual memory cap,
-/// port-conflict refusal, and process-group reaping.
-///
-/// Fails closed if `/usr/bin/bwrap` is absent unless `allow_unsafe_host_fallback` is explicitly true.
+fn build_base_bwrap_cmd(abs_root: &Path, port: u16) -> Command {
+    let mut cmd = Command::new("/usr/bin/bwrap");
+    cmd.process_group(0);
+    cmd.args([
+        "--unshare-all",
+        "--die-with-parent",
+        "--clearenv",
+        "--setenv",
+        "PATH",
+        "/usr/local/bin:/usr/bin:/bin",
+        "--setenv",
+        "HOME",
+        "/tmp",
+        "--setenv",
+        "PORT",
+        &port.to_string(),
+        "--setenv",
+        "NODE_ENV",
+        "test",
+        "--ro-bind",
+        "/usr",
+        "/usr",
+        "--ro-bind",
+        "/lib",
+        "/lib",
+        "--ro-bind",
+        "/bin",
+        "/bin",
+    ]);
+    if Path::new("/lib64").exists() {
+        cmd.args(["--ro-bind", "/lib64", "/lib64"]);
+    }
+    if Path::new("/etc").exists() {
+        cmd.args(["--ro-bind", "/etc", "/etc"]);
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let local_bin = format!("{}/.local/bin", home);
+        if Path::new(&local_bin).exists() {
+            cmd.args(["--ro-bind", &local_bin, &local_bin]);
+            cmd.args([
+                "--setenv",
+                "PATH",
+                &format!("{}:/usr/local/bin:/usr/bin:/bin", local_bin),
+            ]);
+        }
+    }
+    cmd.args([
+        "--ro-bind",
+        &abs_root.to_string_lossy(),
+        "/app",
+        "--tmpfs",
+        "/tmp",
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
+        "--chdir",
+        "/app",
+    ]);
+    cmd
+}
+
+/// B-NET: Runs BOTH the target `boot_cmd` AND `veriforge __probe-netns` inside a single
+/// `--unshare-all` (including `--unshare-net`) Bubblewrap namespace!
+/// Neither the target app nor the probe can dial the host network, LAN, or internet.
+pub fn run_finding_in_isolated_netns(
+    project_root: &Path,
+    boot_cmd: &str,
+    port: u16,
+    finding: &LatticeFinding,
+    concurrency: usize,
+) -> Result<VerifiedFinding> {
+    let abs_root = std::fs::canonicalize(project_root)?;
+    let self_exe = std::env::current_exe().context("Cannot locate current veriforge executable")?;
+    let finding_json = serde_json::to_string(finding)?;
+
+    let mut cmd = build_base_bwrap_cmd(&abs_root, port);
+    cmd.args([
+        "--ro-bind",
+        &self_exe.to_string_lossy(),
+        "/tmp/vf-probe",
+        "--setenv",
+        "VF_FINDING_JSON",
+        &finding_json,
+        "--",
+        "/bin/sh",
+        "-c",
+        &format!(
+            "ulimit -d 1048576 2>/dev/null || true; ({boot_cmd}) >/dev/null 2>&1 & SRV_PID=$!; trap 'kill -9 $SRV_PID 2>/dev/null || true' EXIT; /tmp/vf-probe __probe-netns --port {port} --sync-race {concurrency}; EC=$?; kill -9 $SRV_PID 2>/dev/null || true; exit $EC"
+        ),
+    ]);
+
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let child = cmd.spawn().context("Failed to spawn --unshare-all bwrap")?;
+    ACTIVE_SANDBOX_PGID.store(child.id() as i32, Ordering::SeqCst);
+    let output = child.wait_with_output()?;
+    ACTIVE_SANDBOX_PGID.store(0, Ordering::SeqCst);
+
+    if !output.status.success() {
+        let err_msg = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "Isolated netns probe failed (exit {}): {}",
+            output.status,
+            err_msg.trim()
+        );
+    }
+
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    let parsed: VerifiedFinding = serde_json::from_str(stdout_str.trim()).with_context(|| {
+        format!(
+            "Failed to parse __probe-netns output: {}",
+            stdout_str.chars().take(200).collect::<String>()
+        )
+    })?;
+    Ok(parsed)
+}
+
+/// Spawns a local target server for unsafe host fallback or unit tests.
 pub async fn spawn_sandboxed_server(
     project_root: &Path,
     boot_cmd: &str,
@@ -66,7 +184,6 @@ pub async fn spawn_sandboxed_server(
     if port == 0 {
         anyhow::bail!("Refusing port 0: specify an explicit loopback port");
     }
-    // B18: Refuse immediately if an unrelated listener is already accepting connections on `port`
     if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
         anyhow::bail!(
             "Port 127.0.0.1:{} is already occupied by an unrelated listener; refusing to probe wrong service",
@@ -86,70 +203,8 @@ pub async fn spawn_sandboxed_server(
     let wrapped_cmd = format!("ulimit -d 1048576 2>/dev/null || true; exec {}", boot_cmd);
 
     let child = if use_bwrap {
-        let mut cmd = Command::new("/usr/bin/bwrap");
-        cmd.process_group(0);
-        cmd.args([
-            "--unshare-pid",
-            "--unshare-ipc",
-            "--unshare-uts",
-            "--die-with-parent",
-            "--clearenv",
-            "--setenv",
-            "PATH",
-            "/usr/local/bin:/usr/bin:/bin",
-            "--setenv",
-            "HOME",
-            "/tmp",
-            "--setenv",
-            "PORT",
-            &port.to_string(),
-            "--setenv",
-            "NODE_ENV",
-            "test",
-            "--ro-bind",
-            "/usr",
-            "/usr",
-            "--ro-bind",
-            "/lib",
-            "/lib",
-            "--ro-bind",
-            "/bin",
-            "/bin",
-        ]);
-        if Path::new("/lib64").exists() {
-            cmd.args(["--ro-bind", "/lib64", "/lib64"]);
-        }
-        if Path::new("/etc").exists() {
-            cmd.args(["--ro-bind", "/etc", "/etc"]);
-        }
-        if let Ok(home) = std::env::var("HOME") {
-            let local_bin = format!("{}/.local/bin", home);
-            if Path::new(&local_bin).exists() {
-                cmd.args(["--ro-bind", &local_bin, &local_bin]);
-                cmd.args([
-                    "--setenv",
-                    "PATH",
-                    &format!("{}:/usr/local/bin:/usr/bin:/bin", local_bin),
-                ]);
-            }
-        }
-        cmd.args([
-            "--ro-bind",
-            &abs_root.to_string_lossy(),
-            "/app",
-            "--tmpfs",
-            "/tmp",
-            "--proc",
-            "/proc",
-            "--dev",
-            "/dev",
-            "--chdir",
-            "/app",
-            "--",
-            "/bin/sh",
-            "-c",
-            &wrapped_cmd,
-        ]);
+        let mut cmd = build_base_bwrap_cmd(&abs_root, port);
+        cmd.args(["--", "/bin/sh", "-c", &wrapped_cmd]);
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
         cmd.spawn().context("Failed to spawn bwrap sandbox")?
     } else {

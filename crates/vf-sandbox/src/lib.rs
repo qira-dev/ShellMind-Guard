@@ -5,8 +5,37 @@ use anyhow::Result;
 use std::path::Path;
 use vf_graph::LatticeFinding;
 
-pub use bwrap::{SandboxGuard, has_bwrap, kill_active_sandbox_pgid, spawn_sandboxed_server};
+pub use bwrap::{
+    SandboxGuard, has_bwrap, kill_active_sandbox_pgid, run_finding_in_isolated_netns,
+    spawn_sandboxed_server,
+};
 pub use verifier::{VerificationStatus, VerifiedFinding, verify_finding};
+
+pub fn verify_finding_blocking(
+    port: u16,
+    finding: &LatticeFinding,
+    concurrency: usize,
+) -> Result<VerifiedFinding> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async move {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
+        while tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_err()
+        {
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!(
+                    "Timed out waiting for server inside --unshare-net on 127.0.0.1:{}",
+                    port
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        verify_finding(port, finding, concurrency).await
+    })
+}
 
 pub fn verify_findings_in_sandbox(
     project_root: &Path,
@@ -29,21 +58,34 @@ pub fn verify_findings_in_sandbox(
             }
         });
 
-        let mut results = Vec::with_capacity(findings.len());
-        let mut used_bwrap = false;
+        let use_bwrap = has_bwrap();
+        if !use_bwrap && !allow_unsafe_host_fallback {
+            anyhow::bail!(
+                "/usr/bin/bwrap is unavailable. Refusing fail-open host execution (pass --unsafe-host-fallback to override)."
+            );
+        }
 
-        // B-DRAIN: Always run each finding against a fresh sandboxed server instance
-        // so state mutations (e.g. balance drain) from an Auth probe never skew later probes.
+        let mut results = Vec::with_capacity(findings.len());
+        // B-NET + B-DRAIN: When bwrap is available, run BOTH the target server AND `veriforge __probe-netns`
+        // inside a single `--unshare-all` (including `--unshare-net`!) namespace for each finding!
+        if use_bwrap {
+            for f in findings {
+                let res =
+                    run_finding_in_isolated_netns(project_root, boot_cmd, port, f, concurrency)?;
+                results.push(res);
+            }
+            return Ok((true, results));
+        }
+
         for f in findings {
             let guard =
                 spawn_sandboxed_server(project_root, boot_cmd, port, allow_unsafe_host_fallback)
                     .await?;
-            used_bwrap = guard.isolated_bwrap;
             let res = verify_finding(port, f, concurrency).await?;
             drop(guard);
             results.push(res);
         }
 
-        Ok((used_bwrap, results))
+        Ok((false, results))
     })
 }
