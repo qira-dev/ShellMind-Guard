@@ -24,6 +24,33 @@ enum OutputFormat {
     Sarif,
 }
 
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum FailSeverity {
+    Critical,
+    High,
+    Medium,
+    Low,
+}
+
+#[derive(Subcommand, Debug)]
+enum HookAction {
+    /// Install non-destructive pre-commit hook into `.git/hooks/pre-commit`
+    Install {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Remove ShellMind Guard block from `.git/hooks/pre-commit`
+    Uninstall {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Check if ShellMind Guard git pre-commit hook is active
+    Status {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+}
+
 pub(crate) struct ScanRunOptions<'a> {
     pub path: &'a Path,
     pub layers: &'a [String],
@@ -53,12 +80,14 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Initialize `.shellmind-guard.toml` (and optionally `.github/workflows/shellmind-guard.yml`)
+    /// Initialize `.shellmind-guard.toml` (and optionally `.github/workflows/shellmind-guard.yml` or git hook)
     Init {
         #[arg(default_value = ".")]
         path: PathBuf,
         #[arg(long)]
         ci: bool,
+        #[arg(long)]
+        hook: bool,
     },
     /// Index a repository using parallel ignore walker, BLAKE3 hashing, and SQLite WAL delta cache
     Index {
@@ -98,6 +127,17 @@ enum Commands {
         unsafe_host_fallback: bool,
         #[arg(long)]
         ci: bool,
+        #[arg(
+            long,
+            value_enum,
+            help = "Exit non-zero if any unmitigated finding meets this severity"
+        )]
+        fail_on: Option<FailSeverity>,
+        #[arg(
+            long,
+            help = "Continuously watch repository and re-scan on file changes"
+        )]
+        watch: bool,
     },
     /// Replay the exact sandbox PoC for a specific finding ID (e.g., VF-RACE-002 or VF-AUTH-001)
     Replay {
@@ -130,6 +170,16 @@ enum Commands {
     },
     /// Start stdio JSON-RPC 2.0 MCP server (exposes shellmind_guard_scan, shellmind_guard_explain_finding, shellmind_guard_init)
     Mcp,
+    /// Manage standalone Git pre-commit hook for zero-AI local protection
+    Hook {
+        #[command(subcommand)]
+        action: HookAction,
+    },
+    /// Inspect local environment, sandbox (`bwrap`), config, and hook readiness
+    Doctor {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
     /// Internal probe executed inside `--unshare-net` Bubblewrap namespace
     #[command(name = "__probe-netns", hide = true)]
     ProbeNetns {
@@ -160,9 +210,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
       - name: Install ShellMind Guard
-        run: cargo install --path . || cargo install --locked shellmind-guard
+        run: curl -fsSL https://raw.githubusercontent.com/qira-dev/ShellMind-Guard/main/install.sh | bash && echo "$HOME/.local/bin" >> $GITHUB_PATH
       - name: Run ShellMind Guard 6-Layer Scan (SARIF)
         run: shellmind-guard scan . --format sarif --sarif shellmind-guard.sarif --ci
       - name: Upload SARIF to GitHub Code Scanning
@@ -374,21 +423,29 @@ fn main() -> Result<ExitCode> {
 
     let cli = Cli::parse();
     match cli.command {
-        Commands::Init { path, ci } => {
+        Commands::Init { path, ci, hook } => {
             let (detected, out_path) = ShellMindGuardConfig::detect_and_write_init(&path)?;
+            let mut extras = Vec::new();
             if ci {
                 let ci_path = write_ci_workflow(&path)?;
-                println!(
-                    "ShellMind Guard Init | Detected: {} | Wrote {} and {}",
-                    detected.join(", "),
-                    out_path.display(),
-                    ci_path.display()
-                );
-            } else {
+                extras.push(ci_path.display().to_string());
+            }
+            if hook {
+                let hook_path = install_git_hook(&path)?;
+                extras.push(hook_path.display().to_string());
+            }
+            if extras.is_empty() {
                 println!(
                     "ShellMind Guard Init | Detected: {} | Wrote {}",
                     detected.join(", "),
                     out_path.display()
+                );
+            } else {
+                println!(
+                    "ShellMind Guard Init | Detected: {} | Wrote {} and {}",
+                    detected.join(", "),
+                    out_path.display(),
+                    extras.join(", ")
                 );
             }
         }
@@ -435,12 +492,14 @@ fn main() -> Result<ExitCode> {
             patch,
             unsafe_host_fallback,
             ci,
+            fail_on,
+            watch,
         } => {
             let effective_format = if json { OutputFormat::Json } else { format };
             let outcome = execute_scan_pipeline(ScanRunOptions {
                 path: &path,
                 layers: &layers,
-                boot_cmd,
+                boot_cmd: boot_cmd.clone(),
                 port,
                 sync_race,
                 unsafe_host_fallback,
@@ -479,107 +538,54 @@ fn main() -> Result<ExitCode> {
                 )?;
             }
 
-            match effective_format {
-                OutputFormat::Json => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&serde_json::json!({
-                            "ok": true,
-                            "elapsed_ms": outcome.elapsed_ms,
-                            "findings_count": outcome.graph.findings.len(),
-                            "findings": outcome.graph.findings,
-                            "delta": outcome.delta,
-                            "graph": outcome.graph,
-                            "sandbox_verification": outcome.sandbox.as_ref().map(|(bwrap, res)| serde_json::json!({
-                                "bwrap_isolated": bwrap,
-                                "results": res,
-                            })),
-                        }))?
-                    );
-                }
-                OutputFormat::Sarif => {
-                    if let Some(payload) = sarif_payload {
-                        println!("{}", payload);
-                    }
-                }
-                OutputFormat::Text => {
-                    println!(
-                        "ShellMind Guard Scan | {} files ({} symbols, {} edges, {} routes) | {}ms (delta: +{} / {} cached)",
-                        outcome.graph.parsed_files,
-                        outcome.graph.symbol_count,
-                        outcome.graph.edge_count,
-                        outcome.graph.route_entries,
-                        outcome.elapsed_ms,
-                        outcome.delta.added_or_modified,
-                        outcome.delta.unchanged_cached
-                    );
-                    if outcome.graph.findings.is_empty() {
-                        println!("  [OK] No security or logic issues detected.");
-                    } else {
-                        println!(
-                            "  [!] {} finding(s) detected:",
-                            outcome.graph.findings.len()
-                        );
-                        for f in &outcome.graph.findings {
-                            println!(
-                                "\n  [{}] {} ({}) -> {}",
-                                f.severity, f.id, f.rule_id, f.title
-                            );
-                            println!("      Entry: {}", f.entry_route);
-                            for (i, hop) in f.witness_path.iter().enumerate() {
-                                println!(
-                                    "      [{}] {}:{}  {}",
-                                    i + 1,
-                                    hop.file,
-                                    hop.line,
-                                    hop.symbol
-                                );
-                            }
-                            if !f.remediation.is_empty() {
-                                println!("      Fix  : {}", f.remediation);
-                            }
-                        }
-                    }
+            render_scan_output(
+                &path,
+                effective_format,
+                &outcome,
+                &verified_list,
+                sarif_payload.as_deref(),
+                patch,
+            )?;
 
-                    if let Some((bwrap, verified)) = &outcome.sandbox {
-                        println!(
-                            "\nShellMind Guard Sandbox Proof (bwrap={}):",
-                            if *bwrap { "isolated" } else { "local-loopback" }
-                        );
-                        for v in verified {
-                            let tag = match v.status {
-                                VerificationStatus::Proven => "PROVEN",
-                                VerificationStatus::Mitigated => "MITIGATED",
-                                VerificationStatus::SuspectUnverified => "SUSPECT",
-                            };
-                            println!(
-                                "  [{}] {} ({}) -> {}",
-                                tag, v.finding_id, v.rule_id, v.evidence
-                            );
-                        }
-                    }
-
-                    if patch {
-                        for f in &outcome.graph.findings {
-                            let v_opt = verified_list.iter().find(|v| v.finding_id == f.id);
-                            if let Ok(p) = build_minimal_patch_prompt(&path, f, v_opt) {
-                                println!("\n=== Minimal Patch Context ({} bytes) ===", p.len());
-                                println!("{}", p);
-                            }
-                        }
+            if watch {
+                eprintln!(
+                    "[ShellMind Guard] Watching {} for changes (Ctrl+C to stop)...",
+                    path.display()
+                );
+                let cfg = ShellMindGuardConfig::load_from_dir(&path)?;
+                let mut store = StateStore::open(&path)?;
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(800));
+                    let summary = scan_repository(&path, &cfg)?;
+                    let (delta, _) = store.sync_files(&summary.files)?;
+                    if delta.added_or_modified > 0 || delta.removed > 0 {
+                        let next_outcome = execute_scan_pipeline(ScanRunOptions {
+                            path: &path,
+                            layers: &layers,
+                            boot_cmd: boot_cmd.clone(),
+                            port,
+                            sync_race,
+                            unsafe_host_fallback,
+                        })?;
+                        let next_verified: Vec<VerifiedFinding> = next_outcome
+                            .sandbox
+                            .as_ref()
+                            .map(|(_, v)| v.clone())
+                            .unwrap_or_default();
+                        render_scan_output(
+                            &path,
+                            effective_format,
+                            &next_outcome,
+                            &next_verified,
+                            None,
+                            patch,
+                        )?;
                     }
                 }
             }
 
-            if ci {
-                let has_proven_or_unmitigated_high = outcome.graph.findings.iter().any(|f| {
-                    f.status == "PROVEN"
-                        || (f.status != "MITIGATED"
-                            && (f.severity == "CRITICAL" || f.severity == "HIGH"))
-                });
-                if has_proven_or_unmitigated_high {
-                    return Ok(ExitCode::from(2));
-                }
+            if should_fail_gate(&outcome.graph.findings, ci, fail_on) {
+                return Ok(ExitCode::from(2));
             }
         }
         Commands::Replay {
@@ -681,6 +687,37 @@ fn main() -> Result<ExitCode> {
         Commands::Mcp => {
             mcp::run_stdio_server()?;
         }
+        Commands::Hook { action } => match action {
+            HookAction::Install { path } => {
+                let p = install_git_hook(&path)?;
+                println!(
+                    "ShellMind Guard Hook | Installed pre-commit hook at {}",
+                    p.display()
+                );
+            }
+            HookAction::Uninstall { path } => {
+                let removed = uninstall_git_hook(&path)?;
+                if removed {
+                    println!("ShellMind Guard Hook | Removed pre-commit hook block.");
+                } else {
+                    println!("ShellMind Guard Hook | Not installed.");
+                }
+            }
+            HookAction::Status { path } => {
+                let active = git_hook_status(&path);
+                println!(
+                    "ShellMind Guard Hook | {}",
+                    if active {
+                        "ACTIVE (.git/hooks/pre-commit)"
+                    } else {
+                        "NOT INSTALLED"
+                    }
+                );
+            }
+        },
+        Commands::Doctor { path } => {
+            run_doctor(&path);
+        }
         Commands::ProbeNetns { port, sync_race } => {
             let finding_json = std::env::var("VF_FINDING_JSON")?;
             let finding: LatticeFinding = serde_json::from_str(&finding_json)?;
@@ -690,4 +727,322 @@ fn main() -> Result<ExitCode> {
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+const HOOK_START: &str = "# >>> shellmind-guard pre-commit >>>";
+const HOOK_END: &str = "# <<< shellmind-guard pre-commit <<<";
+
+fn resolve_git_hooks_dir(root: &Path) -> Result<PathBuf> {
+    let git_dir = root.join(".git");
+    if !git_dir.exists() {
+        anyhow::bail!(
+            "Not a git repository ({} has no .git directory)",
+            root.display()
+        );
+    }
+    Ok(git_dir.join("hooks"))
+}
+
+fn install_git_hook(root: &Path) -> Result<PathBuf> {
+    let hooks_dir = resolve_git_hooks_dir(root)?;
+    fs::create_dir_all(&hooks_dir)?;
+    let hook_path = hooks_dir.join("pre-commit");
+    let block = format!(
+        "{}\nif command -v shellmind-guard >/dev/null 2>&1; then\n  shellmind-guard scan . --layers secrets,config --ci\nfi\n{}\n",
+        HOOK_START, HOOK_END
+    );
+
+    let updated = if hook_path.exists() {
+        let existing = fs::read_to_string(&hook_path)?;
+        if existing.contains(HOOK_START) {
+            existing
+        } else if existing.ends_with('\n') {
+            format!("{}\n{}", existing, block)
+        } else {
+            format!("{}\n\n{}", existing, block)
+        }
+    } else {
+        format!("#!/usr/bin/env bash\nset -e\n\n{}", block)
+    };
+
+    fs::write(&hook_path, updated)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&hook_path)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&hook_path, perms)?;
+    }
+    Ok(hook_path)
+}
+
+fn uninstall_git_hook(root: &Path) -> Result<bool> {
+    let Ok(hooks_dir) = resolve_git_hooks_dir(root) else {
+        return Ok(false);
+    };
+    let hook_path = hooks_dir.join("pre-commit");
+    if !hook_path.exists() {
+        return Ok(false);
+    }
+    let existing = fs::read_to_string(&hook_path)?;
+    let Some(start_idx) = existing.find(HOOK_START) else {
+        return Ok(false);
+    };
+    let end_idx = existing[start_idx..]
+        .find(HOOK_END)
+        .map(|rel| start_idx + rel + HOOK_END.len())
+        .unwrap_or(existing.len());
+    let remaining = format!(
+        "{}{}",
+        existing[..start_idx].trim_end(),
+        existing[end_idx..].trim_start()
+    );
+    let trimmed = remaining.trim();
+    if trimmed.is_empty()
+        || trimmed == "#!/usr/bin/env bash\nset -e"
+        || trimmed == "#!/usr/bin/env bash"
+        || trimmed == "#!/bin/sh"
+    {
+        fs::remove_file(&hook_path)?;
+    } else {
+        fs::write(&hook_path, format!("{}\n", trimmed))?;
+    }
+    Ok(true)
+}
+
+fn git_hook_status(root: &Path) -> bool {
+    let Ok(hooks_dir) = resolve_git_hooks_dir(root) else {
+        return false;
+    };
+    let hook_path = hooks_dir.join("pre-commit");
+    fs::read_to_string(hook_path)
+        .map(|s| s.contains(HOOK_START))
+        .unwrap_or(false)
+}
+
+fn severity_rank(sev: &str) -> u8 {
+    match sev.to_ascii_uppercase().as_str() {
+        "CRITICAL" => 4,
+        "HIGH" => 3,
+        "MEDIUM" => 2,
+        "LOW" => 1,
+        _ => 0,
+    }
+}
+
+fn should_fail_gate(findings: &[LatticeFinding], ci: bool, fail_on: Option<FailSeverity>) -> bool {
+    if let Some(threshold) = fail_on {
+        let min_rank = match threshold {
+            FailSeverity::Critical => 4,
+            FailSeverity::High => 3,
+            FailSeverity::Medium => 2,
+            FailSeverity::Low => 1,
+        };
+        return findings.iter().any(|f| {
+            f.status != "MITIGATED"
+                && (f.status == "PROVEN" || severity_rank(&f.severity) >= min_rank)
+        });
+    }
+    if ci {
+        return findings.iter().any(|f| {
+            f.status == "PROVEN"
+                || (f.status != "MITIGATED" && (f.severity == "CRITICAL" || f.severity == "HIGH"))
+        });
+    }
+    false
+}
+
+fn render_scan_output(
+    path: &Path,
+    format: OutputFormat,
+    outcome: &ScanOutcome,
+    verified_list: &[VerifiedFinding],
+    sarif_payload: Option<&str>,
+    patch: bool,
+) -> Result<()> {
+    match format {
+        OutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "ok": true,
+                    "elapsed_ms": outcome.elapsed_ms,
+                    "findings_count": outcome.graph.findings.len(),
+                    "findings": outcome.graph.findings,
+                    "delta": outcome.delta,
+                    "graph": outcome.graph,
+                    "sandbox_verification": outcome.sandbox.as_ref().map(|(bwrap, res)| serde_json::json!({
+                        "bwrap_isolated": bwrap,
+                        "results": res,
+                    })),
+                }))?
+            );
+        }
+        OutputFormat::Sarif => {
+            if let Some(payload) = sarif_payload {
+                println!("{}", payload);
+            }
+        }
+        OutputFormat::Text => {
+            println!(
+                "ShellMind Guard Scan | {} files ({} symbols, {} edges, {} routes) | {}ms (delta: +{} / {} cached)",
+                outcome.graph.parsed_files,
+                outcome.graph.symbol_count,
+                outcome.graph.edge_count,
+                outcome.graph.route_entries,
+                outcome.elapsed_ms,
+                outcome.delta.added_or_modified,
+                outcome.delta.unchanged_cached
+            );
+            if outcome.graph.findings.is_empty() {
+                println!("  [OK] No security or logic issues detected.");
+            } else {
+                println!(
+                    "  [!] {} finding(s) detected:",
+                    outcome.graph.findings.len()
+                );
+                for f in &outcome.graph.findings {
+                    println!(
+                        "\n  [{}] {} ({}) -> {}",
+                        f.severity, f.id, f.rule_id, f.title
+                    );
+                    println!("      Entry: {}", f.entry_route);
+                    for (i, hop) in f.witness_path.iter().enumerate() {
+                        println!(
+                            "      [{}] {}:{}  {}",
+                            i + 1,
+                            hop.file,
+                            hop.line,
+                            hop.symbol
+                        );
+                    }
+                    if !f.remediation.is_empty() {
+                        println!("      Fix  : {}", f.remediation);
+                    }
+                }
+            }
+
+            if let Some((bwrap, verified)) = &outcome.sandbox {
+                println!(
+                    "\nShellMind Guard Sandbox Proof (bwrap={}):",
+                    if *bwrap { "isolated" } else { "local-loopback" }
+                );
+                for v in verified {
+                    let tag = match v.status {
+                        VerificationStatus::Proven => "PROVEN",
+                        VerificationStatus::Mitigated => "MITIGATED",
+                        VerificationStatus::SuspectUnverified => "SUSPECT",
+                    };
+                    println!(
+                        "  [{}] {} ({}) -> {}",
+                        tag, v.finding_id, v.rule_id, v.evidence
+                    );
+                }
+            }
+
+            if patch {
+                for f in &outcome.graph.findings {
+                    let v_opt = verified_list.iter().find(|v| v.finding_id == f.id);
+                    if let Ok(p) = build_minimal_patch_prompt(path, f, v_opt) {
+                        println!("\n=== Minimal Patch Context ({} bytes) ===", p.len());
+                        println!("{}", p);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_doctor(path: &Path) {
+    println!(
+        "ShellMind Guard Doctor | v{} ({}/{})",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
+    let bwrap_ok = Path::new("/usr/bin/bwrap").exists();
+    println!(
+        "  Sandbox (bwrap) : {}",
+        if bwrap_ok {
+            "OK (/usr/bin/bwrap)"
+        } else {
+            "UNAVAILABLE (static 6-layer scan, TUI, SARIF & MCP work; live sandbox requires Linux bwrap)"
+        }
+    );
+    let cfg_exists = path.join(".shellmind-guard.toml").exists();
+    println!(
+        "  Config          : {}",
+        if cfg_exists {
+            ".shellmind-guard.toml present"
+        } else {
+            "using built-in defaults (run `shellmind-guard init` to customize)"
+        }
+    );
+    println!(
+        "  Git Pre-Commit  : {}",
+        if git_hook_status(path) {
+            "ACTIVE"
+        } else {
+            "not installed (run `shellmind-guard hook install` for zero-AI commit protection)"
+        }
+    );
+}
+
+#[cfg(test)]
+mod main_tests {
+    use super::*;
+
+    #[test]
+    fn test_git_hook_install_preserves_existing_and_uninstalls_cleanly() {
+        let tmp = std::env::temp_dir().join(format!("smg_hook_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join(".git").join("hooks")).unwrap();
+        let hook_file = tmp.join(".git").join("hooks").join("pre-commit");
+        fs::write(&hook_file, "#!/bin/sh\necho 'custom hook'\n").unwrap();
+
+        install_git_hook(&tmp).unwrap();
+        assert!(git_hook_status(&tmp));
+        let content = fs::read_to_string(&hook_file).unwrap();
+        assert!(content.contains("echo 'custom hook'"));
+        assert!(content.contains(HOOK_START));
+
+        // Idempotent second install
+        install_git_hook(&tmp).unwrap();
+        let content2 = fs::read_to_string(&hook_file).unwrap();
+        assert_eq!(content2.matches(HOOK_START).count(), 1);
+
+        // Uninstall preserves original custom hook
+        assert!(uninstall_git_hook(&tmp).unwrap());
+        assert!(!git_hook_status(&tmp));
+        let after = fs::read_to_string(&hook_file).unwrap();
+        assert!(after.contains("echo 'custom hook'"));
+        assert!(!after.contains(HOOK_START));
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_fail_on_severity_gate() {
+        let med = LatticeFinding {
+            id: "VF-FE-001".into(),
+            rule_id: "VF-FE-ERR".into(),
+            severity: "MEDIUM".into(),
+            title: "Empty catch".into(),
+            status: "SUSPECT_UNGUARDED".into(),
+            entry_route: "app.ts:1".into(),
+            file: "app.ts".into(),
+            line: 1,
+            sink_kind: vf_graph::SinkKind::SqlWrite,
+            missing_guard: GuardKind::Auth,
+            witness_path: vec![],
+            remediation: String::new(),
+        };
+        assert!(!should_fail_gate(std::slice::from_ref(&med), true, None));
+        assert!(should_fail_gate(
+            std::slice::from_ref(&med),
+            false,
+            Some(FailSeverity::Medium)
+        ));
+        assert!(!should_fail_gate(&[med], false, Some(FailSeverity::High)));
+    }
 }
