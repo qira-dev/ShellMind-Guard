@@ -100,6 +100,19 @@ pub fn scan_repository(root: &Path, cfg: &VeriForgeConfig) -> Result<ScanSummary
         }
         total_seen.fetch_add(1, Ordering::Relaxed);
         let path = entry.path();
+        let fname = entry.file_name().to_string_lossy();
+        if fname.ends_with("_test.go")
+            || fname.ends_with(".test.ts")
+            || fname.ends_with(".spec.ts")
+            || fname.ends_with(".test.tsx")
+            || fname.ends_with(".spec.tsx")
+            || fname.ends_with(".test.js")
+            || fname.ends_with(".spec.js")
+            || fname.ends_with("_test.rs")
+        {
+            skipped.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
         if let Some(lang) = Language::from_path(path) {
             if let Ok(rel) = path.strip_prefix(&canon_root) {
                 candidate_paths.push((
