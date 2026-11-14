@@ -60,7 +60,9 @@ pub fn solve_guard_lattice(summaries: &[FileAstSummary]) -> GraphAnalysisResult 
     for f in summaries {
         let mut imported_targets: HashMap<String, String> = HashMap::new();
         for imp in &f.imports {
-            if let Some(target_file) = resolve_import_target(&f.rel_path, &imp.from_specifier, &known_files) {
+            if let Some(target_file) =
+                resolve_import_target(&f.rel_path, &imp.from_specifier, &known_files)
+            {
                 imported_targets.insert(imp.symbol_name.clone(), target_file);
             }
         }
@@ -75,9 +77,11 @@ pub fn solve_guard_lattice(summaries: &[FileAstSummary]) -> GraphAnalysisResult 
                         graph.update_edge(src_idx, dst_idx, ());
                     }
                 } else if let Some(target_file) = imported_targets.get(callee)
-                    && let Some(&dst_idx) = file_symbol_map.get(&(target_file.clone(), callee.clone())) {
-                        graph.update_edge(src_idx, dst_idx, ());
-                    }
+                    && let Some(&dst_idx) =
+                        file_symbol_map.get(&(target_file.clone(), callee.clone()))
+                {
+                    graph.update_edge(src_idx, dst_idx, ());
+                }
             }
         }
     }
@@ -154,38 +158,47 @@ pub fn solve_guard_lattice(summaries: &[FileAstSummary]) -> GraphAnalysisResult 
 
         // Check Auth Guard requirement
         if !active_guards.contains(&GuardKind::Auth)
-            && let Some((entry_name, witness)) = extract_unguarded_witness(&graph, idx, GuardKind::Auth) {
-                findings.push(LatticeFinding {
-                    id: format!("VF-AUTH-{:03}", seq),
-                    rule_id: "VF-AUTH-001".into(),
-                    severity: "HIGH".into(),
-                    title: format!("Unauthenticated path to {:?} in `{}`", sink_kind, sym.name),
-                    status: "SUSPECT_UNGUARDED".into(),
-                    entry_route: entry_name,
-                    sink_kind,
-                    missing_guard: GuardKind::Auth,
-                    witness_path: witness,
-                });
-                seq += 1;
-            }
+            && let Some((entry_name, witness)) =
+                extract_unguarded_witness(&graph, idx, GuardKind::Auth)
+        {
+            findings.push(LatticeFinding {
+                id: format!("VF-AUTH-{:03}", seq),
+                rule_id: "VF-AUTH-001".into(),
+                severity: "HIGH".into(),
+                title: format!("Unauthenticated path to {:?} in `{}`", sink_kind, sym.name),
+                status: "SUSPECT_UNGUARDED".into(),
+                entry_route: entry_name,
+                sink_kind,
+                missing_guard: GuardKind::Auth,
+                witness_path: witness,
+            });
+            seq += 1;
+        }
 
         // Check Transaction/Lock Guard requirement on Payment & Balance sinks
-        if matches!(sink_kind, SinkKind::PaymentMutation | SinkKind::BalanceUpdate)
-            && !active_guards.contains(&GuardKind::TxLock)
-            && let Some((entry_name, witness)) = extract_unguarded_witness(&graph, idx, GuardKind::TxLock) {
-                findings.push(LatticeFinding {
-                    id: format!("VF-RACE-{:03}", seq),
-                    rule_id: "VF-RACE-001".into(),
-                    severity: "CRITICAL".into(),
-                    title: format!("Missing transaction/lock guard before `{}` (Double-Spend Risk)", sym.name),
-                    status: "SUSPECT_UNGUARDED".into(),
-                    entry_route: entry_name,
-                    sink_kind,
-                    missing_guard: GuardKind::TxLock,
-                    witness_path: witness,
-                });
-                seq += 1;
-            }
+        if matches!(
+            sink_kind,
+            SinkKind::PaymentMutation | SinkKind::BalanceUpdate
+        ) && !active_guards.contains(&GuardKind::TxLock)
+            && let Some((entry_name, witness)) =
+                extract_unguarded_witness(&graph, idx, GuardKind::TxLock)
+        {
+            findings.push(LatticeFinding {
+                id: format!("VF-RACE-{:03}", seq),
+                rule_id: "VF-RACE-001".into(),
+                severity: "CRITICAL".into(),
+                title: format!(
+                    "Missing transaction/lock guard before `{}` (Double-Spend Risk)",
+                    sym.name
+                ),
+                status: "SUSPECT_UNGUARDED".into(),
+                entry_route: entry_name,
+                sink_kind,
+                missing_guard: GuardKind::TxLock,
+                witness_path: witness,
+            });
+            seq += 1;
+        }
     }
 
     // Deduplicate findings on the same (entry_route, rule_id), keeping the deepest witness chain,

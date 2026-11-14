@@ -4,10 +4,7 @@ use vf_graph::{GraphAnalysisResult, LatticeFinding};
 use vf_sandbox::{VerificationStatus, VerifiedFinding};
 
 /// Exports findings in standard SARIF 2.1.0 format for GitHub Code Scanning & CI/CD.
-pub fn to_sarif_json(
-    findings: &[LatticeFinding],
-    verified: &[VerifiedFinding],
-) -> String {
+pub fn to_sarif_json(findings: &[LatticeFinding], verified: &[VerifiedFinding]) -> String {
     let ver_map: HashMap<&str, &VerifiedFinding> = verified
         .iter()
         .map(|v| (v.finding_id.as_str(), v))
@@ -31,7 +28,8 @@ pub fn to_sarif_json(
             };
 
             let primary_hop = f.witness_path.last().or_else(|| f.witness_path.first());
-            let uri = primary_hop.map(|h| h.file.as_str()).unwrap_or("unknown");
+            let uri =
+                percent_encode_uri_path(primary_hop.map(|h| h.file.as_str()).unwrap_or("unknown"));
             let start_line = primary_hop.map(|h| h.line.max(1)).unwrap_or(1);
 
             let thread_locations: Vec<serde_json::Value> = f
@@ -41,7 +39,7 @@ pub fn to_sarif_json(
                     json!({
                         "location": {
                             "physicalLocation": {
-                                "artifactLocation": { "uri": h.file },
+                                "artifactLocation": { "uri": percent_encode_uri_path(&h.file) },
                                 "region": { "startLine": h.line.max(1) }
                             },
                             "message": { "text": format!("Symbol: {}", h.symbol) }
@@ -115,12 +113,19 @@ pub fn to_html_graph(
             Some(v) if v.status == VerificationStatus::Proven => (
                 "PROVEN",
                 "badge-proven",
-                format!("<div class=\"proof\"><strong>Sandbox Proof:</strong> {}<br><code>{}</code></div>", escape_html(&v.evidence), escape_html(&v.replay_cmd)),
+                format!(
+                    "<div class=\"proof\"><strong>Sandbox Proof:</strong> {}<br><code>{}</code></div>",
+                    escape_html(&v.evidence),
+                    escape_html(&v.replay_cmd)
+                ),
             ),
             Some(v) if v.status == VerificationStatus::Mitigated => (
                 "MITIGATED",
                 "badge-mitigated",
-                format!("<div class=\"proof\"><strong>Mitigated:</strong> {}</div>", escape_html(&v.evidence)),
+                format!(
+                    "<div class=\"proof\"><strong>Mitigated:</strong> {}</div>",
+                    escape_html(&v.evidence)
+                ),
             ),
             _ => ("SUSPECT", "badge-suspect", String::new()),
         };
@@ -227,6 +232,19 @@ pub fn to_html_graph(
         proven = proven_count,
         cards = cards
     )
+}
+
+fn percent_encode_uri_path(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        let safe = b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'/' | b'~');
+        if safe {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{:02X}", b));
+        }
+    }
+    out
 }
 
 fn escape_html(s: &str) -> String {

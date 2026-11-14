@@ -1,10 +1,17 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::Barrier;
+use tokio::sync::Notify;
+use tokio::time::timeout;
 use vf_graph::{GuardKind, LatticeFinding};
+
+const MAX_HTTP_BODY_BYTES: usize = 256 * 1024;
+const IO_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VerificationStatus {
@@ -38,8 +45,90 @@ fn extract_http_status(resp: &str) -> u16 {
         .unwrap_or(0)
 }
 
+fn split_headers_and_body(raw: &str) -> (&str, &str) {
+    if let Some((h, b)) = raw.split_once("\r\n\r\n") {
+        (h, b)
+    } else if let Some((h, b)) = raw.split_once("\n\n") {
+        (h, b)
+    } else {
+        (raw, "")
+    }
+}
+
+fn parse_content_length(headers: &str) -> Option<usize> {
+    for line in headers.lines() {
+        if let Some((k, v)) = line.split_once(':')
+            && k.trim().eq_ignore_ascii_case("content-length")
+        {
+            return v.trim().parse::<usize>().ok();
+        }
+    }
+    None
+}
+
+/// Reads an HTTP response with strict timeout and 256 KiB cap, stopping immediately once
+/// `Content-Length` bytes are received so keep-open connections never hang.
+async fn read_http_bounded(stream: &mut TcpStream) -> Result<(u16, String)> {
+    let mut buf = Vec::with_capacity(4096);
+    let mut tmp = [0u8; 4096];
+    let mut expected_total: Option<usize> = None;
+
+    let res = timeout(IO_TIMEOUT, async {
+        loop {
+            let n = stream.read(&mut tmp).await?;
+            if n == 0 {
+                break;
+            }
+            let take = n.min(MAX_HTTP_BODY_BYTES.saturating_sub(buf.len()));
+            buf.extend_from_slice(&tmp[..take]);
+            if expected_total.is_none() {
+                let s = String::from_utf8_lossy(&buf);
+                if let Some(hdr_end) = s.find("\r\n\r\n") {
+                    let hdrs = &s[..hdr_end];
+                    if let Some(cl) = parse_content_length(hdrs) {
+                        expected_total = Some(hdr_end + 4 + cl.min(MAX_HTTP_BODY_BYTES));
+                    }
+                }
+            }
+            if let Some(tot) = expected_total
+                && buf.len() >= tot
+            {
+                break;
+            }
+            if buf.len() >= MAX_HTTP_BODY_BYTES {
+                break;
+            }
+        }
+        Ok::<(), std::io::Error>(())
+    })
+    .await;
+
+    let raw = String::from_utf8_lossy(&buf).to_string();
+    let status = extract_http_status(&raw);
+    let (_, body) = split_headers_and_body(&raw);
+    if res.is_err() && status == 0 {
+        anyhow::bail!("Timed out reading HTTP response");
+    }
+    Ok((status, body.trim().to_string()))
+}
+
+fn is_failure_envelope(status: u16, body: &str) -> bool {
+    if status == 204 || body.is_empty() {
+        return true;
+    }
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+        if v.get("ok").and_then(|b| b.as_bool()) == Some(false) {
+            return true;
+        }
+        if v.get("error").is_some() && v.get("ok").and_then(|b| b.as_bool()) != Some(true) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Checks whether an unauthenticated request to the flagged route is blocked (401/403)
-/// or actually executes (2xx) inside the isolated loopback sandbox.
+/// or actually executes a non-error payload inside the isolated loopback sandbox.
 pub async fn verify_auth_invariant(port: u16, finding: &LatticeFinding) -> Result<VerifiedFinding> {
     let (method, path) = parse_route(&finding.entry_route);
     let body = r#"{"userId":"test-user-1","amount":10}"#;
@@ -48,22 +137,34 @@ pub async fn verify_auth_invariant(port: u16, finding: &LatticeFinding) -> Resul
         body.len()
     );
 
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).await?;
-    stream.write_all(req.as_bytes()).await?;
-    let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).await?;
-    let resp = String::from_utf8_lossy(&buf);
-    let status_code = extract_http_status(&resp);
+    let mut stream = timeout(IO_TIMEOUT, TcpStream::connect(("127.0.0.1", port))).await??;
+    timeout(IO_TIMEOUT, stream.write_all(req.as_bytes())).await??;
+    let (status_code, resp_body) = read_http_bounded(&mut stream)
+        .await
+        .unwrap_or((0, String::new()));
 
     let (status, evidence) = if status_code == 401 || status_code == 403 {
         (
             VerificationStatus::Mitigated,
             format!("Blocked by runtime guard with HTTP {}", status_code),
         )
-    } else if (200..300).contains(&status_code) {
+    } else if (200..300).contains(&status_code) && !is_failure_envelope(status_code, &resp_body) {
         (
             VerificationStatus::Proven,
-            format!("Unauthenticated request succeeded with HTTP {}", status_code),
+            format!(
+                "Unauthenticated request executed with HTTP {} (payload: {})",
+                status_code,
+                resp_body.chars().take(120).collect::<String>()
+            ),
+        )
+    } else if (200..300).contains(&status_code) {
+        (
+            VerificationStatus::SuspectUnverified,
+            format!(
+                "HTTP {} returned empty/failure envelope ({}); cannot prove mutation",
+                status_code,
+                resp_body.chars().take(80).collect::<String>()
+            ),
         )
     } else {
         (
@@ -85,14 +186,25 @@ pub async fn verify_auth_invariant(port: u16, finding: &LatticeFinding) -> Resul
     })
 }
 
-/// Barrier-synchronized Last-Byte Sync concurrency test:
-/// Buffers N identical requests minus the final byte, waits at a Tokio Barrier(N),
-/// and flushes the final byte simultaneously to test idempotency/transaction locking.
+/// Cancel-safe Last-Byte Sync concurrency test:
+/// Buffers N identical requests minus the final byte. Uses an atomic counter + Notify
+/// with a strict 2s deadline so pre-barrier connection/fd errors NEVER deadlock other workers.
 pub async fn verify_concurrency_invariant(
     port: u16,
     finding: &LatticeFinding,
     concurrency: usize,
 ) -> Result<VerifiedFinding> {
+    if concurrency == 0 {
+        return Ok(VerifiedFinding {
+            finding_id: finding.id.clone(),
+            rule_id: finding.rule_id.clone(),
+            entry_route: finding.entry_route.clone(),
+            status: VerificationStatus::SuspectUnverified,
+            evidence: "Concurrency set to 0; no requests dispatched".into(),
+            replay_cmd: format!("veriforge replay {} --sync-race 10", finding.id),
+        });
+    }
+
     let (method, path) = parse_route(&finding.entry_route);
     let body = r#"{"userId":"test-user-1","amount":80}"#;
     let raw_req = format!(
@@ -104,62 +216,122 @@ pub async fn verify_concurrency_invariant(
     let prefix = Arc::new(bytes[..split_at].to_vec());
     let last_byte = bytes[split_at];
 
-    let barrier = Arc::new(Barrier::new(concurrency));
+    let ready_count = Arc::new(AtomicUsize::new(0));
+    let failed_count = Arc::new(AtomicUsize::new(0));
+    let go_notify = Arc::new(Notify::new());
     let mut handles = Vec::with_capacity(concurrency);
 
     for _ in 0..concurrency {
         let pfx = Arc::clone(&prefix);
-        let b = Arc::clone(&barrier);
+        let ready = Arc::clone(&ready_count);
+        let failed = Arc::clone(&failed_count);
+        let go = Arc::clone(&go_notify);
         handles.push(tokio::spawn(async move {
-            let mut stream = TcpStream::connect(("127.0.0.1", port)).await.ok()?;
+            let conn = timeout(
+                Duration::from_secs(2),
+                TcpStream::connect(("127.0.0.1", port)),
+            )
+            .await;
+            let mut stream = match conn {
+                Ok(Ok(s)) => s,
+                _ => {
+                    failed.fetch_add(1, Ordering::SeqCst);
+                    go.notify_waiters();
+                    return None;
+                }
+            };
             let _ = stream.set_nodelay(true);
-            stream.write_all(&pfx).await.ok()?;
-            stream.flush().await.ok()?;
+            if timeout(Duration::from_secs(2), stream.write_all(&pfx))
+                .await
+                .is_err()
+                || stream.flush().await.is_err()
+            {
+                failed.fetch_add(1, Ordering::SeqCst);
+                go.notify_waiters();
+                return None;
+            }
 
-            b.wait().await;
+            let notified = go.notified();
+            ready.fetch_add(1, Ordering::SeqCst);
+            let _ = timeout(Duration::from_secs(2), notified).await;
 
-            stream.write_all(&[last_byte]).await.ok()?;
-            stream.flush().await.ok()?;
+            if failed.load(Ordering::SeqCst) > 0 {
+                return None;
+            }
+            if timeout(Duration::from_secs(2), stream.write_all(&[last_byte]))
+                .await
+                .is_err()
+                || stream.flush().await.is_err()
+            {
+                return None;
+            }
 
-            let mut buf = Vec::new();
-            let _ = stream.read_to_end(&mut buf).await;
-            let resp = String::from_utf8_lossy(&buf);
-            Some(extract_http_status(&resp))
+            read_http_bounded(&mut stream).await.ok()
         }));
     }
 
-    let mut ok_2xx = 0usize;
+    // Wait until all workers are ready or at least one failed (bounded 2.5s)
+    let wait_start = tokio::time::Instant::now();
+    while ready_count.load(Ordering::SeqCst) + failed_count.load(Ordering::SeqCst) < concurrency {
+        if failed_count.load(Ordering::SeqCst) > 0
+            || wait_start.elapsed() > Duration::from_millis(2500)
+        {
+            failed_count.fetch_add(1, Ordering::SeqCst);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    go_notify.notify_waiters();
+
+    let mut valid_2xx = 0usize;
     let mut blocked = 0usize;
+    let mut distinct_bodies: HashSet<String> = HashSet::new();
+
     for h in handles {
-        if let Ok(Some(code)) = h.await {
-            if (200..300).contains(&code) {
-                ok_2xx += 1;
+        if let Ok(Some((code, resp_body))) = h.await {
+            if (200..300).contains(&code) && !is_failure_envelope(code, &resp_body) {
+                valid_2xx += 1;
+                distinct_bodies.insert(resp_body);
             } else if code > 0 {
                 blocked += 1;
             }
         }
     }
 
-    let (status, evidence) = if ok_2xx > 1 {
+    let pre_failed = failed_count.load(Ordering::SeqCst);
+    let (status, evidence) = if pre_failed > 0 && valid_2xx == 0 {
+        (
+            VerificationStatus::SuspectUnverified,
+            format!(
+                "Aborted Last-Byte Sync cleanly: {} pre-barrier worker error(s) without deadlock",
+                pre_failed
+            ),
+        )
+    } else if valid_2xx > 1 {
         (
             VerificationStatus::Proven,
             format!(
-                "Last-Byte Sync ({}x concurrent): {}x HTTP 2xx succeeded simultaneously (idempotency/lock missing!)",
-                concurrency, ok_2xx
+                "Last-Byte Sync ({}x): {}x distinct-state/success HTTP 2xx executed simultaneously ({} distinct bodies)",
+                concurrency,
+                valid_2xx,
+                distinct_bodies.len()
             ),
         )
-    } else if ok_2xx <= 1 && blocked > 0 {
+    } else if valid_2xx <= 1 && blocked > 0 {
         (
             VerificationStatus::Mitigated,
             format!(
-                "Last-Byte Sync ({}x concurrent): only {}x succeeded, {}x blocked by lock/guard",
-                concurrency, ok_2xx, blocked
+                "Last-Byte Sync ({}x): only {}x succeeded, {}x blocked by lock/guard",
+                concurrency, valid_2xx, blocked
             ),
         )
     } else {
         (
             VerificationStatus::SuspectUnverified,
-            format!("Last-Byte Sync ({}x): {}x 2xx, {}x non-2xx", concurrency, ok_2xx, blocked),
+            format!(
+                "Last-Byte Sync ({}x): {}x 2xx, {}x non-2xx (inconclusive)",
+                concurrency, valid_2xx, blocked
+            ),
         )
     };
 
@@ -169,7 +341,10 @@ pub async fn verify_concurrency_invariant(
         entry_route: finding.entry_route.clone(),
         status,
         evidence,
-        replay_cmd: format!("veriforge replay {} --sync-race {}", finding.id, concurrency),
+        replay_cmd: format!(
+            "veriforge replay {} --sync-race {}",
+            finding.id, concurrency
+        ),
     })
 }
 
@@ -181,5 +356,39 @@ pub async fn verify_finding(
     match finding.missing_guard {
         GuardKind::Auth => verify_auth_invariant(port, finding).await,
         GuardKind::TxLock => verify_concurrency_invariant(port, finding, concurrency).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn test_keep_open_response_does_not_hang() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut req = [0u8; 512];
+                let _ = sock.read(&mut req).await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .await;
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            }
+        });
+
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .await
+            .unwrap();
+        let (code, body) = timeout(Duration::from_millis(500), read_http_bounded(&mut stream))
+            .await
+            .expect("must not hang on keep-open socket")
+            .unwrap();
+        assert_eq!(code, 200);
+        assert_eq!(body, "ok");
     }
 }

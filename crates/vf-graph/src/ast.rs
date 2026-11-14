@@ -53,8 +53,13 @@ pub struct FileAstSummary {
     pub symbols: Vec<SymbolInfo>,
 }
 
-pub fn parse_file_ast(file: &IndexedFile, cfg: &VeriForgeConfig) -> Option<FileAstSummary> {
-    let source = fs::read_to_string(&file.abs_path).ok()?;
+pub fn parse_file_ast_with_hash(
+    file: &IndexedFile,
+    cfg: &VeriForgeConfig,
+) -> Option<(String, FileAstSummary)> {
+    let bytes = fs::read(&file.abs_path).ok()?;
+    let actual_hash = blake3::hash(&bytes).to_hex().to_string();
+    let source = String::from_utf8(bytes).ok()?;
     let mut parser = Parser::new();
 
     match file.language {
@@ -87,14 +92,14 @@ pub fn parse_file_ast(file: &IndexedFile, cfg: &VeriForgeConfig) -> Option<FileA
 
     let tree = parser.parse(&source, None)?;
     let root = tree.root_node();
-    let bytes = source.as_bytes();
+    let src_bytes = source.as_bytes();
 
     let mut imports = Vec::new();
     let mut symbols = Vec::new();
 
     extract_node(
         root,
-        bytes,
+        src_bytes,
         &file.rel_path,
         file.language,
         cfg,
@@ -102,11 +107,18 @@ pub fn parse_file_ast(file: &IndexedFile, cfg: &VeriForgeConfig) -> Option<FileA
         &mut symbols,
     );
 
-    Some(FileAstSummary {
-        rel_path: file.rel_path.clone(),
-        imports,
-        symbols,
-    })
+    Some((
+        actual_hash,
+        FileAstSummary {
+            rel_path: file.rel_path.clone(),
+            imports,
+            symbols,
+        },
+    ))
+}
+
+pub fn parse_file_ast(file: &IndexedFile, cfg: &VeriForgeConfig) -> Option<FileAstSummary> {
+    parse_file_ast_with_hash(file, cfg).map(|(_, s)| s)
 }
 
 fn node_text<'a>(node: Node, src: &'a [u8]) -> &'a str {

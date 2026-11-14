@@ -86,7 +86,8 @@ pub fn scan_repository(root: &Path, cfg: &VeriForgeConfig) -> Result<ScanSummary
         .threads(cfg.scan.max_threads)
         .filter_entry(move |entry| {
             let name = entry.file_name().to_string_lossy();
-            if name == ".git" || name == ".veriforge" || name == "node_modules" || name == "target" {
+            if name == ".git" || name == ".veriforge" || name == "node_modules" || name == "target"
+            {
                 return false;
             }
             !ignore_set.iter().any(|ig| ig == name.as_ref())

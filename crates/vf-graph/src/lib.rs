@@ -5,10 +5,13 @@ use anyhow::Result;
 use rayon::prelude::*;
 use vf_core::{IndexedFile, StateStore, VeriForgeConfig};
 
-pub use ast::{FileAstSummary, GuardKind, SinkKind, parse_file_ast};
+pub use ast::{FileAstSummary, GuardKind, SinkKind, parse_file_ast, parse_file_ast_with_hash};
 pub use lattice::{GraphAnalysisResult, LatticeFinding, TraceHop, solve_guard_lattice};
 
-pub fn analyze_codebase(files: &[IndexedFile], cfg: &VeriForgeConfig) -> Result<GraphAnalysisResult> {
+pub fn analyze_codebase(
+    files: &[IndexedFile],
+    cfg: &VeriForgeConfig,
+) -> Result<GraphAnalysisResult> {
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(cfg.scan.max_threads)
         .build()?;
@@ -59,8 +62,8 @@ pub fn analyze_codebase_cached(
             to_parse
                 .par_iter()
                 .filter_map(|f| {
-                    let s = parse_file_ast(f, cfg)?;
-                    Some((f.rel_path.clone(), f.blake3_hash.clone(), s))
+                    let (actual_hash, s) = parse_file_ast_with_hash(f, cfg)?;
+                    Some((f.rel_path.clone(), actual_hash, s))
                 })
                 .collect()
         });

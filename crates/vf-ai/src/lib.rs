@@ -3,7 +3,9 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 use vf_graph::LatticeFinding;
-use vf_sandbox::VerifiedFinding;
+use vf_sandbox::{VerificationStatus, VerifiedFinding};
+
+const MAX_PROMPT_BYTES: usize = 2048;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub enum AiProvider {
@@ -20,46 +22,74 @@ pub enum AiProvider {
     },
 }
 
-/// Extracts ONLY ±10 lines around each hop in a proven witness path (< 2 KB context)
-/// so an optional LLM or coding agent never wastes tokens reading 13,000 files.
+/// Extracts ONLY ±6/+10 lines around each hop in a witness path, strictly contained
+/// within `project_root` (blocking symlinks escaping root) and capped at <= 2048 bytes.
 pub fn build_minimal_patch_prompt(
     project_root: &Path,
     finding: &LatticeFinding,
     verified: Option<&VerifiedFinding>,
 ) -> Result<String> {
+    let canon_root = fs::canonicalize(project_root)?;
+    let status_label = match verified.map(|v| &v.status) {
+        Some(VerificationStatus::Proven) => "PROVEN",
+        Some(VerificationStatus::Mitigated) => "MITIGATED",
+        _ => "SUSPECT",
+    };
+
     let mut prompt = String::new();
     prompt.push_str(&format!(
-        "Fix this PROVEN multi-file vulnerability with a minimal unified diff.\nRule: {} ({})\nTitle: {}\nEntry: {}\n",
-        finding.id, finding.rule_id, finding.title, finding.entry_route
+        "Fix this {} multi-file finding with a minimal unified diff.\nRule: {} ({})\nTitle: {}\nEntry: {}\n",
+        status_label, finding.id, finding.rule_id, finding.title, finding.entry_route
     ));
 
     if let Some(v) = verified {
-        prompt.push_str(&format!("Sandbox Proof: {}\n", v.evidence));
+        prompt.push_str(&format!("Sandbox Evidence: {}\n", v.evidence));
     }
 
-    prompt.push_str("\nRelevant Witness Hops (minimal slices):\n");
+    prompt.push_str("\nRelevant Witness Hops:\n");
     for (idx, hop) in finding.witness_path.iter().enumerate() {
-        let abs = project_root.join(&hop.file);
-        let snippet = if let Ok(raw) = fs::read_to_string(&abs) {
-            let lines: Vec<&str> = raw.lines().collect();
-            let start = hop.line.saturating_sub(6).max(1);
-            let end = (hop.line + 10).min(lines.len());
-            (start..=end)
-                .map(|ln| format!("{:>4} | {}", ln, lines.get(ln - 1).copied().unwrap_or("")))
-                .collect::<Vec<_>>()
-                .join("\n")
-        } else {
-            "<file unreadable>".to_string()
+        let joined = canon_root.join(&hop.file);
+        let snippet = match fs::canonicalize(&joined) {
+            Ok(canon_file) if canon_file.starts_with(&canon_root) => {
+                if let Ok(raw) = fs::read_to_string(&canon_file) {
+                    let lines: Vec<&str> = raw.lines().collect();
+                    let start = hop.line.saturating_sub(4).max(1);
+                    let end = (hop.line + 6).min(lines.len());
+                    (start..=end)
+                        .map(|ln| {
+                            format!("{:>4} | {}", ln, lines.get(ln - 1).copied().unwrap_or(""))
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                } else {
+                    "<file unreadable>".to_string()
+                }
+            }
+            Ok(_) => "<blocked: path escapes project root>".to_string(),
+            Err(_) => "<file missing>".to_string(),
         };
 
-        prompt.push_str(&format!(
+        let block = format!(
             "\n--- Hop [{}] {}:{} ({}) ---\n{}\n",
             idx + 1,
             hop.file,
             hop.line,
             hop.symbol,
             snippet
-        ));
+        );
+        if prompt.len() + block.len() > MAX_PROMPT_BYTES {
+            let remaining = MAX_PROMPT_BYTES.saturating_sub(prompt.len() + 32);
+            if remaining > 0 {
+                let mut end = remaining.min(block.len());
+                while !block.is_char_boundary(end) && end > 0 {
+                    end -= 1;
+                }
+                prompt.push_str(&block[..end]);
+            }
+            prompt.push_str("\n...[truncated to 2KB budget]\n");
+            break;
+        }
+        prompt.push_str(&block);
     }
 
     Ok(prompt)
@@ -107,9 +137,9 @@ mod tests {
     use vf_graph::{GuardKind, SinkKind, TraceHop};
 
     #[test]
-    fn test_disabled_by_default_and_minimal_prompt() {
+    fn test_disabled_by_default_and_minimal_prompt_budget() {
         let finding = LatticeFinding {
-            id: "VF-RACE-004".into(),
+            id: "VF-RACE-002".into(),
             rule_id: "VF-RACE-001".into(),
             severity: "CRITICAL".into(),
             title: "Missing tx lock".into(),
@@ -124,11 +154,17 @@ mod tests {
             }],
         };
 
-        let disabled = generate_patch_plan(&AiProvider::Disabled, Path::new("."), &finding, None).unwrap();
+        let disabled =
+            generate_patch_plan(&AiProvider::Disabled, Path::new("."), &finding, None).unwrap();
         assert!(disabled.is_none());
 
-        let prompt = build_minimal_patch_prompt(Path::new("fixtures/vuln-payment-node"), &finding, None).unwrap();
-        assert!(prompt.len() < 2048);
-        assert!(prompt.contains("VF-RACE-004"));
+        let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("fixtures")
+            .join("vuln-payment-node");
+        let prompt = build_minimal_patch_prompt(&fixture_root, &finding, None).unwrap();
+        assert!(prompt.len() <= MAX_PROMPT_BYTES);
+        assert!(prompt.contains("VF-RACE-002"));
     }
 }

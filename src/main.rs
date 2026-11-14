@@ -50,6 +50,9 @@ enum Commands {
         html: Option<PathBuf>,
         #[arg(long)]
         patch: bool,
+        /// Allow unsafe host execution if `/usr/bin/bwrap` is unavailable
+        #[arg(long)]
+        unsafe_host_fallback: bool,
         #[arg(long)]
         ci: bool,
     },
@@ -65,6 +68,8 @@ enum Commands {
         #[arg(long, default_value_t = 10)]
         sync_race: usize,
         #[arg(long)]
+        unsafe_host_fallback: bool,
+        #[arg(long)]
         patch: bool,
     },
     /// Launch interactive panic-safe ratatui TUI workspace
@@ -77,6 +82,8 @@ enum Commands {
         port: u16,
         #[arg(long, default_value_t = 10)]
         sync_race: usize,
+        #[arg(long)]
+        unsafe_host_fallback: bool,
     },
 }
 
@@ -137,11 +144,7 @@ fn resolve_finding_for_replay(
     cfg: &VeriForgeConfig,
     store: &mut StateStore,
 ) -> Result<LatticeFinding> {
-    if let Some(stored) = store.get_finding(finding_id)?
-        && let Ok(parsed) = serde_json::from_str::<LatticeFinding>(&stored.trace_json)
-    {
-        return Ok(parsed);
-    }
+    // B20: Always re-evaluate against current repository files so renamed/patched routes are never stale!
     let summary = scan_repository(path, cfg)?;
     let _ = store.sync_files(&summary.files)?;
     let graph_res = analyze_codebase_cached(&summary.files, cfg, store)?;
@@ -149,7 +152,13 @@ fn resolve_finding_for_replay(
         .findings
         .into_iter()
         .find(|f| f.id.eq_ignore_ascii_case(finding_id))
-        .ok_or_else(|| anyhow::anyhow!("Finding '{}' not found in {}", finding_id, path.display()))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Finding '{}' not found in current source of {}",
+                finding_id,
+                path.display()
+            )
+        })
 }
 
 fn main() -> Result<ExitCode> {
@@ -198,6 +207,7 @@ fn main() -> Result<ExitCode> {
             sarif,
             html,
             patch,
+            unsafe_host_fallback,
             ci,
         } => {
             let t0 = Instant::now();
@@ -216,6 +226,7 @@ fn main() -> Result<ExitCode> {
                         port,
                         &graph_res.findings,
                         sync_race,
+                        unsafe_host_fallback,
                     )?)
                 } else {
                     None
@@ -229,7 +240,12 @@ fn main() -> Result<ExitCode> {
                 .map(|(_, v)| v.clone())
                 .unwrap_or_default();
 
-            persist_scan_findings(&mut store, delta.scan_id, &graph_res.findings, &verified_list)?;
+            persist_scan_findings(
+                &mut store,
+                delta.scan_id,
+                &graph_res.findings,
+                &verified_list,
+            )?;
 
             if let Some(sarif_path) = sarif {
                 if let Some(parent) = sarif_path.parent()
@@ -237,7 +253,10 @@ fn main() -> Result<ExitCode> {
                 {
                     fs::create_dir_all(parent)?;
                 }
-                fs::write(&sarif_path, to_sarif_json(&graph_res.findings, &verified_list))?;
+                fs::write(
+                    &sarif_path,
+                    to_sarif_json(&graph_res.findings, &verified_list),
+                )?;
             }
             if let Some(html_path) = html {
                 if let Some(parent) = html_path.parent()
@@ -286,10 +305,19 @@ fn main() -> Result<ExitCode> {
                         graph_res.findings.len()
                     );
                     for f in &graph_res.findings {
-                        println!("\n  [{}] {} ({}) -> {}", f.severity, f.id, f.rule_id, f.title);
+                        println!(
+                            "\n  [{}] {} ({}) -> {}",
+                            f.severity, f.id, f.rule_id, f.title
+                        );
                         println!("      Entry: {}", f.entry_route);
                         for (i, hop) in f.witness_path.iter().enumerate() {
-                            println!("      [{}] {}:{}  {}", i + 1, hop.file, hop.line, hop.symbol);
+                            println!(
+                                "      [{}] {}:{}  {}",
+                                i + 1,
+                                hop.file,
+                                hop.line,
+                                hop.symbol
+                            );
                         }
                     }
                 }
@@ -305,7 +333,10 @@ fn main() -> Result<ExitCode> {
                             VerificationStatus::Mitigated => "MITIGATED",
                             VerificationStatus::SuspectUnverified => "SUSPECT",
                         };
-                        println!("  [{}] {} ({}) -> {}", tag, v.finding_id, v.rule_id, v.evidence);
+                        println!(
+                            "  [{}] {} ({}) -> {}",
+                            tag, v.finding_id, v.rule_id, v.evidence
+                        );
                     }
                 }
 
@@ -334,6 +365,7 @@ fn main() -> Result<ExitCode> {
             boot_cmd,
             port,
             sync_race,
+            unsafe_host_fallback,
             patch,
         } => {
             let cfg = VeriForgeConfig::load_from_dir(&path)?;
@@ -349,6 +381,7 @@ fn main() -> Result<ExitCode> {
                 port,
                 std::slice::from_ref(&finding),
                 sync_race,
+                unsafe_host_fallback,
             )?;
 
             println!(
@@ -376,6 +409,7 @@ fn main() -> Result<ExitCode> {
             boot_cmd,
             port,
             sync_race,
+            unsafe_host_fallback,
         } => {
             let t0 = Instant::now();
             let cfg = VeriForgeConfig::load_from_dir(&path)?;
@@ -386,14 +420,27 @@ fn main() -> Result<ExitCode> {
             let effective_boot = boot_cmd.or_else(|| cfg.sandbox.boot_cmd.clone());
             let verified_list = if let Some(cmd) = effective_boot {
                 if !graph_res.findings.is_empty() {
-                    verify_findings_in_sandbox(&path, &cmd, port, &graph_res.findings, sync_race)?.1
+                    verify_findings_in_sandbox(
+                        &path,
+                        &cmd,
+                        port,
+                        &graph_res.findings,
+                        sync_race,
+                        unsafe_host_fallback,
+                    )?
+                    .1
                 } else {
                     Vec::new()
                 }
             } else {
                 Vec::new()
             };
-            persist_scan_findings(&mut store, delta.scan_id, &graph_res.findings, &verified_list)?;
+            persist_scan_findings(
+                &mut store,
+                delta.scan_id,
+                &graph_res.findings,
+                &verified_list,
+            )?;
             let total_ms = t0.elapsed().as_millis();
             run_tui(&path, &graph_res, &verified_list, total_ms)?;
         }

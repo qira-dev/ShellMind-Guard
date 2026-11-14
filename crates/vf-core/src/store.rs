@@ -107,7 +107,10 @@ impl StateStore {
         Ok(Self { conn })
     }
 
-    pub fn sync_files(&mut self, scanned: &[IndexedFile]) -> Result<(DeltaStats, Vec<IndexedFile>)> {
+    pub fn sync_files(
+        &mut self,
+        scanned: &[IndexedFile],
+    ) -> Result<(DeltaStats, Vec<IndexedFile>)> {
         let tx = self.conn.transaction()?;
         tx.execute(
             "INSERT INTO scans (total_files, modified_files) VALUES (?1, 0)",
@@ -259,7 +262,9 @@ impl StateStore {
                 "INSERT INTO findings_fts (id, rule_id, trace_json, poc_cmd) VALUES (?1, ?2, ?3, ?4)",
             )?;
             for (id, rule_id, severity, status, trace_json, poc_cmd) in rows {
-                ins.execute(params![id, scan_id, rule_id, severity, status, trace_json, poc_cmd])?;
+                ins.execute(params![
+                    id, scan_id, rule_id, severity, status, trace_json, poc_cmd
+                ])?;
                 fts.execute(params![id, rule_id, trace_json, poc_cmd])?;
             }
         }

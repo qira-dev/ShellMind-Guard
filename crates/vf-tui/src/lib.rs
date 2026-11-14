@@ -10,7 +10,7 @@ use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{self, Stdout};
 use std::path::Path;
@@ -19,6 +19,15 @@ use vf_ai::build_minimal_patch_prompt;
 use vf_graph::GraphAnalysisResult;
 use vf_report::{to_html_graph, to_sarif_json};
 use vf_sandbox::{VerificationStatus, VerifiedFinding};
+
+const MAX_LOG_LINES: usize = 200;
+
+fn push_log(logs: &mut VecDeque<String>, msg: String) {
+    if logs.len() >= MAX_LOG_LINES {
+        logs.pop_front();
+    }
+    logs.push_back(msg);
+}
 
 struct TerminalGuard {
     terminal: Terminal<CrosstermBackend<Stdout>>,
@@ -59,13 +68,13 @@ pub fn run_tui(
     let mut guard = TerminalGuard::init()?;
     let mut selected = 0usize;
     let mut show_logs = false;
-    let mut logs: Vec<String> = vec![
+    let mut logs: VecDeque<String> = VecDeque::from([
         format!(
             "Indexed {} files ({} symbols, {} edges) in {}ms",
             graph.parsed_files, graph.symbol_count, graph.edge_count, elapsed_ms
         ),
         format!("Verified {} findings in sandbox.", verified.len()),
-    ];
+    ]);
 
     let ver_map: HashMap<&str, &VerifiedFinding> = verified
         .iter()
@@ -237,11 +246,14 @@ pub fn run_tui(
                 }
                 KeyCode::Enter => {
                     if let Some(cur) = graph.findings.get(selected) {
-                        logs.push(format!(
-                            "Replay command ready: veriforge replay {} {}",
-                            cur.id,
-                            project_root.display()
-                        ));
+                        push_log(
+                            &mut logs,
+                            format!(
+                                "Replay command ready: veriforge replay {} {}",
+                                cur.id,
+                                project_root.display()
+                            ),
+                        );
                         show_logs = true;
                     }
                 }
@@ -254,11 +266,14 @@ pub fn run_tui(
                                 .join(format!("patch_{}.prompt.txt", cur.id));
                             let _ = fs::create_dir_all(project_root.join(".veriforge"));
                             if fs::write(&out, &prompt).is_ok() {
-                                logs.push(format!(
-                                    "Saved minimal patch context ({} B) -> {}",
-                                    prompt.len(),
-                                    out.display()
-                                ));
+                                push_log(
+                                    &mut logs,
+                                    format!(
+                                        "Saved minimal patch context ({} B) -> {}",
+                                        prompt.len(),
+                                        out.display()
+                                    ),
+                                );
                                 show_logs = true;
                             }
                         }
@@ -270,10 +285,12 @@ pub fn run_tui(
                 KeyCode::Char('g') => {
                     let out = project_root.join(".veriforge").join("report.html");
                     let _ = fs::create_dir_all(project_root.join(".veriforge"));
-                    let html =
-                        to_html_graph(&project_root.display().to_string(), graph, verified);
+                    let html = to_html_graph(&project_root.display().to_string(), graph, verified);
                     if fs::write(&out, html).is_ok() {
-                        logs.push(format!("Exported HTML graph -> {}", out.display()));
+                        push_log(
+                            &mut logs,
+                            format!("Exported HTML graph -> {}", out.display()),
+                        );
                         show_logs = true;
                     }
                 }
@@ -282,7 +299,10 @@ pub fn run_tui(
                     let _ = fs::create_dir_all(project_root.join(".veriforge"));
                     let sarif = to_sarif_json(&graph.findings, verified);
                     if fs::write(&out, sarif).is_ok() {
-                        logs.push(format!("Exported SARIF 2.1.0 -> {}", out.display()));
+                        push_log(
+                            &mut logs,
+                            format!("Exported SARIF 2.1.0 -> {}", out.display()),
+                        );
                         show_logs = true;
                     }
                 }
