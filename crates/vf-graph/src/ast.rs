@@ -312,6 +312,11 @@ fn classify_sink(name: &str, body: &str) -> Option<SinkKind> {
     if low_body.contains("stripe.")
         || low_body.contains("charges.create")
         || low_body.contains("paymentintent")
+        || low_body.contains("paypal.")
+        || low_body.contains("razorpay.")
+        || low_body.contains("paddle.")
+        || low_body.contains("sslcommerz")
+        || low_body.contains("braintree.")
         || (low_name.contains("charge") && low_body.contains("amount"))
     {
         return Some(SinkKind::PaymentMutation);
@@ -323,13 +328,26 @@ fn classify_sink(name: &str, body: &str) -> Option<SinkKind> {
         && (low_body.contains("update")
             || low_body.contains("-=")
             || low_body.contains("+=")
-            || low_body.contains("set "))
+            || low_body.contains("set ")
+            || low_body.contains(".save("))
     {
         return Some(SinkKind::BalanceUpdate);
     }
     if (low_body.contains("update ") && low_body.contains("set "))
         || low_body.contains("insert into ")
         || low_body.contains("delete from ")
+        || (low_body.contains("prisma.")
+            && (low_body.contains(".create(")
+                || low_body.contains(".update(")
+                || low_body.contains(".upsert(")
+                || low_body.contains(".delete(")))
+        || low_body.contains("db.insert(")
+        || low_body.contains("db.update(")
+        || low_body.contains("db.delete(")
+        || low_body.contains(".updates(")
+        || low_body.contains("db.exec(")
+        || low_body.contains("tx.exec(")
+        || low_body.contains("session.commit(")
     {
         return Some(SinkKind::SqlWrite);
     }
@@ -504,7 +522,7 @@ fn extract_node(
         && let Some(func) = node.child_by_field_name("function")
     {
         let ftxt = node_text(func, src);
-        if (ftxt == "app.use" || ftxt == "router.use")
+        if ftxt.ends_with(".use")
             && let Some(args) = node.child_by_field_name("arguments")
         {
             let mut c = args.walk();
@@ -517,35 +535,45 @@ fn extract_node(
         }
     }
 
-    // 2a. Express / Router HTTP Route entries (TS/JS): app.post('/path', ...middlewares, handler)
+    // 2a. Universal TS/JS HTTP Route entries (Express, Fastify, Hono, Koa, custom routers):
+    // `<router>.(get|post|put|patch|delete)('/...', ...middlewares, handler)`
     if (lang == Language::TypeScript || lang == Language::JavaScript)
         && kind == "call_expression"
         && let Some(func) = node.child_by_field_name("function")
     {
         let ftxt = node_text(func, src);
         let method = ftxt.rsplit('.').next().unwrap_or("");
-        if matches!(method, "get" | "post" | "put" | "patch" | "delete")
-            && (ftxt.starts_with("app.") || ftxt.starts_with("router.") || ftxt.contains("Router"))
+        let is_custom = cfg
+            .guards
+            .custom_routes
+            .iter()
+            .any(|cr| ftxt == cr || ftxt.ends_with(&format!(".{}", cr)));
+        let is_http_method =
+            ftxt.contains('.') && matches!(method, "get" | "post" | "put" | "patch" | "delete");
+        if (is_http_method || is_custom)
+            && let Some(args) = node.child_by_field_name("arguments")
         {
-            let mut route_path = None;
+            let mut route_path: Option<String> = None;
             let mut calls = Vec::new();
             let mut guards = file_middleware_guards.clone();
             let mut seen_handler = false;
             let line_start = node.start_position().row + 1;
             let line_end = node.end_position().row + 1;
 
-            if let Some(args) = node.child_by_field_name("arguments") {
-                let mut c = args.walk();
-                for arg in args.children(&mut c) {
-                    let ak = arg.kind();
-                    if matches!(ak, "(" | ")" | ",") {
-                        continue;
+            let mut c = args.walk();
+            for arg in args.children(&mut c) {
+                let ak = arg.kind();
+                if matches!(ak, "(" | ")" | ",") {
+                    continue;
+                }
+                let atxt = node_text(arg, src).trim();
+                if (atxt.starts_with('\'') || atxt.starts_with('"')) && route_path.is_none() {
+                    let unq = atxt.trim_matches(|ch| ch == '\'' || ch == '"');
+                    if unq.starts_with('/') || is_custom {
+                        route_path = Some(unq.to_string());
                     }
-                    let atxt = node_text(arg, src).trim();
-                    if (atxt.starts_with('\'') || atxt.starts_with('"')) && route_path.is_none() {
-                        route_path =
-                            Some(atxt.trim_matches(|ch| ch == '\'' || ch == '"').to_string());
-                    } else if ak == "identifier" {
+                } else if route_path.is_some() {
+                    if ak == "identifier" {
                         if !seen_handler && is_auth_guard_ident(atxt, cfg) {
                             guards.insert(GuardKind::Auth);
                         } else if !seen_handler && is_lock_guard_ident(atxt, cfg) {
@@ -561,7 +589,6 @@ fn extract_node(
                         guards.extend(inline_guards);
                         collect_calls(arg, src, &mut calls);
 
-                        // B07: Detect inline route mutation sinks directly inside callback
                         if let Some(sk) =
                             classify_sink(route_path.as_deref().unwrap_or("inline"), inline_body)
                         {
@@ -591,11 +618,63 @@ fn extract_node(
                     }
                 }
             }
-            let r_label = format!(
-                "{} {}",
-                method.to_ascii_uppercase(),
-                route_path.clone().unwrap_or_else(|| "/unknown".into())
-            );
+            if let Some(rp) = route_path {
+                let r_label = format!("{} {}", method.to_ascii_uppercase(), rp);
+                symbols.push(SymbolInfo {
+                    id: format!("{}::route:{}", rel_path, line_start),
+                    rel_path: rel_path.to_string(),
+                    name: r_label,
+                    kind: SymbolKind::Route,
+                    sink_kind: None,
+                    line_start,
+                    line_end,
+                    guards,
+                    calls,
+                    route_path: Some(rp),
+                });
+                return;
+            }
+        }
+    }
+
+    // 2a-trpc. tRPC `publicProcedure...mutation(...)` / `protectedProcedure...mutation(...)`
+    if (lang == Language::TypeScript || lang == Language::JavaScript)
+        && kind == "call_expression"
+        && let Some(func) = node.child_by_field_name("function")
+    {
+        let ftxt = node_text(func, src);
+        if (ftxt.ends_with(".mutation") || ftxt.ends_with(".query"))
+            && (ftxt.contains("publicProcedure") || ftxt.contains("protectedProcedure"))
+        {
+            let line_start = node.start_position().row + 1;
+            let line_end = node.end_position().row + 1;
+            let mut guards = file_middleware_guards.clone();
+            if ftxt.contains("protectedProcedure") {
+                guards.insert(GuardKind::Auth);
+            }
+            let mut calls = Vec::new();
+            let mut inline_body = "";
+            if let Some(args) = node.child_by_field_name("arguments") {
+                inline_body = node_text(args, src);
+                collect_calls(args, src, &mut calls);
+            }
+            let r_label = format!("TRPC {}:{}", rel_path, line_start);
+            if let Some(sk) = classify_sink(&r_label, inline_body) {
+                let inline_name = format!("trpc_sink_{}", line_start);
+                symbols.push(SymbolInfo {
+                    id: format!("{}::{}", rel_path, inline_name),
+                    rel_path: rel_path.to_string(),
+                    name: inline_name.clone(),
+                    kind: SymbolKind::Sink,
+                    sink_kind: Some(sk),
+                    line_start,
+                    line_end,
+                    guards: guards.clone(),
+                    calls: calls.clone(),
+                    route_path: None,
+                });
+                calls.push(inline_name);
+            }
             symbols.push(SymbolInfo {
                 id: format!("{}::route:{}", rel_path, line_start),
                 rel_path: rel_path.to_string(),
@@ -606,9 +685,71 @@ fn extract_node(
                 line_end,
                 guards,
                 calls,
-                route_path,
+                route_path: Some(format!("/trpc/{}", line_start)),
             });
             return;
+        }
+    }
+
+    // 2a-nest. NestJS `@Controller` / `@Get` / `@Post` / `@UseGuards` inside `class_declaration`
+    if (lang == Language::TypeScript || lang == Language::JavaScript) && kind == "class_declaration"
+    {
+        let class_txt = node_text(node, src);
+        let class_has_auth = class_txt.contains("@UseGuards") && class_txt.contains("Auth");
+        if let Some(body) = node.child_by_field_name("body") {
+            let mut pending_method: Option<String> = None;
+            let mut pending_path: Option<String> = None;
+            let mut pending_guards = HashSet::new();
+            if class_has_auth {
+                pending_guards.insert(GuardKind::Auth);
+            }
+            let mut c = body.walk();
+            for ch in body.children(&mut c) {
+                if ch.kind() == "decorator" {
+                    let dtxt = node_text(ch, src);
+                    for m in ["Get", "Post", "Put", "Patch", "Delete"] {
+                        if dtxt.contains(&format!("@{}(", m)) {
+                            pending_method = Some(m.to_ascii_uppercase());
+                            let rp = dtxt
+                                .split('(')
+                                .nth(1)
+                                .and_then(|s| s.split(')').next())
+                                .map(|s| s.trim().trim_matches(|q| q == '\'' || q == '"'))
+                                .unwrap_or("/");
+                            pending_path = Some(if rp.is_empty() {
+                                "/".into()
+                            } else {
+                                rp.to_string()
+                            });
+                        }
+                    }
+                    pending_guards.extend(classify_guards(dtxt, cfg));
+                } else if ch.kind() == "method_definition"
+                    && let Some(m) = pending_method.take()
+                {
+                    let rp = pending_path.take().unwrap_or_else(|| "/".into());
+                    if let Some(name_node) = ch.child_by_field_name("name") {
+                        let mname = node_text(name_node, src).trim().to_string();
+                        let line_start = ch.start_position().row + 1;
+                        let line_end = ch.end_position().row + 1;
+                        symbols.push(SymbolInfo {
+                            id: format!("{}::route:{}", rel_path, line_start),
+                            rel_path: rel_path.to_string(),
+                            name: format!("{} {}", m, rp),
+                            kind: SymbolKind::Route,
+                            sink_kind: None,
+                            line_start,
+                            line_end,
+                            guards: std::mem::take(&mut pending_guards),
+                            calls: vec![mname],
+                            route_path: Some(rp),
+                        });
+                    }
+                    if class_has_auth {
+                        pending_guards.insert(GuardKind::Auth);
+                    }
+                }
+            }
         }
     }
 
@@ -733,7 +874,57 @@ fn extract_node(
         }
     }
 
-    // 2d. Go Gin / Echo / Fiber HTTP routes: r.GET("/api/...", mw..., handlers.Foo)
+    // 2c-django. Python Django `path("api/...", views.my_view)`
+    if lang == Language::Python
+        && kind == "call"
+        && let Some(func) = node.child_by_field_name("function")
+    {
+        let ftxt = node_text(func, src).trim();
+        if (ftxt == "path" || ftxt == "re_path")
+            && let Some(args) = node.child_by_field_name("arguments")
+        {
+            let mut route_path = None;
+            let mut calls = Vec::new();
+            let mut c = args.walk();
+            for arg in args.children(&mut c) {
+                let atxt = node_text(arg, src).trim();
+                if (atxt.starts_with('\'') || atxt.starts_with('"')) && route_path.is_none() {
+                    let rp = atxt.trim_matches(|ch| ch == '\'' || ch == '"');
+                    route_path = Some(if rp.starts_with('/') {
+                        rp.to_string()
+                    } else {
+                        format!("/{}", rp)
+                    });
+                } else if !matches!(arg.kind(), "(" | ")" | "," | "keyword_argument") {
+                    let short = atxt.rsplit('.').next().unwrap_or(atxt).trim();
+                    if !short.is_empty() {
+                        calls.push(short.to_string());
+                    }
+                }
+            }
+            if let Some(rp) = route_path
+                && !calls.is_empty()
+            {
+                let line_start = node.start_position().row + 1;
+                let line_end = node.end_position().row + 1;
+                symbols.push(SymbolInfo {
+                    id: format!("{}::route:{}", rel_path, line_start),
+                    rel_path: rel_path.to_string(),
+                    name: format!("DJANGO {}", rp),
+                    kind: SymbolKind::Route,
+                    sink_kind: None,
+                    line_start,
+                    line_end,
+                    guards: HashSet::new(),
+                    calls,
+                    route_path: Some(rp),
+                });
+                return;
+            }
+        }
+    }
+
+    // 2d. Go Gin/Echo/Fiber/Chi + `net/http` `HandleFunc` + `r.Group(..., mw...)`
     if lang == Language::Go
         && kind == "call_expression"
         && let Some(func) = node.child_by_field_name("function")
@@ -741,10 +932,16 @@ fn extract_node(
         let ftxt = node_text(func, src);
         let method = ftxt.rsplit('.').next().unwrap_or("");
         let method_upper = method.to_ascii_uppercase();
-        if matches!(
+        if method == "Group" || method == "Use" {
+            let gtxt = node_text(node, src);
+            file_middleware_guards.extend(classify_guards(gtxt, cfg));
+        }
+        let is_go_http = matches!(
             method_upper.as_str(),
-            "GET" | "POST" | "PUT" | "PATCH" | "DELETE"
-        ) && ftxt.contains('.')
+            "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HANDLEFUNC"
+        );
+        if is_go_http
+            && ftxt.contains('.')
             && let Some(args) = node.child_by_field_name("arguments")
         {
             let mut route_path = None;
@@ -785,10 +982,15 @@ fn extract_node(
             }
 
             if let Some(rp) = route_path {
+                let label_method = if method_upper == "HANDLEFUNC" {
+                    "HTTP".to_string()
+                } else {
+                    method_upper
+                };
                 symbols.push(SymbolInfo {
                     id: format!("{}::route:{}", rel_path, line_start),
                     rel_path: rel_path.to_string(),
-                    name: format!("{} {}", method_upper, rp),
+                    name: format!("{} {}", label_method, rp),
                     kind: SymbolKind::Route,
                     sink_kind: None,
                     line_start,
@@ -798,6 +1000,80 @@ fn extract_node(
                     route_path: Some(rp),
                 });
                 return;
+            }
+        }
+    }
+
+    // 2e. Next.js App Router (`app/**/route.ts|js`): exported GET/POST/PUT/PATCH/DELETE
+    if (lang == Language::TypeScript || lang == Language::JavaScript)
+        && (rel_path.ends_with("/route.ts")
+            || rel_path.ends_with("/route.tsx")
+            || rel_path.ends_with("/route.js")
+            || rel_path == "route.ts")
+        && kind == "function_declaration"
+        && let Some(name_node) = node.child_by_field_name("name")
+    {
+        let fn_name = node_text(name_node, src).trim().to_string();
+        if matches!(
+            fn_name.as_str(),
+            "GET" | "POST" | "PUT" | "PATCH" | "DELETE"
+        ) {
+            let route_p = format!(
+                "/{}",
+                rel_path
+                    .trim_start_matches("src/")
+                    .trim_start_matches("app/")
+                    .trim_end_matches("/route.ts")
+                    .trim_end_matches("/route.tsx")
+                    .trim_end_matches("/route.js")
+            );
+            let line_start = node.start_position().row + 1;
+            let line_end = node.end_position().row + 1;
+            symbols.push(SymbolInfo {
+                id: format!("{}::route:{}", rel_path, line_start),
+                rel_path: rel_path.to_string(),
+                name: format!("{} {}", fn_name, route_p),
+                kind: SymbolKind::Route,
+                sink_kind: None,
+                line_start,
+                line_end,
+                guards: HashSet::new(),
+                calls: vec![fn_name],
+                route_path: Some(route_p),
+            });
+        }
+    }
+
+    // 2f. Rust Actix-web `#[post("/...")]` / `#[get("/...")]` attribute_item + function_item
+    if lang == Language::Rust && kind == "attribute_item" {
+        let atxt = node_text(node, src);
+        for m in ["get", "post", "put", "patch", "delete"] {
+            let needle = format!("#[{}(\"", m);
+            if let Some(pos) = atxt.find(&needle) {
+                let rest = &atxt[pos + needle.len()..];
+                if let Some(q2) = rest.find('"') {
+                    let rp = rest[..q2].to_string();
+                    if let Some(next_fn) = node.next_named_sibling()
+                        && next_fn.kind() == "function_item"
+                        && let Some(name_node) = next_fn.child_by_field_name("name")
+                    {
+                        let fn_name = node_text(name_node, src).trim().to_string();
+                        let line_start = next_fn.start_position().row + 1;
+                        let line_end = next_fn.end_position().row + 1;
+                        symbols.push(SymbolInfo {
+                            id: format!("{}::route:{}", rel_path, line_start),
+                            rel_path: rel_path.to_string(),
+                            name: format!("{} {}", m.to_ascii_uppercase(), rp),
+                            kind: SymbolKind::Route,
+                            sink_kind: None,
+                            line_start,
+                            line_end,
+                            guards: HashSet::new(),
+                            calls: vec![fn_name],
+                            route_path: Some(rp),
+                        });
+                    }
+                }
             }
         }
     }
@@ -1172,6 +1448,233 @@ def withdraw(amount: int):
             symbols
                 .iter()
                 .any(|s| s.kind == SymbolKind::Sink && s.name == "withdraw")
+        );
+    }
+
+    fn parse_inline_file(rel_path: &str, code: &str, cfg: &VeriForgeConfig) -> FileAstSummary {
+        let lang = if rel_path.ends_with(".go") {
+            Language::Go
+        } else if rel_path.ends_with(".py") {
+            Language::Python
+        } else if rel_path.ends_with(".rs") {
+            Language::Rust
+        } else if rel_path.ends_with(".js") {
+            Language::JavaScript
+        } else {
+            Language::TypeScript
+        };
+        let mut parser = Parser::new();
+        let ts_lang: tree_sitter::Language = match lang {
+            Language::Go => tree_sitter_go::LANGUAGE.into(),
+            Language::Python => tree_sitter_python::LANGUAGE.into(),
+            Language::Rust => tree_sitter_rust::LANGUAGE.into(),
+            Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
+            Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            Language::Sql => unreachable!(),
+        };
+        parser.set_language(&ts_lang).unwrap();
+        let tree = parser.parse(code, None).unwrap();
+        let mut mw = HashSet::new();
+        let mut imports = Vec::new();
+        let mut symbols = Vec::new();
+        extract_node(
+            tree.root_node(),
+            code.as_bytes(),
+            rel_path,
+            lang,
+            cfg,
+            &mut mw,
+            &mut imports,
+            &mut symbols,
+        );
+        FileAstSummary {
+            rel_path: rel_path.into(),
+            imports,
+            symbols,
+        }
+    }
+
+    #[test]
+    fn test_universal_go_gin_group_and_net_http() {
+        let go_code = r#"
+package main
+
+func registerRoutes(r *gin.Engine) {
+    api := r.Group("/api/v1")
+    api.Use(AuthMiddleware())
+    api.POST("/charge", handleCharge)
+    http.HandleFunc("/webhook/stripe", handleWebhook)
+}
+
+func handleCharge(c *gin.Context) {
+    razorpay.Orders.Create(100)
+}
+
+func handleWebhook(w http.ResponseWriter, r *http.Request) {
+    tx.Exec("UPDATE balances SET amt = amt - 1")
+}
+"#;
+        let ast = parse_inline_file("main.go", go_code, &VeriForgeConfig::default());
+        let charge_route = ast
+            .symbols
+            .iter()
+            .find(|s| s.kind == SymbolKind::Route && s.name == "POST /charge")
+            .expect("Go Gin Group route must be extracted");
+        assert!(
+            charge_route.guards.contains(&GuardKind::Auth),
+            "Go Gin Group.Use(AuthMiddleware) must propagate Auth guard"
+        );
+        assert!(
+            ast.symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Route && s.name == "HTTP /webhook/stripe"),
+            "net/http HandleFunc route must be extracted"
+        );
+        assert!(
+            ast.symbols.iter().any(|s| s.kind == SymbolKind::Sink
+                && s.name == "handleCharge"
+                && s.sink_kind == Some(SinkKind::PaymentMutation)),
+            "Razorpay sink must be detected"
+        );
+        assert!(
+            ast.symbols.iter().any(|s| s.kind == SymbolKind::Sink
+                && s.name == "handleWebhook"
+                && s.sink_kind == Some(SinkKind::BalanceUpdate)),
+            "tx.Exec sink must be detected"
+        );
+    }
+
+    #[test]
+    fn test_universal_nextjs_nestjs_trpc_django_actix() {
+        let cfg = VeriForgeConfig::default();
+
+        // Next.js App Router
+        let nextjs_code = r#"
+export async function POST(req: Request) {
+    await prisma.ledger.update({ data: { balance: 0 } });
+}
+"#;
+        let next_ast = parse_inline_file("app/api/pay/route.ts", nextjs_code, &cfg);
+        assert!(
+            next_ast
+                .symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Route && s.name == "POST /api/pay"),
+            "Next.js App Router route must be extracted"
+        );
+        assert!(
+            next_ast
+                .symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Sink && s.sink_kind == Some(SinkKind::BalanceUpdate)),
+            "Prisma sink must be detected"
+        );
+
+        // NestJS
+        let nest_code = r#"
+@Controller("billing")
+export class BillingController {
+    @Post("payout")
+    @UseGuards(AuthGuard)
+    async payout() {
+        await stripe.transfers.create({});
+    }
+}
+"#;
+        let nest_ast = parse_inline_file("billing.controller.ts", nest_code, &cfg);
+        let nest_route = nest_ast
+            .symbols
+            .iter()
+            .find(|s| s.kind == SymbolKind::Route && s.name.contains("payout"))
+            .expect("NestJS @Post route must be extracted");
+        assert!(nest_route.guards.contains(&GuardKind::Auth));
+
+        // tRPC
+        let trpc_code = r#"
+export const payRouter = router({
+    openPay: publicProcedure.mutation(async () => {
+        await paddle.transactions.create({});
+    }),
+    safePay: protectedProcedure.mutation(async () => {
+        await paddle.transactions.create({});
+    }),
+});
+"#;
+        let trpc_ast = parse_inline_file("trpc/pay.ts", trpc_code, &cfg);
+        let trpc_routes: Vec<_> = trpc_ast
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Route && s.name.starts_with("TRPC trpc/pay.ts:"))
+            .collect();
+        assert_eq!(
+            trpc_routes.len(),
+            2,
+            "Both tRPC mutations must be extracted"
+        );
+        assert!(
+            trpc_routes
+                .iter()
+                .any(|r| !r.guards.contains(&GuardKind::Auth)),
+            "tRPC publicProcedure must NOT have Auth guard"
+        );
+        assert!(
+            trpc_routes
+                .iter()
+                .any(|r| r.guards.contains(&GuardKind::Auth)),
+            "tRPC protectedProcedure must have Auth guard"
+        );
+
+        // Django
+        let django_code = r#"
+urlpatterns = [
+    path("api/v1/refund/", refund_view),
+]
+"#;
+        let dj_ast = parse_inline_file("urls.py", django_code, &cfg);
+        assert!(
+            dj_ast
+                .symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Route && s.name == "DJANGO /api/v1/refund/"),
+            "Django path() route must be extracted"
+        );
+
+        // Rust Actix-web
+        let actix_code = r#"
+#[post("/api/v1/transfer")]
+async fn transfer_funds() {
+    let amount = 10;
+    balance -= amount;
+}
+"#;
+        let actix_ast = parse_inline_file("routes.rs", actix_code, &cfg);
+        assert!(
+            actix_ast
+                .symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Route && s.name == "POST /api/v1/transfer"),
+            "Actix-web #[post] route must be extracted"
+        );
+    }
+
+    #[test]
+    fn test_public_routes_suppresses_auth_only() {
+        let ts_code = r#"
+app.post('/api/v1/auth/2fa/confirm', async (req, res) => {
+    await stripe.charges.create({ amount: 100 });
+});
+"#;
+        let cfg = VeriForgeConfig::default();
+        let ast = parse_inline_file("auth.ts", ts_code, &cfg);
+        let res =
+            crate::lattice::solve_guard_lattice_with_public(&[ast], &cfg.guards.public_routes);
+        assert!(
+            !res.findings.iter().any(|f| f.rule_id == "VF-AUTH-001"),
+            "public_routes must suppress VF-AUTH-001"
+        );
+        assert!(
+            res.findings.iter().any(|f| f.rule_id == "VF-RACE-001"),
+            "public_routes must still report VF-RACE-001 if unlocked"
         );
     }
 }

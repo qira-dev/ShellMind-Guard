@@ -6,7 +6,10 @@ use rayon::prelude::*;
 use vf_core::{IndexedFile, StateStore, VeriForgeConfig};
 
 pub use ast::{FileAstSummary, GuardKind, SinkKind, parse_file_ast, parse_file_ast_with_hash};
-pub use lattice::{GraphAnalysisResult, LatticeFinding, TraceHop, solve_guard_lattice};
+pub use lattice::{
+    GraphAnalysisResult, LatticeFinding, TraceHop, solve_guard_lattice,
+    solve_guard_lattice_with_public,
+};
 
 pub fn analyze_codebase(
     files: &[IndexedFile],
@@ -23,7 +26,10 @@ pub fn analyze_codebase(
             .collect()
     });
 
-    Ok(solve_guard_lattice(&summaries))
+    Ok(solve_guard_lattice_with_public(
+        &summaries,
+        &cfg.guards.public_routes,
+    ))
 }
 
 /// Two-Phase Incremental AST Cache + Global Guard-Set Lattice Linker:
@@ -78,5 +84,8 @@ pub fn analyze_codebase_cached(
         store.save_ast_cache(&cfg_hash, &cache_rows)?;
     }
 
-    Ok(solve_guard_lattice(&all_summaries))
+    Ok(solve_guard_lattice_with_public(
+        &all_summaries,
+        &cfg.guards.public_routes,
+    ))
 }

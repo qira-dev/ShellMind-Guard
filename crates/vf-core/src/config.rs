@@ -19,6 +19,10 @@ pub struct GuardConfig {
     pub auth_guards: Vec<String>,
     #[serde(default = "default_lock_guards")]
     pub lock_guards: Vec<String>,
+    #[serde(default = "default_public_routes")]
+    pub public_routes: Vec<String>,
+    #[serde(default)]
+    pub custom_routes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,6 +49,10 @@ fn default_auth_guards() -> Vec<String> {
         "withAuth".into(),
         "requireAdmin".into(),
         "ensureAuthenticated".into(),
+        "AuthGuard".into(),
+        "UseGuards".into(),
+        "protectedProcedure".into(),
+        "login_required".into(),
         "AuthV1".into(),
         "AuthMiddleware".into(),
         "AdminAuth".into(),
@@ -61,6 +69,24 @@ fn default_lock_guards() -> Vec<String> {
         "idempotencyKey".into(),
         "BeginTx".into(),
         "db.Transaction".into(),
+        "$transaction".into(),
+    ]
+}
+
+fn default_public_routes() -> Vec<String> {
+    vec![
+        "/health".into(),
+        "/healthz".into(),
+        "/readyz".into(),
+        "/metrics".into(),
+        "/login".into(),
+        "/register".into(),
+        "/signup".into(),
+        "/webhook".into(),
+        "/api/v1/healthz".into(),
+        "/api/v1/auth/login".into(),
+        "/api/v1/auth/register".into(),
+        "/api/v1/auth/2fa/confirm".into(),
     ]
 }
 
@@ -72,7 +98,7 @@ fn default_max_threads() -> usize {
 }
 
 fn default_max_file_bytes() -> u64 {
-    2 * 1024 * 1024 // 2 MiB max per source file
+    2 * 1024 * 1024
 }
 
 impl Default for GuardConfig {
@@ -80,6 +106,8 @@ impl Default for GuardConfig {
         Self {
             auth_guards: default_auth_guards(),
             lock_guards: default_lock_guards(),
+            public_routes: default_public_routes(),
+            custom_routes: Vec::new(),
         }
     }
 }
@@ -112,5 +140,30 @@ impl VeriForgeConfig {
         let parsed: Self = toml::from_str(&raw)
             .with_context(|| format!("Invalid TOML in {}", cfg_path.display()))?;
         Ok(parsed)
+    }
+
+    pub fn detect_and_write_init(root: &Path) -> Result<(Vec<String>, std::path::PathBuf)> {
+        let mut detected = Vec::new();
+        if root.join("package.json").exists() {
+            detected.push("Node.js / TypeScript".to_string());
+        }
+        if root.join("go.mod").exists() {
+            detected.push("Go".to_string());
+        }
+        if root.join("Cargo.toml").exists() {
+            detected.push("Rust".to_string());
+        }
+        if root.join("pyproject.toml").exists() || root.join("requirements.txt").exists() {
+            detected.push("Python".to_string());
+        }
+        if detected.is_empty() {
+            detected.push("Generic Multi-Language".to_string());
+        }
+
+        let cfg = Self::default();
+        let toml_str = toml::to_string_pretty(&cfg)?;
+        let out_path = root.join(".veriforge.toml");
+        fs::write(&out_path, toml_str)?;
+        Ok((detected, out_path))
     }
 }

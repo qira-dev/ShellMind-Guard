@@ -35,8 +35,24 @@ pub struct GraphAnalysisResult {
     pub findings: Vec<LatticeFinding>,
 }
 
-/// Global Cross-File Call Graph + True O(V + E) Guard-Set Lattice & Witness Solver
 pub fn solve_guard_lattice(summaries: &[FileAstSummary]) -> GraphAnalysisResult {
+    solve_guard_lattice_with_public(summaries, &[])
+}
+
+fn is_public_route(entry_route: &str, public_routes: &[String]) -> bool {
+    let path_part = entry_route.split_whitespace().nth(1).unwrap_or(entry_route);
+    let low = path_part.to_ascii_lowercase();
+    public_routes.iter().any(|p| {
+        let pl = p.to_ascii_lowercase();
+        low == pl || low.starts_with(&format!("{}/", pl.trim_end_matches('/')))
+    })
+}
+
+/// Global Cross-File Call Graph + True O(V + E) Guard-Set Lattice & Witness Solver
+pub fn solve_guard_lattice_with_public(
+    summaries: &[FileAstSummary],
+    public_routes: &[String],
+) -> GraphAnalysisResult {
     let mut graph = DiGraph::<SymbolInfo, ()>::new();
     let mut id_to_idx: HashMap<String, NodeIndex> = HashMap::new();
     let mut file_symbol_map: HashMap<(String, String), NodeIndex> = HashMap::new();
@@ -174,6 +190,7 @@ pub fn solve_guard_lattice(summaries: &[FileAstSummary]) -> GraphAnalysisResult 
 
         if !active_guards.contains(&GuardKind::Auth)
             && let Some((entry_name, witness)) = reconstruct_witness(&graph, &auth_parents, idx)
+            && !is_public_route(&entry_name, public_routes)
         {
             let key = (entry_name.clone(), "VF-AUTH-001".to_string());
             let replace = match best_by_key.get(&key) {

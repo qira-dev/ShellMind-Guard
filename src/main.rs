@@ -27,6 +27,11 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Initialize `.veriforge.toml` by auto-detecting languages & frameworks
+    Init {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
     /// Index a repository using parallel ignore walker, BLAKE3 hashing, and SQLite WAL delta cache
     Index {
         #[arg(default_value = ".")]
@@ -178,6 +183,14 @@ fn main() -> Result<ExitCode> {
 
     let cli = Cli::parse();
     match cli.command {
+        Commands::Init { path } => {
+            let (detected, out_path) = VeriForgeConfig::detect_and_write_init(&path)?;
+            println!(
+                "VeriForge Init | Detected: {} | Wrote {}",
+                detected.join(", "),
+                out_path.display()
+            );
+        }
         Commands::Index { path, json } => {
             let cfg = VeriForgeConfig::load_from_dir(&path)?;
             let summary = scan_repository(&path, &cfg)?;
