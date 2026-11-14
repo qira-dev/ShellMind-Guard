@@ -435,7 +435,7 @@ fn render_system_legend_card(f: &mut Frame, area: Rect, state: &TuiState) {
             Span::raw("   "),
             Span::styled("◆ SUSPECT Static", Style::default().fg(SEM_SUSPECT_AMBER)),
             Span::raw("   "),
-            Span::styled("✓ MITIGATED Safe", Style::default().fg(SEM_SAFE_GREEN)),
+            Span::styled("✓ MITIGATED", Style::default().fg(SEM_SAFE_GREEN)),
         ]),
         Line::from(vec![
             Span::styled("  Defect  : ", Style::default().fg(FG_SECONDARY)),

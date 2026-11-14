@@ -40,14 +40,19 @@ pub fn solve_guard_lattice(summaries: &[FileAstSummary]) -> GraphAnalysisResult 
     let mut graph = DiGraph::<SymbolInfo, ()>::new();
     let mut id_to_idx: HashMap<String, NodeIndex> = HashMap::new();
     let mut file_symbol_map: HashMap<(String, String), NodeIndex> = HashMap::new();
+    let mut go_exported_map: HashMap<String, NodeIndex> = HashMap::new();
     let mut known_files: HashSet<String> = HashSet::new();
 
     for f in summaries {
         known_files.insert(f.rel_path.clone());
+        let is_go = f.rel_path.ends_with(".go");
         for sym in &f.symbols {
             let idx = graph.add_node(sym.clone());
             id_to_idx.insert(sym.id.clone(), idx);
             file_symbol_map.insert((f.rel_path.clone(), sym.name.clone()), idx);
+            if is_go && sym.name.chars().next().is_some_and(|c| c.is_uppercase()) {
+                go_exported_map.entry(sym.name.clone()).or_insert(idx);
+            }
         }
     }
 
@@ -76,6 +81,13 @@ pub fn solve_guard_lattice(summaries: &[FileAstSummary]) -> GraphAnalysisResult 
                             .get(callee)
                             .and_then(|tf| file_symbol_map.get(&(tf.clone(), callee.clone())))
                             .copied()
+                    })
+                    .or_else(|| {
+                        if f.rel_path.ends_with(".go") {
+                            go_exported_map.get(callee).copied()
+                        } else {
+                            None
+                        }
                     });
                 if let Some(dst_idx) = dst_opt
                     && src_idx != dst_idx

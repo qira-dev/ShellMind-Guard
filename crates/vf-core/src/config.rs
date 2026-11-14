@@ -45,6 +45,11 @@ fn default_auth_guards() -> Vec<String> {
         "withAuth".into(),
         "requireAdmin".into(),
         "ensureAuthenticated".into(),
+        "AuthV1".into(),
+        "AuthMiddleware".into(),
+        "AdminAuth".into(),
+        "TeamRequire".into(),
+        "MetricsTokenGate".into(),
     ]
 }
 
@@ -54,6 +59,8 @@ fn default_lock_guards() -> Vec<String> {
         "FOR UPDATE".into(),
         "acquireLock".into(),
         "idempotencyKey".into(),
+        "BeginTx".into(),
+        "db.Transaction".into(),
     ]
 }
 

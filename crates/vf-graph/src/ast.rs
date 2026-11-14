@@ -87,7 +87,10 @@ pub fn parse_file_ast_with_hash(
                 .set_language(&tree_sitter_python::LANGUAGE.into())
                 .ok()?;
         }
-        Language::Go | Language::Sql => return None,
+        Language::Go => {
+            parser.set_language(&tree_sitter_go::LANGUAGE.into()).ok()?;
+        }
+        Language::Sql => return None,
     }
 
     let tree = parser.parse(&source, None)?;
@@ -616,8 +619,8 @@ fn extract_node(
         let mut dec_guards = HashSet::new();
         let mut fn_node = None;
 
-        let mut c = node.walk();
-        for ch in node.children(&mut c) {
+        let mut cursor = node.walk();
+        for ch in node.children(&mut cursor) {
             if ch.kind() == "decorator" {
                 let dtxt = node_text(ch, src);
                 for m in ["get", "post", "put", "patch", "delete"] {
@@ -730,10 +733,83 @@ fn extract_node(
         }
     }
 
-    // 3. Function / Method declarations (TS/JS, Rust, Python)
+    // 2d. Go Gin / Echo / Fiber HTTP routes: r.GET("/api/...", mw..., handlers.Foo)
+    if lang == Language::Go
+        && kind == "call_expression"
+        && let Some(func) = node.child_by_field_name("function")
+    {
+        let ftxt = node_text(func, src);
+        let method = ftxt.rsplit('.').next().unwrap_or("");
+        let method_upper = method.to_ascii_uppercase();
+        if matches!(
+            method_upper.as_str(),
+            "GET" | "POST" | "PUT" | "PATCH" | "DELETE"
+        ) && ftxt.contains('.')
+            && let Some(args) = node.child_by_field_name("arguments")
+        {
+            let mut route_path = None;
+            let mut calls = Vec::new();
+            let mut guards = file_middleware_guards.clone();
+            let mut seen_handler = false;
+            let line_start = node.start_position().row + 1;
+            let line_end = node.end_position().row + 1;
+
+            let mut c = args.walk();
+            for arg in args.children(&mut c) {
+                let ak = arg.kind();
+                if matches!(ak, "(" | ")" | ",") {
+                    continue;
+                }
+                let atxt = node_text(arg, src).trim();
+                if (atxt.starts_with('"') || atxt.starts_with('`')) && route_path.is_none() {
+                    route_path = Some(atxt.trim_matches(|ch| ch == '"' || ch == '`').to_string());
+                } else {
+                    let short = atxt
+                        .split('(')
+                        .next()
+                        .unwrap_or(atxt)
+                        .rsplit('.')
+                        .next()
+                        .unwrap_or(atxt)
+                        .trim();
+                    if !seen_handler && is_auth_guard_ident(short, cfg) {
+                        guards.insert(GuardKind::Auth);
+                    } else if !seen_handler && is_lock_guard_ident(short, cfg) {
+                        guards.insert(GuardKind::TxLock);
+                    } else if !short.is_empty() {
+                        seen_handler = true;
+                        calls.push(short.to_string());
+                    }
+                    collect_calls(arg, src, &mut calls);
+                }
+            }
+
+            if let Some(rp) = route_path {
+                symbols.push(SymbolInfo {
+                    id: format!("{}::route:{}", rel_path, line_start),
+                    rel_path: rel_path.to_string(),
+                    name: format!("{} {}", method_upper, rp),
+                    kind: SymbolKind::Route,
+                    sink_kind: None,
+                    line_start,
+                    line_end,
+                    guards,
+                    calls,
+                    route_path: Some(rp),
+                });
+                return;
+            }
+        }
+    }
+
+    // 3. Function / Method declarations (TS/JS, Rust, Python, Go)
     if matches!(
         kind,
-        "function_declaration" | "method_definition" | "function_item" | "function_definition"
+        "function_declaration"
+            | "method_definition"
+            | "function_item"
+            | "function_definition"
+            | "method_declaration"
     ) && let Some(name_node) = node.child_by_field_name("name")
     {
         let name = node_text(name_node, src).trim().to_string();
