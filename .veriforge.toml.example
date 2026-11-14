@@ -1,14 +1,50 @@
 # VeriForge Project Configuration (.veriforge.toml)
 
 [guards]
-auth_guards = ["requireAuth", "authenticate", "verifyJwt", "withAuth", "requireAdmin"]
-lock_guards = ["withTransaction", "FOR UPDATE", "acquireLock", "idempotencyKey"]
+auth_guards = [
+  "requireAuth",
+  "authenticate",
+  "verifyJwt",
+  "withAuth",
+  "requireAdmin",
+  "ensureAuthenticated",
+  "AuthGuard",
+  "UseGuards",
+  "protectedProcedure",
+  "login_required",
+  "AuthMiddleware",
+]
+
+lock_guards = [
+  "withTransaction",
+  "FOR UPDATE",
+  "acquireLock",
+  "idempotencyKey",
+  "BeginTx",
+  "db.Transaction",
+  "$transaction",
+]
+
+# Intentionally unauthenticated routes (suppresses VF-AUTH-001 only; never suppresses SQLi/CMDi/Race)
+public_routes = [
+  "/health",
+  "/healthz",
+  "/readyz",
+  "/metrics",
+  "/login",
+  "/register",
+  "/signup",
+  "/webhook",
+]
+
+# Optional custom router methods
+custom_routes = []
 
 [scan]
 ignore_paths = ["node_modules", "target", "dist", "build", ".next", ".veriforge"]
-max_threads = 3
+max_threads = 4
 max_file_bytes = 2097152
 
 [sandbox]
-# boot_cmd = "npm run start"
+# boot_cmd = "node server.mjs"
 # base_url = "http://127.0.0.1:3000"

@@ -1,0 +1,44 @@
+name: False Positive / False Negative Report
+description: Report an inaccurate finding (false positive) or missed vulnerability (false negative) in the 6-Layer Engine.
+title: "[Rule]: "
+labels: ["rule-accuracy"]
+body:
+  - type: input
+    id: rule_id
+    attributes:
+      label: Rule ID
+      description: Which VeriForge rule is involved?
+      placeholder: "e.g. VF-SQLI-001, VF-IDOR-001, VF-RACE-001, VF-SEC-ENTROPY"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Classification
+      options:
+        - "False Positive (safe/sanitized code was flagged)"
+        - "False Negative (vulnerable code was not flagged)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: language
+    attributes:
+      label: Language / Framework
+      options:
+        - "TypeScript / JavaScript (Express, Next.js, NestJS, tRPC, Fastify, Hono)"
+        - "Go (net/http, Gin, Echo, Chi)"
+        - "Python (FastAPI, Flask, Django)"
+        - "Rust (Axum, Actix-Web)"
+        - "Dockerfile / Manifest / .env"
+    validations:
+      required: true
+
+  - type: textarea
+    id: snippet
+    attributes:
+      label: Minimal Source Code Snippet
+      description: Paste the minimal self-contained snippet showing the route, guard/sanitizer, and sink.
+    validations:
+      required: true

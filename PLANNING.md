@@ -12,13 +12,14 @@ VeriForge/
 ├── Cargo.toml                 # Workspace root (resolver = "2")
 ├── crates/
 │   ├── vf-core/               # .veriforge.toml, BLAKE3 walker (ignore), SQLite WAL+FTS5 store
-│   ├── vf-graph/              # Rayon + Tree-sitter AST, TS/Rust resolver, O(V+E) Guard Lattice
-│   ├── vf-sandbox/            # Bubblewrap + cgroup reaper, mock shims, Last-Byte Sync PoC
+│   ├── vf-graph/              # Rayon + Tree-sitter AST (TS/JS/Go/Python/Rust), 6-layer taint & O(V+E) Lattice
+│   ├── vf-sandbox/            # Bubblewrap + process-group reaper, 12-way Barrier + JoinSet race & auth prover
 │   ├── vf-tui/                # Panic-safe ratatui 3-pane workspace + [L] log ring-buffer
 │   ├── vf-report/             # JSON, SARIF 2.1.0, CI exit-codes & self-contained HTML graph
-│   └── vf-ai/                 # Optional BYOK / Ollama patch generator + tmpfs PoC re-verifier
+│   └── vf-ai/                 # Optional BYOK / Ollama minimal-context (<4 KB) patch prompt builder
 ├── src/
-│   └── main.rs                # Unified CLI/TUI entrypoint (`scan`, `replay`, `ui`, `ci`)
+│   ├── main.rs                # Unified CLI/TUI entrypoint (`init`, `index`, `scan`, `replay`, `ui`, `mcp`)
+│   └── mcp.rs                 # Stdio JSON-RPC 2.0 Model Context Protocol server (`veriforge mcp`)
 └── fixtures/                  # Intentionally vulnerable multi-file test apps (Node/TS, Rust)
     ├── vuln-payment-node/     # Double-spend race condition + negative-amount checkout bug
     └── vuln-auth-rust/        # Cross-tenant IDOR + missing middleware guard
@@ -43,7 +44,7 @@ VeriForge/
 
 - **CLI & Async Runtime:** `clap` (derive), `tokio` (multi-thread), `anyhow`, `tracing`
 - **13k-File Walker & Hashing:** `ignore`, `rayon`, `blake3`, `toml`
-- **AST & Lattice Graph Engine:** `tree-sitter`, `tree-sitter-typescript`, `tree-sitter-rust`, `tree-sitter-python`, `petgraph`
+- **AST & Lattice Graph Engine:** `tree-sitter`, `tree-sitter-typescript`, `tree-sitter-javascript`, `tree-sitter-go`, `tree-sitter-rust`, `tree-sitter-python`, `petgraph`
 - **Database:** `rusqlite` (`features = ["bundled", "fts5"]`)
 - **TUI & Web Report:** `ratatui`, `crossterm`, `axum` (ephemeral report server), `serde_json`
 - **Sandbox & Last-Byte Sync PoC:** `/usr/bin/bwrap`, raw `tokio::net::TcpStream` (for `<50us` Last-Byte Sync), `reqwest` (rustls)

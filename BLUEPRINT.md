@@ -39,10 +39,13 @@
 +=========================================================================================+
 |         STAGE 2: MULTI-FILE CALL GRAPH & GUARD-LATTICE SOLVER (O(V + E) Linear)         |
 +=========================================================================================+
-|  [Rayon Pool: max 3 workers] Tree-sitter Parsers (TS/JS, Rust, Python, SQL)             |
-|    - Entry Points: HTTP routes, RPC, Server Actions, Webhook handlers                   |
-|    - Middleware Edges: app.use(), Router::layer(), .veriforge.toml custom guards        |
-|    - Business Sinks: Payment charge, Balance/Ledger write, Auth/Role mutation, DB SQL   |
+|  [Rayon Pool: bounded workers] Tree-sitter Parsers (TS/TSX, JS/JSX, Go, Python, Rust)   |
+|    - Layer 1: Secrets (`VF-SEC-*`) & Misconfigurations (`VF-CFG-*`, `Dockerfile`)       |
+|    - Layer 2: Offline Manifest & Lockfile Audit (`VF-DEP-001`)                          |
+|    - Layer 3: Cross-File Taint & Sanitizer Disproof (`VF-SQLI/CMDI/PATH/SSRF`)          |
+|    - Layer 4: Auth & Ownership Lattice (`VF-AUTH-001`, `VF-IDOR-001`)                   |
+|    - Layer 5: Concurrency / Transaction Lock Lattice (`VF-RACE-001`)                    |
+|    - Layer 6: Frontend <-> Backend Route Contract (`VF-FE-404`, `VF-FE-ERR`)            |
 |                                                                                         |
 |  [Mathematical Guard-Set Lattice (NO exponential all_simple_paths O(V!) explosion!)]    |
 |    For every node v:  G(v) = Intersection_{p in Pred(v)} ( G(p) U Guards(p -> v) )      |

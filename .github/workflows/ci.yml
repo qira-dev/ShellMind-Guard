@@ -6,18 +6,51 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   verify:
+    name: Format, Clippy, Tests & Self-Verification
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: Clippy (zero warnings)
+          components: rustfmt, clippy
+
+      - name: Cache Cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting (rustfmt)
+        run: cargo fmt --all -- --check
+
+      - name: Lint workspace (clippy -D warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Test workspace
+
+      - name: Run unit & integration test suite
         run: cargo test --workspace
-      - name: Build release binary
+
+      - name: Build optimized release binary
         run: cargo build --release
+
+      - name: Dogfooding self-scan & MCP stdio verification
+        run: |
+          ./target/release/veriforge scan . --format json | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          crate_findings = [f for f in data['findings'] if not f['file'].startswith('fixtures/')]
+          assert len(crate_findings) == 0, f'Unexpected findings in VeriForge crates: {crate_findings}'
+          "
+          printf '%s\n%s\n' \
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+            '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
+            | ./target/release/veriforge mcp | python3 -c "
+          import sys, json
+          lines = [json.loads(l) for l in sys.stdin if l.strip()]
+          assert len(lines) == 2
+          assert len(lines[1]['result']['tools']) == 3
+          "

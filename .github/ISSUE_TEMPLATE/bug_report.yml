@@ -1,0 +1,51 @@
+name: Bug Report
+description: Report a bug in VeriForge CLI, AST parser, Guard-Set Lattice, Bubblewrap sandbox, or MCP server.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for taking the time to report a bug in **VeriForge**.
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - "vf-core (Scanner / BLAKE3 / SQLite Cache / Config)"
+        - "vf-graph (Tree-sitter AST / Guard-Set Lattice / Taint / Secrets / Deps)"
+        - "vf-sandbox (Bubblewrap / Concurrent Race Prover)"
+        - "vf-report (SARIF 2.1.0 / HTML Graph)"
+        - "vf-tui (ratatui Terminal UI)"
+        - "veriforge mcp (JSON-RPC 2.0 Stdio MCP Server)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal Reproduction
+      description: Provide the command run and a minimal code snippet or fixture that reproduces the issue.
+      placeholder: |
+        ```bash
+        veriforge scan ./repro --format json
+        ```
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs. Actual Behavior
+      description: What did you expect VeriForge to output, and what happened instead?
+    validations:
+      required: true
+
+  - type: input
+    id: env
+    attributes:
+      label: Environment (OS, Kernel, Rust Version)
+      placeholder: "Ubuntu 24.04, Linux 6.8, rustc 1.85+"
+    validations:
+      required: true

@@ -43,8 +43,10 @@
   - Closed-loop verification: applies patch in `tmpfs` sandbox and re-runs the exact Last-Byte Sync / IDOR PoC to confirm `[MITIGATED]`.
 - **Verification Gate:** Patch `vuln-payment-node` double-spend via AI adapter and automatically verify the fix passes the Last-Byte Sync race PoC.
 
-## Phase 5: Hardening, Packaging & Open-Source Release
+## Phase 5: Universal 6-Layer Engine, MCP Server & Open-Source Release
 - **Deliverables:**
-  - Cross-language expansion (Go, SQL schema constraint checking, Next.js Server Actions).
-  - GitHub Actions CI workflow, release binary stripping (`lto = "thin"`), benchmark suite (`13k_files_bench`), and documentation.
-- **Verification Gate:** Clean release binary (< 15 MB), full test suite green, 0 clippy warnings.
+  - Universal 6-layer verification engine: Secrets & Misconfigurations (`VF-SEC-*`, `VF-CFG-*`), Offline Dependency & Lockfile Audit (`VF-DEP-001`), Sanitizer-Aware Cross-File Taint (`VF-SQLI-001`, `VF-CMDI-001`, `VF-PATH-001`, `VF-SSRF-001`), Auth & IDOR Ownership Lattice (`VF-AUTH-001`, `VF-IDOR-001`), 12-Way Barrier Race Prover (`VF-RACE-001`), and Frontend ↔ Backend API Contract Verification (`VF-FE-404`, `VF-FE-ERR`).
+  - Polyglot `Tree-sitter` support across TypeScript/TSX, JavaScript/JSX, Go (`net/http`, Gin, Echo, Chi), Python (FastAPI, Flask, Django), and Rust (Axum, Actix-Web).
+  - Stdio JSON-RPC 2.0 Model Context Protocol server (`veriforge mcp`) for AI coding agents (`veriforge_scan`, `veriforge_explain_finding`, `veriforge_init`).
+  - GitHub Actions CI workflow (`veriforge init --ci`), release binary stripping, benchmark suite, and complete documentation.
+- **Verification Gate:** Clean release binary (< 15 MB), full 27-test suite green, 0 clippy warnings, 0 self-scan false positives.
