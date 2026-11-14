@@ -856,7 +856,7 @@ mod tests {
     use super::*;
     use crate::ast::{FrontendApiCall, parse_file_ast};
     use std::time::Instant;
-    use vf_core::{IndexedFile, Language, VeriForgeConfig};
+    use vf_core::{IndexedFile, Language, ShellMindGuardConfig};
 
     #[test]
     fn test_b11_2000_node_all_sink_chain_is_linear() {
@@ -944,7 +944,7 @@ export async function syncData() {
         std::fs::write(dir.join("db/queries.ts"), query_src).unwrap();
         std::fs::write(dir.join("web/app.ts"), fe_src).unwrap();
 
-        let cfg = VeriForgeConfig::default();
+        let cfg = ShellMindGuardConfig::default();
         let f1 = IndexedFile {
             abs_path: dir.join("routes/users.ts"),
             rel_path: "routes/users.ts".into(),
@@ -1020,7 +1020,7 @@ app = FastAPI()
 def get_user(user_id: str):
     cursor.execute(f"SELECT * FROM users WHERE id = '{user_id}'")
 "#;
-        let cfg = VeriForgeConfig::default();
+        let cfg = ShellMindGuardConfig::default();
         let file = IndexedFile {
             abs_path: "api.py".into(),
             rel_path: "api.py".into(),

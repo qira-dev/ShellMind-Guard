@@ -6,7 +6,7 @@ pub mod taint;
 
 use anyhow::Result;
 use rayon::prelude::*;
-use vf_core::{IndexedFile, StateStore, VeriForgeConfig};
+use vf_core::{IndexedFile, ShellMindGuardConfig, StateStore};
 
 pub use ast::{
     FileAstSummary, FrontendApiCall, GuardKind, LocalStaticFinding, SinkKind, parse_file_ast,
@@ -19,7 +19,7 @@ pub use lattice::{
 
 pub fn analyze_codebase(
     files: &[IndexedFile],
-    cfg: &VeriForgeConfig,
+    cfg: &ShellMindGuardConfig,
 ) -> Result<GraphAnalysisResult> {
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(cfg.scan.max_threads)
@@ -44,7 +44,7 @@ pub fn analyze_codebase(
 /// 3. Global cross-file edges and the O(V+E) Guard-Set Lattice ALWAYS run across all files in RAM.
 pub fn analyze_codebase_cached(
     files: &[IndexedFile],
-    cfg: &VeriForgeConfig,
+    cfg: &ShellMindGuardConfig,
     store: &mut StateStore,
 ) -> Result<GraphAnalysisResult> {
     let cfg_json = serde_json::to_string(&cfg.guards).unwrap_or_default();

@@ -254,7 +254,7 @@ pub async fn verify_concurrency_invariant(
             entry_route: finding.entry_route.clone(),
             status: VerificationStatus::SuspectUnverified,
             evidence: "Concurrency set to 0; no requests dispatched".into(),
-            replay_cmd: format!("veriforge replay {} --sync-race 12", finding.id),
+            replay_cmd: format!("shellmind-guard replay {} --sync-race 12", finding.id),
         });
     }
 
@@ -396,7 +396,7 @@ pub async fn verify_concurrency_invariant(
         status,
         evidence,
         replay_cmd: format!(
-            "veriforge replay {} --sync-race {}",
+            "shellmind-guard replay {} --sync-race {}",
             finding.id, concurrency
         ),
     })
@@ -419,7 +419,7 @@ pub async fn verify_finding(
                 "Static/AST finding ({:?}); live exploit probe applies to Auth and Race findings",
                 other
             ),
-            replay_cmd: format!("veriforge replay {}", finding.id),
+            replay_cmd: format!("shellmind-guard replay {}", finding.id),
         }),
     }
 }

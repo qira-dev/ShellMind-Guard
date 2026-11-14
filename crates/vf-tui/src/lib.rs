@@ -342,7 +342,7 @@ fn render_brand_header(f: &mut Frame, area: Rect, state: &TuiState) {
 
     let header = Paragraph::new(Line::from(vec![
         Span::styled(
-            " ◆ VERIFORGE ",
+            " ◆ SHELLMIND GUARD ",
             Style::default()
                 .fg(Color::Black)
                 .bg(SEM_BRAND_CYAN)
@@ -1032,7 +1032,7 @@ fn render_proof_and_remediation(f: &mut Frame, area: Rect, state: &TuiState) {
                     Span::styled("  CLI     : ", Style::default().fg(FG_SECONDARY)),
                     Span::styled(
                         format!(
-                            "veriforge replay {} {}",
+                            "shellmind-guard replay {} {}",
                             cur.id,
                             state.project_root.display()
                         ),
@@ -1195,7 +1195,7 @@ fn render_help_modal(f: &mut Frame, area: Rect) {
     f.render_widget(Clear, modal);
     let lines = vec![
         Line::from(Span::styled(
-            "VERIFORGE // by Qira-Dev — Power-User Reference",
+            "SHELLMIND GUARD // by Qira-Dev — Power-User Reference",
             Style::default()
                 .fg(SEM_BRAND_CYAN)
                 .add_modifier(Modifier::BOLD),
@@ -1282,7 +1282,7 @@ fn render_patch_modal(f: &mut Frame, area: Rect, fid: &str, prompt_txt: &str) {
         .style(Style::default().bg(BG_CANVAS))
         .border_style(Style::default().fg(SEM_BRAND_CYAN))
         .title(format!(
-            " ◆ Minimal AI Patch Context — {} ({} bytes, saved to .veriforge/patch_{}.prompt.txt) [Esc/p to close] ",
+            " ◆ Minimal AI Patch Context — {} ({} bytes, saved to .shellmind-guard/patch_{}.prompt.txt) [Esc/p to close] ",
             fid,
             prompt_txt.len(),
             fid
@@ -1423,9 +1423,9 @@ pub fn run_tui(
                         {
                             let out = state
                                 .project_root
-                                .join(".veriforge")
+                                .join(".shellmind-guard")
                                 .join(format!("patch_{}.prompt.txt", cur.id));
-                            let _ = fs::create_dir_all(state.project_root.join(".veriforge"));
+                            let _ = fs::create_dir_all(state.project_root.join(".shellmind-guard"));
                             let _ = fs::write(&out, &prompt);
                             state.push_log(format!(
                                 "Saved & opened patch context ({} B) -> {}",
@@ -1440,7 +1440,10 @@ pub fn run_tui(
                     state.show_logs = !state.show_logs;
                 }
                 KeyCode::Char('g') => {
-                    let out = state.project_root.join(".veriforge").join("report.html");
+                    let out = state
+                        .project_root
+                        .join(".shellmind-guard")
+                        .join("report.html");
                     let verified_vec: Vec<VerifiedFinding> =
                         state.verified_map.values().cloned().collect();
                     let html = to_html_graph(
@@ -1448,7 +1451,7 @@ pub fn run_tui(
                         &state.graph,
                         &verified_vec,
                     );
-                    match fs::create_dir_all(state.project_root.join(".veriforge"))
+                    match fs::create_dir_all(state.project_root.join(".shellmind-guard"))
                         .and_then(|_| fs::write(&out, html))
                     {
                         Ok(_) => {
@@ -1463,11 +1466,14 @@ pub fn run_tui(
                     }
                 }
                 KeyCode::Char('s') => {
-                    let out = state.project_root.join(".veriforge").join("report.sarif");
+                    let out = state
+                        .project_root
+                        .join(".shellmind-guard")
+                        .join("report.sarif");
                     let verified_vec: Vec<VerifiedFinding> =
                         state.verified_map.values().cloned().collect();
                     let sarif = to_sarif_json(&state.graph.findings, &verified_vec);
-                    match fs::create_dir_all(state.project_root.join(".veriforge"))
+                    match fs::create_dir_all(state.project_root.join(".shellmind-guard"))
                         .and_then(|_| fs::write(&out, sarif))
                     {
                         Ok(_) => state.push_log(format!("Exported SARIF -> {}", out.display())),
@@ -1527,7 +1533,7 @@ mod tests {
             entry_route: "POST /api/v1/checkout/withdraw".into(),
             status: VerificationStatus::Proven,
             evidence: "Last-Byte Sync (10x): 10x HTTP 2xx".into(),
-            replay_cmd: "veriforge replay VF-RACE-002".into(),
+            replay_cmd: "shellmind-guard replay VF-RACE-002".into(),
         }];
 
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))

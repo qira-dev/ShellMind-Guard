@@ -1,17 +1,17 @@
-# VeriForge — Execution Planning & Module Specification (v2 Audited)
+# ShellMind Guard — Execution Planning & Module Specification (v2 Audited)
 
 ---
 
 ## 1. Cargo Workspace & Directory Structure
 
 ```text
-VeriForge/
+ShellMind Guard/
 ├── BLUEPRINT.md               # Master ASCII architecture, lattice math & OS/UX design
 ├── ROADMAP.md                 # Phase 0–5 milestones & verification gates
 ├── PLANNING.md                # Sprint tasks, crate layout & risk matrix
 ├── Cargo.toml                 # Workspace root (resolver = "2")
 ├── crates/
-│   ├── vf-core/               # .veriforge.toml, BLAKE3 walker (ignore), SQLite WAL+FTS5 store
+│   ├── vf-core/               # .shellmind-guard.toml, BLAKE3 walker (ignore), SQLite WAL+FTS5 store
 │   ├── vf-graph/              # Rayon + Tree-sitter AST (TS/JS/Go/Python/Rust), 6-layer taint & O(V+E) Lattice
 │   ├── vf-sandbox/            # Bubblewrap + process-group reaper, 12-way Barrier + JoinSet race & auth prover
 │   ├── vf-tui/                # Panic-safe ratatui 3-pane workspace + [L] log ring-buffer
@@ -19,7 +19,7 @@ VeriForge/
 │   └── vf-ai/                 # Optional BYOK / Ollama minimal-context (<4 KB) patch prompt builder
 ├── src/
 │   ├── main.rs                # Unified CLI/TUI entrypoint (`init`, `index`, `scan`, `replay`, `ui`, `mcp`)
-│   └── mcp.rs                 # Stdio JSON-RPC 2.0 Model Context Protocol server (`veriforge mcp`)
+│   └── mcp.rs                 # Stdio JSON-RPC 2.0 Model Context Protocol server (`shellmind-guard mcp`)
 └── fixtures/                  # Intentionally vulnerable multi-file test apps (Node/TS, Rust)
     ├── vuln-payment-node/     # Double-spend race condition + negative-amount checkout bug
     └── vuln-auth-rust/        # Cross-tenant IDOR + missing middleware guard
@@ -32,8 +32,8 @@ VeriForge/
 | Task ID | Component | Concrete Engineering Task | Acceptance Criteria |
 | :--- | :--- | :--- | :--- |
 | `S1-01` | Workspace | Initialize Cargo workspace + `vf-core` + `vf-graph` crates | `cargo check` passes cleanly |
-| `S1-02` | `vf-core` | Implement `ignore::WalkParallel`, `.veriforge.toml` & `BLAKE3` scanner | Ignores `node_modules`/`.git`/`target`, hashes 13k files < 250ms |
-| `S1-03` | `vf-core` | Implement `.veriforge/state.db` (`SQLite` WAL + FTS5 symbol cache) | Warm delta skips 100% of unchanged files; cross-file link stays fresh |
+| `S1-02` | `vf-core` | Implement `ignore::WalkParallel`, `.shellmind-guard.toml` & `BLAKE3` scanner | Ignores `node_modules`/`.git`/`target`, hashes 13k files < 250ms |
+| `S1-03` | `vf-core` | Implement `.shellmind-guard/state.db` (`SQLite` WAL + FTS5 symbol cache) | Warm delta skips 100% of unchanged files; cross-file link stays fresh |
 | `S1-04` | `vf-graph` | Integrate `tree-sitter-typescript` & `tree-sitter-rust` | Extracts routes, middleware, functions, imports, DB/payment sinks |
 | `S1-05` | `vf-graph` | Build `petgraph` linker + $O(V + E)$ Guard-Set Lattice solver | Traces `route -> service -> sink` across 3+ files; no $O(V!)$ blowup |
 | `S1-06` | `fixtures` | Create `vuln-payment-node` & `vuln-auth-rust` multi-file fixtures | Scanner flags missing lock/auth witness path in < 500ms |

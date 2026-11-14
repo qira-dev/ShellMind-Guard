@@ -7,7 +7,7 @@ body:
     id: rule_id
     attributes:
       label: Rule ID
-      description: Which VeriForge rule is involved?
+      description: Which ShellMind Guard rule is involved?
       placeholder: "e.g. VF-SQLI-001, VF-IDOR-001, VF-RACE-001, VF-SEC-ENTROPY"
     validations:
       required: true

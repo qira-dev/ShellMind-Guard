@@ -1,4 +1,4 @@
-use crate::config::VeriForgeConfig;
+use crate::config::ShellMindGuardConfig;
 use anyhow::Result;
 use ignore::WalkBuilder;
 use rayon::prelude::*;
@@ -96,7 +96,7 @@ pub struct ScanSummary {
     pub files: Vec<IndexedFile>,
 }
 
-pub fn scan_repository(root: &Path, cfg: &VeriForgeConfig) -> Result<ScanSummary> {
+pub fn scan_repository(root: &Path, cfg: &ShellMindGuardConfig) -> Result<ScanSummary> {
     let start = Instant::now();
     let canon_root = fs::canonicalize(root)?;
     let total_seen = AtomicUsize::new(0);
@@ -121,7 +121,10 @@ pub fn scan_repository(root: &Path, cfg: &VeriForgeConfig) -> Result<ScanSummary
         .threads(cfg.scan.max_threads)
         .filter_entry(move |entry| {
             let name = entry.file_name().to_string_lossy();
-            if name == ".git" || name == ".veriforge" || name == "node_modules" || name == "target"
+            if name == ".git"
+                || name == ".shellmind-guard"
+                || name == "node_modules"
+                || name == "target"
             {
                 return false;
             }

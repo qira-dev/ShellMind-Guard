@@ -32,7 +32,7 @@ pub struct StateStore {
 
 impl StateStore {
     pub fn open(project_root: &Path) -> Result<Self> {
-        let vf_dir = project_root.join(".veriforge");
+        let vf_dir = project_root.join(".shellmind-guard");
         fs::create_dir_all(&vf_dir)?;
         let db_path = vf_dir.join("state.db");
         let conn = Connection::open(db_path)?;

@@ -1,4 +1,4 @@
-# VeriForge Project Configuration (.veriforge.toml)
+# ShellMind Guard Project Configuration (.shellmind-guard.toml)
 
 [guards]
 auth_guards = [
@@ -41,7 +41,7 @@ public_routes = [
 custom_routes = []
 
 [scan]
-ignore_paths = ["node_modules", "target", "dist", "build", ".next", ".veriforge"]
+ignore_paths = ["node_modules", "target", "dist", "build", ".next", ".shellmind-guard"]
 max_threads = 4
 max_file_bytes = 2097152
 

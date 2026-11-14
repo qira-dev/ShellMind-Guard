@@ -1,17 +1,17 @@
-# VeriForge — Engineering Roadmap (v2 Audited)
+# ShellMind Guard — Engineering Roadmap (v2 Audited)
 
-> **Goal:** Build VeriForge from zero to a compiler-grade, zero-false-positive multi-file security & business-logic verifier in 5 structured phases. Every phase has strict mathematical/performance SLAs and a binary verification gate.
+> **Goal:** Build ShellMind Guard from zero to a compiler-grade, zero-false-positive multi-file security & business-logic verifier in 5 structured phases. Every phase has strict mathematical/performance SLAs and a binary verification gate.
 
 ---
 
 ## Phase 0: Workspace, Config & Two-Phase Cache (`vf-core`)
 - **Deliverables:**
   - Cargo workspace (`vf-core`, `vf-graph`, `vf-sandbox`, `vf-tui`, `vf-report`, `vf-ai`).
-  - `.veriforge.toml` parser (custom `auth_guards`, `ignore_paths`, `sandbox_boot_cmd`).
+  - `.shellmind-guard.toml` parser (custom `auth_guards`, `ignore_paths`, `sandbox_boot_cmd`).
   - `ignore`-based parallel directory walker + `BLAKE3` file fingerprinter.
   - `SQLite` (`rusqlite` with `bundled` + `WAL` + `FTS5`) two-phase symbol cache.
 - **Performance Target:** Walk 13,000 files and compute/check `BLAKE3` hashes in **< 250ms**.
-- **Verification Gate:** Run `veriforge index <enterprise_13k_repo>` twice; verify cold pass < 500ms and warm delta pass < 50ms.
+- **Verification Gate:** Run `shellmind-guard index <enterprise_13k_repo>` twice; verify cold pass < 500ms and warm delta pass < 50ms.
 
 ## Phase 1: Parallel AST, Middleware Resolution & Guard-Lattice Solver (`vf-graph`)
 - **Deliverables:**
@@ -26,7 +26,7 @@
   - Unprivileged `/usr/bin/bwrap` launcher with `--ro-bind` code, `--tmpfs` writable overlays, isolated loopback, `RLIMIT_AS` (1 GiB), and `cgroup v2` / process-group reaper on drop/Ctrl+C.
   - In-sandbox deterministic HTTP/Webhook mock responder (`127.0.0.1`) + explicit `UNBOOTABLE` status when external dependencies cannot be mocked.
   - **Last-Byte Sync (Single-Packet Attack) Race Runner:** `tokio::sync::Barrier`-synchronized raw TCP/HTTP frames flushing final byte in `< 50 µs` to prove double-spend / over-credit bugs.
-  - **Auth/IDOR Swapper & Negative-Qty/Price-Tamper Runner** + `PROVEN` vs `MITIGATED` classifier + 1-command `veriforge replay <id>` & `curl` PoC.
+  - **Auth/IDOR Swapper & Negative-Qty/Price-Tamper Runner** + `PROVEN` vs `MITIGATED` classifier + 1-command `shellmind-guard replay <id>` & `curl` PoC.
 - **Verification Gate:** Run against `fixtures/vuln-payment-node` and `fixtures/vuln-auth-rust`; confirm 100% detection of double-spend & IDOR with **0 false positives** on patched builds and **0 orphan processes** on `SIGINT`.
 
 ## Phase 3: Panic-Safe `ratatui` TUI, SARIF & Interactive HTML Graph (`vf-tui`, `vf-report`)
@@ -47,6 +47,6 @@
 - **Deliverables:**
   - Universal 6-layer verification engine: Secrets & Misconfigurations (`VF-SEC-*`, `VF-CFG-*`), Offline Dependency & Lockfile Audit (`VF-DEP-001`), Sanitizer-Aware Cross-File Taint (`VF-SQLI-001`, `VF-CMDI-001`, `VF-PATH-001`, `VF-SSRF-001`), Auth & IDOR Ownership Lattice (`VF-AUTH-001`, `VF-IDOR-001`), 12-Way Barrier Race Prover (`VF-RACE-001`), and Frontend ↔ Backend API Contract Verification (`VF-FE-404`, `VF-FE-ERR`).
   - Polyglot `Tree-sitter` support across TypeScript/TSX, JavaScript/JSX, Go (`net/http`, Gin, Echo, Chi), Python (FastAPI, Flask, Django), and Rust (Axum, Actix-Web).
-  - Stdio JSON-RPC 2.0 Model Context Protocol server (`veriforge mcp`) for AI coding agents (`veriforge_scan`, `veriforge_explain_finding`, `veriforge_init`).
-  - GitHub Actions CI workflow (`veriforge init --ci`), release binary stripping, benchmark suite, and complete documentation.
+  - Stdio JSON-RPC 2.0 Model Context Protocol server (`shellmind-guard mcp`) for AI coding agents (`shellmind_guard_scan`, `shellmind_guard_explain_finding`, `shellmind_guard_init`).
+  - GitHub Actions CI workflow (`shellmind-guard init --ci`), release binary stripping, benchmark suite, and complete documentation.
 - **Verification Gate:** Clean release binary (< 15 MB), full 27-test suite green, 0 clippy warnings, 0 self-scan false positives.

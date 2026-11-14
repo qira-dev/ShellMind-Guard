@@ -116,7 +116,7 @@ fn build_base_bwrap_cmd(abs_root: &Path, port: u16) -> Command {
     cmd
 }
 
-/// B-NET: Runs BOTH the target `boot_cmd` AND `veriforge __probe-netns` inside a single
+/// B-NET: Runs BOTH the target `boot_cmd` AND `shellmind-guard __probe-netns` inside a single
 /// `--unshare-all` (including `--unshare-net`) Bubblewrap namespace!
 /// Neither the target app nor the probe can dial the host network, LAN, or internet.
 pub fn run_finding_in_isolated_netns(
@@ -127,7 +127,8 @@ pub fn run_finding_in_isolated_netns(
     concurrency: usize,
 ) -> Result<VerifiedFinding> {
     let abs_root = std::fs::canonicalize(project_root)?;
-    let self_exe = std::env::current_exe().context("Cannot locate current veriforge executable")?;
+    let self_exe =
+        std::env::current_exe().context("Cannot locate current shellmind-guard executable")?;
     let finding_json = serde_json::to_string(finding)?;
 
     let mut cmd = build_base_bwrap_cmd(&abs_root, port);

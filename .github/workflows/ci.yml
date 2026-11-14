@@ -1,4 +1,4 @@
-name: VeriForge CI
+name: ShellMind Guard CI
 
 on:
   push:
@@ -39,16 +39,16 @@ jobs:
 
       - name: Dogfooding self-scan & MCP stdio verification
         run: |
-          ./target/release/veriforge scan . --format json | python3 -c "
+          ./target/release/shellmind-guard scan . --format json | python3 -c "
           import sys, json
           data = json.load(sys.stdin)
           crate_findings = [f for f in data['findings'] if not f['file'].startswith('fixtures/')]
-          assert len(crate_findings) == 0, f'Unexpected findings in VeriForge crates: {crate_findings}'
+          assert len(crate_findings) == 0, f'Unexpected findings in ShellMind Guard crates: {crate_findings}'
           "
           printf '%s\n%s\n' \
             '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
             '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
-            | ./target/release/veriforge mcp | python3 -c "
+            | ./target/release/shellmind-guard mcp | python3 -c "
           import sys, json
           lines = [json.loads(l) for l in sys.stdin if l.strip()]
           assert len(lines) == 2

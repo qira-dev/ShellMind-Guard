@@ -66,7 +66,7 @@ pub fn verify_findings_in_sandbox(
         }
 
         let mut results = Vec::with_capacity(findings.len());
-        // B-NET + B-DRAIN: When bwrap is available, run BOTH the target server AND `veriforge __probe-netns`
+        // B-NET + B-DRAIN: When bwrap is available, run BOTH the target server AND `shellmind-guard __probe-netns`
         // inside a single `--unshare-all` (including `--unshare-net`!) namespace for each dynamic Auth/Race finding!
         if use_bwrap {
             for f in findings {

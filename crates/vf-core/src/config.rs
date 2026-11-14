@@ -4,7 +4,7 @@ use std::fs;
 use std::path::Path;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct VeriForgeConfig {
+pub struct ShellMindGuardConfig {
     #[serde(default)]
     pub guards: GuardConfig,
     #[serde(default)]
@@ -121,7 +121,7 @@ impl Default for ScanConfig {
                 "dist".into(),
                 "build".into(),
                 ".next".into(),
-                ".veriforge".into(),
+                ".shellmind-guard".into(),
             ],
             max_threads: default_max_threads(),
             max_file_bytes: default_max_file_bytes(),
@@ -129,9 +129,9 @@ impl Default for ScanConfig {
     }
 }
 
-impl VeriForgeConfig {
+impl ShellMindGuardConfig {
     pub fn load_from_dir(root: &Path) -> Result<Self> {
-        let cfg_path = root.join(".veriforge.toml");
+        let cfg_path = root.join(".shellmind-guard.toml");
         if !cfg_path.exists() {
             return Ok(Self::default());
         }
@@ -162,7 +162,7 @@ impl VeriForgeConfig {
 
         let cfg = Self::default();
         let toml_str = toml::to_string_pretty(&cfg)?;
-        let out_path = root.join(".veriforge.toml");
+        let out_path = root.join(".shellmind-guard.toml");
         fs::write(&out_path, toml_str)?;
         Ok((detected, out_path))
     }

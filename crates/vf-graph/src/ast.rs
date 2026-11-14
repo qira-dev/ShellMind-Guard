@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use tree_sitter::{Node, Parser};
-use vf_core::{IndexedFile, Language, VeriForgeConfig};
+use vf_core::{IndexedFile, Language, ShellMindGuardConfig};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SymbolKind {
@@ -183,7 +183,7 @@ impl SymbolInfo {
 
 pub fn parse_file_ast_with_hash(
     file: &IndexedFile,
-    cfg: &VeriForgeConfig,
+    cfg: &ShellMindGuardConfig,
 ) -> Option<(String, FileAstSummary)> {
     let owned_bytes;
     let bytes: &[u8] = if let Some(ref cached) = file.cached_bytes {
@@ -326,7 +326,7 @@ pub fn parse_file_ast_with_hash(
     ))
 }
 
-pub fn parse_file_ast(file: &IndexedFile, cfg: &VeriForgeConfig) -> Option<FileAstSummary> {
+pub fn parse_file_ast(file: &IndexedFile, cfg: &ShellMindGuardConfig) -> Option<FileAstSummary> {
     parse_file_ast_with_hash(file, cfg).map(|(_, s)| s)
 }
 
@@ -370,21 +370,21 @@ fn strip_comments(src: &str) -> String {
     out
 }
 
-fn is_auth_guard_ident(name: &str, cfg: &VeriForgeConfig) -> bool {
+fn is_auth_guard_ident(name: &str, cfg: &ShellMindGuardConfig) -> bool {
     let low = name.to_ascii_lowercase();
     cfg.guards.auth_guards.iter().any(|pat| {
         low == pat.to_ascii_lowercase() || low.ends_with(&format!(".{}", pat.to_ascii_lowercase()))
     })
 }
 
-fn is_lock_guard_ident(name: &str, cfg: &VeriForgeConfig) -> bool {
+fn is_lock_guard_ident(name: &str, cfg: &ShellMindGuardConfig) -> bool {
     let low = name.to_ascii_lowercase();
     cfg.guards.lock_guards.iter().any(|pat| {
         low == pat.to_ascii_lowercase() || low.ends_with(&format!(".{}", pat.to_ascii_lowercase()))
     })
 }
 
-fn classify_guards(text: &str, cfg: &VeriForgeConfig) -> HashSet<GuardKind> {
+fn classify_guards(text: &str, cfg: &ShellMindGuardConfig) -> HashSet<GuardKind> {
     let mut g = HashSet::new();
     let code_only = strip_comments(text);
     let low = code_only.to_ascii_lowercase();
@@ -452,7 +452,11 @@ fn stmt_has_sink_or_mutation(stmt: Node, src: &[u8]) -> bool {
 /// - Ignores guards inside string literals, comments, `if` branches, or uncalled nested functions.
 /// - Requires unconditional guard call to execute BEFORE the first mutation/sink statement
 ///   (or wrap it via `withTransaction(...)`).
-fn classify_fn_guards_cfg(fn_node: Node, src: &[u8], cfg: &VeriForgeConfig) -> HashSet<GuardKind> {
+fn classify_fn_guards_cfg(
+    fn_node: Node,
+    src: &[u8],
+    cfg: &ShellMindGuardConfig,
+) -> HashSet<GuardKind> {
     let mut guards = HashSet::new();
     let Some(body) = fn_node.child_by_field_name("body") else {
         return guards;
@@ -584,7 +588,7 @@ fn extract_node(
     src: &[u8],
     rel_path: &str,
     lang: Language,
-    cfg: &VeriForgeConfig,
+    cfg: &ShellMindGuardConfig,
     file_middleware_guards: &mut HashSet<GuardKind>,
     imports: &mut Vec<ImportRef>,
     symbols: &mut Vec<SymbolInfo>,
@@ -1718,7 +1722,7 @@ mod tests {
             .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
             .unwrap();
         let tree = parser.parse(code, None).unwrap();
-        let cfg = VeriForgeConfig::default();
+        let cfg = ShellMindGuardConfig::default();
         let mut mw = HashSet::new();
         let mut imports = Vec::new();
         let mut symbols = Vec::new();
@@ -1822,7 +1826,7 @@ def withdraw(amount: int):
             .set_language(&tree_sitter_python::LANGUAGE.into())
             .unwrap();
         let tree = parser.parse(py_code, None).unwrap();
-        let cfg = VeriForgeConfig::default();
+        let cfg = ShellMindGuardConfig::default();
         let mut mw = HashSet::new();
         let mut imports = Vec::new();
         let mut symbols = Vec::new();
@@ -1850,7 +1854,7 @@ def withdraw(amount: int):
         );
     }
 
-    fn parse_inline_file(rel_path: &str, code: &str, cfg: &VeriForgeConfig) -> FileAstSummary {
+    fn parse_inline_file(rel_path: &str, code: &str, cfg: &ShellMindGuardConfig) -> FileAstSummary {
         let lang = if rel_path.ends_with(".go") {
             Language::Go
         } else if rel_path.ends_with(".py") {
@@ -1929,7 +1933,7 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
     tx.Exec("UPDATE balances SET amt = amt - 1")
 }
 "#;
-        let ast = parse_inline_file("main.go", go_code, &VeriForgeConfig::default());
+        let ast = parse_inline_file("main.go", go_code, &ShellMindGuardConfig::default());
         let charge_route = ast
             .symbols
             .iter()
@@ -1961,7 +1965,7 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 
     #[test]
     fn test_universal_nextjs_nestjs_trpc_django_actix() {
-        let cfg = VeriForgeConfig::default();
+        let cfg = ShellMindGuardConfig::default();
 
         // Next.js App Router
         let nextjs_code = r#"
@@ -2079,7 +2083,7 @@ app.post('/api/v1/auth/2fa/confirm', async (req, res) => {
     await stripe.charges.create({ amount: 100 });
 });
 "#;
-        let cfg = VeriForgeConfig::default();
+        let cfg = ShellMindGuardConfig::default();
         let ast = parse_inline_file("auth.ts", ts_code, &cfg);
         let res =
             crate::lattice::solve_guard_lattice_with_public(&[ast], &cfg.guards.public_routes);
@@ -2095,7 +2099,7 @@ app.post('/api/v1/auth/2fa/confirm', async (req, res) => {
 
     #[test]
     fn test_phase2_taint_idor_and_frontend_extraction() {
-        let cfg = VeriForgeConfig::default();
+        let cfg = ShellMindGuardConfig::default();
         let backend = r#"
 app.get('/api/users/:id', requireAuth, async (req, res) => {
     const id = req.params.id;

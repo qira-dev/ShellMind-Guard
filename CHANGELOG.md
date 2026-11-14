@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to **VeriForge** are documented in this file.
+All notable changes to **ShellMind Guard** are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
@@ -12,8 +12,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **`vf-core` — Two-Phase Incremental Ingestion & Storage:**
   - Parallel `.gitignore`-aware directory walker (`ignore::WalkParallel`) with multi-segment `ignore_paths` and automatic test/fixture filtering.
   - Fast `(mtime_ns, size_bytes)` metadata pre-check + `BLAKE3` 128-bit content fingerprinting.
-  - `SQLite WAL + FTS5` state store (`.veriforge/state.db`) caching per-file `FileAstSummary` blobs (`ast_cache`) and scan findings.
-  - Stack auto-detection (`veriforge init [--ci]`) generating `.veriforge.toml` and `.github/workflows/veriforge.yml`.
+  - `SQLite WAL + FTS5` state store (`.shellmind-guard/state.db`) caching per-file `FileAstSummary` blobs (`ast_cache`) and scan findings.
+  - Stack auto-detection (`shellmind-guard init [--ci]`) generating `.shellmind-guard.toml` and `.github/workflows/shellmind-guard.yml`.
 - **`vf-graph` — Polyglot `Tree-sitter` AST & 6-Layer Guard-Set Lattice Engine:**
   - Parallel `rayon` AST extraction for **TypeScript/TSX**, **JavaScript/JSX**, **Go**, **Python**, and **Rust**.
   - Universal route discovery for Express, Fastify, Hono, Koa, Next.js App Router, NestJS, tRPC, Go `net/http`/Gin/Echo/Chi, Python FastAPI/Flask/Django, and Rust Axum/Actix-Web.
@@ -27,8 +27,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **`vf-sandbox` — OS-Isolated Bubblewrap (`bwrap`) & Concurrent Race Prover:**
   - Unprivileged Linux namespace sandbox (`bwrap --unshare-all`, `--ro-bind`, `--tmpfs`, `RLIMIT_AS`, process-group `SIGKILL` reaper).
   - Synchronized 12-way concurrent HTTP burst prover (`tokio::sync::Barrier` + `tokio::task::JoinSet` Last-Byte Sync) upgrading static `VF-AUTH-*` and `VF-RACE-*` findings to `PROVEN` or `MITIGATED`.
-- **`vf-report`, `vf-tui`, `vf-ai` & `veriforge mcp`:**
+- **`vf-report`, `vf-tui`, `vf-ai` & `shellmind-guard mcp`:**
   - Standard `SARIF 2.1.0` exporter and self-contained Carbon-Slate HTML/SVG witness graph generator.
-  - Panic-safe 60fps 3-pane `ratatui` terminal UI (`veriforge ui`).
+  - Panic-safe 60fps 3-pane `ratatui` terminal UI (`shellmind-guard ui`).
   - Minimal (<4 KB) witness-hop patch context generator (`--patch`).
-  - Stdio JSON-RPC 2.0 Model Context Protocol server (`veriforge mcp`) exposing `veriforge_scan`, `veriforge_explain_finding`, and `veriforge_init`.
+  - Stdio JSON-RPC 2.0 Model Context Protocol server (`shellmind-guard mcp`) exposing `shellmind_guard_scan`, `shellmind_guard_explain_finding`, and `shellmind_guard_init`.

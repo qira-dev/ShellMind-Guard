@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 use vf_ai::build_minimal_patch_prompt;
-use vf_core::{DeltaStats, StateStore, VeriForgeConfig, scan_repository};
+use vf_core::{DeltaStats, ShellMindGuardConfig, StateStore, scan_repository};
 use vf_graph::{GraphAnalysisResult, GuardKind, LatticeFinding, analyze_codebase_cached};
 use vf_report::{to_html_graph, to_sarif_json};
 use vf_sandbox::{
@@ -42,7 +42,7 @@ pub(crate) struct ScanOutcome {
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "veriforge",
+    name = "shellmind-guard",
     version,
     about = "Zero-false-positive multi-file business-logic & AI-code security verifier"
 )]
@@ -53,7 +53,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Initialize `.veriforge.toml` (and optionally `.github/workflows/veriforge.yml`)
+    /// Initialize `.shellmind-guard.toml` (and optionally `.github/workflows/shellmind-guard.yml`)
     Init {
         #[arg(default_value = ".")]
         path: PathBuf,
@@ -67,7 +67,7 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Scan a repository across all 6 VeriForge layers (with optional sandbox, SARIF, HTML, patch & CI gate)
+    /// Scan a repository across all 6 ShellMind Guard layers (with optional sandbox, SARIF, HTML, patch & CI gate)
     Scan {
         #[arg(default_value = ".")]
         path: PathBuf,
@@ -128,7 +128,7 @@ enum Commands {
         #[arg(long)]
         unsafe_host_fallback: bool,
     },
-    /// Start stdio JSON-RPC 2.0 MCP server (exposes veriforge_scan, veriforge_explain_finding, veriforge_init)
+    /// Start stdio JSON-RPC 2.0 MCP server (exposes shellmind_guard_scan, shellmind_guard_explain_finding, shellmind_guard_init)
     Mcp,
     /// Internal probe executed inside `--unshare-net` Bubblewrap namespace
     #[command(name = "__probe-netns", hide = true)]
@@ -143,8 +143,8 @@ enum Commands {
 pub(crate) fn write_ci_workflow(root: &Path) -> Result<PathBuf> {
     let wf_dir = root.join(".github").join("workflows");
     fs::create_dir_all(&wf_dir)?;
-    let wf_path = wf_dir.join("veriforge.yml");
-    let content = r#"name: VeriForge Security Gate
+    let wf_path = wf_dir.join("shellmind-guard.yml");
+    let content = r#"name: ShellMind Guard Security Gate
 
 on:
   push:
@@ -156,20 +156,20 @@ permissions:
   security-events: write
 
 jobs:
-  veriforge:
+  shellmind-guard:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install VeriForge
-        run: cargo install --path . || cargo install --locked veriforge
-      - name: Run VeriForge 6-Layer Scan (SARIF)
-        run: veriforge scan . --format sarif --sarif veriforge.sarif --ci
+      - name: Install ShellMind Guard
+        run: cargo install --path . || cargo install --locked shellmind-guard
+      - name: Run ShellMind Guard 6-Layer Scan (SARIF)
+        run: shellmind-guard scan . --format sarif --sarif shellmind-guard.sarif --ci
       - name: Upload SARIF to GitHub Code Scanning
         if: always()
         uses: github/codeql-action/upload-sarif@v3
         with:
-          sarif_file: veriforge.sarif
+          sarif_file: shellmind-guard.sarif
 "#;
     fs::write(&wf_path, content)?;
     Ok(wf_path)
@@ -220,7 +220,7 @@ fn finding_matches_layer(f: &LatticeFinding, layer: &str) -> bool {
 
 pub(crate) fn execute_scan_pipeline(opts: ScanRunOptions<'_>) -> Result<ScanOutcome> {
     let t0 = Instant::now();
-    let cfg = VeriForgeConfig::load_from_dir(opts.path)?;
+    let cfg = ShellMindGuardConfig::load_from_dir(opts.path)?;
     let summary = scan_repository(opts.path, &cfg)?;
     let mut store = StateStore::open(opts.path)?;
     let (delta, _) = store.sync_files(&summary.files)?;
@@ -309,7 +309,7 @@ fn persist_scan_findings(
         let trace_json = serde_json::to_string(f).unwrap_or_else(|_| "{}".into());
         let poc_cmd = v_opt
             .map(|v| v.replay_cmd.clone())
-            .unwrap_or_else(|| format!("veriforge replay {}", f.id));
+            .unwrap_or_else(|| format!("shellmind-guard replay {}", f.id));
         owned_rows.push((
             f.id.clone(),
             f.rule_id.clone(),
@@ -340,7 +340,7 @@ fn persist_scan_findings(
 fn resolve_finding_for_replay(
     path: &Path,
     finding_id: &str,
-    cfg: &VeriForgeConfig,
+    cfg: &ShellMindGuardConfig,
     store: &mut StateStore,
 ) -> Result<LatticeFinding> {
     // B20: Always re-evaluate against current repository files so renamed/patched routes are never stale!
@@ -375,25 +375,25 @@ fn main() -> Result<ExitCode> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Init { path, ci } => {
-            let (detected, out_path) = VeriForgeConfig::detect_and_write_init(&path)?;
+            let (detected, out_path) = ShellMindGuardConfig::detect_and_write_init(&path)?;
             if ci {
                 let ci_path = write_ci_workflow(&path)?;
                 println!(
-                    "VeriForge Init | Detected: {} | Wrote {} and {}",
+                    "ShellMind Guard Init | Detected: {} | Wrote {} and {}",
                     detected.join(", "),
                     out_path.display(),
                     ci_path.display()
                 );
             } else {
                 println!(
-                    "VeriForge Init | Detected: {} | Wrote {}",
+                    "ShellMind Guard Init | Detected: {} | Wrote {}",
                     detected.join(", "),
                     out_path.display()
                 );
             }
         }
         Commands::Index { path, json } => {
-            let cfg = VeriForgeConfig::load_from_dir(&path)?;
+            let cfg = ShellMindGuardConfig::load_from_dir(&path)?;
             let summary = scan_repository(&path, &cfg)?;
             let mut store = StateStore::open(&path)?;
             let (delta, _changed) = store.sync_files(&summary.files)?;
@@ -412,7 +412,7 @@ fn main() -> Result<ExitCode> {
                 );
             } else {
                 println!(
-                    "VeriForge Index | {} source files ({} total entries) | {}ms | delta: +{} modified / {} cached / {} removed",
+                    "ShellMind Guard Index | {} source files ({} total entries) | {}ms | delta: +{} modified / {} cached / {} removed",
                     summary.source_files_hashed,
                     summary.total_entries_seen,
                     summary.elapsed_ms,
@@ -504,7 +504,7 @@ fn main() -> Result<ExitCode> {
                 }
                 OutputFormat::Text => {
                     println!(
-                        "VeriForge Scan | {} files ({} symbols, {} edges, {} routes) | {}ms (delta: +{} / {} cached)",
+                        "ShellMind Guard Scan | {} files ({} symbols, {} edges, {} routes) | {}ms (delta: +{} / {} cached)",
                         outcome.graph.parsed_files,
                         outcome.graph.symbol_count,
                         outcome.graph.edge_count,
@@ -543,7 +543,7 @@ fn main() -> Result<ExitCode> {
 
                     if let Some((bwrap, verified)) = &outcome.sandbox {
                         println!(
-                            "\nVeriForge Sandbox Proof (bwrap={}):",
+                            "\nShellMind Guard Sandbox Proof (bwrap={}):",
                             if *bwrap { "isolated" } else { "local-loopback" }
                         );
                         for v in verified {
@@ -591,7 +591,7 @@ fn main() -> Result<ExitCode> {
             unsafe_host_fallback,
             patch,
         } => {
-            let cfg = VeriForgeConfig::load_from_dir(&path)?;
+            let cfg = ShellMindGuardConfig::load_from_dir(&path)?;
             let mut store = StateStore::open(&path)?;
             let finding = resolve_finding_for_replay(&path, &finding_id, &cfg, &mut store)?;
             let effective_boot = boot_cmd
@@ -608,7 +608,7 @@ fn main() -> Result<ExitCode> {
             )?;
 
             println!(
-                "VeriForge Replay | {} ({}) | bwrap={}",
+                "ShellMind Guard Replay | {} ({}) | bwrap={}",
                 finding.id,
                 finding.entry_route,
                 if bwrap { "isolated" } else { "local-loopback" }
@@ -635,7 +635,7 @@ fn main() -> Result<ExitCode> {
             unsafe_host_fallback,
         } => {
             let t0 = Instant::now();
-            let cfg = VeriForgeConfig::load_from_dir(&path)?;
+            let cfg = ShellMindGuardConfig::load_from_dir(&path)?;
             let summary = scan_repository(&path, &cfg)?;
             let mut store = StateStore::open(&path)?;
             let (delta, _) = store.sync_files(&summary.files)?;

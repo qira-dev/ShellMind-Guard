@@ -85,8 +85,8 @@ pub fn to_sarif_json(findings: &[LatticeFinding], verified: &[VerifiedFinding]) 
         "runs": [{
             "tool": {
                 "driver": {
-                    "name": "VeriForge",
-                    "informationUri": "https://github.com/qira-dev/VeriForge",
+                    "name": "ShellMind Guard",
+                    "informationUri": "https://github.com/qira-dev/ShellMind-Guard",
                     "version": env!("CARGO_PKG_VERSION")
                 }
             },
@@ -195,7 +195,7 @@ pub fn to_html_graph(
 <html lang=\"en\">
 <head>
 <meta charset=\"utf-8\">
-<title>VeriForge Report — {project}</title>
+<title>ShellMind Guard Report — {project}</title>
 <style>
   body {{ background:#0d1117; color:#c9d1d9; font-family:system-ui,-apple-system,sans-serif; margin:0; padding:24px; }}
   .wrap {{ max-width:1100px; margin:0 auto; }}
@@ -217,7 +217,7 @@ pub fn to_html_graph(
 </head>
 <body>
 <div class=\"wrap\">
-  <h1>VeriForge Multi-File Security &amp; Logic Graph — {project}</h1>
+  <h1>ShellMind Guard Multi-File Security &amp; Logic Graph — {project}</h1>
   <div class=\"stats\">
     <div class=\"stat\">Parsed Files: <strong>{files}</strong></div>
     <div class=\"stat\">Symbols: <strong>{syms}</strong></div>

@@ -1,4 +1,4 @@
-# VeriForge — Master Architecture & Engineering Blueprint (v2 Audited)
+# ShellMind Guard — Master Architecture & Engineering Blueprint (v2 Audited)
 
 > **Mission:** Zero-False-Positive, Compiler-Grade Multi-File Business-Logic & AI-Code Security Verifier.  
 > **Target Machine Baseline:** Linux (Ubuntu/GNOME Wayland), 4-Core CPU, 15 GiB RAM, `rustc 1.98.0`, `/usr/bin/bwrap`.  
@@ -10,14 +10,14 @@
 
 ```text
 +=========================================================================================+
-|                                    VERIFORGE BINARY                                     |
+|                                    SHELLMIND GUARD BINARY                                     |
 |                  Single Static Rust Executable (CLI + TUI + HTTP Report)                |
 +=========================================================================================+
          |                                    |                                   |
          v                                    v                                   v
 +-------------------+              +--------------------+              +------------------+
 |   CLI / CI Mode   |              |  Interactive TUI   |              |   Agent / MCP    |
-| veriforge scan .  |              |  (ratatui 60fps)   |              |  --json / --sarif|
+| shellmind-guard scan .  |              |  (ratatui 60fps)   |              |  --json / --sarif|
 | Exit Code 0 / 2   |              |  Panic-Safe Raw    |              |  Claude / ZCode  |
 +-------------------+              +--------------------+              +------------------+
          |                                    |                                   |
@@ -87,18 +87,18 @@
 
 ## 2. Mathematical & Scale Guarantees (13,000 Files / 575 Directories)
 
-Why VeriForge stays sub-4-second and never suffers $O(V!)$ path explosion or stale cross-file edges:
+Why ShellMind Guard stays sub-4-second and never suffers $O(V!)$ path explosion or stale cross-file edges:
 
 1. **Two-Phase Incremental Cache (No Cross-File Staleness):**
    - **Phase A (Cached by `BLAKE3`):** File $\to$ Local Symbols, Imports, Exports, Local Calls. If `file_hash` matches `SQLite`, skip `Tree-sitter` completely.
    - **Phase B (Always Re-linked in RAM, $<80\text{ms}$):** All cached symbols across 3,000 files are linked into a fresh `petgraph` directed graph. Modifying `auth.ts` immediately invalidates every route in `routes.ts` that imports it.
 2. **Guard-Set Lattice Data-Flow ($O(V + E)$):**
-   - Instead of enumerating all paths (which explodes on cyclic/enterprise graphs), VeriForge runs a **Worklist Fixed-Point Lattice** from all Entry Points:
+   - Instead of enumerating all paths (which explodes on cyclic/enterprise graphs), ShellMind Guard runs a **Worklist Fixed-Point Lattice** from all Entry Points:
      $$\mathcal{G}(v) = \bigcap_{p \in \text{Pred}(v)} \left( \mathcal{G}(p) \cup \text{EdgeGuards}(p \to v) \right)$$
    - A sink $s$ is flagged **only** when a required guard (e.g., `Auth`, `TxLock`, `IdempotencyKey`, `OwnershipCheck`) is absent from $\mathcal{G}(s)$, and BFS extracts the shortest unguarded witness path.
 3. **Last-Byte Sync Race-Condition Physics:**
    - Standard `tokio::join!` HTTP requests suffer TCP/TLS jitter ($5\text{–}40\text{ms}$), missing narrow SQLite/Postgres `READ COMMITTED` race windows.
-   - VeriForge holds the **final byte** of $N$ pre-buffered HTTP/1.1 or HTTP/2 frames behind a `tokio::sync::Barrier`, releasing all $N$ final bytes within $<50\,\mu\text{s}$ to hit the server's event loop in the same tick.
+   - ShellMind Guard holds the **final byte** of $N$ pre-buffered HTTP/1.1 or HTTP/2 frames behind a `tokio::sync::Barrier`, releasing all $N$ final bytes within $<50\,\mu\text{s}$ to hit the server's event loop in the same tick.
 
 ---
 
@@ -106,7 +106,7 @@ Why VeriForge stays sub-4-second and never suffers $O(V!)$ path explosion or sta
 
 ```text
 +-----------------------------------------------------------------------------------------+
-| VeriForge v0.1  |  Target: /home/km-abdullah/CloudNest (2,640 src / 13,120 total)       |
+| ShellMind Guard v0.1  |  Target: /home/km-abdullah/CloudNest (2,640 src / 13,120 total)       |
 | Mode: [Hybrid-NoAI]  |  Scan: 1.38s  |  PROVEN: 2 CRITICAL  |  MITIGATED: 5  |  [?]Help |
 +-----------------------------------------------------------------------------------------+
 | [1] PROVEN FLOWS (2)       | [2] MULTI-FILE TRACE & SANDBOX PROOF                       |
@@ -121,7 +121,7 @@ Why VeriForge stays sub-4-second and never suffers $O(V!)$ path explosion or sta
 |   (0 items)                |   Result: 3x HTTP 200 OK   |  Final Balance: -140.00       |
 |                            |                                                            |
 |                            | Replay PoC:                                                |
-|                            |   $ veriforge replay VF-2026-001 --sync-race 15            |
+|                            |   $ shellmind-guard replay VF-2026-001 --sync-race 15            |
 +----------------------------+------------------------------------------------------------+
 | [3] ACTION BAR:  [Enter] Replay PoC  [g] Graph HTML  [L] Logs  [p] AI Patch  [e] Export |
 +-----------------------------------------------------------------------------------------+
@@ -130,7 +130,7 @@ Why VeriForge stays sub-4-second and never suffers $O(V!)$ path explosion or sta
 ### Terminal & UX Safeguards
 - **Panic-Safe Raw Mode:** Global `std::panic::set_hook` guarantees `disable_raw_mode()` + `LeaveAlternateScreen` before printing any panic, never leaving the user's terminal broken.
 - **Zero Stdout Pollution:** Child `bwrap` processes and internal `tracing` logs write exclusively to a bounded ring-buffer (`[L]` drawer), never corrupting `ratatui` frames.
-- **Configurable Rules (`.veriforge.toml`):** Users can declare custom auth middleware names, ignored paths, or sandbox boot commands in 5 lines of TOML.
+- **Configurable Rules (`.shellmind-guard.toml`):** Users can declare custom auth middleware names, ignored paths, or sandbox boot commands in 5 lines of TOML.
 
 ---
 
@@ -161,7 +161,7 @@ Why VeriForge stays sub-4-second and never suffers $O(V!)$ path explosion or sta
 
 ## 5. SQLite Data Model (`WAL Mode + FTS5`)
 
-Stored per-project in `.veriforge/state.db` (or `~/.cache/veriforge/<project_hash>.db`):
+Stored per-project in `.shellmind-guard/state.db` (or `~/.cache/shellmind-guard/<project_hash>.db`):
 
 | Table | Purpose | Key Columns |
 | :--- | :--- | :--- |

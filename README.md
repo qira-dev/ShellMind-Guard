@@ -1,25 +1,25 @@
 <div align="center">
 
-# VeriForge
+# ShellMind Guard
 
 **Compiler-Grade Multi-File Security, Business-Logic & Concurrency Verifier**
 
 *Traces cross-file taint and guard invariants via an $O(V + E)$ Guard-Set Lattice across TypeScript, JavaScript, Go, Python, and Rust—then mathematically proves exploitability inside an unprivileged Linux Bubblewrap (`bwrap`) sandbox with zero AI API cost.*
 
-[![CI](https://github.com/qira-dev/VeriForge/actions/workflows/ci.yml/badge.svg)](https://github.com/qira-dev/VeriForge/actions/workflows/ci.yml)
+[![CI](https://github.com/qira-dev/ShellMind-Guard/actions/workflows/ci.yml/badge.svg)](https://github.com/qira-dev/ShellMind-Guard/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Rust Edition](https://img.shields.io/badge/Rust-2024_Edition-orange.svg)](Cargo.toml)
 [![Sandbox](https://img.shields.io/badge/Sandbox-Bubblewrap_Namespaces-success.svg)](crates/vf-sandbox)
 [![MCP Server](https://img.shields.io/badge/MCP-JSON--RPC_2.0_Stdio-purple.svg)](src/mcp.rs)
 [![SARIF](https://img.shields.io/badge/Output-SARIF_2.1.0_%7C_HTML_%7C_JSON-informational.svg)](crates/vf-report)
 
-[**Architecture**](#system-architecture) · [**6-Layer Engine**](#the-6-layer-universal-verification-engine) · [**Quickstart**](#quickstart) · [**AI Agent MCP**](#model-context-protocol-veriforge-mcp) · [**Benchmarks**](#verified-performance-benchmarks) · [**Blueprint**](BLUEPRINT.md)
+[**Architecture**](#system-architecture) · [**6-Layer Engine**](#the-6-layer-universal-verification-engine) · [**Quickstart**](#quickstart) · [**AI Agent MCP**](#model-context-protocol-shellmind-guard-mcp) · [**Benchmarks**](#verified-performance-benchmarks) · [**Blueprint**](BLUEPRINT.md)
 
 </div>
 
 ---
 
-## Why VeriForge?
+## Why ShellMind Guard?
 
 Modern software—especially high-velocity, AI-assisted full-stack codebases—suffers from vulnerabilities that span multiple files and execution layers: a route in `routes/checkout.ts` delegates to `services/ledger.ts`, which mutates a balance in `db/queries.ts` without an authentication middleware, ownership filter, or `SELECT ... FOR UPDATE` transaction lock.
 
@@ -28,13 +28,13 @@ Conventional security tools fail on these bugs in two predictable ways:
 1. **Regex / Single-File SAST Scanners** lack cross-file call-graph and middleware-order semantics, burying engineering teams under hundreds of false positives while missing multi-hop business-logic and race-condition flaws.
 2. **LLM-Only Code Scanners** burn tens of thousands of tokens per scan, hallucinate findings on sanitized paths, cannot execute deterministic data-flow proofs, and cannot verify whether a concurrency bug is actually exploitable at runtime.
 
-**VeriForge** solves both problems with a deterministic, systems-engineered architecture:
+**ShellMind Guard** solves both problems with a deterministic, systems-engineered architecture:
 
 - **Two-Phase Incremental Ingestion (`BLAKE3` + `SQLite WAL`):** Fingerprints 13,000+ files at >1 GB/s, caching per-file `Tree-sitter` AST summaries in SQLite while **always re-linking the global cross-file call graph in RAM (<80 ms)** so edits to a shared middleware (`auth.ts`) immediately invalidate downstream routes (`routes.ts`).
 - **$O(V + E)$ Guard-Set Lattice Solver:** Computes fixed-point security guard intersections across all incoming call paths without exponential $O(V!)$ path enumeration—terminating in linear time even on cyclic enterprise call graphs.
 - **Universal 6-Layer Static & Taint Engine:** Covers hardcoded secrets, CORS/JWT/TLS/Dockerfile misconfigurations, offline lockfile advisories, cross-file SQL/Command/Path/SSRF taint with sanitizer disproof, missing auth/transaction locks, IDOR missing ownership filters, and frontend-to-backend API contract drift (`404` dead routes).
 - **OS-Isolated Bubblewrap (`bwrap`) Exploit Prover:** Boots your service inside an unprivileged Linux namespace (`--unshare-all`, read-only rootfs, ephemeral `tmpfs`, 1 GiB `RLIMIT_AS` memory cap, process-group reaper) and fires barrier-synchronized **12-way Last-Byte Sync** concurrent HTTP bursts (`tokio::sync::Barrier` + `tokio::task::JoinSet`) to upgrade static `SUSPECT` findings to **`PROVEN`** or **`MITIGATED`**.
-- **Native Model Context Protocol (`veriforge mcp`) Server:** Exposes deterministic, zero-token-overhead security verification over `stdio` JSON-RPC 2.0 for **Claude Code, Cursor, AntiGravity, Windsurf, OpenCode, and Z-Code**.
+- **Native Model Context Protocol (`shellmind-guard mcp`) Server:** Exposes deterministic, zero-token-overhead security verification over `stdio` JSON-RPC 2.0 for **Claude Code, Cursor, AntiGravity, Windsurf, OpenCode, and Z-Code**.
 
 ---
 
@@ -42,16 +42,16 @@ Conventional security tools fail on these bugs in two predictable ways:
 
 ```mermaid
 flowchart TD
-    subgraph CLI["Unified Rust Binary (veriforge)"]
-        A1["CLI / CI Gate\nveriforge scan --ci"]
-        A2["60fps Terminal UI\nveriforge ui (ratatui)"]
-        A3["Stdio MCP Server\nveriforge mcp (JSON-RPC 2.0)"]
+    subgraph CLI["Unified Rust Binary (shellmind-guard)"]
+        A1["CLI / CI Gate\nshellmind-guard scan --ci"]
+        A2["60fps Terminal UI\nshellmind-guard ui (ratatui)"]
+        A3["Stdio MCP Server\nshellmind-guard mcp (JSON-RPC 2.0)"]
     end
 
     subgraph S1["Stage 1: Two-Phase Incremental Ingestion (vf-core)"]
         B1["ignore::WalkParallel\n(.gitignore + fast path filter)"]
         B2["BLAKE3 Content Fingerprinting\n+ mtime_ns Fast-Skip"]
-        B3["SQLite WAL + FTS5 Store\n(.veriforge/state.db)"]
+        B3["SQLite WAL + FTS5 Store\n(.shellmind-guard/state.db)"]
         B1 --> B2 --> B3
     end
 
@@ -82,7 +82,7 @@ flowchart TD
 
 ### Mathematical Formulation: The $O(V + E)$ Guard-Set Lattice
 
-Instead of enumerating all simple paths between routes and sinks (which degrades to $O(V!)$ on cyclic call graphs), VeriForge formulates security invariant verification as a forward data-flow monotone lattice over the finite universe of security guards $\mathcal{U} = \{\text{Auth}, \text{TxLock}, \text{OwnershipCheck}, \text{SqlSanitizer}, \text{CmdSanitizer}, \text{PathSanitizer}, \text{SsrfSanitizer}\}$:
+Instead of enumerating all simple paths between routes and sinks (which degrades to $O(V!)$ on cyclic call graphs), ShellMind Guard formulates security invariant verification as a forward data-flow monotone lattice over the finite universe of security guards $\mathcal{U} = \{\text{Auth}, \text{TxLock}, \text{OwnershipCheck}, \text{SqlSanitizer}, \text{CmdSanitizer}, \text{PathSanitizer}, \text{SsrfSanitizer}\}$:
 
 $$\mathcal{G}_{\text{in}}(v) = \begin{cases} \emptyset & \text{if } v \in \text{EntryRoutes} \\ \displaystyle\bigcap_{p \in \text{Pred}(v)} \mathcal{G}_{\text{out}}(p) & \text{otherwise} \end{cases}, \qquad \mathcal{G}_{\text{out}}(v) = \mathcal{G}_{\text{in}}(v) \cup \text{LocalGuards}(v)$$
 
@@ -94,7 +94,7 @@ $$\mathcal{G}_{\text{in}}(v) = \begin{cases} \emptyset & \text{if } v \in \text{
 
 ## The 6-Layer Universal Verification Engine
 
-VeriForge executes all 6 verification layers in a single unified pass:
+ShellMind Guard executes all 6 verification layers in a single unified pass:
 
 | Layer | Rule ID | Severity | Category & Invariant Checked | Required Guard / Sanitizer Disproof |
 | :---: | :--- | :---: | :--- | :--- |
@@ -106,7 +106,7 @@ VeriForge executes all 6 verification layers in a single unified pass:
 | **3** | `VF-CMDI-001` | `CRITICAL` | **Command Injection:** Tainted input reaches `exec`, `execSync`, `spawn(..., { shell: true })`, `os.system`, `subprocess.run(..., shell=True)`, `exec.Command("sh", "-c", ...)`, or `Command::new("sh")`. | Argument array execution without shell, `shlex.quote`, `shellEscape`, or strict allowlist/numeric parser. |
 | **3** | `VF-PATH-001` | `HIGH` | **Path Traversal:** Tainted input reaches `fs.readFile`, `fs.writeFile`, `res.sendFile`, `os.Open`, `os.ReadFile`, `http.ServeFile`, `open()`, or `std::fs::read`. | `path.basename`, `filepath.Base`, `filepath.Clean` + `.startsWith(baseDir)` prefix check. |
 | **3** | `VF-SSRF-001` | `HIGH` | **Server-Side Request Forgery (SSRF):** Tainted URL reaches `fetch`, `axios`, `http.Get`, `requests.get`, `httpx.get`, or `reqwest::get`. | Explicit hostname allowlist (`allowedHosts`, `validateUrl`) and private/link-local CIDR block. |
-| **4** | `VF-AUTH-001` | `HIGH` | **Missing Authentication Guard:** Reachable path from an HTTP route to a privileged state-mutating sink (`PaymentMutation`, `BalanceUpdate`, `SqlWrite`, `AuthMutation`, `ResourceDestroy`) without an active `Auth` guard. | Route/router middleware (`requireAuth`, `UseGuards`, `protectedProcedure`, `login_required`, `AuthMiddleware`) or `.veriforge.toml` `public_routes`. |
+| **4** | `VF-AUTH-001` | `HIGH` | **Missing Authentication Guard:** Reachable path from an HTTP route to a privileged state-mutating sink (`PaymentMutation`, `BalanceUpdate`, `SqlWrite`, `AuthMutation`, `ResourceDestroy`) without an active `Auth` guard. | Route/router middleware (`requireAuth`, `UseGuards`, `protectedProcedure`, `login_required`, `AuthMiddleware`) or `.shellmind-guard.toml` `public_routes`. |
 | **4** | `VF-IDOR-001` | `HIGH` | **Insecure Direct Object Reference (IDOR):** Authenticated route accepts a resource ID (`:id`, `{id}`, `[id]`) and executes a DB read/update/delete (`prisma.*.delete`, `db.*.findUnique`, `SELECT/UPDATE/DELETE WHERE id = ...`) without scoping by caller identity. | Include caller ownership predicate (`user_id = req.user.id`, `owner_id`, `tenant_id`, `org_id`, `current_user`). |
 | **5** | `VF-RACE-001` | `CRITICAL` | **Concurrency / Double-Spend Race:** Payment or balance/wallet mutation reachable without an enclosing ACID transaction lock or idempotency guard—proven at runtime via 12 concurrent barrier-synchronized requests. | `withTransaction`, `SELECT ... FOR UPDATE`, `db.Transaction`, `BeginTx`, `$transaction`, or atomic `idempotencyKey`. |
 | **6** | `VF-FE-404`<br>`VF-FE-ERR` | `MEDIUM`<br>`LOW` | **Frontend ↔ Backend Contract & UI Integrity:** Frontend `fetch('/api/...')` / `axios.<method>('/api/...')` calling a path that matches no backend route (`VF-FE-404`), dead `onClick={() => {}}` handlers, or unhandled async `fetch`/`axios` calls without `try/catch` or `.catch()`. | Align frontend API paths with backend routes (including mounted prefixes) and handle async rejection states. |
@@ -131,7 +131,7 @@ Measured on a 4-Core Linux workstation (Ubuntu Wayland, 15 GiB RAM, NVMe SSD, 12
 | **Enterprise TypeScript Monorepo** | 575 directories / **13,225 `.ts` files** | **414 ms** | **195 ms** | Full walk + `BLAKE3` + `Tree-sitter` + $O(V+E)$ Lattice (Warm Delta Index: **76 ms**) |
 | **2,000-Node Cyclic Sink Chain** | Stress test (`test_b11_2000_node_all_sink_chain_is_linear`) | **< 15 ms** | **< 5 ms** | Proves linear $O(V + E)$ scaling without path explosion |
 | **Polyglot 6-Layer Suite** | TS + TSX + Go + Python + Dockerfile + `package.json` + `.env` | **19 ms** | **3 ms** | Detects all 14 rule families across all 6 layers |
-| **MCP `veriforge_scan` Tool Call** | JSON-RPC 2.0 `stdio` round-trip | **19 ms** | **4 ms** | Zero LLM token overhead |
+| **MCP `shellmind_guard_scan` Tool Call** | JSON-RPC 2.0 `stdio` round-trip | **19 ms** | **4 ms** | Zero LLM token overhead |
 
 ---
 
@@ -140,10 +140,10 @@ Measured on a 4-Core Linux workstation (Ubuntu Wayland, 15 GiB RAM, NVMe SSD, 12
 ### 1. Build & Install from Source
 
 ```bash
-git clone https://github.com/qira-dev/VeriForge.git
-cd VeriForge
+git clone https://github.com/qira-dev/ShellMind-Guard.git
+cd ShellMind Guard
 
-# Install the optimized release binary to ~/.cargo/bin/veriforge
+# Install the optimized release binary to ~/.cargo/bin/shellmind-guard
 cargo install --path .
 ```
 
@@ -152,39 +152,39 @@ cargo install --path .
 ### 2. Initialize a Project & CI Gate
 
 ```bash
-# Auto-detect project stack, write .veriforge.toml, and generate .github/workflows/veriforge.yml
-veriforge init /path/to/your/repo --ci
+# Auto-detect project stack, write .shellmind-guard.toml, and generate .github/workflows/shellmind-guard.yml
+shellmind-guard init /path/to/your/repo --ci
 ```
 
 ### 3. Run a Full 6-Layer Scan
 
 ```bash
 # Human-readable terminal report
-veriforge scan /path/to/your/repo
+shellmind-guard scan /path/to/your/repo
 
 # Machine-readable JSON or SARIF 2.1.0 report
-veriforge scan /path/to/your/repo --format json
-veriforge scan /path/to/your/repo --format sarif
+shellmind-guard scan /path/to/your/repo --format json
+shellmind-guard scan /path/to/your/repo --format sarif
 
 # Filter specific layers or rule families
-veriforge scan /path/to/your/repo --layers secrets,sqli,idor,race
+shellmind-guard scan /path/to/your/repo --layers secrets,sqli,idor,race
 ```
 
 ### 4. Prove Exploits in the Isolated Bubblewrap Sandbox
 
-Run VeriForge against the included vulnerable Node/TypeScript payment fixture (`fixtures/vuln-payment-node`) to see static `SUSPECT` findings upgraded to **`PROVEN`** via live sandbox execution and 12-way barrier-synchronized race probing:
+Run ShellMind Guard against the included vulnerable Node/TypeScript payment fixture (`fixtures/vuln-payment-node`) to see static `SUSPECT` findings upgraded to **`PROVEN`** via live sandbox execution and 12-way barrier-synchronized race probing:
 
 ```bash
-veriforge scan fixtures/vuln-payment-node \
+shellmind-guard scan fixtures/vuln-payment-node \
   --boot-cmd "node server.mjs" \
-  --sarif .veriforge/report.sarif \
-  --html .veriforge/report.html
+  --sarif .shellmind-guard/report.sarif \
+  --html .shellmind-guard/report.html
 ```
 
 Sample output:
 
 ```text
-VeriForge Scan | 5 files (14 symbols, 5 edges, 3 routes) | 42ms (delta: +5 / 0 cached)
+ShellMind Guard Scan | 5 files (14 symbols, 5 edges, 3 routes) | 42ms (delta: +5 / 0 cached)
   [!] 5 finding(s) detected:
 
   [HIGH] VF-AUTH-001 (VF-AUTH-001) -> Unauthenticated path to BalanceUpdate in `debitBalance`
@@ -199,7 +199,7 @@ VeriForge Scan | 5 files (14 symbols, 5 edges, 3 routes) | 42ms (delta: +5 / 0 c
       [2] src/services/ledger.ts:3  processWithdrawal
       [3] src/db/queries.ts:1       debitBalance
 
-VeriForge Sandbox Proof (bwrap=isolated):
+ShellMind Guard Sandbox Proof (bwrap=isolated):
   [PROVEN] VF-AUTH-001 (VF-AUTH-001) -> Unauthenticated POST /api/v1/checkout/withdraw returned HTTP 200 (body: {"ok":true,...})
   [PROVEN] VF-RACE-002 (VF-RACE-001) -> 12/12 concurrent requests returned HTTP 200 (Last-Byte Sync, 1 distinct bodies)
 ```
@@ -207,7 +207,7 @@ VeriForge Sandbox Proof (bwrap=isolated):
 ### 5. Replay a Single Finding & Generate a Minimal (<4 KB) Patch Prompt
 
 ```bash
-veriforge replay VF-RACE-002 fixtures/vuln-payment-node \
+shellmind-guard replay VF-RACE-002 fixtures/vuln-payment-node \
   --boot-cmd "node server.mjs" \
   --patch
 ```
@@ -215,7 +215,7 @@ veriforge replay VF-RACE-002 fixtures/vuln-payment-node \
 ### 6. Launch the Panic-Safe 60fps Terminal UI (`ratatui`)
 
 ```bash
-veriforge ui fixtures/vuln-payment-node --boot-cmd "node server.mjs"
+shellmind-guard ui fixtures/vuln-payment-node --boot-cmd "node server.mjs"
 ```
 
 - **`[j]` / `[k]` or `↑` / `↓`:** Navigate findings across all 6 layers
@@ -226,19 +226,19 @@ veriforge ui fixtures/vuln-payment-node --boot-cmd "node server.mjs"
 
 ---
 
-## Model Context Protocol (`veriforge mcp`)
+## Model Context Protocol (`shellmind-guard mcp`)
 
-VeriForge includes a built-in, newline-delimited **JSON-RPC 2.0 Stdio MCP Server** (`veriforge mcp`) so AI coding agents (**Claude Code, Cursor, AntiGravity, Windsurf, OpenCode, Z-Code**) can run deterministic multi-file security verification without burning context tokens on raw file reads.
+ShellMind Guard includes a built-in, newline-delimited **JSON-RPC 2.0 Stdio MCP Server** (`shellmind-guard mcp`) so AI coding agents (**Claude Code, Cursor, AntiGravity, Windsurf, OpenCode, Z-Code**) can run deterministic multi-file security verification without burning context tokens on raw file reads.
 
-### Add VeriForge to Your AI Agent (`mcpServers` Config)
+### Add ShellMind Guard to Your AI Agent (`mcpServers` Config)
 
 Add the following to your `.mcp.json`, `~/.claude.json`, or `.cursor/mcp.json`:
 
 ```json
 {
   "mcpServers": {
-    "veriforge": {
-      "command": "veriforge",
+    "shellmind-guard": {
+      "command": "shellmind-guard",
       "args": ["mcp"]
     }
   }
@@ -249,15 +249,15 @@ Add the following to your `.mcp.json`, `~/.claude.json`, or `.cursor/mcp.json`:
 
 | Tool Name | Input Schema | Description |
 | :--- | :--- | :--- |
-| `veriforge_scan` | `{ "path"?: string, "layers"?: string[], "boot_cmd"?: string }` | Runs the full 6-layer AST + Guard-Set Lattice scan (and optional `bwrap` sandbox proof) and returns structured JSON findings with witness hops and remediation. |
-| `veriforge_explain_finding` | `{ "path"?: string, "finding_id": string }` | Resolves a finding by `id` (e.g. `VF-RACE-002`) or `rule_id` (e.g. `VF-SQLI-001`) and returns exact source lines around every hop in `witness_path`, a<4 KB patch prompt, and concrete remediation guidance. |
-| `veriforge_init` | `{ "path"?: string, "ci"?: boolean }` | Detects the repository language stack, writes `.veriforge.toml`, and optionally scaffolds `.github/workflows/veriforge.yml`. |
+| `shellmind_guard_scan` | `{ "path"?: string, "layers"?: string[], "boot_cmd"?: string }` | Runs the full 6-layer AST + Guard-Set Lattice scan (and optional `bwrap` sandbox proof) and returns structured JSON findings with witness hops and remediation. |
+| `shellmind_guard_explain_finding` | `{ "path"?: string, "finding_id": string }` | Resolves a finding by `id` (e.g. `VF-RACE-002`) or `rule_id` (e.g. `VF-SQLI-001`) and returns exact source lines around every hop in `witness_path`, a<4 KB patch prompt, and concrete remediation guidance. |
+| `shellmind_guard_init` | `{ "path"?: string, "ci"?: boolean }` | Detects the repository language stack, writes `.shellmind-guard.toml`, and optionally scaffolds `.github/workflows/shellmind-guard.yml`. |
 
 ---
 
-## Configuration (`.veriforge.toml`)
+## Configuration (`.shellmind-guard.toml`)
 
-VeriForge works out of the box with zero configuration, or can be customized via `.veriforge.toml` in your repository root:
+ShellMind Guard works out of the box with zero configuration, or can be customized via `.shellmind-guard.toml` in your repository root:
 
 ```toml
 [guards]
@@ -284,12 +284,12 @@ public_routes = [
 custom_routes = []
 
 [scan]
-ignore_paths = ["node_modules", "target", "dist", "build", ".next", ".veriforge"]
+ignore_paths = ["node_modules", "target", "dist", "build", ".next", ".shellmind-guard"]
 max_threads = 4
 max_file_bytes = 2097152
 
 [sandbox]
-# Default boot command for `veriforge scan`, `veriforge replay`, and `veriforge ui`
+# Default boot command for `shellmind-guard scan`, `shellmind-guard replay`, and `shellmind-guard ui`
 # boot_cmd = "node server.mjs"
 ```
 
@@ -297,16 +297,16 @@ max_file_bytes = 2097152
 
 ## Workspace Architecture
 
-VeriForge is organized as a modular, 100% pure-Rust Cargo workspace:
+ShellMind Guard is organized as a modular, 100% pure-Rust Cargo workspace:
 
 ```text
-VeriForge/
+ShellMind Guard/
 ├── Cargo.toml                     # Workspace root (Rust 2024 Edition)
 ├── src/
 │   ├── main.rs                    # Unified CLI (`init`, `index`, `scan`, `replay`, `ui`, `mcp`)
 │   └── mcp.rs                     # Stdio JSON-RPC 2.0 Model Context Protocol server
 ├── crates/
-│   ├── vf-core/                   # .veriforge.toml config, ignore::WalkParallel + BLAKE3 scanner,
+│   ├── vf-core/                   # .shellmind-guard.toml config, ignore::WalkParallel + BLAKE3 scanner,
 │   │                              # SQLite WAL + FTS5 Two-Phase AST & findings store
 │   ├── vf-graph/                  # Parallel Tree-sitter AST (TS/JS/Go/Python/Rust), cross-file
 │   │                              # module resolver, 6-layer taint engine & O(V+E) Guard-Set Lattice

@@ -4,12 +4,12 @@ use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use vf_ai::build_minimal_patch_prompt;
-use vf_core::{StateStore, VeriForgeConfig, scan_repository};
+use vf_core::{ShellMindGuardConfig, StateStore, scan_repository};
 use vf_graph::analyze_codebase_cached;
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
-/// Runs VeriForge's stdio JSON-RPC 2.0 MCP server loop.
+/// Runs ShellMind Guard's stdio JSON-RPC 2.0 MCP server loop.
 /// Reads newline-delimited requests from `stdin` and writes single-line responses exclusively to `stdout`.
 pub fn run_stdio_server() -> Result<()> {
     let stdin = io::stdin();
@@ -81,7 +81,7 @@ pub fn handle_jsonrpc_line(raw: &str) -> Option<Value> {
                     "tools": { "listChanged": false }
                 },
                 "serverInfo": {
-                    "name": "veriforge",
+                    "name": "shellmind-guard",
                     "version": env!("CARGO_PKG_VERSION")
                 }
             }),
@@ -126,8 +126,8 @@ fn json_error(id: Value, code: i64, message: &str) -> Value {
 fn tool_definitions() -> Value {
     json!([
         {
-            "name": "veriforge_scan",
-            "description": "Scan a repository across VeriForge's 6 deterministic layers (Auth & Secrets, Taint/Injection/IDOR/Frontend Contract, Offline Dependencies, Security Misconfigs, Concurrency Race Conditions, and optional Bubblewrap runtime exploit verification).",
+            "name": "shellmind_guard_scan",
+            "description": "Scan a repository across ShellMind Guard's 6 deterministic layers (Auth & Secrets, Taint/Injection/IDOR/Frontend Contract, Offline Dependencies, Security Misconfigs, Concurrency Race Conditions, and optional Bubblewrap runtime exploit verification).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -160,7 +160,7 @@ fn tool_definitions() -> Value {
             }
         },
         {
-            "name": "veriforge_explain_finding",
+            "name": "shellmind_guard_explain_finding",
             "description": "Inspect a specific finding ID (e.g. VF-RACE-002, VF-SQLI-001) and return its full cross-file trace hops, source code excerpt, remediation, and replay command.",
             "inputSchema": {
                 "type": "object",
@@ -168,7 +168,7 @@ fn tool_definitions() -> Value {
                 "properties": {
                     "finding_id": {
                         "type": "string",
-                        "description": "Finding ID returned by veriforge_scan (e.g. VF-AUTH-001)"
+                        "description": "Finding ID returned by shellmind_guard_scan (e.g. VF-AUTH-001)"
                     },
                     "path": {
                         "type": "string",
@@ -178,8 +178,8 @@ fn tool_definitions() -> Value {
             }
         },
         {
-            "name": "veriforge_init",
-            "description": "Auto-detect project languages and frameworks to generate .veriforge.toml (and optionally .github/workflows/veriforge.yml).",
+            "name": "shellmind_guard_init",
+            "description": "Auto-detect project languages and frameworks to generate .shellmind-guard.toml (and optionally .github/workflows/shellmind-guard.yml).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -189,7 +189,7 @@ fn tool_definitions() -> Value {
                     },
                     "ci": {
                         "type": "boolean",
-                        "description": "Also generate .github/workflows/veriforge.yml GitHub Actions SARIF workflow"
+                        "description": "Also generate .github/workflows/shellmind-guard.yml GitHub Actions SARIF workflow"
                     }
                 }
             }
@@ -208,7 +208,7 @@ fn handle_tool_call(params: &Value) -> Result<Value> {
         .unwrap_or_else(|| json!({}));
 
     let payload = match tool_name {
-        "veriforge_scan" => {
+        "shellmind_guard_scan" => {
             let root = PathBuf::from(args.get("path").and_then(|v| v.as_str()).unwrap_or("."));
             let layers: Vec<String> = args
                 .get("layers")
@@ -260,13 +260,13 @@ fn handle_tool_call(params: &Value) -> Result<Value> {
                 })),
             })
         }
-        "veriforge_explain_finding" => {
+        "shellmind_guard_explain_finding" => {
             let finding_id = args
                 .get("finding_id")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow::anyhow!("Missing required argument `finding_id`"))?;
             let root = PathBuf::from(args.get("path").and_then(|v| v.as_str()).unwrap_or("."));
-            let cfg = VeriForgeConfig::load_from_dir(&root)?;
+            let cfg = ShellMindGuardConfig::load_from_dir(&root)?;
             let summary = scan_repository(&root, &cfg)?;
             let mut store = StateStore::open(&root)?;
             let _ = store.sync_files(&summary.files)?;
@@ -291,13 +291,13 @@ fn handle_tool_call(params: &Value) -> Result<Value> {
                 "finding": finding,
                 "remediation": finding.remediation,
                 "source_context": prompt_excerpt,
-                "replay_cmd": format!("veriforge replay {}", finding.id),
+                "replay_cmd": format!("shellmind-guard replay {}", finding.id),
             })
         }
-        "veriforge_init" => {
+        "shellmind_guard_init" => {
             let root = PathBuf::from(args.get("path").and_then(|v| v.as_str()).unwrap_or("."));
             let ci = args.get("ci").and_then(|v| v.as_bool()).unwrap_or(false);
-            let (detected, config_path) = VeriForgeConfig::detect_and_write_init(&root)?;
+            let (detected, config_path) = ShellMindGuardConfig::detect_and_write_init(&root)?;
             let ci_path = if ci {
                 Some(write_ci_workflow(&root)?)
             } else {
@@ -333,7 +333,7 @@ mod tests {
         let init_resp = handle_jsonrpc_line(init_req).expect("initialize must reply");
         assert_eq!(init_resp["jsonrpc"], "2.0");
         assert_eq!(init_resp["id"], 1);
-        assert_eq!(init_resp["result"]["serverInfo"]["name"], "veriforge");
+        assert_eq!(init_resp["result"]["serverInfo"]["name"], "shellmind-guard");
 
         let notif = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
         assert!(
@@ -346,9 +346,9 @@ mod tests {
         let tools = list_resp["result"]["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 3);
         let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
-        assert!(names.contains(&"veriforge_scan"));
-        assert!(names.contains(&"veriforge_explain_finding"));
-        assert!(names.contains(&"veriforge_init"));
+        assert!(names.contains(&"shellmind_guard_scan"));
+        assert!(names.contains(&"shellmind_guard_explain_finding"));
+        assert!(names.contains(&"shellmind_guard_init"));
 
         let bad_json = handle_jsonrpc_line("{not valid json").unwrap();
         assert_eq!(bad_json["error"]["code"], -32700);
@@ -359,7 +359,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mcp_veriforge_scan_and_explain_end_to_end() {
+    fn test_mcp_shellmind_guard_scan_and_explain_end_to_end() {
         let dir = std::env::temp_dir().join("vf_mcp_e2e_unit");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("src")).unwrap();
@@ -374,7 +374,7 @@ mod tests {
             "id": 10,
             "method": "tools/call",
             "params": {
-                "name": "veriforge_scan",
+                "name": "shellmind_guard_scan",
                 "arguments": { "path": dir.display().to_string() }
             }
         });
@@ -401,7 +401,7 @@ mod tests {
             "id": 11,
             "method": "tools/call",
             "params": {
-                "name": "veriforge_explain_finding",
+                "name": "shellmind_guard_explain_finding",
                 "arguments": {
                     "path": dir.display().to_string(),
                     "finding_id": fid

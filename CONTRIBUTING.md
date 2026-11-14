@@ -1,6 +1,6 @@
-# Contributing to VeriForge
+# Contributing to ShellMind Guard
 
-Thank you for contributing to **VeriForge**! To keep the codebase fast, deterministic, and compiler-grade, every contribution must uphold the architectural invariants below.
+Thank you for contributing to **ShellMind Guard**! To keep the codebase fast, deterministic, and compiler-grade, every contribution must uphold the architectural invariants below.
 
 ---
 
@@ -16,15 +16,15 @@ Thank you for contributing to **VeriForge**! To keep the codebase fast, determin
    - Never compile a `Regex::new(...)` inside a per-file or per-node loop; always use `std::sync::OnceLock<Regex>`.
 
 3. **Two-Phase Incremental Cache Correctness:**
-   - Per-file `FileAstSummary` records may be cached by `(mtime_ns, size_bytes)` and `BLAKE3` content hash in `.veriforge/state.db` (`crates/vf-core/src/store.rs`).
+   - Per-file `FileAstSummary` records may be cached by `(mtime_ns, size_bytes)` and `BLAKE3` content hash in `.shellmind-guard/state.db` (`crates/vf-core/src/store.rs`).
    - Global cross-file symbol linking and lattice solving (`solve_guard_lattice`) **must always run fresh in RAM** so edits to imported middleware or services immediately propagate across unmodified caller files.
 
 4. **Strict Stdout Hygiene in `mcp` & `ui` Modes:**
-   - In `veriforge mcp` (`src/mcp.rs`), `stdout` is strictly reserved for newline-delimited JSON-RPC 2.0 responses; all diagnostics must go to `stderr`.
-   - In `veriforge ui` (`crates/vf-tui`), child `bwrap` output and internal logs must route to the bounded ring-buffer (`[L]` drawer), never corrupting the `ratatui` alternate screen.
+   - In `shellmind-guard mcp` (`src/mcp.rs`), `stdout` is strictly reserved for newline-delimited JSON-RPC 2.0 responses; all diagnostics must go to `stderr`.
+   - In `shellmind-guard ui` (`crates/vf-tui`), child `bwrap` output and internal logs must route to the bounded ring-buffer (`[L]` drawer), never corrupting the `ratatui` alternate screen.
 
 5. **Zero Self-Scan False Positives:**
-   - Running `veriforge scan .` on the VeriForge repository itself must always produce **0 findings** across all VeriForge crates (`crates/*` and `src/*`).
+   - Running `shellmind-guard scan .` on the ShellMind Guard repository itself must always produce **0 findings** across all ShellMind Guard crates (`crates/*` and `src/*`).
 
 ---
 
@@ -42,7 +42,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 # 3. Run all unit & integration tests across all 6 crates
 cargo test --workspace
 
-# 4. Dogfooding check: verify 0 false positives on VeriForge crates
+# 4. Dogfooding check: verify 0 false positives on ShellMind Guard crates
 cargo run --release -- scan .
 ```
 
