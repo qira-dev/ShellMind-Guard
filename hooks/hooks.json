@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash -c 'if echo \"$CLAUDE_TOOL_INPUT\" | grep -q \"git commit\"; then command -v shellmind-guard >/dev/null 2>&1 && shellmind-guard scan . --layers secrets,config --ci; fi'"
+            "command": "shellmind-guard hook claude-pre-commit"
           }
         ]
       }

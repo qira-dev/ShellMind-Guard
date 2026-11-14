@@ -1,11 +1,11 @@
-$ErrorActionPreference = "Stop"
-
-# ShellMind Guard — 1-Command Windows Installer
 param(
     [string]$Version = "latest",
     [switch]$FromSource
 )
 
+$ErrorActionPreference = "Stop"
+
+# ShellMind Guard — 1-Command Windows Installer
 $Repo = "qira-dev/ShellMind-Guard"
 $Asset = "shellmind-guard-windows-x86_64.zip"
 $InstallDir = Join-Path $env:LOCALAPPDATA "ShellMind-Guard\bin"
@@ -29,11 +29,22 @@ if (-not $FromSource) {
     New-Item -ItemType Directory -Force -Path $TmpDir | Out-Null
     try {
         $ZipPath = Join-Path $TmpDir $Asset
+        $SumsPath = Join-Path $TmpDir "SHA256SUMS.txt"
         Write-Host "[ShellMind Guard] Downloading $Asset ($Version)..."
         Invoke-WebRequest -Uri "$BaseUrl/$Asset" -OutFile $ZipPath -UseBasicParsing
+        Invoke-WebRequest -Uri "$BaseUrl/SHA256SUMS.txt" -OutFile $SumsPath -UseBasicParsing
+        $ExpectedLine = Get-Content $SumsPath | Where-Object { $_ -match "\s+$Asset`$" } | Select-Object -First 1
+        if (-not $ExpectedLine) {
+            throw "Checksum for $Asset not found in SHA256SUMS.txt"
+        }
+        $ExpectedHash = ($ExpectedLine -split "\s+")[0].ToUpperInvariant()
+        $ActualHash = (Get-FileHash -Path $ZipPath -Algorithm SHA256).Hash.ToUpperInvariant()
+        if ($ExpectedHash -ne $ActualHash) {
+            throw "SHA256 checksum mismatch for $Asset! Expected $ExpectedHash, got $ActualHash"
+        }
         Expand-Archive -Path $ZipPath -DestinationPath $InstallDir -Force
     } catch {
-        Write-Warning "Prebuilt release download failed; falling back to source build."
+        Write-Warning "Prebuilt release verification failed ($_); falling back to source build."
         Install-FromSource
     } finally {
         Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue

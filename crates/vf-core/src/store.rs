@@ -32,10 +32,23 @@ pub struct StateStore {
 
 impl StateStore {
     pub fn open(project_root: &Path) -> Result<Self> {
-        let vf_dir = project_root.join(".shellmind-guard");
+        let canon = fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+        let repo_key = blake3::hash(canon.to_string_lossy().as_bytes()).to_hex();
+        let cache_base = std::env::var_os("XDG_CACHE_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .or_else(|| std::env::var_os("USERPROFILE"))
+                    .map(|h| std::path::PathBuf::from(h).join(".cache"))
+            })
+            .unwrap_or_else(std::env::temp_dir);
+        let vf_dir = cache_base
+            .join("shellmind-guard")
+            .join(&repo_key.as_str()[..16]);
         fs::create_dir_all(&vf_dir)?;
         let db_path = vf_dir.join("state.db");
         let conn = Connection::open(db_path)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
 
         conn.execute_batch(
             "
@@ -302,7 +315,7 @@ mod tests {
 
     #[test]
     fn test_delta_cache_and_ast_cache() {
-        let tmp = std::env::temp_dir().join("vf_core_test_delta");
+        let tmp = std::env::temp_dir().join(format!("vf_core_test_delta_{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
 

@@ -49,6 +49,9 @@ enum HookAction {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
+    /// Internal handler for Claude Code PreToolUse Bash hook (reads JSON from stdin)
+    #[command(name = "claude-pre-commit", hide = true)]
+    ClaudePreCommit,
 }
 
 pub(crate) struct ScanRunOptions<'a> {
@@ -58,6 +61,7 @@ pub(crate) struct ScanRunOptions<'a> {
     pub port: u16,
     pub sync_race: usize,
     pub unsafe_host_fallback: bool,
+    pub trust_repo_config: bool,
 }
 
 pub(crate) struct ScanOutcome {
@@ -125,6 +129,9 @@ enum Commands {
         /// Allow unsafe host execution if `/usr/bin/bwrap` is unavailable
         #[arg(long)]
         unsafe_host_fallback: bool,
+        /// Trust `sandbox.boot_cmd` defined in the scanned repo's `.shellmind-guard.toml`
+        #[arg(long)]
+        trust_repo_config: bool,
         #[arg(long)]
         ci: bool,
         #[arg(
@@ -153,6 +160,8 @@ enum Commands {
         #[arg(long)]
         unsafe_host_fallback: bool,
         #[arg(long)]
+        trust_repo_config: bool,
+        #[arg(long)]
         patch: bool,
     },
     /// Launch interactive panic-safe ratatui TUI workspace
@@ -167,6 +176,8 @@ enum Commands {
         sync_race: usize,
         #[arg(long)]
         unsafe_host_fallback: bool,
+        #[arg(long)]
+        trust_repo_config: bool,
     },
     /// Start stdio JSON-RPC 2.0 MCP server (exposes shellmind_guard_scan, shellmind_guard_explain_finding, shellmind_guard_init)
     Mcp,
@@ -281,17 +292,31 @@ pub(crate) fn execute_scan_pipeline(opts: ScanRunOptions<'_>) -> Result<ScanOutc
             .retain(|f| opts.layers.iter().any(|l| finding_matches_layer(f, l)));
     }
 
-    let effective_boot = opts.boot_cmd.or_else(|| cfg.sandbox.boot_cmd.clone());
+    let effective_boot = opts.boot_cmd.or_else(|| {
+        opts.trust_repo_config
+            .then(|| cfg.sandbox.boot_cmd.clone())
+            .flatten()
+    });
+    let has_dynamic_targets = graph_res
+        .findings
+        .iter()
+        .any(|f| matches!(f.missing_guard, GuardKind::Auth | GuardKind::TxLock));
     let sandbox_res = if let Some(cmd) = effective_boot {
-        if !graph_res.findings.is_empty() {
-            Some(verify_findings_in_sandbox(
+        if has_dynamic_targets {
+            match verify_findings_in_sandbox(
                 opts.path,
                 &cmd,
                 opts.port,
                 &graph_res.findings,
                 opts.sync_race,
                 opts.unsafe_host_fallback,
-            )?)
+            ) {
+                Ok(res) => Some(res),
+                Err(e) => {
+                    eprintln!("[ShellMind Guard] Sandbox verification failed: {}", e);
+                    None
+                }
+            }
         } else {
             None
         }
@@ -491,6 +516,7 @@ fn main() -> Result<ExitCode> {
             html,
             patch,
             unsafe_host_fallback,
+            trust_repo_config,
             ci,
             fail_on,
             watch,
@@ -503,6 +529,7 @@ fn main() -> Result<ExitCode> {
                 port,
                 sync_race,
                 unsafe_host_fallback,
+                trust_repo_config,
             })?;
             let verified_list: Vec<VerifiedFinding> = outcome
                 .sandbox
@@ -566,6 +593,7 @@ fn main() -> Result<ExitCode> {
                             port,
                             sync_race,
                             unsafe_host_fallback,
+                            trust_repo_config,
                         })?;
                         let next_verified: Vec<VerifiedFinding> = next_outcome
                             .sandbox
@@ -595,14 +623,19 @@ fn main() -> Result<ExitCode> {
             port,
             sync_race,
             unsafe_host_fallback,
+            trust_repo_config,
             patch,
         } => {
             let cfg = ShellMindGuardConfig::load_from_dir(&path)?;
             let mut store = StateStore::open(&path)?;
             let finding = resolve_finding_for_replay(&path, &finding_id, &cfg, &mut store)?;
             let effective_boot = boot_cmd
-                .or_else(|| cfg.sandbox.boot_cmd.clone())
-                .unwrap_or_else(|| "node server.mjs".into());
+                .or_else(|| trust_repo_config.then(|| cfg.sandbox.boot_cmd.clone()).flatten())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "No --boot-cmd provided (pass --boot-cmd \"...\" or --trust-repo-config if .shellmind-guard.toml defines one)"
+                    )
+                })?;
 
             let (bwrap, verified) = verify_findings_in_sandbox(
                 &path,
@@ -639,6 +672,7 @@ fn main() -> Result<ExitCode> {
             port,
             sync_race,
             unsafe_host_fallback,
+            trust_repo_config,
         } => {
             let t0 = Instant::now();
             let cfg = ShellMindGuardConfig::load_from_dir(&path)?;
@@ -646,7 +680,11 @@ fn main() -> Result<ExitCode> {
             let mut store = StateStore::open(&path)?;
             let (delta, _) = store.sync_files(&summary.files)?;
             let graph_res = analyze_codebase_cached(&summary.files, &cfg, &mut store)?;
-            let effective_boot = boot_cmd.or_else(|| cfg.sandbox.boot_cmd.clone());
+            let effective_boot = boot_cmd.or_else(|| {
+                trust_repo_config
+                    .then(|| cfg.sandbox.boot_cmd.clone())
+                    .flatten()
+            });
             let verified_list = if let Some(ref cmd) = effective_boot {
                 if !graph_res.findings.is_empty() {
                     verify_findings_in_sandbox(
@@ -714,6 +752,9 @@ fn main() -> Result<ExitCode> {
                     }
                 );
             }
+            HookAction::ClaudePreCommit => {
+                return handle_claude_pre_commit();
+            }
         },
         Commands::Doctor { path } => {
             run_doctor(&path);
@@ -726,6 +767,56 @@ fn main() -> Result<ExitCode> {
         }
     }
 
+    vf_sandbox::kill_active_sandbox_pgid();
+    Ok(ExitCode::SUCCESS)
+}
+
+fn handle_claude_pre_commit() -> Result<ExitCode> {
+    use std::io::Read;
+    let mut stdin_buf = String::new();
+    let _ = std::io::stdin().read_to_string(&mut stdin_buf);
+    let cmd_str = serde_json::from_str::<serde_json::Value>(&stdin_buf)
+        .ok()
+        .and_then(|v| {
+            v.get("tool_input")
+                .and_then(|ti| ti.get("command"))
+                .and_then(|c| c.as_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_default();
+
+    let is_git_commit = cmd_str.split([';', '&', '|', '\n']).any(|seg| {
+        let parts: Vec<&str> = seg.split_whitespace().collect();
+        parts.first() == Some(&"git") && parts.contains(&"commit")
+    });
+    if !is_git_commit {
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let layers = vec!["secrets".to_string(), "config".to_string()];
+    let outcome = execute_scan_pipeline(ScanRunOptions {
+        path: Path::new("."),
+        layers: &layers,
+        boot_cmd: None,
+        port: 39911,
+        sync_race: 12,
+        unsafe_host_fallback: false,
+        trust_repo_config: false,
+    })?;
+
+    if should_fail_gate(&outcome.graph.findings, true, None) {
+        eprintln!(
+            "[ShellMind Guard] Blocked git commit: {} secret/config issue(s) found.",
+            outcome.graph.findings.len()
+        );
+        for f in &outcome.graph.findings {
+            eprintln!(
+                "  [{}] {} -> {} ({}:{})",
+                f.severity, f.id, f.title, f.file, f.line
+            );
+        }
+        return Ok(ExitCode::from(2));
+    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -733,6 +824,23 @@ const HOOK_START: &str = "# >>> shellmind-guard pre-commit >>>";
 const HOOK_END: &str = "# <<< shellmind-guard pre-commit <<<";
 
 fn resolve_git_hooks_dir(root: &Path) -> Result<PathBuf> {
+    if let Ok(out) = std::process::Command::new("git")
+        .args([
+            "-C",
+            &root.to_string_lossy(),
+            "rev-parse",
+            "--git-path",
+            "hooks",
+        ])
+        .output()
+        && out.status.success()
+    {
+        let rel = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !rel.is_empty() {
+            let p = PathBuf::from(&rel);
+            return Ok(if p.is_absolute() { p } else { root.join(p) });
+        }
+    }
     let git_dir = root.join(".git");
     if !git_dir.exists() {
         anyhow::bail!(
@@ -788,10 +896,14 @@ fn uninstall_git_hook(root: &Path) -> Result<bool> {
     let Some(start_idx) = existing.find(HOOK_START) else {
         return Ok(false);
     };
-    let end_idx = existing[start_idx..]
-        .find(HOOK_END)
-        .map(|rel| start_idx + rel + HOOK_END.len())
-        .unwrap_or(existing.len());
+    let Some(rel_end) = existing[start_idx..].find(HOOK_END) else {
+        anyhow::bail!(
+            "Found {} without matching {}; refusing partial hook edit",
+            HOOK_START,
+            HOOK_END
+        );
+    };
+    let end_idx = start_idx + rel_end + HOOK_END.len();
     let remaining = format!(
         "{}{}",
         existing[..start_idx].trim_end(),
@@ -838,10 +950,9 @@ fn should_fail_gate(findings: &[LatticeFinding], ci: bool, fail_on: Option<FailS
             FailSeverity::Medium => 2,
             FailSeverity::Low => 1,
         };
-        return findings.iter().any(|f| {
-            f.status != "MITIGATED"
-                && (f.status == "PROVEN" || severity_rank(&f.severity) >= min_rank)
-        });
+        return findings
+            .iter()
+            .any(|f| f.status != "MITIGATED" && severity_rank(&f.severity) >= min_rank);
     }
     if ci {
         return findings.iter().any(|f| {

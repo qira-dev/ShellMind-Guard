@@ -46,16 +46,6 @@ fn extract_http_status(resp: &str) -> u16 {
         .unwrap_or(0)
 }
 
-fn split_headers_and_body(raw: &str) -> (&str, &str) {
-    if let Some((h, b)) = raw.split_once("\r\n\r\n") {
-        (h, b)
-    } else if let Some((h, b)) = raw.split_once("\n\n") {
-        (h, b)
-    } else {
-        (raw, "")
-    }
-}
-
 fn parse_content_length(headers: &str) -> Option<usize> {
     for line in headers.lines() {
         if let Some((k, v)) = line.split_once(':')
@@ -79,10 +69,11 @@ fn is_chunked_encoding(headers: &str) -> bool {
     false
 }
 
-fn decode_chunked_body(raw_body: &str) -> String {
-    let mut out = String::with_capacity(raw_body.len());
+fn decode_chunked_body(raw_body: &[u8]) -> String {
+    let mut out: Vec<u8> = Vec::with_capacity(raw_body.len());
     let mut rest = raw_body;
-    while let Some((size_line, after_size)) = rest.split_once("\r\n") {
+    while let Some(pos) = rest.windows(2).position(|w| w == b"\r\n") {
+        let size_line = std::str::from_utf8(&rest[..pos]).unwrap_or("");
         let hex_part = size_line.split(';').next().unwrap_or("").trim();
         let Ok(chunk_len) = usize::from_str_radix(hex_part, 16) else {
             break;
@@ -90,24 +81,27 @@ fn decode_chunked_body(raw_body: &str) -> String {
         if chunk_len == 0 {
             break;
         }
+        let after_size = &rest[pos + 2..];
         if after_size.len() < chunk_len {
-            out.push_str(after_size);
+            out.extend_from_slice(after_size);
             break;
         }
-        out.push_str(&after_size[..chunk_len]);
+        out.extend_from_slice(&after_size[..chunk_len]);
         rest = &after_size[chunk_len..];
-        rest = rest.strip_prefix("\r\n").unwrap_or(rest);
+        if rest.starts_with(b"\r\n") {
+            rest = &rest[2..];
+        }
     }
     if out.is_empty() {
-        raw_body.to_string()
+        String::from_utf8_lossy(raw_body).to_string()
     } else {
-        out
+        String::from_utf8_lossy(&out).to_string()
     }
 }
 
 /// Reads an HTTP response with strict timeout and 256 KiB cap, decoding `Transfer-Encoding: chunked`
 /// and stopping immediately once `Content-Length` or `0\r\n\r\n` arrives.
-async fn read_http_bounded(stream: &mut TcpStream) -> Result<(u16, String)> {
+async fn read_http_bounded(stream: &mut TcpStream) -> Result<(u16, String, bool)> {
     let mut buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; 4096];
     let mut expected_total: Option<usize> = None;
@@ -132,11 +126,13 @@ async fn read_http_bounded(stream: &mut TcpStream) -> Result<(u16, String)> {
                     expected_total = Some(hdr_end + 4 + cl.min(MAX_HTTP_BODY_BYTES));
                 }
             }
-            if chunked
-                && let Some(hdr_end) = s.find("\r\n\r\n")
-                && s[hdr_end + 4..].contains("0\r\n\r\n")
-            {
-                break;
+            if chunked && let Some(hdr_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let body_bytes = &buf[hdr_end + 4..];
+                if body_bytes.starts_with(b"0\r\n\r\n")
+                    || body_bytes.windows(7).any(|w| w == b"\r\n0\r\n\r\n")
+                {
+                    break;
+                }
             }
             if let Some(tot) = expected_total
                 && buf.len() >= tot
@@ -151,18 +147,26 @@ async fn read_http_bounded(stream: &mut TcpStream) -> Result<(u16, String)> {
     })
     .await;
 
-    let raw = String::from_utf8_lossy(&buf).to_string();
-    let status = extract_http_status(&raw);
-    let (hdrs, body) = split_headers_and_body(&raw);
-    let decoded = if is_chunked_encoding(hdrs) {
-        decode_chunked_body(body)
+    let hdr_split = buf.windows(4).position(|w| w == b"\r\n\r\n");
+    let (hdr_bytes, body_bytes) = match hdr_split {
+        Some(pos) => (&buf[..pos], &buf[pos + 4..]),
+        None => (&buf[..], &[][..]),
+    };
+    let hdrs = String::from_utf8_lossy(hdr_bytes);
+    let status = extract_http_status(&hdrs);
+    let is_html = hdrs.lines().any(|l| {
+        l.to_ascii_lowercase().starts_with("content-type:")
+            && l.to_ascii_lowercase().contains("text/html")
+    });
+    let decoded = if is_chunked_encoding(&hdrs) {
+        decode_chunked_body(body_bytes)
     } else {
-        body.to_string()
+        String::from_utf8_lossy(body_bytes).to_string()
     };
     if res.is_err() && status == 0 {
         anyhow::bail!("Timed out reading HTTP response");
     }
-    Ok((status, decoded.trim().to_string()))
+    Ok((status, decoded.trim().to_string(), is_html))
 }
 
 fn is_failure_envelope(status: u16, body: &str) -> bool {
@@ -173,17 +177,50 @@ fn is_failure_envelope(status: u16, body: &str) -> bool {
         if v.get("ok").and_then(|b| b.as_bool()) == Some(false) {
             return true;
         }
-        if v.get("error").is_some() && v.get("ok").and_then(|b| b.as_bool()) != Some(true) {
+        if v.get("success").and_then(|b| b.as_bool()) == Some(false) {
+            return true;
+        }
+        if let Some(st) = v.get("status").and_then(|s| s.as_str())
+            && matches!(
+                st.to_ascii_lowercase().as_str(),
+                "error" | "duplicate" | "rejected" | "failed"
+            )
+        {
+            return true;
+        }
+        if let Some(errs) = v.get("errors").and_then(|e| e.as_array())
+            && !errs.is_empty()
+        {
+            return true;
+        }
+        if let Some(err) = v.get("error")
+            && !err.is_null()
+            && v.get("ok").and_then(|b| b.as_bool()) != Some(true)
+        {
             return true;
         }
     }
     false
 }
 
+fn substitute_route_params(path: &str) -> String {
+    path.split('/')
+        .map(|seg| {
+            if seg.starts_with(':') || (seg.starts_with('{') && seg.ends_with('}')) {
+                "1"
+            } else {
+                seg
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Checks whether an unauthenticated request to the flagged route is blocked (401/403)
 /// or actually executes a non-error payload inside the isolated loopback sandbox.
 pub async fn verify_auth_invariant(port: u16, finding: &LatticeFinding) -> Result<VerifiedFinding> {
-    let (method, path) = parse_route(&finding.entry_route);
+    let (method, raw_path) = parse_route(&finding.entry_route);
+    let path = substitute_route_params(raw_path);
     let body = r#"{"userId":"test-user-1","amount":10}"#;
     let req = format!(
         "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -192,16 +229,20 @@ pub async fn verify_auth_invariant(port: u16, finding: &LatticeFinding) -> Resul
 
     let mut stream = timeout(IO_TIMEOUT, TcpStream::connect(("127.0.0.1", port))).await??;
     timeout(IO_TIMEOUT, stream.write_all(req.as_bytes())).await??;
-    let (status_code, resp_body) = read_http_bounded(&mut stream)
-        .await
-        .unwrap_or((0, String::new()));
+    let (status_code, resp_body, is_html) =
+        read_http_bounded(&mut stream)
+            .await
+            .unwrap_or((0, String::new(), false));
 
     let (status, evidence) = if status_code == 401 || status_code == 403 {
         (
             VerificationStatus::Mitigated,
             format!("Blocked by runtime guard with HTTP {}", status_code),
         )
-    } else if (200..300).contains(&status_code) && !is_failure_envelope(status_code, &resp_body) {
+    } else if (200..300).contains(&status_code)
+        && !is_html
+        && !is_failure_envelope(status_code, &resp_body)
+    {
         (
             VerificationStatus::Proven,
             format!(
@@ -214,7 +255,7 @@ pub async fn verify_auth_invariant(port: u16, finding: &LatticeFinding) -> Resul
         (
             VerificationStatus::SuspectUnverified,
             format!(
-                "HTTP {} returned empty/failure envelope ({}); cannot prove mutation",
+                "HTTP {} returned empty/HTML/failure envelope ({}); cannot prove mutation",
                 status_code,
                 resp_body.chars().take(80).collect::<String>()
             ),
@@ -258,7 +299,8 @@ pub async fn verify_concurrency_invariant(
         });
     }
 
-    let (method, path) = parse_route(&finding.entry_route);
+    let (method, raw_path) = parse_route(&finding.entry_route);
+    let path = substitute_route_params(raw_path);
     let body = r#"{"userId":"test-user-1","amount":80}"#;
     let raw_req = format!(
         "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -335,8 +377,9 @@ pub async fn verify_concurrency_invariant(
     let mut distinct_bodies: HashSet<String> = HashSet::new();
 
     while let Some(joined) = set.join_next().await {
-        if let Ok(Some((code, resp_body))) = joined {
+        if let Ok(Some((code, resp_body, is_html))) = joined {
             if (200..300).contains(&code)
+                && !is_html
                 && !is_failure_envelope(code, &resp_body)
                 && !matches!(code, 409 | 429 | 400)
             {
@@ -371,12 +414,12 @@ pub async fn verify_concurrency_invariant(
                 distinct_bodies.len()
             ),
         )
-    } else if valid_2xx <= 1 && blocked > 0 {
+    } else if valid_2xx == 1 && blocked > 0 {
         (
             VerificationStatus::Mitigated,
             format!(
-                "Last-Byte Sync ({}x): only {}x succeeded, {}x blocked by lock/idempotency guard",
-                concurrency, valid_2xx, blocked
+                "Last-Byte Sync ({}x): only 1x succeeded, {}x blocked by lock/idempotency guard",
+                concurrency, blocked
             ),
         )
     } else {
@@ -449,7 +492,7 @@ mod tests {
             .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
             .await
             .unwrap();
-        let (code, body) = timeout(Duration::from_millis(500), read_http_bounded(&mut stream))
+        let (code, body, _) = timeout(Duration::from_millis(500), read_http_bounded(&mut stream))
             .await
             .expect("must not hang on keep-open socket")
             .unwrap();
@@ -480,7 +523,7 @@ mod tests {
             .write_all(b"POST /test HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
             .await
             .unwrap();
-        let (code, body) = read_http_bounded(&mut stream).await.unwrap();
+        let (code, body, _) = read_http_bounded(&mut stream).await.unwrap();
         assert_eq!(code, 200);
         assert!(is_failure_envelope(code, &body));
     }

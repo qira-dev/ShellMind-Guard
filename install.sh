@@ -43,8 +43,10 @@ install_from_source() {
     exit 1
   fi
   local script_dir=""
-  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" 2>/dev/null && pwd || true)"
-  if [[ -n "${script_dir}" && -f "${script_dir}/Cargo.toml" ]]; then
+  if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
+  fi
+  if [[ -n "${script_dir}" && -f "${script_dir}/Cargo.toml" ]] && grep -q 'name = "shellmind-guard"' "${script_dir}/Cargo.toml"; then
     echo "[ShellMind Guard] Building from local source..."
     cargo install --path "${script_dir}" --locked
   else
@@ -63,20 +65,20 @@ if [[ "${FROM_SOURCE}" -eq 0 ]] && asset="$(detect_asset)"; then
   trap 'rm -rf "${tmp_dir}"' EXIT
 
   echo "[ShellMind Guard] Downloading ${asset} (${VERSION})..."
-  if curl -fsSL "${base_url}/${asset}" -o "${tmp_dir}/${asset}"; then
-    if curl -fsSL "${base_url}/SHA256SUMS.txt" -o "${tmp_dir}/SHA256SUMS.txt" 2>/dev/null; then
-      expected="$(grep " ${asset}\$" "${tmp_dir}/SHA256SUMS.txt" | awk '{print $1}' || true)"
-      if [[ -n "${expected}" ]]; then
-        if command -v sha256sum >/dev/null 2>&1; then
-          actual="$(sha256sum "${tmp_dir}/${asset}" | awk '{print $1}')"
-        else
-          actual="$(shasum -a 256 "${tmp_dir}/${asset}" | awk '{print $1}')"
-        fi
-        if [[ "${expected}" != "${actual}" ]]; then
-          echo "[ShellMind Guard] Checksum mismatch! Aborting." >&2
-          exit 1
-        fi
-      fi
+  if curl -fsSL "${base_url}/${asset}" -o "${tmp_dir}/${asset}" && curl -fsSL "${base_url}/SHA256SUMS.txt" -o "${tmp_dir}/SHA256SUMS.txt"; then
+    expected="$(grep " ${asset}\$" "${tmp_dir}/SHA256SUMS.txt" | awk '{print $1}' || true)"
+    if [[ -z "${expected}" ]]; then
+      echo "[ShellMind Guard] Missing SHA256 entry for ${asset} in SHA256SUMS.txt! Aborting." >&2
+      exit 1
+    fi
+    if command -v sha256sum >/dev/null 2>&1; then
+      actual="$(sha256sum "${tmp_dir}/${asset}" | awk '{print $1}')"
+    else
+      actual="$(shasum -a 256 "${tmp_dir}/${asset}" | awk '{print $1}')"
+    fi
+    if [[ "${expected}" != "${actual}" ]]; then
+      echo "[ShellMind Guard] Checksum mismatch! Aborting." >&2
+      exit 1
     fi
     tar -xzf "${tmp_dir}/${asset}" -C "${tmp_dir}"
     install -m 0755 "${tmp_dir}/${BIN_NAME}" "${INSTALL_DIR}/${BIN_NAME}"

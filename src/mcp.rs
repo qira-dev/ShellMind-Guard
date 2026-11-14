@@ -127,7 +127,7 @@ fn tool_definitions() -> Value {
     json!([
         {
             "name": "shellmind_guard_scan",
-            "description": "Scan a repository across ShellMind Guard's 6 deterministic layers (Auth & Secrets, Taint/Injection/IDOR/Frontend Contract, Offline Dependencies, Security Misconfigs, Concurrency Race Conditions, and optional Bubblewrap runtime exploit verification).",
+            "description": "Scan a repository across ShellMind Guard's 6 deterministic layers (Auth & Secrets, Taint/Injection/IDOR/Frontend Contract, Offline Dependencies, Security Misconfigs, and Concurrency Race Conditions).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -139,22 +139,6 @@ fn tool_definitions() -> Value {
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "Optional layer filters: auth, race, taint, sqli, cmdi, path, ssrf, idor, secrets, config, deps, frontend"
-                    },
-                    "boot_cmd": {
-                        "type": "string",
-                        "description": "Optional boot command for live Bubblewrap sandbox verification (e.g. 'node server.mjs')"
-                    },
-                    "port": {
-                        "type": "integer",
-                        "description": "Loopback port used inside sandbox (default 39911)"
-                    },
-                    "sync_race": {
-                        "type": "integer",
-                        "description": "Concurrent requests for Last-Byte Sync race probe (default 12)"
-                    },
-                    "unsafe_host_fallback": {
-                        "type": "boolean",
-                        "description": "Allow host loopback fallback if /usr/bin/bwrap is unavailable"
                     }
                 }
             }
@@ -190,11 +174,31 @@ fn tool_definitions() -> Value {
                     "ci": {
                         "type": "boolean",
                         "description": "Also generate .github/workflows/shellmind-guard.yml GitHub Actions SARIF workflow"
+                    },
+                    "overwrite": {
+                        "type": "boolean",
+                        "description": "Overwrite existing .shellmind-guard.toml if present (default false)"
                     }
                 }
             }
         }
     ])
+}
+
+fn validate_mcp_target_path(raw_path: &str) -> Result<PathBuf> {
+    let p = PathBuf::from(raw_path);
+    let canon = std::fs::canonicalize(&p).unwrap_or_else(|_| p.clone());
+    let cwd = std::fs::canonicalize(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+        .unwrap_or_else(|_| PathBuf::from("."));
+    let tmp = std::fs::canonicalize(std::env::temp_dir()).unwrap_or_else(|_| std::env::temp_dir());
+    if !canon.starts_with(&cwd) && !canon.starts_with(&tmp) {
+        anyhow::bail!(
+            "Refusing MCP access outside workspace root ({}) or temp dir: {}",
+            cwd.display(),
+            canon.display()
+        );
+    }
+    Ok(canon)
 }
 
 fn handle_tool_call(params: &Value) -> Result<Value> {
@@ -209,7 +213,8 @@ fn handle_tool_call(params: &Value) -> Result<Value> {
 
     let payload = match tool_name {
         "shellmind_guard_scan" => {
-            let root = PathBuf::from(args.get("path").and_then(|v| v.as_str()).unwrap_or("."));
+            let root =
+                validate_mcp_target_path(args.get("path").and_then(|v| v.as_str()).unwrap_or("."))?;
             let layers: Vec<String> = args
                 .get("layers")
                 .and_then(|v| v.as_array())
@@ -219,45 +224,38 @@ fn handle_tool_call(params: &Value) -> Result<Value> {
                         .collect()
                 })
                 .unwrap_or_default();
-            let boot_cmd = args
-                .get("boot_cmd")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            let port = args
-                .get("port")
-                .and_then(|v| v.as_u64())
-                .map(|p| p as u16)
-                .unwrap_or(39911);
-            let sync_race = args
-                .get("sync_race")
-                .and_then(|v| v.as_u64())
-                .map(|n| n as usize)
-                .unwrap_or(12);
-            let unsafe_host_fallback = args
-                .get("unsafe_host_fallback")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
 
             let outcome = execute_scan_pipeline(ScanRunOptions {
                 path: &root,
                 layers: &layers,
-                boot_cmd,
-                port,
-                sync_race,
-                unsafe_host_fallback,
+                boot_cmd: None,
+                port: 39911,
+                sync_race: 12,
+                unsafe_host_fallback: false,
+                trust_repo_config: false,
             })?;
+
+            const MAX_MCP_FINDINGS: usize = 50;
+            let total_findings = outcome.graph.findings.len();
+            let truncated = total_findings > MAX_MCP_FINDINGS;
+            let findings_slice: Vec<_> = outcome
+                .graph
+                .findings
+                .into_iter()
+                .take(MAX_MCP_FINDINGS)
+                .collect();
 
             json!({
                 "ok": true,
                 "elapsed_ms": outcome.elapsed_ms,
-                "findings_count": outcome.graph.findings.len(),
-                "findings": outcome.graph.findings,
+                "parsed_files": outcome.graph.parsed_files,
+                "symbol_count": outcome.graph.symbol_count,
+                "edge_count": outcome.graph.edge_count,
+                "route_entries": outcome.graph.route_entries,
+                "findings_count": total_findings,
+                "truncated": truncated,
+                "findings": findings_slice,
                 "delta": outcome.delta,
-                "graph": outcome.graph,
-                "sandbox_verification": outcome.sandbox.as_ref().map(|(bwrap, res)| json!({
-                    "bwrap_isolated": bwrap,
-                    "results": res,
-                })),
             })
         }
         "shellmind_guard_explain_finding" => {
@@ -265,7 +263,8 @@ fn handle_tool_call(params: &Value) -> Result<Value> {
                 .get("finding_id")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow::anyhow!("Missing required argument `finding_id`"))?;
-            let root = PathBuf::from(args.get("path").and_then(|v| v.as_str()).unwrap_or("."));
+            let root =
+                validate_mcp_target_path(args.get("path").and_then(|v| v.as_str()).unwrap_or("."))?;
             let cfg = ShellMindGuardConfig::load_from_dir(&root)?;
             let summary = scan_repository(&root, &cfg)?;
             let mut store = StateStore::open(&root)?;
@@ -295,8 +294,20 @@ fn handle_tool_call(params: &Value) -> Result<Value> {
             })
         }
         "shellmind_guard_init" => {
-            let root = PathBuf::from(args.get("path").and_then(|v| v.as_str()).unwrap_or("."));
+            let root =
+                validate_mcp_target_path(args.get("path").and_then(|v| v.as_str()).unwrap_or("."))?;
             let ci = args.get("ci").and_then(|v| v.as_bool()).unwrap_or(false);
+            let overwrite = args
+                .get("overwrite")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let cfg_target = root.join(".shellmind-guard.toml");
+            if cfg_target.exists() && !overwrite {
+                anyhow::bail!(
+                    "{} already exists (pass overwrite: true to replace)",
+                    cfg_target.display()
+                );
+            }
             let (detected, config_path) = ShellMindGuardConfig::detect_and_write_init(&root)?;
             let ci_path = if ci {
                 Some(write_ci_workflow(&root)?)
@@ -316,7 +327,7 @@ fn handle_tool_call(params: &Value) -> Result<Value> {
     Ok(json!({
         "content": [{
             "type": "text",
-            "text": serde_json::to_string_pretty(&payload)?
+            "text": serde_json::to_string(&payload)?
         }],
         "isError": false
     }))
@@ -382,7 +393,7 @@ mod tests {
         assert_eq!(scan_resp["result"]["isError"], false);
         let text = scan_resp["result"]["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(text).unwrap();
-        let findings = parsed["graph"]["findings"].as_array().unwrap();
+        let findings = parsed["findings"].as_array().unwrap();
         assert!(
             findings.iter().any(|f| f["rule_id"] == "VF-SQLI-001"),
             "MCP scan must return SQLi finding: {}",
