@@ -4,7 +4,7 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio::time::sleep;
 
 static ACTIVE_SANDBOX_PGID: AtomicI32 = AtomicI32::new(0);
@@ -39,6 +39,12 @@ impl Drop for SandboxGuard {
             .status();
         let _ = self.child.kill();
         let _ = self.child.wait();
+        for _ in 0..25 {
+            if std::net::TcpStream::connect(("127.0.0.1", self.port)).is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }
 
@@ -60,8 +66,8 @@ pub async fn spawn_sandboxed_server(
     if port == 0 {
         anyhow::bail!("Refusing port 0: specify an explicit loopback port");
     }
-    // B18: Refuse immediately if an unrelated listener already occupies `port`
-    if TcpListener::bind(("127.0.0.1", port)).await.is_err() {
+    // B18: Refuse immediately if an unrelated listener is already accepting connections on `port`
+    if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
         anyhow::bail!(
             "Port 127.0.0.1:{} is already occupied by an unrelated listener; refusing to probe wrong service",
             port
@@ -117,13 +123,13 @@ pub async fn spawn_sandboxed_server(
             cmd.args(["--ro-bind", "/etc", "/etc"]);
         }
         if let Ok(home) = std::env::var("HOME") {
-            let local_bin = format!("{}/.local", home);
+            let local_bin = format!("{}/.local/bin", home);
             if Path::new(&local_bin).exists() {
                 cmd.args(["--ro-bind", &local_bin, &local_bin]);
                 cmd.args([
                     "--setenv",
                     "PATH",
-                    &format!("{}/bin:/usr/local/bin:/usr/bin:/bin", local_bin),
+                    &format!("{}:/usr/local/bin:/usr/bin:/bin", local_bin),
                 ]);
             }
         }
@@ -195,7 +201,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_port_conflict_is_refused() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
         let occupied_port = listener.local_addr().unwrap().port();
         let err = spawn_sandboxed_server(
             Path::new("."),

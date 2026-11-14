@@ -3,7 +3,7 @@ pub mod verifier;
 
 use anyhow::Result;
 use std::path::Path;
-use vf_graph::{GuardKind, LatticeFinding};
+use vf_graph::LatticeFinding;
 
 pub use bwrap::{SandboxGuard, has_bwrap, kill_active_sandbox_pgid, spawn_sandboxed_server};
 pub use verifier::{VerificationStatus, VerifiedFinding, verify_finding};
@@ -29,31 +29,21 @@ pub fn verify_findings_in_sandbox(
             }
         });
 
-        let mut guard =
-            spawn_sandboxed_server(project_root, boot_cmd, port, allow_unsafe_host_fallback)
-                .await?;
-        let used_bwrap = guard.isolated_bwrap;
         let mut results = Vec::with_capacity(findings.len());
-        let mut state_mutated = false;
+        let mut used_bwrap = false;
 
+        // B-DRAIN: Always run each finding against a fresh sandboxed server instance
+        // so state mutations (e.g. balance drain) from an Auth probe never skew later probes.
         for f in findings {
-            if state_mutated && f.missing_guard == GuardKind::TxLock {
-                drop(guard);
-                guard = spawn_sandboxed_server(
-                    project_root,
-                    boot_cmd,
-                    port,
-                    allow_unsafe_host_fallback,
-                )
-                .await?;
-            }
+            let guard =
+                spawn_sandboxed_server(project_root, boot_cmd, port, allow_unsafe_host_fallback)
+                    .await?;
+            used_bwrap = guard.isolated_bwrap;
             let res = verify_finding(port, f, concurrency).await?;
-            if f.missing_guard == GuardKind::TxLock {
-                state_mutated = true;
-            }
+            drop(guard);
             results.push(res);
         }
-        drop(guard);
+
         Ok((used_bwrap, results))
     })
 }

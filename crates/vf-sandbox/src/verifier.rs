@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::Notify;
+use tokio::sync::watch;
 use tokio::time::timeout;
 use vf_graph::{GuardKind, LatticeFinding};
 
@@ -66,12 +66,51 @@ fn parse_content_length(headers: &str) -> Option<usize> {
     None
 }
 
-/// Reads an HTTP response with strict timeout and 256 KiB cap, stopping immediately once
-/// `Content-Length` bytes are received so keep-open connections never hang.
+fn is_chunked_encoding(headers: &str) -> bool {
+    for line in headers.lines() {
+        if let Some((k, v)) = line.split_once(':')
+            && k.trim().eq_ignore_ascii_case("transfer-encoding")
+            && v.to_ascii_lowercase().contains("chunked")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn decode_chunked_body(raw_body: &str) -> String {
+    let mut out = String::with_capacity(raw_body.len());
+    let mut rest = raw_body;
+    while let Some((size_line, after_size)) = rest.split_once("\r\n") {
+        let hex_part = size_line.split(';').next().unwrap_or("").trim();
+        let Ok(chunk_len) = usize::from_str_radix(hex_part, 16) else {
+            break;
+        };
+        if chunk_len == 0 {
+            break;
+        }
+        if after_size.len() < chunk_len {
+            out.push_str(after_size);
+            break;
+        }
+        out.push_str(&after_size[..chunk_len]);
+        rest = &after_size[chunk_len..];
+        rest = rest.strip_prefix("\r\n").unwrap_or(rest);
+    }
+    if out.is_empty() {
+        raw_body.to_string()
+    } else {
+        out
+    }
+}
+
+/// Reads an HTTP response with strict timeout and 256 KiB cap, decoding `Transfer-Encoding: chunked`
+/// and stopping immediately once `Content-Length` or `0\r\n\r\n` arrives.
 async fn read_http_bounded(stream: &mut TcpStream) -> Result<(u16, String)> {
     let mut buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; 4096];
     let mut expected_total: Option<usize> = None;
+    let mut chunked = false;
 
     let res = timeout(IO_TIMEOUT, async {
         loop {
@@ -81,14 +120,22 @@ async fn read_http_bounded(stream: &mut TcpStream) -> Result<(u16, String)> {
             }
             let take = n.min(MAX_HTTP_BODY_BYTES.saturating_sub(buf.len()));
             buf.extend_from_slice(&tmp[..take]);
-            if expected_total.is_none() {
-                let s = String::from_utf8_lossy(&buf);
-                if let Some(hdr_end) = s.find("\r\n\r\n") {
-                    let hdrs = &s[..hdr_end];
-                    if let Some(cl) = parse_content_length(hdrs) {
-                        expected_total = Some(hdr_end + 4 + cl.min(MAX_HTTP_BODY_BYTES));
-                    }
+            let s = String::from_utf8_lossy(&buf);
+            if expected_total.is_none()
+                && !chunked
+                && let Some(hdr_end) = s.find("\r\n\r\n")
+            {
+                let hdrs = &s[..hdr_end];
+                chunked = is_chunked_encoding(hdrs);
+                if !chunked && let Some(cl) = parse_content_length(hdrs) {
+                    expected_total = Some(hdr_end + 4 + cl.min(MAX_HTTP_BODY_BYTES));
                 }
+            }
+            if chunked
+                && let Some(hdr_end) = s.find("\r\n\r\n")
+                && s[hdr_end + 4..].contains("0\r\n\r\n")
+            {
+                break;
             }
             if let Some(tot) = expected_total
                 && buf.len() >= tot
@@ -105,11 +152,16 @@ async fn read_http_bounded(stream: &mut TcpStream) -> Result<(u16, String)> {
 
     let raw = String::from_utf8_lossy(&buf).to_string();
     let status = extract_http_status(&raw);
-    let (_, body) = split_headers_and_body(&raw);
+    let (hdrs, body) = split_headers_and_body(&raw);
+    let decoded = if is_chunked_encoding(hdrs) {
+        decode_chunked_body(body)
+    } else {
+        body.to_string()
+    };
     if res.is_err() && status == 0 {
         anyhow::bail!("Timed out reading HTTP response");
     }
-    Ok((status, body.trim().to_string()))
+    Ok((status, decoded.trim().to_string()))
 }
 
 fn is_failure_envelope(status: u16, body: &str) -> bool {
@@ -218,14 +270,14 @@ pub async fn verify_concurrency_invariant(
 
     let ready_count = Arc::new(AtomicUsize::new(0));
     let failed_count = Arc::new(AtomicUsize::new(0));
-    let go_notify = Arc::new(Notify::new());
+    let (go_tx, go_rx) = watch::channel(false);
     let mut handles = Vec::with_capacity(concurrency);
 
     for _ in 0..concurrency {
         let pfx = Arc::clone(&prefix);
         let ready = Arc::clone(&ready_count);
         let failed = Arc::clone(&failed_count);
-        let go = Arc::clone(&go_notify);
+        let mut rx = go_rx.clone();
         handles.push(tokio::spawn(async move {
             let conn = timeout(
                 Duration::from_secs(2),
@@ -236,7 +288,6 @@ pub async fn verify_concurrency_invariant(
                 Ok(Ok(s)) => s,
                 _ => {
                     failed.fetch_add(1, Ordering::SeqCst);
-                    go.notify_waiters();
                     return None;
                 }
             };
@@ -247,13 +298,11 @@ pub async fn verify_concurrency_invariant(
                 || stream.flush().await.is_err()
             {
                 failed.fetch_add(1, Ordering::SeqCst);
-                go.notify_waiters();
                 return None;
             }
 
-            let notified = go.notified();
             ready.fetch_add(1, Ordering::SeqCst);
-            let _ = timeout(Duration::from_secs(2), notified).await;
+            let _ = timeout(Duration::from_secs(2), rx.wait_for(|&v| v)).await;
 
             if failed.load(Ordering::SeqCst) > 0 {
                 return None;
@@ -279,9 +328,9 @@ pub async fn verify_concurrency_invariant(
             failed_count.fetch_add(1, Ordering::SeqCst);
             break;
         }
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        tokio::time::sleep(Duration::from_millis(2)).await;
     }
-    go_notify.notify_waiters();
+    let _ = go_tx.send(true);
 
     let mut valid_2xx = 0usize;
     let mut blocked = 0usize;
@@ -390,5 +439,33 @@ mod tests {
             .unwrap();
         assert_eq!(code, 200);
         assert_eq!(body, "ok");
+    }
+
+    #[tokio::test]
+    async fn test_chunked_failure_envelope_is_decoded_and_not_false_proven() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut req = [0u8; 512];
+                let _ = sock.read(&mut req).await;
+                let payload = r#"{"ok":false,"error":"rejected"}"#;
+                let chunked = format!(
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+                    payload.len(),
+                    payload
+                );
+                let _ = sock.write_all(chunked.as_bytes()).await;
+            }
+        });
+
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        stream
+            .write_all(b"POST /test HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .await
+            .unwrap();
+        let (code, body) = read_http_bounded(&mut stream).await.unwrap();
+        assert_eq!(code, 200);
+        assert!(is_failure_envelope(code, &body));
     }
 }

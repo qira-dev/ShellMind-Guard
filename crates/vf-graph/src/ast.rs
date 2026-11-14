@@ -246,7 +246,7 @@ fn extract_node(
 ) {
     let kind = node.kind();
 
-    // 1a. Cross-file imports & re-exports (TS/JS)
+    // 1a. Cross-file imports & re-exports (TS/JS: named, default, namespace `* as`)
     if kind == "import_statement" || kind == "export_statement" {
         let txt = node_text(node, src);
         if let Some(spec_node) = node.child_by_field_name("source") {
@@ -261,6 +261,69 @@ fn extract_node(
                         });
                     }
                 }
+            }
+            // Also extract default import (`import foo from './y'`) or namespace (`import * as ns from './y'`)
+            if let Some(clause) = txt
+                .strip_prefix("import ")
+                .and_then(|s| s.split(" from ").next())
+            {
+                let before_brace = clause
+                    .split('{')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .trim_end_matches(',');
+                if let Some((_, ns)) = before_brace.split_once("* as ") {
+                    let sym = ns.trim();
+                    if !sym.is_empty() {
+                        imports.push(ImportRef {
+                            symbol_name: sym.to_string(),
+                            from_specifier: spec.to_string(),
+                        });
+                    }
+                } else if !before_brace.is_empty() && !before_brace.contains('*') {
+                    imports.push(ImportRef {
+                        symbol_name: before_brace.to_string(),
+                        from_specifier: spec.to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    // 1a-cjs. CommonJS `const { a, b } = require('./y')` or `const mod = require('./y')`
+    if (lang == Language::TypeScript || lang == Language::JavaScript)
+        && kind == "variable_declarator"
+        && let (Some(name_node), Some(val_node)) = (
+            node.child_by_field_name("name"),
+            node.child_by_field_name("value"),
+        )
+        && val_node.kind() == "call_expression"
+        && let Some(fn_node) = val_node.child_by_field_name("function")
+        && node_text(fn_node, src).trim() == "require"
+        && let Some(args) = val_node.child_by_field_name("arguments")
+    {
+        let args_txt = node_text(args, src);
+        let spec = args_txt.trim_matches(|c: char| {
+            c == '(' || c == ')' || c == '\'' || c == '"' || c.is_whitespace()
+        });
+        if !spec.is_empty() {
+            let ntxt = node_text(name_node, src).trim();
+            if let (Some(lbrace), Some(rbrace)) = (ntxt.find('{'), ntxt.find('}')) {
+                for item in ntxt[lbrace + 1..rbrace].split(',') {
+                    let sym = item.split(':').next().unwrap_or(item).trim();
+                    if !sym.is_empty() {
+                        imports.push(ImportRef {
+                            symbol_name: sym.to_string(),
+                            from_specifier: spec.to_string(),
+                        });
+                    }
+                }
+            } else if !ntxt.is_empty() {
+                imports.push(ImportRef {
+                    symbol_name: ntxt.to_string(),
+                    from_specifier: spec.to_string(),
+                });
             }
         }
     }
@@ -498,10 +561,40 @@ pub fn resolve_import_target(
 ) -> Option<String> {
     // 1. Rust `rust::crate/...` or `rust::super/...`
     if let Some(rs_spec) = spec.strip_prefix("rust::") {
-        let cleaned = rs_spec
-            .strip_prefix("crate/")
-            .or_else(|| rs_spec.strip_prefix("super/"))
-            .unwrap_or(rs_spec);
+        if let Some(mut rest) = rs_spec.strip_prefix("super") {
+            let mut dir = Path::new(from_file).parent()?;
+            // If `from_file` is `src/services/account.rs` (not `mod.rs`), `super::` refers to `src/services/`
+            if !from_file.ends_with("mod.rs")
+                && !from_file.ends_with("lib.rs")
+                && !from_file.ends_with("main.rs")
+            {
+                // `super` in `src/services/account.rs` is `src/services`, and each extra `super/` walks up
+                rest = rest.strip_prefix('/').unwrap_or(rest);
+            } else if let Some(p) = dir.parent() {
+                dir = p;
+                rest = rest.strip_prefix('/').unwrap_or(rest);
+            }
+            while let Some(after) = rest.strip_prefix("super/") {
+                if let Some(p) = dir.parent() {
+                    dir = p;
+                }
+                rest = after;
+            }
+            let base = if rest.is_empty() {
+                dir.to_string_lossy().to_string()
+            } else {
+                dir.join(rest).to_string_lossy().replace('\\', "/")
+            };
+            for ext in [".rs", "/mod.rs"] {
+                let cand = format!("{}{}", base, ext);
+                if known_files.contains(&cand) {
+                    return Some(cand);
+                }
+            }
+            return None;
+        }
+
+        let cleaned = rs_spec.strip_prefix("crate/").unwrap_or(rs_spec);
         for prefix in ["src/", ""] {
             for ext in [".rs", "/mod.rs"] {
                 let cand = format!("{}{}{}", prefix, cleaned, ext);
@@ -513,12 +606,33 @@ pub fn resolve_import_target(
         return None;
     }
 
-    // 2. Python `py::...`
+    // 2. Python `py::...` (handles relative `.db`, `..pkg.db` relative to `from_file`)
     if let Some(py_spec) = spec.strip_prefix("py::") {
-        let cleaned = py_spec.trim_start_matches('.').replace('.', "/");
+        let dot_count = py_spec.chars().take_while(|&c| c == '.').count();
+        let mod_tail = py_spec[dot_count..].replace('.', "/");
+        if dot_count > 0 {
+            let mut dir = Path::new(from_file).parent()?;
+            for _ in 1..dot_count {
+                if let Some(p) = dir.parent() {
+                    dir = p;
+                }
+            }
+            let base = if mod_tail.is_empty() {
+                dir.to_string_lossy().to_string()
+            } else {
+                dir.join(&mod_tail).to_string_lossy().replace('\\', "/")
+            };
+            for ext in [".py", "/__init__.py"] {
+                let cand = format!("{}{}", base, ext);
+                if known_files.contains(&cand) {
+                    return Some(cand);
+                }
+            }
+            return None;
+        }
         for prefix in ["src/", "app/", ""] {
             for ext in [".py", "/__init__.py"] {
-                let cand = format!("{}{}{}", prefix, cleaned, ext);
+                let cand = format!("{}{}{}", prefix, mod_tail, ext);
                 if known_files.contains(&cand) {
                     return Some(cand);
                 }
@@ -583,10 +697,13 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_aliases_and_rust_modules() {
+    fn test_resolve_aliases_and_rust_python_relative_modules() {
         let mut known = HashSet::new();
         known.insert("src/services/ledger.ts".to_string());
+        known.insert("src/services/helper.rs".to_string());
         known.insert("src/db/queries.rs".to_string());
+        known.insert("src/py_pkg/db.py".to_string());
+        known.insert("app/db.py".to_string());
 
         assert_eq!(
             resolve_import_target("src/routes/checkout.ts", "@/services/ledger", &known),
@@ -595,6 +712,14 @@ mod tests {
         assert_eq!(
             resolve_import_target("src/main.rs", "rust::crate/db/queries", &known),
             Some("src/db/queries.rs".to_string())
+        );
+        assert_eq!(
+            resolve_import_target("src/services/account.rs", "rust::super/helper", &known),
+            Some("src/services/helper.rs".to_string())
+        );
+        assert_eq!(
+            resolve_import_target("src/py_pkg/app.py", "py::.db", &known),
+            Some("src/py_pkg/db.py".to_string())
         );
     }
 }
