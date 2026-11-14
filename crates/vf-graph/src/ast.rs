@@ -97,12 +97,14 @@ pub fn parse_file_ast_with_hash(
     let mut imports = Vec::new();
     let mut symbols = Vec::new();
 
+    let mut file_middleware_guards = HashSet::new();
     extract_node(
         root,
         src_bytes,
         &file.rel_path,
         file.language,
         cfg,
+        &mut file_middleware_guards,
         &mut imports,
         &mut symbols,
     );
@@ -161,6 +163,20 @@ fn strip_comments(src: &str) -> String {
     out
 }
 
+fn is_auth_guard_ident(name: &str, cfg: &VeriForgeConfig) -> bool {
+    let low = name.to_ascii_lowercase();
+    cfg.guards.auth_guards.iter().any(|pat| {
+        low == pat.to_ascii_lowercase() || low.ends_with(&format!(".{}", pat.to_ascii_lowercase()))
+    })
+}
+
+fn is_lock_guard_ident(name: &str, cfg: &VeriForgeConfig) -> bool {
+    let low = name.to_ascii_lowercase();
+    cfg.guards.lock_guards.iter().any(|pat| {
+        low == pat.to_ascii_lowercase() || low.ends_with(&format!(".{}", pat.to_ascii_lowercase()))
+    })
+}
+
 fn classify_guards(text: &str, cfg: &VeriForgeConfig) -> HashSet<GuardKind> {
     let mut g = HashSet::new();
     let code_only = strip_comments(text);
@@ -182,6 +198,108 @@ fn classify_guards(text: &str, cfg: &VeriForgeConfig) -> HashSet<GuardKind> {
         g.insert(GuardKind::TxLock);
     }
     g
+}
+
+fn collect_call_names_shallow(node: Node, src: &[u8], out: &mut Vec<String>) {
+    let k = node.kind();
+    if matches!(
+        k,
+        "if_statement"
+            | "switch_statement"
+            | "function_declaration"
+            | "arrow_function"
+            | "function_expression"
+    ) {
+        return;
+    }
+    if (k == "call_expression" || k == "call")
+        && let Some(func) = node.child_by_field_name("function")
+    {
+        let txt = node_text(func, src).trim();
+        let short = txt.rsplit('.').next().unwrap_or(txt);
+        let short = short.rsplit("::").next().unwrap_or(short);
+        if !short.is_empty() {
+            out.push(short.to_string());
+        }
+    }
+    let mut c = node.walk();
+    for ch in node.children(&mut c) {
+        collect_call_names_shallow(ch, src, out);
+    }
+}
+
+fn stmt_has_sink_or_mutation(stmt: Node, src: &[u8]) -> bool {
+    let txt = strip_comments(node_text(stmt, src)).to_ascii_lowercase();
+    txt.contains("stripe.")
+        || txt.contains("charges.create")
+        || txt.contains("paymentintent")
+        || txt.contains("update ")
+        || txt.contains("insert into ")
+        || txt.contains("delete from ")
+        || txt.contains("debit")
+        || txt.contains("withdraw")
+        || txt.contains("balance")
+}
+
+/// Control-flow & statement-order aware guard extractor (B02):
+/// - Ignores guards inside string literals, comments, `if` branches, or uncalled nested functions.
+/// - Requires unconditional guard call to execute BEFORE the first mutation/sink statement
+///   (or wrap it via `withTransaction(...)`).
+fn classify_fn_guards_cfg(fn_node: Node, src: &[u8], cfg: &VeriForgeConfig) -> HashSet<GuardKind> {
+    let mut guards = HashSet::new();
+    let Some(body) = fn_node.child_by_field_name("body") else {
+        return guards;
+    };
+
+    let mut seen_mutation = false;
+    let mut cursor = body.walk();
+    for stmt in body.children(&mut cursor) {
+        let sk = stmt.kind();
+        if matches!(sk, "{" | "}" | "comment" | "line_comment" | "block_comment") {
+            continue;
+        }
+        // Skip conditional branches & uncalled nested functions for unconditional guard proof
+        if matches!(
+            sk,
+            "if_statement"
+                | "switch_statement"
+                | "for_statement"
+                | "while_statement"
+                | "function_declaration"
+                | "function_item"
+                | "function_definition"
+        ) {
+            if stmt_has_sink_or_mutation(stmt, src) {
+                seen_mutation = true;
+            }
+            continue;
+        }
+
+        // Check wrapper transaction like `return withTransaction(async () => { ... })`
+        let mut calls = Vec::new();
+        collect_call_names_shallow(stmt, src, &mut calls);
+
+        for c in &calls {
+            if !seen_mutation && is_auth_guard_ident(c, cfg) {
+                guards.insert(GuardKind::Auth);
+            }
+            if !seen_mutation && is_lock_guard_ident(c, cfg) {
+                guards.insert(GuardKind::TxLock);
+            }
+        }
+
+        // Also allow SQL-level `SELECT ... FOR UPDATE` inside an unconditional top-level statement before mutation
+        let stmt_code = strip_comments(node_text(stmt, src)).to_ascii_lowercase();
+        if !seen_mutation && stmt_code.contains("select ") && stmt_code.contains("for update") {
+            guards.insert(GuardKind::TxLock);
+        }
+
+        if stmt_has_sink_or_mutation(stmt, src) {
+            seen_mutation = true;
+        }
+    }
+
+    guards
 }
 
 fn classify_sink(name: &str, body: &str) -> Option<SinkKind> {
@@ -235,12 +353,14 @@ fn collect_calls(node: Node, src: &[u8], calls: &mut Vec<String>) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn extract_node(
     node: Node,
     src: &[u8],
     rel_path: &str,
     lang: Language,
     cfg: &VeriForgeConfig,
+    file_middleware_guards: &mut HashSet<GuardKind>,
     imports: &mut Vec<ImportRef>,
     symbols: &mut Vec<SymbolInfo>,
 ) {
@@ -375,7 +495,26 @@ fn extract_node(
         }
     }
 
-    // 2a. Express / Router HTTP Route entries (TS/JS): app.post('/path', ...handlers)
+    // 2a-use. File-level `app.use(requireAuth)` / `router.use(requireAuth)` (B03)
+    if (lang == Language::TypeScript || lang == Language::JavaScript)
+        && kind == "call_expression"
+        && let Some(func) = node.child_by_field_name("function")
+    {
+        let ftxt = node_text(func, src);
+        if (ftxt == "app.use" || ftxt == "router.use")
+            && let Some(args) = node.child_by_field_name("arguments")
+        {
+            let mut c = args.walk();
+            for arg in args.children(&mut c) {
+                let atxt = node_text(arg, src).trim();
+                if is_auth_guard_ident(atxt, cfg) {
+                    file_middleware_guards.insert(GuardKind::Auth);
+                }
+            }
+        }
+    }
+
+    // 2a. Express / Router HTTP Route entries (TS/JS): app.post('/path', ...middlewares, handler)
     if (lang == Language::TypeScript || lang == Language::JavaScript)
         && kind == "call_expression"
         && let Some(func) = node.child_by_field_name("function")
@@ -385,26 +524,70 @@ fn extract_node(
         if matches!(method, "get" | "post" | "put" | "patch" | "delete")
             && (ftxt.starts_with("app.") || ftxt.starts_with("router.") || ftxt.contains("Router"))
         {
-            let full_txt = node_text(node, src);
             let mut route_path = None;
             let mut calls = Vec::new();
+            let mut guards = file_middleware_guards.clone();
+            let mut seen_handler = false;
+            let line_start = node.start_position().row + 1;
+            let line_end = node.end_position().row + 1;
+
             if let Some(args) = node.child_by_field_name("arguments") {
                 let mut c = args.walk();
                 for arg in args.children(&mut c) {
+                    let ak = arg.kind();
+                    if matches!(ak, "(" | ")" | ",") {
+                        continue;
+                    }
                     let atxt = node_text(arg, src).trim();
                     if (atxt.starts_with('\'') || atxt.starts_with('"')) && route_path.is_none() {
                         route_path =
                             Some(atxt.trim_matches(|ch| ch == '\'' || ch == '"').to_string());
-                    } else if arg.kind() == "identifier" {
+                    } else if ak == "identifier" {
+                        if !seen_handler && is_auth_guard_ident(atxt, cfg) {
+                            guards.insert(GuardKind::Auth);
+                        } else if !seen_handler && is_lock_guard_ident(atxt, cfg) {
+                            guards.insert(GuardKind::TxLock);
+                        } else {
+                            seen_handler = true;
+                        }
                         calls.push(atxt.to_string());
+                    } else if matches!(ak, "arrow_function" | "function_expression") {
+                        seen_handler = true;
+                        let inline_body = node_text(arg, src);
+                        let inline_guards = classify_fn_guards_cfg(arg, src, cfg);
+                        guards.extend(inline_guards);
+                        collect_calls(arg, src, &mut calls);
+
+                        // B07: Detect inline route mutation sinks directly inside callback
+                        if let Some(sk) =
+                            classify_sink(route_path.as_deref().unwrap_or("inline"), inline_body)
+                        {
+                            let inline_id = format!("{}::inline_sink:{}", rel_path, line_start);
+                            let inline_name = format!("inline_sink_{}", line_start);
+                            let mut inline_calls = Vec::new();
+                            collect_calls(arg, src, &mut inline_calls);
+                            symbols.push(SymbolInfo {
+                                id: inline_id,
+                                rel_path: rel_path.to_string(),
+                                name: inline_name.clone(),
+                                kind: SymbolKind::Sink,
+                                sink_kind: Some(sk),
+                                line_start: arg.start_position().row + 1,
+                                line_end: arg.end_position().row + 1,
+                                guards: classify_fn_guards_cfg(arg, src, cfg),
+                                calls: inline_calls,
+                                route_path: None,
+                            });
+                            calls.push(inline_name);
+                        }
                     } else {
+                        if !seen_handler && is_auth_guard_ident(atxt, cfg) {
+                            guards.insert(GuardKind::Auth);
+                        }
                         collect_calls(arg, src, &mut calls);
                     }
                 }
             }
-            let guards = classify_guards(full_txt, cfg);
-            let line_start = node.start_position().row + 1;
-            let line_end = node.end_position().row + 1;
             let r_label = format!(
                 "{} {}",
                 method.to_ascii_uppercase(),
@@ -422,6 +605,70 @@ fn extract_node(
                 calls,
                 route_path,
             });
+            return;
+        }
+    }
+
+    // 2c. Python Flask / FastAPI `@app.post("/api/...")` decorated_definition (B06)
+    if lang == Language::Python && kind == "decorated_definition" {
+        let mut route_method = None;
+        let mut route_path = None;
+        let mut dec_guards = HashSet::new();
+        let mut fn_node = None;
+
+        let mut c = node.walk();
+        for ch in node.children(&mut c) {
+            if ch.kind() == "decorator" {
+                let dtxt = node_text(ch, src);
+                for m in ["get", "post", "put", "patch", "delete"] {
+                    let needle = format!(".{}(", m);
+                    if let Some(pos) = dtxt.find(&needle) {
+                        route_method = Some(m.to_ascii_uppercase());
+                        let rest = &dtxt[pos + needle.len()..];
+                        if let Some(q1) = rest.find(['\'', '"']) {
+                            let qch = rest.as_bytes()[q1] as char;
+                            if let Some(q2) = rest[q1 + 1..].find(qch) {
+                                route_path = Some(rest[q1 + 1..q1 + 1 + q2].to_string());
+                            }
+                        }
+                    }
+                }
+                dec_guards.extend(classify_guards(dtxt, cfg));
+            } else if ch.kind() == "function_definition" {
+                fn_node = Some(ch);
+            }
+        }
+
+        if let (Some(method), Some(rp), Some(fnode)) = (route_method, route_path, fn_node)
+            && let Some(name_node) = fnode.child_by_field_name("name")
+        {
+            let fn_name = node_text(name_node, src).trim().to_string();
+            let line_start = node.start_position().row + 1;
+            let line_end = fnode.end_position().row + 1;
+            symbols.push(SymbolInfo {
+                id: format!("{}::route:{}", rel_path, line_start),
+                rel_path: rel_path.to_string(),
+                name: format!("{} {}", method, rp),
+                kind: SymbolKind::Route,
+                sink_kind: None,
+                line_start,
+                line_end,
+                guards: dec_guards,
+                calls: vec![fn_name],
+                route_path: Some(rp),
+            });
+            // Continue into `fnode` to emit the Function / Sink symbol itself
+            extract_node(
+                fnode,
+                src,
+                rel_path,
+                lang,
+                cfg,
+                file_middleware_guards,
+                imports,
+                symbols,
+            );
+            return;
         }
     }
 
@@ -493,7 +740,7 @@ fn extract_node(
         let body = node_text(node, src);
         let mut calls = Vec::new();
         collect_calls(node, src, &mut calls);
-        let guards = classify_guards(body, cfg);
+        let guards = classify_fn_guards_cfg(node, src, cfg);
         let sink_kind = classify_sink(&name, body);
         let sym_kind = if sink_kind.is_some() {
             SymbolKind::Sink
@@ -526,7 +773,7 @@ fn extract_node(
         let body = node_text(val_node, src);
         let mut calls = Vec::new();
         collect_calls(val_node, src, &mut calls);
-        let guards = classify_guards(body, cfg);
+        let guards = classify_fn_guards_cfg(val_node, src, cfg);
         let sink_kind = classify_sink(&name, body);
         let sym_kind = if sink_kind.is_some() {
             SymbolKind::Sink
@@ -550,7 +797,16 @@ fn extract_node(
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        extract_node(child, src, rel_path, lang, cfg, imports, symbols);
+        extract_node(
+            child,
+            src,
+            rel_path,
+            lang,
+            cfg,
+            file_middleware_guards,
+            imports,
+            symbols,
+        );
     }
 }
 
@@ -720,6 +976,126 @@ mod tests {
         assert_eq!(
             resolve_import_target("src/py_pkg/app.py", "py::.db", &known),
             Some("src/py_pkg/db.py".to_string())
+        );
+    }
+
+    fn parse_inline_ts(code: &str) -> FileAstSummary {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+            .unwrap();
+        let tree = parser.parse(code, None).unwrap();
+        let cfg = VeriForgeConfig::default();
+        let mut mw = HashSet::new();
+        let mut imports = Vec::new();
+        let mut symbols = Vec::new();
+        extract_node(
+            tree.root_node(),
+            code.as_bytes(),
+            "test.ts",
+            Language::TypeScript,
+            &cfg,
+            &mut mw,
+            &mut imports,
+            &mut symbols,
+        );
+        FileAstSummary {
+            rel_path: "test.ts".into(),
+            imports,
+            symbols,
+        }
+    }
+
+    #[test]
+    fn test_b02_guard_after_write_and_branch_only_do_not_protect() {
+        let code = r#"
+            function debitLateAuth(amount: number) {
+                balance -= amount;
+                requireAuth();
+            }
+            function debitBranchLock(cond: boolean, amount: number) {
+                if (cond) { withTransaction(); }
+                balance -= amount;
+            }
+            function debitStringFake(amount: number) {
+                const label = "requireAuth FOR UPDATE";
+                balance -= amount;
+            }
+        "#;
+        let ast = parse_inline_ts(code);
+        for sym in &ast.symbols {
+            assert!(
+                !sym.guards.contains(&GuardKind::Auth),
+                "{} must NOT have Auth guard",
+                sym.name
+            );
+            assert!(
+                !sym.guards.contains(&GuardKind::TxLock),
+                "{} must NOT have TxLock guard",
+                sym.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_b03_middleware_order_and_b07_inline_route_sink() {
+        let code = r#"
+            app.post('/api/late-mw', handler, requireAuth);
+            app.post('/api/inline-pay', async (req, res) => {
+                await stripe.charges.create({ amount: req.body.amount });
+            });
+        "#;
+        let ast = parse_inline_ts(code);
+        let late = ast
+            .symbols
+            .iter()
+            .find(|s| s.name == "POST /api/late-mw")
+            .unwrap();
+        assert!(!late.guards.contains(&GuardKind::Auth));
+
+        let inline_sink = ast
+            .symbols
+            .iter()
+            .find(|s| s.kind == SymbolKind::Sink && s.sink_kind == Some(SinkKind::PaymentMutation))
+            .expect("inline route sink must be extracted");
+        assert!(!inline_sink.guards.contains(&GuardKind::Auth));
+    }
+
+    #[test]
+    fn test_b06_python_fastapi_route_discovery() {
+        let py_code = r#"
+@app.post("/api/v1/py/withdraw")
+def withdraw(amount: int):
+    balance -= amount
+"#;
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(py_code, None).unwrap();
+        let cfg = VeriForgeConfig::default();
+        let mut mw = HashSet::new();
+        let mut imports = Vec::new();
+        let mut symbols = Vec::new();
+        extract_node(
+            tree.root_node(),
+            py_code.as_bytes(),
+            "app.py",
+            Language::Python,
+            &cfg,
+            &mut mw,
+            &mut imports,
+            &mut symbols,
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Route && s.name == "POST /api/v1/py/withdraw")
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Sink && s.name == "withdraw")
         );
     }
 }
