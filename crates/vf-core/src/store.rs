@@ -314,6 +314,7 @@ mod tests {
             blake3_hash: "abc123".into(),
             mtime_ns: 1,
             size_bytes: 10,
+            cached_bytes: None,
         };
         let (d1, c1) = store.sync_files(std::slice::from_ref(&f1)).unwrap();
         assert_eq!(d1.added_or_modified, 1);

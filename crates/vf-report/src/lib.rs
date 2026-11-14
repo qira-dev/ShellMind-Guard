@@ -49,7 +49,14 @@ pub fn to_sarif_json(findings: &[LatticeFinding], verified: &[VerifiedFinding]) 
                 .collect();
 
             let msg = match v_opt {
+                Some(v) if !f.remediation.is_empty() => format!(
+                    "[{}] {} — {} | Fix: {}",
+                    status_tag, f.title, v.evidence, f.remediation
+                ),
                 Some(v) => format!("[{}] {} — {}", status_tag, f.title, v.evidence),
+                None if !f.remediation.is_empty() => {
+                    format!("[{}] {} | Fix: {}", status_tag, f.title, f.remediation)
+                }
                 None => format!("[{}] {}", status_tag, f.title),
             };
 

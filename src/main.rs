@@ -1,18 +1,44 @@
+mod mcp;
+
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 use vf_ai::build_minimal_patch_prompt;
-use vf_core::{StateStore, VeriForgeConfig, scan_repository};
-use vf_graph::{LatticeFinding, analyze_codebase_cached};
+use vf_core::{DeltaStats, StateStore, VeriForgeConfig, scan_repository};
+use vf_graph::{GraphAnalysisResult, GuardKind, LatticeFinding, analyze_codebase_cached};
 use vf_report::{to_html_graph, to_sarif_json};
 use vf_sandbox::{
     VerificationStatus, VerifiedFinding, verify_finding_blocking, verify_findings_in_sandbox,
 };
 use vf_tui::{TuiLaunchConfig, run_tui};
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum OutputFormat {
+    #[default]
+    Text,
+    Json,
+    Sarif,
+}
+
+pub(crate) struct ScanRunOptions<'a> {
+    pub path: &'a Path,
+    pub layers: &'a [String],
+    pub boot_cmd: Option<String>,
+    pub port: u16,
+    pub sync_race: usize,
+    pub unsafe_host_fallback: bool,
+}
+
+pub(crate) struct ScanOutcome {
+    pub elapsed_ms: u128,
+    pub delta: DeltaStats,
+    pub graph: GraphAnalysisResult,
+    pub sandbox: Option<(bool, Vec<VerifiedFinding>)>,
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -27,10 +53,12 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Initialize `.veriforge.toml` by auto-detecting languages & frameworks
+    /// Initialize `.veriforge.toml` (and optionally `.github/workflows/veriforge.yml`)
     Init {
         #[arg(default_value = ".")]
         path: PathBuf,
+        #[arg(long)]
+        ci: bool,
     },
     /// Index a repository using parallel ignore walker, BLAKE3 hashing, and SQLite WAL delta cache
     Index {
@@ -39,17 +67,25 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Scan a repository using Two-Phase AST cache & Guard-Set Lattice (with optional sandbox, SARIF, HTML, patch & CI gate)
+    /// Scan a repository across all 6 VeriForge layers (with optional sandbox, SARIF, HTML, patch & CI gate)
     Scan {
         #[arg(default_value = ".")]
         path: PathBuf,
-        #[arg(long)]
+        #[arg(long, help = "Shorthand for --format json")]
         json: bool,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+        #[arg(
+            long,
+            value_delimiter = ',',
+            help = "Filter active layers (auth,race,taint,sqli,cmdi,path,ssrf,idor,secrets,config,deps,frontend)"
+        )]
+        layers: Vec<String>,
         #[arg(long)]
         boot_cmd: Option<String>,
         #[arg(long, default_value_t = 39911)]
         port: u16,
-        #[arg(long, default_value_t = 10)]
+        #[arg(long, default_value_t = 12)]
         sync_race: usize,
         #[arg(long)]
         sarif: Option<PathBuf>,
@@ -72,7 +108,7 @@ enum Commands {
         boot_cmd: Option<String>,
         #[arg(long, default_value_t = 39911)]
         port: u16,
-        #[arg(long, default_value_t = 10)]
+        #[arg(long, default_value_t = 12)]
         sync_race: usize,
         #[arg(long)]
         unsafe_host_fallback: bool,
@@ -87,19 +123,132 @@ enum Commands {
         boot_cmd: Option<String>,
         #[arg(long, default_value_t = 39911)]
         port: u16,
-        #[arg(long, default_value_t = 10)]
+        #[arg(long, default_value_t = 12)]
         sync_race: usize,
         #[arg(long)]
         unsafe_host_fallback: bool,
     },
+    /// Start stdio JSON-RPC 2.0 MCP server (exposes veriforge_scan, veriforge_explain_finding, veriforge_init)
+    Mcp,
     /// Internal probe executed inside `--unshare-net` Bubblewrap namespace
     #[command(name = "__probe-netns", hide = true)]
     ProbeNetns {
         #[arg(long)]
         port: u16,
-        #[arg(long, default_value_t = 10)]
+        #[arg(long, default_value_t = 12)]
         sync_race: usize,
     },
+}
+
+pub(crate) fn write_ci_workflow(root: &Path) -> Result<PathBuf> {
+    let wf_dir = root.join(".github").join("workflows");
+    fs::create_dir_all(&wf_dir)?;
+    let wf_path = wf_dir.join("veriforge.yml");
+    let content = r#"name: VeriForge Security Gate
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  veriforge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install VeriForge
+        run: cargo install --path . || cargo install --locked veriforge
+      - name: Run VeriForge 6-Layer Scan (SARIF)
+        run: veriforge scan . --format sarif --sarif veriforge.sarif --ci
+      - name: Upload SARIF to GitHub Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: veriforge.sarif
+"#;
+    fs::write(&wf_path, content)?;
+    Ok(wf_path)
+}
+
+fn finding_matches_layer(f: &LatticeFinding, layer: &str) -> bool {
+    match layer.trim().to_ascii_lowercase().as_str() {
+        "auth" => f.missing_guard == GuardKind::Auth,
+        "race" | "concurrency" => f.missing_guard == GuardKind::TxLock,
+        "taint" => matches!(
+            f.missing_guard,
+            GuardKind::SqlSanitizer
+                | GuardKind::CmdSanitizer
+                | GuardKind::PathSanitizer
+                | GuardKind::SsrfSanitizer
+        ),
+        "sqli" => f.missing_guard == GuardKind::SqlSanitizer,
+        "cmdi" => f.missing_guard == GuardKind::CmdSanitizer,
+        "path" => f.missing_guard == GuardKind::PathSanitizer,
+        "ssrf" => f.missing_guard == GuardKind::SsrfSanitizer,
+        "idor" => f.missing_guard == GuardKind::OwnershipCheck,
+        "secrets" | "secret" => f.missing_guard == GuardKind::SecretPolicy,
+        "config" | "misconfig" => f.missing_guard == GuardKind::ConfigPolicy,
+        "deps" | "dep" | "dependencies" => f.missing_guard == GuardKind::DependencyPolicy,
+        "frontend" | "fe" | "contract" => f.missing_guard == GuardKind::FrontendContract,
+        _ => true,
+    }
+}
+
+pub(crate) fn execute_scan_pipeline(opts: ScanRunOptions<'_>) -> Result<ScanOutcome> {
+    let t0 = Instant::now();
+    let cfg = VeriForgeConfig::load_from_dir(opts.path)?;
+    let summary = scan_repository(opts.path, &cfg)?;
+    let mut store = StateStore::open(opts.path)?;
+    let (delta, _) = store.sync_files(&summary.files)?;
+    let mut graph_res = analyze_codebase_cached(&summary.files, &cfg, &mut store)?;
+
+    if !opts.layers.is_empty() {
+        graph_res
+            .findings
+            .retain(|f| opts.layers.iter().any(|l| finding_matches_layer(f, l)));
+    }
+
+    let effective_boot = opts.boot_cmd.or_else(|| cfg.sandbox.boot_cmd.clone());
+    let sandbox_res = if let Some(cmd) = effective_boot {
+        if !graph_res.findings.is_empty() {
+            Some(verify_findings_in_sandbox(
+                opts.path,
+                &cmd,
+                opts.port,
+                &graph_res.findings,
+                opts.sync_race,
+                opts.unsafe_host_fallback,
+            )?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let verified_list: Vec<VerifiedFinding> = sandbox_res
+        .as_ref()
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+
+    persist_scan_findings(
+        &mut store,
+        delta.scan_id,
+        &graph_res.findings,
+        &verified_list,
+    )?;
+
+    Ok(ScanOutcome {
+        elapsed_ms: t0.elapsed().as_millis(),
+        delta,
+        graph: graph_res,
+        sandbox: sandbox_res,
+    })
 }
 
 fn persist_scan_findings(
@@ -178,18 +327,29 @@ fn resolve_finding_for_replay(
 
 fn main() -> Result<ExitCode> {
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
     let cli = Cli::parse();
     match cli.command {
-        Commands::Init { path } => {
+        Commands::Init { path, ci } => {
             let (detected, out_path) = VeriForgeConfig::detect_and_write_init(&path)?;
-            println!(
-                "VeriForge Init | Detected: {} | Wrote {}",
-                detected.join(", "),
-                out_path.display()
-            );
+            if ci {
+                let ci_path = write_ci_workflow(&path)?;
+                println!(
+                    "VeriForge Init | Detected: {} | Wrote {} and {}",
+                    detected.join(", "),
+                    out_path.display(),
+                    ci_path.display()
+                );
+            } else {
+                println!(
+                    "VeriForge Init | Detected: {} | Wrote {}",
+                    detected.join(", "),
+                    out_path.display()
+                );
+            }
         }
         Commands::Index { path, json } => {
             let cfg = VeriForgeConfig::load_from_dir(&path)?;
@@ -224,6 +384,8 @@ fn main() -> Result<ExitCode> {
         Commands::Scan {
             path,
             json,
+            format,
+            layers,
             boot_cmd,
             port,
             sync_race,
@@ -233,53 +395,36 @@ fn main() -> Result<ExitCode> {
             unsafe_host_fallback,
             ci,
         } => {
-            let t0 = Instant::now();
-            let cfg = VeriForgeConfig::load_from_dir(&path)?;
-            let summary = scan_repository(&path, &cfg)?;
-            let mut store = StateStore::open(&path)?;
-            let (delta, _) = store.sync_files(&summary.files)?;
-            let graph_res = analyze_codebase_cached(&summary.files, &cfg, &mut store)?;
-
-            let effective_boot = boot_cmd.or_else(|| cfg.sandbox.boot_cmd.clone());
-            let sandbox_res = if let Some(cmd) = effective_boot {
-                if !graph_res.findings.is_empty() {
-                    Some(verify_findings_in_sandbox(
-                        &path,
-                        &cmd,
-                        port,
-                        &graph_res.findings,
-                        sync_race,
-                        unsafe_host_fallback,
-                    )?)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            let verified_list: Vec<VerifiedFinding> = sandbox_res
+            let effective_format = if json { OutputFormat::Json } else { format };
+            let outcome = execute_scan_pipeline(ScanRunOptions {
+                path: &path,
+                layers: &layers,
+                boot_cmd,
+                port,
+                sync_race,
+                unsafe_host_fallback,
+            })?;
+            let verified_list: Vec<VerifiedFinding> = outcome
+                .sandbox
                 .as_ref()
                 .map(|(_, v)| v.clone())
                 .unwrap_or_default();
 
-            persist_scan_findings(
-                &mut store,
-                delta.scan_id,
-                &graph_res.findings,
-                &verified_list,
-            )?;
+            let sarif_payload = if sarif.is_some() || effective_format == OutputFormat::Sarif {
+                Some(to_sarif_json(&outcome.graph.findings, &verified_list))
+            } else {
+                None
+            };
 
-            if let Some(sarif_path) = sarif {
+            if let Some(ref sarif_path) = sarif
+                && let Some(ref payload) = sarif_payload
+            {
                 if let Some(parent) = sarif_path.parent()
                     && !parent.as_os_str().is_empty()
                 {
                     fs::create_dir_all(parent)?;
                 }
-                fs::write(
-                    &sarif_path,
-                    to_sarif_json(&graph_res.findings, &verified_list),
-                )?;
+                fs::write(sarif_path, payload)?;
             }
             if let Some(html_path) = html {
                 if let Some(parent) = html_path.parent()
@@ -289,86 +434,95 @@ fn main() -> Result<ExitCode> {
                 }
                 fs::write(
                     &html_path,
-                    to_html_graph(&path.display().to_string(), &graph_res, &verified_list),
+                    to_html_graph(&path.display().to_string(), &outcome.graph, &verified_list),
                 )?;
             }
 
-            let total_ms = t0.elapsed().as_millis();
-
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "ok": true,
-                        "elapsed_ms": total_ms,
-                        "delta": delta,
-                        "graph": graph_res,
-                        "sandbox_verification": sandbox_res.as_ref().map(|(bwrap, res)| serde_json::json!({
-                            "bwrap_isolated": bwrap,
-                            "results": res,
-                        })),
-                    }))?
-                );
-            } else {
-                println!(
-                    "VeriForge Scan | {} files ({} symbols, {} edges, {} routes) | {}ms (delta: +{} / {} cached)",
-                    graph_res.parsed_files,
-                    graph_res.symbol_count,
-                    graph_res.edge_count,
-                    graph_res.route_entries,
-                    total_ms,
-                    delta.added_or_modified,
-                    delta.unchanged_cached
-                );
-                if graph_res.findings.is_empty() {
-                    println!("  [OK] No unguarded entry-to-sink paths detected.");
-                } else {
+            match effective_format {
+                OutputFormat::Json => {
                     println!(
-                        "  [!] {} unguarded multi-file flow(s) detected:",
-                        graph_res.findings.len()
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "ok": true,
+                            "elapsed_ms": outcome.elapsed_ms,
+                            "delta": outcome.delta,
+                            "graph": outcome.graph,
+                            "sandbox_verification": outcome.sandbox.as_ref().map(|(bwrap, res)| serde_json::json!({
+                                "bwrap_isolated": bwrap,
+                                "results": res,
+                            })),
+                        }))?
                     );
-                    for f in &graph_res.findings {
+                }
+                OutputFormat::Sarif => {
+                    if let Some(payload) = sarif_payload {
+                        println!("{}", payload);
+                    }
+                }
+                OutputFormat::Text => {
+                    println!(
+                        "VeriForge Scan | {} files ({} symbols, {} edges, {} routes) | {}ms (delta: +{} / {} cached)",
+                        outcome.graph.parsed_files,
+                        outcome.graph.symbol_count,
+                        outcome.graph.edge_count,
+                        outcome.graph.route_entries,
+                        outcome.elapsed_ms,
+                        outcome.delta.added_or_modified,
+                        outcome.delta.unchanged_cached
+                    );
+                    if outcome.graph.findings.is_empty() {
+                        println!("  [OK] No security or logic issues detected.");
+                    } else {
                         println!(
-                            "\n  [{}] {} ({}) -> {}",
-                            f.severity, f.id, f.rule_id, f.title
+                            "  [!] {} finding(s) detected:",
+                            outcome.graph.findings.len()
                         );
-                        println!("      Entry: {}", f.entry_route);
-                        for (i, hop) in f.witness_path.iter().enumerate() {
+                        for f in &outcome.graph.findings {
                             println!(
-                                "      [{}] {}:{}  {}",
-                                i + 1,
-                                hop.file,
-                                hop.line,
-                                hop.symbol
+                                "\n  [{}] {} ({}) -> {}",
+                                f.severity, f.id, f.rule_id, f.title
+                            );
+                            println!("      Entry: {}", f.entry_route);
+                            for (i, hop) in f.witness_path.iter().enumerate() {
+                                println!(
+                                    "      [{}] {}:{}  {}",
+                                    i + 1,
+                                    hop.file,
+                                    hop.line,
+                                    hop.symbol
+                                );
+                            }
+                            if !f.remediation.is_empty() {
+                                println!("      Fix  : {}", f.remediation);
+                            }
+                        }
+                    }
+
+                    if let Some((bwrap, verified)) = &outcome.sandbox {
+                        println!(
+                            "\nVeriForge Sandbox Proof (bwrap={}):",
+                            if *bwrap { "isolated" } else { "local-loopback" }
+                        );
+                        for v in verified {
+                            let tag = match v.status {
+                                VerificationStatus::Proven => "PROVEN",
+                                VerificationStatus::Mitigated => "MITIGATED",
+                                VerificationStatus::SuspectUnverified => "SUSPECT",
+                            };
+                            println!(
+                                "  [{}] {} ({}) -> {}",
+                                tag, v.finding_id, v.rule_id, v.evidence
                             );
                         }
                     }
-                }
 
-                if let Some((bwrap, verified)) = &sandbox_res {
-                    println!(
-                        "\nVeriForge Sandbox Proof (bwrap={}):",
-                        if *bwrap { "isolated" } else { "local-loopback" }
-                    );
-                    for v in verified {
-                        let tag = match v.status {
-                            VerificationStatus::Proven => "PROVEN",
-                            VerificationStatus::Mitigated => "MITIGATED",
-                            VerificationStatus::SuspectUnverified => "SUSPECT",
-                        };
-                        println!(
-                            "  [{}] {} ({}) -> {}",
-                            tag, v.finding_id, v.rule_id, v.evidence
-                        );
-                    }
-                }
-
-                if patch {
-                    for f in &graph_res.findings {
-                        let v_opt = verified_list.iter().find(|v| v.finding_id == f.id);
-                        if let Ok(p) = build_minimal_patch_prompt(&path, f, v_opt) {
-                            println!("\n=== Minimal Patch Context ({} bytes) ===", p.len());
-                            println!("{}", p);
+                    if patch {
+                        for f in &outcome.graph.findings {
+                            let v_opt = verified_list.iter().find(|v| v.finding_id == f.id);
+                            if let Ok(p) = build_minimal_patch_prompt(&path, f, v_opt) {
+                                println!("\n=== Minimal Patch Context ({} bytes) ===", p.len());
+                                println!("{}", p);
+                            }
                         }
                     }
                 }
@@ -477,6 +631,9 @@ fn main() -> Result<ExitCode> {
                     unsafe_host_fallback,
                 },
             )?;
+        }
+        Commands::Mcp => {
+            mcp::run_stdio_server()?;
         }
         Commands::ProbeNetns { port, sync_race } => {
             let finding_json = std::env::var("VF_FINDING_JSON")?;

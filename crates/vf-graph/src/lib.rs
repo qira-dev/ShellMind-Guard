@@ -1,11 +1,17 @@
 pub mod ast;
+pub mod deps;
 pub mod lattice;
+pub mod secrets_config;
+pub mod taint;
 
 use anyhow::Result;
 use rayon::prelude::*;
 use vf_core::{IndexedFile, StateStore, VeriForgeConfig};
 
-pub use ast::{FileAstSummary, GuardKind, SinkKind, parse_file_ast, parse_file_ast_with_hash};
+pub use ast::{
+    FileAstSummary, FrontendApiCall, GuardKind, LocalStaticFinding, SinkKind, parse_file_ast,
+    parse_file_ast_with_hash,
+};
 pub use lattice::{
     GraphAnalysisResult, LatticeFinding, TraceHop, solve_guard_lattice,
     solve_guard_lattice_with_public,
@@ -42,7 +48,8 @@ pub fn analyze_codebase_cached(
     store: &mut StateStore,
 ) -> Result<GraphAnalysisResult> {
     let cfg_json = serde_json::to_string(&cfg.guards).unwrap_or_default();
-    let cfg_hash = blake3::hash(cfg_json.as_bytes()).to_hex().to_string();
+    let versioned_cfg = format!("v2-6layer|{}", cfg_json);
+    let cfg_hash = blake3::hash(versioned_cfg.as_bytes()).to_hex().to_string();
 
     let cached_map = store.load_ast_cache(&cfg_hash)?;
     let mut all_summaries: Vec<FileAstSummary> = Vec::with_capacity(files.len());

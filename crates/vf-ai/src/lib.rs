@@ -152,6 +152,7 @@ mod tests {
                 symbol: "POST /api/v1/checkout/withdraw".into(),
                 line: 8,
             }],
+            remediation: String::new(),
         };
 
         let disabled =

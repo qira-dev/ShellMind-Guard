@@ -16,6 +16,8 @@ pub enum Language {
     Python,
     Go,
     Sql,
+    Config,
+    Manifest,
 }
 
 impl Language {
@@ -27,10 +29,37 @@ impl Language {
             Language::Python => "python",
             Language::Go => "go",
             Language::Sql => "sql",
+            Language::Config => "config",
+            Language::Manifest => "manifest",
         }
     }
 
     pub fn from_path(path: &Path) -> Option<Self> {
+        let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if matches!(
+            fname,
+            "package.json"
+                | "package-lock.json"
+                | "Cargo.toml"
+                | "Cargo.lock"
+                | "go.mod"
+                | "requirements.txt"
+        ) {
+            return Some(Language::Manifest);
+        }
+        if fname == ".gitignore"
+            || fname == "Dockerfile"
+            || fname.starts_with("Dockerfile.")
+            || (fname == ".env"
+                || (fname.starts_with(".env.")
+                    && !matches!(
+                        fname,
+                        ".env.example" | ".env.sample" | ".env.template" | ".env.dist"
+                    )))
+        {
+            return Some(Language::Config);
+        }
+
         let ext = path.extension()?.to_str()?.to_ascii_lowercase();
         match ext.as_str() {
             "ts" | "tsx" | "mts" | "cts" => Some(Language::TypeScript),
@@ -39,6 +68,8 @@ impl Language {
             "py" => Some(Language::Python),
             "go" => Some(Language::Go),
             "sql" => Some(Language::Sql),
+            "dockerfile" | "yml" | "yaml" | "toml" | "json" | "ini" | "cfg" | "conf"
+            | "properties" | "pem" | "key" | "sh" | "bash" | "zsh" => Some(Language::Config),
             _ => None,
         }
     }
@@ -52,6 +83,8 @@ pub struct IndexedFile {
     pub blake3_hash: String,
     pub mtime_ns: i64,
     pub size_bytes: u64,
+    #[serde(skip)]
+    pub cached_bytes: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +113,7 @@ pub fn scan_repository(root: &Path, cfg: &VeriForgeConfig) -> Result<ScanSummary
 
     let walker = WalkBuilder::new(&canon_root)
         .hidden(false)
+        .require_git(false)
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
@@ -137,7 +171,12 @@ pub fn scan_repository(root: &Path, cfg: &VeriForgeConfig) -> Result<ScanSummary
             .filter_map(|(abs_path, rel_path, language)| {
                 let meta = fs::metadata(&abs_path).ok()?;
                 let size_bytes = meta.len();
-                if size_bytes > max_bytes {
+                let limit = if language == Language::Manifest {
+                    max_bytes.max(16 * 1024 * 1024)
+                } else {
+                    max_bytes
+                };
+                if size_bytes > limit {
                     return None;
                 }
                 let mtime_ns = meta
@@ -157,6 +196,7 @@ pub fn scan_repository(root: &Path, cfg: &VeriForgeConfig) -> Result<ScanSummary
                     blake3_hash: hash,
                     mtime_ns,
                     size_bytes,
+                    cached_bytes: Some(bytes),
                 })
             })
             .collect()

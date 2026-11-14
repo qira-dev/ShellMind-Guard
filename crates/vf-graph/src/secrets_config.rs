@@ -1,0 +1,907 @@
+use crate::ast::{GuardKind, LocalStaticFinding, SinkKind};
+use regex::Regex;
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::OnceLock;
+
+fn aws_key_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\b(AKIA[0-9A-Z]{16})\b").expect("valid aws regex"))
+}
+
+fn stripe_key_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"\b((?:sk|rk)_live_[0-9A-Za-z_]{10,})\b").expect("valid stripe regex")
+    })
+}
+
+fn github_pat_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"\b(ghp_[0-9A-Za-z]{16,}|github_pat_[0-9A-Za-z_]{16,})\b")
+            .expect("valid github regex")
+    })
+}
+
+fn private_key_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"-----BEGIN (?:(?:RSA|EC|OPENSSH|PGP|DSA|ENCRYPTED) ?)?PRIVATE KEY(?: BLOCK)?-----",
+        )
+        .expect("valid pem regex")
+    })
+}
+
+fn db_uri_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r#"(?i)\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis)://([^:\s"'`<>@/]+):([^@\s"'`<>]+)@([^\s"'`<>]+)"#,
+        )
+        .expect("valid db uri regex")
+    })
+}
+
+fn jwt_js_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r#"(?i)(?:jwt|jsonwebtoken)\.sign\s*\([^;\n]+?,\s*(?:"([^"\n]{4,})"|'([^'\n]{4,})')"#,
+        )
+        .expect("valid jwt js regex")
+    })
+}
+
+fn jwt_go_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"\.SignedString\s*\(\s*\[\]\s*byte\s*\(\s*["`]([^"`\n]{4,})["`]\s*\)\s*\)"#)
+            .expect("valid jwt go regex")
+    })
+}
+
+fn jwt_py_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"(?i)\bjwt\.encode\s*\([^;\n]+?,\s*(?:"([^"\n]{4,})"|'([^'\n]{4,})')"#)
+            .expect("valid jwt py regex")
+    })
+}
+
+fn jwt_rs_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"EncodingKey::from_secret\s*\(\s*b"([^"\n]{4,})"\s*\)"#)
+            .expect("valid jwt rs regex")
+    })
+}
+
+fn cors_header_wildcard_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"(?i)access-control-allow-origin['"]?\s*[:,=]\s*['"]?\*['"]?"#)
+            .expect("valid cors header regex")
+    })
+}
+
+fn cors_origin_wildcard_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r#"(?i)(?:origin\s*[:=]\s*['"]\*['"]|origins\s*[:=]\s*\[\s*['"]\*['"]\s*\]|allow_origins\s*[:=]\s*\[\s*['"]\*['"]\s*\]|AllowAllOrigins\s*:\s*true)"#,
+        )
+        .expect("valid cors origin regex")
+    })
+}
+
+fn cors_credentials_true_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r#"(?i)(?:credentials\s*[:=]\s*true|supports_credentials\s*[:=]\s*true|allow_credentials\s*[:=]\s*true|AllowCredentials\s*:\s*true)"#,
+        )
+        .expect("valid cors credentials regex")
+    })
+}
+
+fn tls_disabled_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r#"(?i)(?:rejectUnauthorized\s*:\s*false|InsecureSkipVerify\s*:\s*true|\bverify\s*=\s*False\b|NODE_TLS_REJECT_UNAUTHORIZED\s*=\s*['"]?0\b|danger_accept_invalid_certs\s*\(\s*true\s*\))"#,
+        )
+        .expect("valid tls regex")
+    })
+}
+
+fn insecure_cookie_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"(?i)\b(?:httpOnly|httponly|secure)\s*[:=]\s*false\b"#)
+            .expect("valid cookie regex")
+    })
+}
+
+fn weak_hash_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r#"(?i)(?:createHash\s*\(\s*['"](?:md5|sha1)['"]\s*\)|hashlib\.(?:md5|sha1)\s*\(|\b(?:md5|sha1)\.(?:New|Sum)\s*\()"#,
+        )
+        .expect("valid weak hash regex")
+    })
+}
+
+fn weak_prng_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r#"(?:\bMath\.random\s*\(\s*\)|\brand\.Intn\s*\(|\brandom\.(?:random|randint|choice)\s*\()"#,
+        )
+        .expect("valid weak prng regex")
+    })
+}
+
+fn debug_mode_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r#"(?:(?:^|[\s,{;])DEBUG\s*=\s*(?:True|true)\b|\bapp\.debug\s*=\s*(?:True|true)\b|\.run\s*\([^)\n]*\bdebug\s*=\s*True\b|\bgin\.SetMode\s*\(\s*gin\.DebugMode\s*\))"#,
+        )
+        .expect("valid debug regex")
+    })
+}
+
+fn docker_privileged_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?i)^\s*privileged\s*:\s*true\b").expect("valid docker priv re"))
+}
+
+fn docker_user_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?i)^\s*USER\s+(\S+)").expect("valid docker user re"))
+}
+
+pub fn shannon_entropy(s: &str) -> f64 {
+    if s.is_empty() {
+        return 0.0;
+    }
+    let mut counts: HashMap<u8, usize> = HashMap::new();
+    let bytes = s.as_bytes();
+    for &b in bytes {
+        *counts.entry(b).or_insert(0) += 1;
+    }
+    let len = bytes.len() as f64;
+    let mut entropy = 0.0_f64;
+    for count in counts.values() {
+        let p = (*count as f64) / len;
+        entropy -= p * p.log2();
+    }
+    entropy
+}
+
+pub fn is_placeholder_secret(val: &str) -> bool {
+    let low = val.trim().to_ascii_lowercase();
+    if low.is_empty() {
+        return true;
+    }
+    if low.contains("${") || low.contains("{{") || low.contains("<your") || low.contains("%s") {
+        return true;
+    }
+    const MARKERS: &[&str] = &[
+        "your-",
+        "your_",
+        "example",
+        "placeholder",
+        "changeme",
+        "change_me",
+        "replace_me",
+        "replace-me",
+        "dummy",
+        "sample",
+        "xxxx",
+        "****",
+        "insert_",
+    ];
+    if MARKERS.iter().any(|m| low.contains(m)) {
+        return true;
+    }
+    matches!(
+        low.as_str(),
+        "password" | "pass" | "pwd" | "secret" | "token" | "api-key" | "apikey" | "root" | "123456"
+    )
+}
+
+fn redact_token(tok: &str) -> String {
+    let chars: Vec<char> = tok.chars().collect();
+    if chars.len() <= 10 {
+        return "***".to_string();
+    }
+    let prefix: String = chars.iter().take(6).collect();
+    let suffix: String = chars
+        .iter()
+        .rev()
+        .take(2)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{}...{}", prefix, suffix)
+}
+
+fn is_comment_line(trimmed: &str) -> bool {
+    trimmed.starts_with("//")
+        || trimmed.starts_with("/*")
+        || trimmed.starts_with('*')
+        || trimmed.starts_with('#')
+}
+
+fn has_context_keyword(lines: &[&str], idx: usize, radius: usize, keywords: &[&str]) -> bool {
+    let start = idx.saturating_sub(radius);
+    let end = (idx + radius + 1).min(lines.len());
+    for line in &lines[start..end] {
+        let low = line.to_ascii_lowercase();
+        if keywords.iter().any(|k| low.contains(k)) {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_dockerfile(rel_path: &str) -> bool {
+    let fname = Path::new(rel_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    let low = fname.to_ascii_lowercase();
+    low == "dockerfile" || low.starts_with("dockerfile.") || low.ends_with(".dockerfile")
+}
+
+fn is_yaml_file(rel_path: &str) -> bool {
+    let low = rel_path.to_ascii_lowercase();
+    low.ends_with(".yml") || low.ends_with(".yaml")
+}
+
+pub fn is_sensitive_env_or_pem(rel_path: &str) -> bool {
+    let fname = Path::new(rel_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    let low = fname.to_ascii_lowercase();
+    if low == ".env"
+        || (low.starts_with(".env.")
+            && !matches!(
+                low.as_str(),
+                ".env.example" | ".env.sample" | ".env.template" | ".env.dist"
+            ))
+    {
+        return true;
+    }
+    low.ends_with(".pem")
+}
+
+fn make_sec_finding(
+    rule_id: &str,
+    severity: &str,
+    title: String,
+    rel_path: &str,
+    line: usize,
+    remediation: &str,
+) -> LocalStaticFinding {
+    LocalStaticFinding {
+        rule_id: rule_id.to_string(),
+        severity: severity.to_string(),
+        title,
+        rel_path: rel_path.to_string(),
+        line,
+        symbol: format!("{}:{}", rel_path, line),
+        sink_kind: SinkKind::SecretLeak,
+        missing_guard: GuardKind::SecretPolicy,
+        remediation: remediation.to_string(),
+    }
+}
+
+fn make_cfg_finding(
+    rule_id: &str,
+    severity: &str,
+    title: String,
+    rel_path: &str,
+    line: usize,
+    remediation: &str,
+) -> LocalStaticFinding {
+    LocalStaticFinding {
+        rule_id: rule_id.to_string(),
+        severity: severity.to_string(),
+        title,
+        rel_path: rel_path.to_string(),
+        line,
+        symbol: format!("{}:{}", rel_path, line),
+        sink_kind: SinkKind::Misconfiguration,
+        missing_guard: GuardKind::ConfigPolicy,
+        remediation: remediation.to_string(),
+    }
+}
+
+/// Scans a single file's content in-memory (zero disk I/O) for hardcoded secrets and security misconfigurations.
+pub fn scan_secrets_and_config(rel_path: &str, content: &str) -> Vec<LocalStaticFinding> {
+    let fname = Path::new(rel_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    if matches!(fname, "package-lock.json" | "Cargo.lock" | ".gitignore")
+        || matches!(
+            fname,
+            ".env.example" | ".env.sample" | ".env.template" | ".env.dist"
+        )
+    {
+        return Vec::new();
+    }
+
+    let is_rust = rel_path.ends_with(".rs");
+    let is_docker = is_dockerfile(rel_path);
+    let is_yaml = is_yaml_file(rel_path);
+    let lines: Vec<&str> = content.lines().collect();
+    let mut findings = Vec::new();
+
+    // Pre-scan Rust test module start so #[cfg(test)] blocks don't emit test-fixture false positives
+    let mut in_cfg_test = false;
+    let mut test_brace_depth: i32 = 0;
+
+    // Track CORS wildcard origins and credentials lines for block-level pairing
+    let mut cors_origin_lines: Vec<usize> = Vec::new();
+    let mut cors_cred_lines: Vec<usize> = Vec::new();
+
+    // Track Dockerfile USER instructions
+    let mut docker_root_lines: Vec<usize> = Vec::new();
+    let mut docker_last_non_root_line: Option<usize> = None;
+
+    for (idx, line) in lines.iter().enumerate() {
+        let ln = idx + 1;
+        let trimmed = line.trim();
+
+        if is_rust {
+            if trimmed.starts_with("#[cfg(test)]") {
+                in_cfg_test = true;
+                test_brace_depth = 0;
+                continue;
+            }
+            if in_cfg_test {
+                for ch in line.chars() {
+                    if ch == '{' {
+                        test_brace_depth += 1;
+                    } else if ch == '}' {
+                        test_brace_depth -= 1;
+                        if test_brace_depth <= 0 {
+                            in_cfg_test = false;
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
+        }
+
+        // --- Layer 1a: Secrets & Credential Leak Rules (VF-SEC-*) ---
+        if line.contains("AKIA") {
+            for cap in aws_key_re().captures_iter(line) {
+                let tok = &cap[1];
+                let suffix = &tok[4..];
+                if !is_placeholder_secret(tok) && shannon_entropy(suffix) >= 2.5 {
+                    findings.push(make_sec_finding(
+                        "VF-SEC-AWS",
+                        "CRITICAL",
+                        format!("Hardcoded AWS Access Key ID ({})", redact_token(tok)),
+                        rel_path,
+                        ln,
+                        "Remove the hardcoded AWS access key, rotate it in IAM immediately, and load credentials via IAM roles or environment variables.",
+                    ));
+                }
+            }
+        }
+
+        if line.contains("sk_live_") || line.contains("rk_live_") {
+            for cap in stripe_key_re().captures_iter(line) {
+                let tok = &cap[1];
+                let suffix = &tok[8..];
+                if !is_placeholder_secret(suffix) && shannon_entropy(suffix) >= 2.5 {
+                    findings.push(make_sec_finding(
+                        "VF-SEC-STRIPE",
+                        "CRITICAL",
+                        format!("Hardcoded Stripe live API key ({})", redact_token(tok)),
+                        rel_path,
+                        ln,
+                        "Revoke and roll the Stripe secret key in the Stripe Dashboard and read it from `process.env.STRIPE_SECRET_KEY` / a secret manager.",
+                    ));
+                }
+            }
+        }
+
+        if line.contains("ghp_") || line.contains("github_pat_") {
+            for cap in github_pat_re().captures_iter(line) {
+                let tok = &cap[1];
+                let suffix = tok
+                    .strip_prefix("github_pat_")
+                    .or_else(|| tok.strip_prefix("ghp_"))
+                    .unwrap_or(tok);
+                if !is_placeholder_secret(suffix) && shannon_entropy(suffix) >= 2.5 {
+                    findings.push(make_sec_finding(
+                        "VF-SEC-GITHUB",
+                        "CRITICAL",
+                        format!("Hardcoded GitHub Personal Access Token ({})", redact_token(tok)),
+                        rel_path,
+                        ln,
+                        "Revoke the GitHub token immediately and inject credentials via CI/runtime secrets or `GITHUB_TOKEN`.",
+                    ));
+                }
+            }
+        }
+
+        if line.contains("-----BEGIN ") && private_key_re().is_match(line) {
+            findings.push(make_sec_finding(
+                "VF-SEC-KEY",
+                "CRITICAL",
+                "Committed private cryptographic key block".into(),
+                rel_path,
+                ln,
+                "Remove the private key file/block from source control, rotate the keypair, and mount keys via a secret store at runtime.",
+            ));
+        }
+
+        if line.contains("://") && line.contains('@') {
+            for cap in db_uri_re().captures_iter(line) {
+                let pass = &cap[2];
+                if !is_placeholder_secret(pass) && shannon_entropy(pass) >= 2.0 {
+                    findings.push(make_sec_finding(
+                        "VF-SEC-DBURI",
+                        "HIGH",
+                        "Hardcoded database URI with embedded credentials".into(),
+                        rel_path,
+                        ln,
+                        "Move the database connection string to an environment variable (e.g., `DATABASE_URL`) and rotate the database password.",
+                    ));
+                }
+            }
+        }
+
+        let check_jwt_literal = |secret: &str, findings: &mut Vec<LocalStaticFinding>| {
+            if secret.len() >= 6 && !is_placeholder_secret(secret) && shannon_entropy(secret) >= 2.2
+            {
+                findings.push(make_sec_finding(
+                    "VF-SEC-JWT",
+                    "HIGH",
+                    "Hardcoded JWT signing secret literal".into(),
+                    rel_path,
+                    ln,
+                    "Load the JWT signing key from a high-entropy environment secret (`process.env.JWT_SECRET` / `os.Getenv(\"JWT_SECRET\")`) or asymmetric KMS/JWKS.",
+                ));
+            }
+        };
+
+        if line.contains(".sign(") || line.contains(".sign (") {
+            for cap in jwt_js_re().captures_iter(line) {
+                if let Some(m) = cap.get(1).or_else(|| cap.get(2)) {
+                    check_jwt_literal(m.as_str(), &mut findings);
+                }
+            }
+        }
+        if line.contains("SignedString") {
+            for cap in jwt_go_re().captures_iter(line) {
+                check_jwt_literal(&cap[1], &mut findings);
+            }
+        }
+        if line.contains("jwt.encode") {
+            for cap in jwt_py_re().captures_iter(line) {
+                if let Some(m) = cap.get(1).or_else(|| cap.get(2)) {
+                    check_jwt_literal(m.as_str(), &mut findings);
+                }
+            }
+        }
+        if line.contains("from_secret") {
+            for cap in jwt_rs_re().captures_iter(line) {
+                check_jwt_literal(&cap[1], &mut findings);
+            }
+        }
+
+        // Skip comment lines for configuration/misconfiguration checks
+        if is_comment_line(trimmed) {
+            continue;
+        }
+
+        // --- Layer 1b: Security Misconfiguration Rules (VF-CFG-*) ---
+        if line
+            .to_ascii_lowercase()
+            .contains("access-control-allow-origin")
+            && cors_header_wildcard_re().is_match(line)
+        {
+            findings.push(make_cfg_finding(
+                "VF-CFG-CORS",
+                "HIGH",
+                "Wildcard CORS header (`Access-Control-Allow-Origin: *`) allows arbitrary origins"
+                    .into(),
+                rel_path,
+                ln,
+                "Restrict CORS `Access-Control-Allow-Origin` to an explicit allowlist of trusted origins.",
+            ));
+        }
+
+        if cors_origin_wildcard_re().is_match(line) {
+            cors_origin_lines.push(ln);
+        }
+        if cors_credentials_true_re().is_match(line) {
+            cors_cred_lines.push(ln);
+        }
+
+        if (line.contains("rejectUnauthorized")
+            || line.contains("InsecureSkipVerify")
+            || line.contains("verify")
+            || line.contains("NODE_TLS_REJECT_UNAUTHORIZED")
+            || line.contains("danger_accept_invalid_certs"))
+            && tls_disabled_re().is_match(line)
+        {
+            findings.push(make_cfg_finding(
+                "VF-CFG-TLS",
+                "HIGH",
+                "TLS certificate verification disabled (MITM vulnerability)".into(),
+                rel_path,
+                ln,
+                "Re-enable TLS certificate validation and configure trusted CA certificates instead of bypassing verification.",
+            ));
+        }
+
+        if (line.to_ascii_lowercase().contains("httponly")
+            || line.to_ascii_lowercase().contains("secure"))
+            && insecure_cookie_re().is_match(line)
+            && has_context_keyword(
+                &lines,
+                idx,
+                8,
+                &[
+                    "cookie",
+                    "session",
+                    "auth",
+                    "token",
+                    "jwt",
+                    "sid",
+                    "set-cookie",
+                    "res.cookie",
+                ],
+            )
+        {
+            findings.push(make_cfg_finding(
+                "VF-CFG-COOKIE",
+                "MEDIUM",
+                "Insecure session/auth cookie flag (`httpOnly: false` or `secure: false`)".into(),
+                rel_path,
+                ln,
+                "Set `httpOnly: true`, `secure: true`, and `sameSite: 'lax' | 'strict'` on session and authentication cookies.",
+            ));
+        }
+
+        if weak_hash_re().is_match(line)
+            && has_context_keyword(
+                &lines,
+                idx,
+                5,
+                &[
+                    "password",
+                    "passwd",
+                    "pwd",
+                    "pw",
+                    "token",
+                    "secret",
+                    "auth",
+                    "session",
+                    "hmac",
+                    "sign",
+                    "credential",
+                    "salt",
+                    "login",
+                ],
+            )
+        {
+            findings.push(make_cfg_finding(
+                "VF-CFG-CRYPTO",
+                "HIGH",
+                "Weak cryptographic hash (MD5/SHA1) used for password, token, or auth material"
+                    .into(),
+                rel_path,
+                ln,
+                "Replace MD5/SHA1 with Argon2id/bcrypt/scrypt for passwords or SHA-256/HMAC-SHA256 for tokens.",
+            ));
+        } else if weak_prng_re().is_match(line)
+            && has_context_keyword(
+                &lines,
+                idx,
+                4,
+                &[
+                    "token", "secret", "key", "password", "salt", "nonce", "otp", "csrf",
+                    "session", "auth", "reset", "api_key", "apikey", "pin",
+                ],
+            )
+        {
+            findings.push(make_cfg_finding(
+                "VF-CFG-CRYPTO",
+                "HIGH",
+                "Non-cryptographic PRNG (`Math.random` / `rand.Intn`) used for security token"
+                    .into(),
+                rel_path,
+                ln,
+                "Use a CSPRNG (`crypto.randomBytes` / `crypto.randomUUID` / `crypto/rand` / `secrets.token_urlsafe`).",
+            ));
+        }
+
+        if (line.contains("DEBUG") || line.contains("debug")) && debug_mode_re().is_match(line) {
+            findings.push(make_cfg_finding(
+                "VF-CFG-DEBUG",
+                "MEDIUM",
+                "Debug mode enabled in application/config (stack traces & info exposure risk)"
+                    .into(),
+                rel_path,
+                ln,
+                "Disable debug mode in production configurations (`DEBUG = False`, `gin.ReleaseMode`) and gate via environment variables.",
+            ));
+        }
+
+        if is_yaml && docker_privileged_re().is_match(line) {
+            findings.push(make_cfg_finding(
+                "VF-CFG-DOCKER",
+                "HIGH",
+                "Container configured with `privileged: true` (host escape risk)".into(),
+                rel_path,
+                ln,
+                "Remove `privileged: true` and grant only minimal required Linux capabilities via `cap_add`.",
+            ));
+        }
+
+        if is_docker && let Some(cap) = docker_user_re().captures(line) {
+            let user = cap[1].trim().to_ascii_lowercase();
+            if user == "root" || user == "0" || user.starts_with("root:") {
+                docker_root_lines.push(ln);
+            } else {
+                docker_last_non_root_line = Some(ln);
+            }
+        }
+    }
+
+    // Emit VF-CFG-CORS for `origin: "*"` paired with `credentials: true` within 15 lines
+    for &orig_ln in &cors_origin_lines {
+        if cors_cred_lines
+            .iter()
+            .any(|&cred_ln| orig_ln.abs_diff(cred_ln) <= 15)
+        {
+            findings.push(make_cfg_finding(
+                "VF-CFG-CORS",
+                "HIGH",
+                "Wildcard CORS (`origin: \"*\"`) combined with `credentials: true`".into(),
+                rel_path,
+                orig_ln,
+                "Specify explicit trusted origins instead of `*` when `credentials: true` is enabled.",
+            ));
+        }
+    }
+
+    // Emit VF-CFG-DOCKER if Dockerfile sets `USER root` without dropping to a non-root USER afterwards
+    if let Some(&root_ln) = docker_root_lines.last() {
+        let dropped_after = docker_last_non_root_line.is_some_and(|non_root| non_root > root_ln);
+        if !dropped_after {
+            findings.push(make_cfg_finding(
+                "VF-CFG-DOCKER",
+                "MEDIUM",
+                "Dockerfile runs as `USER root` without dropping to a non-root user".into(),
+                rel_path,
+                root_ln,
+                "Add a non-root user (`RUN useradd ...` / `adduser ...`) and switch to it with `USER appuser` before `CMD`/`ENTRYPOINT`.",
+            ));
+        }
+    }
+
+    findings
+}
+
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star_p, mut star_t) = (None, 0usize);
+
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star_p = Some(pi);
+            star_t = ti;
+            pi += 1;
+        } else if let Some(sp) = star_p {
+            pi = sp + 1;
+            star_t += 1;
+            ti = star_t;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+fn is_ignored_by_gitignore(rel_path: &str, gitignore_files: &[(&str, &[String])]) -> bool {
+    let norm_path = rel_path.trim_start_matches("./").replace('\\', "/");
+    let file_name = Path::new(&norm_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(&norm_path);
+
+    let mut ignored = false;
+    for (gi_path, lines) in gitignore_files {
+        let gi_dir = Path::new(gi_path)
+            .parent()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        let candidate_rel = if gi_dir.is_empty() {
+            norm_path.as_str()
+        } else if let Some(rest) = norm_path.strip_prefix(&format!("{}/", gi_dir)) {
+            rest
+        } else {
+            continue;
+        };
+
+        for raw in *lines {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let (negated, pat) = if let Some(rest) = trimmed.strip_prefix('!') {
+                (true, rest.trim())
+            } else {
+                (false, trimmed)
+            };
+            let clean_pat = pat.trim_start_matches('/').trim_end_matches('/');
+            let matched = if clean_pat.contains('/') {
+                glob_match(clean_pat, candidate_rel)
+            } else {
+                glob_match(clean_pat, file_name) || glob_match(clean_pat, candidate_rel)
+            };
+            if matched {
+                ignored = !negated;
+            }
+        }
+    }
+    ignored
+}
+
+/// Checks if `.env`, `.env.local`, `.env.*`, or `*.pem` files exist in the repository without being ignored by `.gitignore`.
+pub fn check_gitignore_exposure(
+    sensitive_files: &[&str],
+    gitignore_files: &[(&str, &[String])],
+) -> Vec<LocalStaticFinding> {
+    let mut findings = Vec::new();
+    for &rel_path in sensitive_files {
+        if !is_ignored_by_gitignore(rel_path, gitignore_files) {
+            findings.push(make_sec_finding(
+                "VF-SEC-ENV",
+                "HIGH",
+                format!(
+                    "Sensitive file `{}` is not ignored by `.gitignore`",
+                    rel_path
+                ),
+                rel_path,
+                1,
+                "Add `.env`, `.env.*`, and `*.pem` to `.gitignore`, and purge any previously committed secrets from git history.",
+            ));
+        }
+    }
+    findings
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_secrets_detection_and_entropy_false_positive_guard() {
+        let aws_real = concat!("AKIA", "Z7X9K2M4P8Q1R5T3");
+        let stripe_real = concat!("sk_live_", "51H9xK2L8mNpQ4rStUvWxYz78");
+        let github_real = concat!("ghp_", "9aBcDeFgHiJkLmNoPqRsTuVwXyZ12345");
+        let pem_real = concat!("-----BEGIN ", "RSA PRIVATE KEY-----");
+        let dburi_real = concat!(
+            "postgres://",
+            "admin:S3cr3tP4ss99@db.prod.internal:5432/app"
+        );
+        let jwt_real = concat!(
+            "jwt.sign(payload, \"",
+            "super-secret-prod-jwt-key-99",
+            "\")"
+        );
+
+        let dummy_src = concat!(
+            "const a = 'your-api-key';\n",
+            "const b = '",
+            "sk_live_",
+            "xxxxxxxxxxxx';\n",
+            "const c = '",
+            "sk_live_",
+            "your_key_here';\n",
+            "const d = 'AKIAIOSFODNN7EXAMPLE';\n",
+            "const e = jwt.sign(p, 'your-secret-key');\n",
+            "const f = 'postgres://user:password@localhost/db';\n",
+        );
+        assert!(
+            scan_secrets_and_config("src/example.ts", dummy_src).is_empty(),
+            "Dummy/example strings must not trigger false positives"
+        );
+
+        let vuln_src = format!(
+            "export const AWS = '{aws_real}';\n\
+             export const STRIPE = '{stripe_real}';\n\
+             export const GH = '{github_real}';\n\
+             export const KEY = `{pem_real}`;\n\
+             export const DB = '{dburi_real}';\n\
+             export const TOK = {jwt_real};\n"
+        );
+        let hits = scan_secrets_and_config("src/secrets.ts", &vuln_src);
+        let rules: Vec<&str> = hits.iter().map(|h| h.rule_id.as_str()).collect();
+        assert!(rules.contains(&"VF-SEC-AWS"));
+        assert!(rules.contains(&"VF-SEC-STRIPE"));
+        assert!(rules.contains(&"VF-SEC-GITHUB"));
+        assert!(rules.contains(&"VF-SEC-KEY"));
+        assert!(rules.contains(&"VF-SEC-DBURI"));
+        assert!(rules.contains(&"VF-SEC-JWT"));
+    }
+
+    #[test]
+    fn test_misconfig_rules_and_dockerfile_root_drop() {
+        let cors_js = r#"
+app.use(cors({
+  origin: "*",
+  credentials: true,
+}));
+app.get('/x', () => {
+  res.cookie('sid', val, { httpOnly: false, secure: true });
+});
+https.get({ rejectUnauthorized: false });
+const token = Math.random().toString(36);
+const pwHash = crypto.createHash('md5').update(password).digest('hex');
+"#;
+        let hits = scan_secrets_and_config("src/app.js", cors_js);
+        let rules: Vec<&str> = hits.iter().map(|h| h.rule_id.as_str()).collect();
+        assert!(rules.contains(&"VF-CFG-CORS"));
+        assert!(rules.contains(&"VF-CFG-COOKIE"));
+        assert!(rules.contains(&"VF-CFG-TLS"));
+        assert!(rules.contains(&"VF-CFG-CRYPTO"));
+
+        let safe_docker =
+            "FROM node:20\nUSER root\nRUN apt-get update\nUSER node\nCMD [\"node\"]\n";
+        assert!(scan_secrets_and_config("Dockerfile", safe_docker).is_empty());
+
+        let unsafe_docker = "FROM node:20\nUSER root\nCMD [\"node\"]\n";
+        let dhits = scan_secrets_and_config("Dockerfile", unsafe_docker);
+        assert!(dhits.iter().any(|h| h.rule_id == "VF-CFG-DOCKER"));
+
+        let debug_py = "DEBUG = True\n";
+        assert!(
+            scan_secrets_and_config("settings.py", debug_py)
+                .iter()
+                .any(|h| h.rule_id == "VF-CFG-DEBUG")
+        );
+    }
+
+    #[test]
+    fn test_gitignore_env_exposure() {
+        let gi = vec![".gitignore".into(), "*.log".into()];
+        let gi_refs: Vec<(&str, &[String])> = vec![(".gitignore", &gi)];
+        let exposed = check_gitignore_exposure(&[".env", "certs/dev.pem"], &gi_refs);
+        assert_eq!(exposed.len(), 2);
+        assert!(exposed.iter().all(|f| f.rule_id == "VF-SEC-ENV"));
+
+        let gi_safe = vec![".env*".into(), "*.pem".into()];
+        let gi_safe_refs: Vec<(&str, &[String])> = vec![(".gitignore", &gi_safe)];
+        assert!(
+            check_gitignore_exposure(&[".env", ".env.local", "certs/dev.pem"], &gi_safe_refs)
+                .is_empty()
+        );
+    }
+}

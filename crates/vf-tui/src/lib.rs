@@ -501,6 +501,51 @@ fn render_findings_queue(f: &mut Frame, area: Rect, state: &TuiState) {
                     GuardKind::Auth => {
                         ("[HIGH · AUTH]", SEM_AUTH_CORAL, "Missing: Auth Middleware")
                     }
+                    GuardKind::SqlSanitizer => (
+                        "[CRIT · SQLI]",
+                        SEM_PROVEN_RED,
+                        "Missing: Parameterized Query",
+                    ),
+                    GuardKind::CmdSanitizer => (
+                        "[CRIT · CMDI]",
+                        SEM_PROVEN_RED,
+                        "Missing: Shell Escaping / execFile",
+                    ),
+                    GuardKind::PathSanitizer => (
+                        "[HIGH · PATH]",
+                        SEM_AUTH_CORAL,
+                        "Missing: Path Canonicalization",
+                    ),
+                    GuardKind::SsrfSanitizer => (
+                        "[HIGH · SSRF]",
+                        SEM_AUTH_CORAL,
+                        "Missing: URL Host Allowlist",
+                    ),
+                    GuardKind::OwnershipCheck => (
+                        "[HIGH · IDOR]",
+                        SEM_AUTH_CORAL,
+                        "Missing: Object Ownership Filter",
+                    ),
+                    GuardKind::SecretPolicy => (
+                        "[CRIT · SECRET]",
+                        SEM_PROVEN_RED,
+                        "Exposed Secret / Credential",
+                    ),
+                    GuardKind::ConfigPolicy => (
+                        "[HIGH · CONFIG]",
+                        SEM_SUSPECT_AMBER,
+                        "Security Misconfiguration",
+                    ),
+                    GuardKind::DependencyPolicy => (
+                        "[HIGH · DEPS]",
+                        SEM_SUSPECT_AMBER,
+                        "Vulnerable / Unpinned Dep",
+                    ),
+                    GuardKind::FrontendContract => (
+                        "[MED · FE/API]",
+                        SEM_BRAND_CYAN,
+                        "Frontend Contract / UI Bug",
+                    ),
                 };
 
                 let sink_hop = item.witness_path.last();
@@ -646,6 +691,26 @@ fn render_pipeline_card(f: &mut Frame, area: Rect, state: &TuiState) {
             (GuardKind::Auth, sk) => ("Auth Guard (requireAuth / verifyJwt)", format!("{:?}", sk)),
             (GuardKind::TxLock, sk) => (
                 "Atomic Lock (withTransaction / SELECT ... FOR UPDATE)",
+                format!("{:?}", sk),
+            ),
+            (GuardKind::SqlSanitizer, sk) => ("Parameterized SQL ($1 / ?)", format!("{:?}", sk)),
+            (GuardKind::CmdSanitizer, sk) => ("Safe Argv Spawn / Allowlist", format!("{:?}", sk)),
+            (GuardKind::PathSanitizer, sk) => {
+                ("Path Canonicalization + BaseDir Check", format!("{:?}", sk))
+            }
+            (GuardKind::SsrfSanitizer, sk) => ("Outbound URL Host Allowlist", format!("{:?}", sk)),
+            (GuardKind::OwnershipCheck, sk) => {
+                ("Actor / Tenant Ownership Filter", format!("{:?}", sk))
+            }
+            (GuardKind::SecretPolicy, sk) => {
+                ("Secret Vault & .gitignore Hygiene", format!("{:?}", sk))
+            }
+            (GuardKind::ConfigPolicy, sk) => {
+                ("Hardened Security Configuration", format!("{:?}", sk))
+            }
+            (GuardKind::DependencyPolicy, sk) => ("Pinned Patched Dependency", format!("{:?}", sk)),
+            (GuardKind::FrontendContract, sk) => (
+                "Matching Backend Route & Error Handling",
                 format!("{:?}", sk),
             ),
         };
@@ -907,16 +972,18 @@ fn render_proof_and_remediation(f: &mut Frame, area: Rect, state: &TuiState) {
         ));
 
     let lines = if let Some(cur) = state.current_finding() {
-        let remediation = match (cur.missing_guard, cur.sink_kind) {
-            (GuardKind::Auth, _) => format!(
-                "Attach authentication middleware (`requireAuth` / `verifyJwt`) to `{}` before invoking downstream handlers.",
-                cur.entry_route
-            ),
-            (GuardKind::TxLock, SinkKind::BalanceUpdate | SinkKind::PaymentMutation) => {
-                "Wrap balance/payment mutation in an atomic DB transaction (`withTransaction` / `SELECT ... FOR UPDATE`) or enforce an idempotency key.".to_string()
-            }
-            (GuardKind::TxLock, _) => {
-                "Acquire a transaction lock before executing state mutation.".to_string()
+        let remediation = if !cur.remediation.is_empty() {
+            cur.remediation.clone()
+        } else {
+            match (cur.missing_guard, cur.sink_kind) {
+                (GuardKind::Auth, _) => format!(
+                    "Attach authentication middleware (`requireAuth` / `verifyJwt`) to `{}` before invoking downstream handlers.",
+                    cur.entry_route
+                ),
+                (GuardKind::TxLock, SinkKind::BalanceUpdate | SinkKind::PaymentMutation) => {
+                    "Wrap balance/payment mutation in an atomic DB transaction (`withTransaction` / `SELECT ... FOR UPDATE`) or enforce an idempotency key.".to_string()
+                }
+                _ => "Apply the recommended security control before deploying.".to_string(),
             }
         };
 
@@ -1449,6 +1516,7 @@ mod tests {
                         line: 1,
                     },
                 ],
+                remediation: String::new(),
             }],
         };
         let verified = vec![VerifiedFinding {

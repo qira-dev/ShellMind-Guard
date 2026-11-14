@@ -2,11 +2,12 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::watch;
+use tokio::sync::{Barrier, Notify};
+use tokio::task::JoinSet;
 use tokio::time::timeout;
 use vf_graph::{GuardKind, LatticeFinding};
 
@@ -239,8 +240,8 @@ pub async fn verify_auth_invariant(port: u16, finding: &LatticeFinding) -> Resul
 }
 
 /// Cancel-safe Last-Byte Sync concurrency test:
-/// Buffers N identical requests minus the final byte. Uses an atomic counter + Notify
-/// with a strict 2s deadline so pre-barrier connection/fd errors NEVER deadlock other workers.
+/// Buffers N identical requests minus the final byte, aligns them on a `tokio::sync::Barrier`
+/// inside a `JoinSet`, and cancels cleanly via `Notify` on any pre-barrier I/O error.
 pub async fn verify_concurrency_invariant(
     port: u16,
     finding: &LatticeFinding,
@@ -253,7 +254,7 @@ pub async fn verify_concurrency_invariant(
             entry_route: finding.entry_route.clone(),
             status: VerificationStatus::SuspectUnverified,
             evidence: "Concurrency set to 0; no requests dispatched".into(),
-            replay_cmd: format!("veriforge replay {} --sync-race 10", finding.id),
+            replay_cmd: format!("veriforge replay {} --sync-race 12", finding.id),
         });
     }
 
@@ -268,17 +269,19 @@ pub async fn verify_concurrency_invariant(
     let prefix = Arc::new(bytes[..split_at].to_vec());
     let last_byte = bytes[split_at];
 
-    let ready_count = Arc::new(AtomicUsize::new(0));
+    let barrier = Arc::new(Barrier::new(concurrency));
+    let abort = Arc::new(Notify::new());
+    let aborted = Arc::new(AtomicBool::new(false));
     let failed_count = Arc::new(AtomicUsize::new(0));
-    let (go_tx, go_rx) = watch::channel(false);
-    let mut handles = Vec::with_capacity(concurrency);
+    let mut set = JoinSet::new();
 
     for _ in 0..concurrency {
         let pfx = Arc::clone(&prefix);
-        let ready = Arc::clone(&ready_count);
+        let bar = Arc::clone(&barrier);
+        let abt = Arc::clone(&abort);
+        let abtd = Arc::clone(&aborted);
         let failed = Arc::clone(&failed_count);
-        let mut rx = go_rx.clone();
-        handles.push(tokio::spawn(async move {
+        set.spawn(async move {
             let conn = timeout(
                 Duration::from_secs(2),
                 TcpStream::connect(("127.0.0.1", port)),
@@ -288,6 +291,8 @@ pub async fn verify_concurrency_invariant(
                 Ok(Ok(s)) => s,
                 _ => {
                     failed.fetch_add(1, Ordering::SeqCst);
+                    abtd.store(true, Ordering::SeqCst);
+                    abt.notify_waiters();
                     return None;
                 }
             };
@@ -298,15 +303,20 @@ pub async fn verify_concurrency_invariant(
                 || stream.flush().await.is_err()
             {
                 failed.fetch_add(1, Ordering::SeqCst);
+                abtd.store(true, Ordering::SeqCst);
+                abt.notify_waiters();
                 return None;
             }
 
-            ready.fetch_add(1, Ordering::SeqCst);
-            let _ = timeout(Duration::from_secs(2), rx.wait_for(|&v| v)).await;
-
-            if failed.load(Ordering::SeqCst) > 0 {
+            let released = tokio::select! {
+                _ = bar.wait() => true,
+                _ = abt.notified() => false,
+                _ = tokio::time::sleep(Duration::from_millis(2500)) => false,
+            };
+            if !released || abtd.load(Ordering::SeqCst) {
                 return None;
             }
+
             if timeout(Duration::from_secs(2), stream.write_all(&[last_byte]))
                 .await
                 .is_err()
@@ -316,30 +326,24 @@ pub async fn verify_concurrency_invariant(
             }
 
             read_http_bounded(&mut stream).await.ok()
-        }));
+        });
     }
-
-    // Wait until all workers are ready or at least one failed (bounded 2.5s)
-    let wait_start = tokio::time::Instant::now();
-    while ready_count.load(Ordering::SeqCst) + failed_count.load(Ordering::SeqCst) < concurrency {
-        if failed_count.load(Ordering::SeqCst) > 0
-            || wait_start.elapsed() > Duration::from_millis(2500)
-        {
-            failed_count.fetch_add(1, Ordering::SeqCst);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(2)).await;
-    }
-    let _ = go_tx.send(true);
 
     let mut valid_2xx = 0usize;
     let mut blocked = 0usize;
+    let mut first_2xx_code: Option<u16> = None;
     let mut distinct_bodies: HashSet<String> = HashSet::new();
 
-    for h in handles {
-        if let Ok(Some((code, resp_body))) = h.await {
-            if (200..300).contains(&code) && !is_failure_envelope(code, &resp_body) {
+    while let Some(joined) = set.join_next().await {
+        if let Ok(Some((code, resp_body))) = joined {
+            if (200..300).contains(&code)
+                && !is_failure_envelope(code, &resp_body)
+                && !matches!(code, 409 | 429 | 400)
+            {
                 valid_2xx += 1;
+                if first_2xx_code.is_none() {
+                    first_2xx_code = Some(code);
+                }
                 distinct_bodies.insert(resp_body);
             } else if code > 0 {
                 blocked += 1;
@@ -348,7 +352,7 @@ pub async fn verify_concurrency_invariant(
     }
 
     let pre_failed = failed_count.load(Ordering::SeqCst);
-    let (status, evidence) = if pre_failed > 0 && valid_2xx == 0 {
+    let (status, evidence) = if pre_failed > 0 && valid_2xx == 0 && blocked == 0 {
         (
             VerificationStatus::SuspectUnverified,
             format!(
@@ -356,13 +360,14 @@ pub async fn verify_concurrency_invariant(
                 pre_failed
             ),
         )
-    } else if valid_2xx > 1 {
+    } else if valid_2xx >= 2 {
         (
             VerificationStatus::Proven,
             format!(
-                "Last-Byte Sync ({}x): {}x distinct-state/success HTTP 2xx executed simultaneously ({} distinct bodies)",
-                concurrency,
+                "{}/{} concurrent requests returned HTTP {} (Last-Byte Sync, {} distinct bodies)",
                 valid_2xx,
+                concurrency,
+                first_2xx_code.unwrap_or(200),
                 distinct_bodies.len()
             ),
         )
@@ -370,7 +375,7 @@ pub async fn verify_concurrency_invariant(
         (
             VerificationStatus::Mitigated,
             format!(
-                "Last-Byte Sync ({}x): only {}x succeeded, {}x blocked by lock/guard",
+                "Last-Byte Sync ({}x): only {}x succeeded, {}x blocked by lock/idempotency guard",
                 concurrency, valid_2xx, blocked
             ),
         )
@@ -405,6 +410,17 @@ pub async fn verify_finding(
     match finding.missing_guard {
         GuardKind::Auth => verify_auth_invariant(port, finding).await,
         GuardKind::TxLock => verify_concurrency_invariant(port, finding, concurrency).await,
+        other => Ok(VerifiedFinding {
+            finding_id: finding.id.clone(),
+            rule_id: finding.rule_id.clone(),
+            entry_route: finding.entry_route.clone(),
+            status: VerificationStatus::SuspectUnverified,
+            evidence: format!(
+                "Static/AST finding ({:?}); live exploit probe applies to Auth and Race findings",
+                other
+            ),
+            replay_cmd: format!("veriforge replay {}", finding.id),
+        }),
     }
 }
 
@@ -467,5 +483,123 @@ mod tests {
         let (code, body) = read_http_bounded(&mut stream).await.unwrap();
         assert_eq!(code, 200);
         assert!(is_failure_envelope(code, &body));
+    }
+
+    #[tokio::test]
+    async fn test_joinset_barrier_12_concurrent_200_marks_proven() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c_srv = Arc::clone(&counter);
+        tokio::spawn(async move {
+            loop {
+                if let Ok((mut sock, _)) = listener.accept().await {
+                    let c_req = Arc::clone(&c_srv);
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 4096];
+                        let mut total = 0usize;
+                        while total < buf.len() {
+                            match sock.read(&mut buf[total..]).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => {
+                                    total += n;
+                                    let s = String::from_utf8_lossy(&buf[..total]);
+                                    if s.ends_with('}') {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        let id = c_req.fetch_add(1, Ordering::SeqCst) + 1;
+                        let body = format!(r#"{{"ok":true,"tx":{}}}"#, id);
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = sock.write_all(resp.as_bytes()).await;
+                    });
+                }
+            }
+        });
+
+        let finding = LatticeFinding {
+            id: "VF-RACE-002".into(),
+            rule_id: "VF-RACE-001".into(),
+            severity: "CRITICAL".into(),
+            title: "Double spend".into(),
+            status: "SUSPECT".into(),
+            entry_route: "POST /api/pay".into(),
+            sink_kind: vf_graph::SinkKind::BalanceUpdate,
+            missing_guard: GuardKind::TxLock,
+            witness_path: Vec::new(),
+            remediation: String::new(),
+        };
+        let vf = verify_concurrency_invariant(port, &finding, 12)
+            .await
+            .unwrap();
+        assert_eq!(vf.status, VerificationStatus::Proven);
+        assert!(vf.evidence.contains("12/12"), "evidence: {}", vf.evidence);
+    }
+
+    #[tokio::test]
+    async fn test_joinset_barrier_409_rejection_marks_mitigated() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c_srv = Arc::clone(&counter);
+        tokio::spawn(async move {
+            loop {
+                if let Ok((mut sock, _)) = listener.accept().await {
+                    let c_req = Arc::clone(&c_srv);
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 4096];
+                        let mut total = 0usize;
+                        while total < buf.len() {
+                            match sock.read(&mut buf[total..]).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => {
+                                    total += n;
+                                    let s = String::from_utf8_lossy(&buf[..total]);
+                                    if s.ends_with('}') {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        let seq = c_req.fetch_add(1, Ordering::SeqCst);
+                        let (status_line, body) = if seq == 0 {
+                            ("200 OK", r#"{"ok":true}"#)
+                        } else {
+                            ("409 Conflict", r#"{"error":"idempotency lock active"}"#)
+                        };
+                        let resp = format!(
+                            "HTTP/1.1 {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            status_line,
+                            body.len(),
+                            body
+                        );
+                        let _ = sock.write_all(resp.as_bytes()).await;
+                    });
+                }
+            }
+        });
+
+        let finding = LatticeFinding {
+            id: "VF-RACE-002".into(),
+            rule_id: "VF-RACE-001".into(),
+            severity: "CRITICAL".into(),
+            title: "Double spend".into(),
+            status: "SUSPECT".into(),
+            entry_route: "POST /api/pay".into(),
+            sink_kind: vf_graph::SinkKind::BalanceUpdate,
+            missing_guard: GuardKind::TxLock,
+            witness_path: Vec::new(),
+            remediation: String::new(),
+        };
+        let vf = verify_concurrency_invariant(port, &finding, 12)
+            .await
+            .unwrap();
+        assert_eq!(vf.status, VerificationStatus::Mitigated);
     }
 }

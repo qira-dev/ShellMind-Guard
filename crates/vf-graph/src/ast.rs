@@ -5,9 +5,10 @@ use std::path::Path;
 use tree_sitter::{Node, Parser};
 use vf_core::{IndexedFile, Language, VeriForgeConfig};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SymbolKind {
     Route,
+    #[default]
     Function,
     Sink,
 }
@@ -18,12 +19,54 @@ pub enum SinkKind {
     BalanceUpdate,
     SqlWrite,
     AuthMutation,
+    SqlInjection,
+    CommandInjection,
+    PathTraversal,
+    Ssrf,
+    IdorDbAccess,
+    SecretLeak,
+    Misconfiguration,
+    DependencyRisk,
+    FrontendContract,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum GuardKind {
     Auth,
     TxLock,
+    SqlSanitizer,
+    CmdSanitizer,
+    PathSanitizer,
+    SsrfSanitizer,
+    OwnershipCheck,
+    SecretPolicy,
+    ConfigPolicy,
+    DependencyPolicy,
+    FrontendContract,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalStaticFinding {
+    pub rule_id: String,
+    pub severity: String,
+    pub title: String,
+    pub rel_path: String,
+    pub line: usize,
+    pub symbol: String,
+    pub sink_kind: SinkKind,
+    pub missing_guard: GuardKind,
+    #[serde(default)]
+    pub remediation: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrontendApiCall {
+    pub rel_path: String,
+    pub line: usize,
+    pub method: String,
+    pub raw_path: String,
+    pub normalized_path: String,
+    pub symbol: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,7 +75,7 @@ pub struct ImportRef {
     pub from_specifier: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct SymbolInfo {
     pub id: String,
     pub rel_path: String,
@@ -44,22 +87,166 @@ pub struct SymbolInfo {
     pub guards: HashSet<GuardKind>,
     pub calls: Vec<String>,
     pub route_path: Option<String>,
+    #[serde(default)]
+    pub has_taint_source: bool,
+    #[serde(default)]
+    pub has_resource_id: bool,
+    #[serde(default)]
+    pub has_db_crud_sink: bool,
+    #[serde(default)]
+    pub db_crud_line: Option<usize>,
+    #[serde(default)]
+    pub tainted_calls: Vec<String>,
+    #[serde(default)]
+    pub param_forwarding_calls: Vec<String>,
+    #[serde(default)]
+    pub local_taint_hits: Vec<LocalStaticFinding>,
+    #[serde(default)]
+    pub param_sinks: Vec<LocalStaticFinding>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FileAstSummary {
     pub rel_path: String,
     pub imports: Vec<ImportRef>,
     pub symbols: Vec<SymbolInfo>,
+    #[serde(default)]
+    pub static_findings: Vec<LocalStaticFinding>,
+    #[serde(default)]
+    pub frontend_calls: Vec<FrontendApiCall>,
+    #[serde(default)]
+    pub route_prefixes: Vec<String>,
+    #[serde(default)]
+    pub gitignore_lines: Option<Vec<String>>,
+    #[serde(default)]
+    pub is_sensitive_env_or_pem: bool,
+}
+
+impl SymbolInfo {
+    #[allow(clippy::too_many_arguments)]
+    fn base(
+        id: String,
+        rel_path: &str,
+        name: String,
+        kind: SymbolKind,
+        sink_kind: Option<SinkKind>,
+        line_start: usize,
+        line_end: usize,
+        guards: HashSet<GuardKind>,
+        calls: Vec<String>,
+        route_path: Option<String>,
+    ) -> Self {
+        Self {
+            id,
+            rel_path: rel_path.to_string(),
+            name,
+            kind,
+            sink_kind,
+            line_start,
+            line_end,
+            guards,
+            calls,
+            route_path,
+            has_taint_source: false,
+            has_resource_id: false,
+            has_db_crud_sink: false,
+            db_crud_line: None,
+            tainted_calls: Vec::new(),
+            param_forwarding_calls: Vec::new(),
+            local_taint_hits: Vec::new(),
+            param_sinks: Vec::new(),
+        }
+    }
+
+    fn apply_taint(&mut self, t: crate::taint::FunctionTaintSummary) {
+        self.guards.extend(t.guards);
+        self.has_taint_source = self.has_taint_source || t.has_taint_source;
+        self.has_resource_id = self.has_resource_id || t.has_resource_id;
+        self.has_db_crud_sink = self.has_db_crud_sink || t.has_db_crud_sink;
+        if self.db_crud_line.is_none() {
+            self.db_crud_line = t.db_crud_line;
+        }
+        for c in t.tainted_calls {
+            if !self.tainted_calls.iter().any(|x| x == &c) {
+                self.tainted_calls.push(c);
+            }
+        }
+        for c in t.param_forwarding_calls {
+            if !self.param_forwarding_calls.iter().any(|x| x == &c) {
+                self.param_forwarding_calls.push(c);
+            }
+        }
+        self.local_taint_hits.extend(t.local_taint_hits);
+        self.param_sinks.extend(t.param_sinks);
+    }
 }
 
 pub fn parse_file_ast_with_hash(
     file: &IndexedFile,
     cfg: &VeriForgeConfig,
 ) -> Option<(String, FileAstSummary)> {
-    let bytes = fs::read(&file.abs_path).ok()?;
-    let actual_hash = blake3::hash(&bytes).to_hex().to_string();
-    let source = String::from_utf8(bytes).ok()?;
+    let owned_bytes;
+    let bytes: &[u8] = if let Some(ref cached) = file.cached_bytes {
+        cached.as_slice()
+    } else {
+        owned_bytes = fs::read(&file.abs_path).ok()?;
+        owned_bytes.as_slice()
+    };
+    let actual_hash = if file.cached_bytes.is_some() && !file.blake3_hash.is_empty() {
+        file.blake3_hash.clone()
+    } else {
+        blake3::hash(bytes).to_hex().to_string()
+    };
+    let is_sensitive = crate::secrets_config::is_sensitive_env_or_pem(&file.rel_path);
+    let source = match std::str::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            if is_sensitive {
+                return Some((
+                    actual_hash,
+                    FileAstSummary {
+                        rel_path: file.rel_path.clone(),
+                        is_sensitive_env_or_pem: true,
+                        ..Default::default()
+                    },
+                ));
+            }
+            return None;
+        }
+    };
+
+    let gitignore_lines = if Path::new(&file.rel_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        == Some(".gitignore")
+    {
+        Some(source.lines().map(|l| l.to_string()).collect())
+    } else {
+        None
+    };
+
+    let mut static_findings =
+        crate::secrets_config::scan_secrets_and_config(&file.rel_path, source);
+    if matches!(file.language, Language::Manifest) {
+        static_findings.extend(crate::deps::scan_dependencies(&file.rel_path, source));
+    }
+
+    if matches!(
+        file.language,
+        Language::Config | Language::Manifest | Language::Sql
+    ) {
+        return Some((
+            actual_hash,
+            FileAstSummary {
+                rel_path: file.rel_path.clone(),
+                static_findings,
+                gitignore_lines,
+                is_sensitive_env_or_pem: is_sensitive,
+                ..Default::default()
+            },
+        ));
+    }
+
     let mut parser = Parser::new();
 
     match file.language {
@@ -90,15 +277,16 @@ pub fn parse_file_ast_with_hash(
         Language::Go => {
             parser.set_language(&tree_sitter_go::LANGUAGE.into()).ok()?;
         }
-        Language::Sql => return None,
+        Language::Sql | Language::Config | Language::Manifest => unreachable!(),
     }
 
-    let tree = parser.parse(&source, None)?;
+    let tree = parser.parse(source, None)?;
     let root = tree.root_node();
     let src_bytes = source.as_bytes();
 
     let mut imports = Vec::new();
     let mut symbols = Vec::new();
+    let mut route_prefixes = Vec::new();
 
     let mut file_middleware_guards = HashSet::new();
     extract_node(
@@ -110,6 +298,17 @@ pub fn parse_file_ast_with_hash(
         &mut file_middleware_guards,
         &mut imports,
         &mut symbols,
+        &mut route_prefixes,
+    );
+
+    let mut frontend_calls = Vec::new();
+    crate::taint::extract_frontend_calls_and_bugs(
+        root,
+        src_bytes,
+        &file.rel_path,
+        file.language,
+        &mut frontend_calls,
+        &mut static_findings,
     );
 
     Some((
@@ -118,6 +317,11 @@ pub fn parse_file_ast_with_hash(
             rel_path: file.rel_path.clone(),
             imports,
             symbols,
+            static_findings,
+            frontend_calls,
+            route_prefixes,
+            gitignore_lines,
+            is_sensitive_env_or_pem: is_sensitive,
         },
     ))
 }
@@ -384,6 +588,7 @@ fn extract_node(
     file_middleware_guards: &mut HashSet<GuardKind>,
     imports: &mut Vec<ImportRef>,
     symbols: &mut Vec<SymbolInfo>,
+    route_prefixes: &mut Vec<String>,
 ) {
     let kind = node.kind();
 
@@ -516,7 +721,7 @@ fn extract_node(
         }
     }
 
-    // 2a-use. File-level `app.use(requireAuth)` / `router.use(requireAuth)` (B03)
+    // 2a-use. File-level `app.use(requireAuth)` / `router.use(requireAuth)` & prefix capture (B03)
     if (lang == Language::TypeScript || lang == Language::JavaScript)
         && kind == "call_expression"
         && let Some(func) = node.child_by_field_name("function")
@@ -528,8 +733,37 @@ fn extract_node(
             let mut c = args.walk();
             for arg in args.children(&mut c) {
                 let atxt = node_text(arg, src).trim();
+                if atxt.starts_with('\'') || atxt.starts_with('"') {
+                    let unq = atxt.trim_matches(|ch| ch == '\'' || ch == '"');
+                    if unq.starts_with('/')
+                        && unq.len() > 1
+                        && !route_prefixes.iter().any(|p| p == unq)
+                    {
+                        route_prefixes.push(unq.to_string());
+                    }
+                }
                 if is_auth_guard_ident(atxt, cfg) {
                     file_middleware_guards.insert(GuardKind::Auth);
+                }
+            }
+        }
+    }
+
+    // 2a-nest-ctrl. NestJS `@Controller("prefix")` decorator capture
+    if (lang == Language::TypeScript || lang == Language::JavaScript) && kind == "decorator" {
+        let dtxt = node_text(node, src).trim();
+        if dtxt.contains("@Controller(")
+            && let Some(raw) = dtxt.split('(').nth(1).and_then(|s| s.split(')').next())
+        {
+            let cleaned = raw.trim().trim_matches(|ch| ch == '\'' || ch == '"');
+            if !cleaned.is_empty() && cleaned != "/" {
+                let pref = if cleaned.starts_with('/') {
+                    cleaned.to_string()
+                } else {
+                    format!("/{}", cleaned)
+                };
+                if !route_prefixes.iter().any(|p| p == &pref) {
+                    route_prefixes.push(pref);
                 }
             }
         }
@@ -557,6 +791,7 @@ fn extract_node(
             let mut calls = Vec::new();
             let mut guards = file_middleware_guards.clone();
             let mut seen_handler = false;
+            let mut route_taints = Vec::new();
             let line_start = node.start_position().row + 1;
             let line_end = node.end_position().row + 1;
 
@@ -589,6 +824,19 @@ fn extract_node(
                         guards.extend(inline_guards);
                         collect_calls(arg, src, &mut calls);
 
+                        let handler_label = route_path
+                            .as_deref()
+                            .map(|rp| format!("{} {}", method.to_ascii_uppercase(), rp))
+                            .unwrap_or_else(|| format!("inline_{}", line_start));
+                        let t_inline = crate::taint::analyze_function_taint(
+                            arg,
+                            src,
+                            rel_path,
+                            lang,
+                            &handler_label,
+                            route_path.as_deref(),
+                        );
+
                         if let Some(sk) =
                             classify_sink(route_path.as_deref().unwrap_or("inline"), inline_body)
                         {
@@ -596,20 +844,27 @@ fn extract_node(
                             let inline_name = format!("inline_sink_{}", line_start);
                             let mut inline_calls = Vec::new();
                             collect_calls(arg, src, &mut inline_calls);
-                            symbols.push(SymbolInfo {
-                                id: inline_id,
-                                rel_path: rel_path.to_string(),
-                                name: inline_name.clone(),
-                                kind: SymbolKind::Sink,
-                                sink_kind: Some(sk),
-                                line_start: arg.start_position().row + 1,
-                                line_end: arg.end_position().row + 1,
-                                guards: classify_fn_guards_cfg(arg, src, cfg),
-                                calls: inline_calls,
-                                route_path: None,
-                            });
+                            let mut sink_sym = SymbolInfo::base(
+                                inline_id,
+                                rel_path,
+                                inline_name.clone(),
+                                SymbolKind::Sink,
+                                Some(sk),
+                                arg.start_position().row + 1,
+                                arg.end_position().row + 1,
+                                classify_fn_guards_cfg(arg, src, cfg),
+                                inline_calls,
+                                None,
+                            );
+                            sink_sym.has_db_crud_sink = t_inline.has_db_crud_sink;
+                            sink_sym.db_crud_line = t_inline.db_crud_line;
+                            sink_sym.has_resource_id = t_inline.has_resource_id;
+                            sink_sym.has_taint_source = t_inline.has_taint_source;
+                            sink_sym.guards.extend(t_inline.guards.iter().copied());
+                            symbols.push(sink_sym);
                             calls.push(inline_name);
                         }
+                        route_taints.push(t_inline);
                     } else {
                         if !seen_handler && is_auth_guard_ident(atxt, cfg) {
                             guards.insert(GuardKind::Auth);
@@ -620,18 +875,26 @@ fn extract_node(
             }
             if let Some(rp) = route_path {
                 let r_label = format!("{} {}", method.to_ascii_uppercase(), rp);
-                symbols.push(SymbolInfo {
-                    id: format!("{}::route:{}", rel_path, line_start),
-                    rel_path: rel_path.to_string(),
-                    name: r_label,
-                    kind: SymbolKind::Route,
-                    sink_kind: None,
+                let has_res_id = crate::taint::has_resource_id_expr("", Some(&rp));
+                let mut route_sym = SymbolInfo::base(
+                    format!("{}::route:{}", rel_path, line_start),
+                    rel_path,
+                    r_label,
+                    SymbolKind::Route,
+                    None,
                     line_start,
                     line_end,
                     guards,
                     calls,
-                    route_path: Some(rp),
-                });
+                    Some(rp),
+                );
+                if has_res_id {
+                    route_sym.has_resource_id = true;
+                }
+                for t in route_taints {
+                    route_sym.apply_taint(t);
+                }
+                symbols.push(route_sym);
                 return;
             }
         }
@@ -654,39 +917,61 @@ fn extract_node(
             }
             let mut calls = Vec::new();
             let mut inline_body = "";
+            let r_label = format!("TRPC {}:{}", rel_path, line_start);
+            let trpc_path = format!("/trpc/{}", line_start);
+            let mut trpc_taint = None;
             if let Some(args) = node.child_by_field_name("arguments") {
                 inline_body = node_text(args, src);
                 collect_calls(args, src, &mut calls);
+                trpc_taint = Some(crate::taint::analyze_function_taint(
+                    args,
+                    src,
+                    rel_path,
+                    lang,
+                    &r_label,
+                    Some(&trpc_path),
+                ));
             }
-            let r_label = format!("TRPC {}:{}", rel_path, line_start);
             if let Some(sk) = classify_sink(&r_label, inline_body) {
                 let inline_name = format!("trpc_sink_{}", line_start);
-                symbols.push(SymbolInfo {
-                    id: format!("{}::{}", rel_path, inline_name),
-                    rel_path: rel_path.to_string(),
-                    name: inline_name.clone(),
-                    kind: SymbolKind::Sink,
-                    sink_kind: Some(sk),
+                let mut sink_sym = SymbolInfo::base(
+                    format!("{}::{}", rel_path, inline_name),
+                    rel_path,
+                    inline_name.clone(),
+                    SymbolKind::Sink,
+                    Some(sk),
                     line_start,
                     line_end,
-                    guards: guards.clone(),
-                    calls: calls.clone(),
-                    route_path: None,
-                });
+                    guards.clone(),
+                    calls.clone(),
+                    None,
+                );
+                if let Some(ref t) = trpc_taint {
+                    sink_sym.has_db_crud_sink = t.has_db_crud_sink;
+                    sink_sym.db_crud_line = t.db_crud_line;
+                    sink_sym.has_resource_id = t.has_resource_id;
+                    sink_sym.has_taint_source = t.has_taint_source;
+                    sink_sym.guards.extend(t.guards.iter().copied());
+                }
+                symbols.push(sink_sym);
                 calls.push(inline_name);
             }
-            symbols.push(SymbolInfo {
-                id: format!("{}::route:{}", rel_path, line_start),
-                rel_path: rel_path.to_string(),
-                name: r_label,
-                kind: SymbolKind::Route,
-                sink_kind: None,
+            let mut route_sym = SymbolInfo::base(
+                format!("{}::route:{}", rel_path, line_start),
+                rel_path,
+                r_label,
+                SymbolKind::Route,
+                None,
                 line_start,
                 line_end,
                 guards,
                 calls,
-                route_path: Some(format!("/trpc/{}", line_start)),
-            });
+                Some(trpc_path),
+            );
+            if let Some(t) = trpc_taint {
+                route_sym.apply_taint(t);
+            }
+            symbols.push(route_sym);
             return;
         }
     }
@@ -732,18 +1017,21 @@ fn extract_node(
                         let mname = node_text(name_node, src).trim().to_string();
                         let line_start = ch.start_position().row + 1;
                         let line_end = ch.end_position().row + 1;
-                        symbols.push(SymbolInfo {
-                            id: format!("{}::route:{}", rel_path, line_start),
-                            rel_path: rel_path.to_string(),
-                            name: format!("{} {}", m, rp),
-                            kind: SymbolKind::Route,
-                            sink_kind: None,
+                        let has_res_id = crate::taint::has_resource_id_expr("", Some(&rp));
+                        let mut route_sym = SymbolInfo::base(
+                            format!("{}::route:{}", rel_path, line_start),
+                            rel_path,
+                            format!("{} {}", m, rp),
+                            SymbolKind::Route,
+                            None,
                             line_start,
                             line_end,
-                            guards: std::mem::take(&mut pending_guards),
-                            calls: vec![mname],
-                            route_path: Some(rp),
-                        });
+                            std::mem::take(&mut pending_guards),
+                            vec![mname],
+                            Some(rp),
+                        );
+                        route_sym.has_resource_id = has_res_id;
+                        symbols.push(route_sym);
                     }
                     if class_has_auth {
                         pending_guards.insert(GuardKind::Auth);
@@ -789,18 +1077,21 @@ fn extract_node(
             let fn_name = node_text(name_node, src).trim().to_string();
             let line_start = node.start_position().row + 1;
             let line_end = fnode.end_position().row + 1;
-            symbols.push(SymbolInfo {
-                id: format!("{}::route:{}", rel_path, line_start),
-                rel_path: rel_path.to_string(),
-                name: format!("{} {}", method, rp),
-                kind: SymbolKind::Route,
-                sink_kind: None,
+            let has_res_id = crate::taint::has_resource_id_expr("", Some(&rp));
+            let mut route_sym = SymbolInfo::base(
+                format!("{}::route:{}", rel_path, line_start),
+                rel_path,
+                format!("{} {}", method, rp),
+                SymbolKind::Route,
+                None,
                 line_start,
                 line_end,
-                guards: dec_guards,
-                calls: vec![fn_name],
-                route_path: Some(rp),
-            });
+                dec_guards,
+                vec![fn_name],
+                Some(rp),
+            );
+            route_sym.has_resource_id = has_res_id;
+            symbols.push(route_sym);
             // Continue into `fnode` to emit the Function / Sink symbol itself
             extract_node(
                 fnode,
@@ -811,6 +1102,7 @@ fn extract_node(
                 file_middleware_guards,
                 imports,
                 symbols,
+                route_prefixes,
             );
             return;
         }
@@ -858,18 +1150,21 @@ fn extract_node(
                 let guards = classify_guards(&calls.join(" "), cfg);
                 let line_start = args.start_position().row + 1;
                 let line_end = args.end_position().row + 1;
-                symbols.push(SymbolInfo {
-                    id: format!("{}::route:{}", rel_path, line_start),
-                    rel_path: rel_path.to_string(),
-                    name: format!("{} {}", method, rp),
-                    kind: SymbolKind::Route,
-                    sink_kind: None,
+                let has_res_id = crate::taint::has_resource_id_expr("", Some(&rp));
+                let mut route_sym = SymbolInfo::base(
+                    format!("{}::route:{}", rel_path, line_start),
+                    rel_path,
+                    format!("{} {}", method, rp),
+                    SymbolKind::Route,
+                    None,
                     line_start,
                     line_end,
                     guards,
                     calls,
-                    route_path: Some(rp),
-                });
+                    Some(rp),
+                );
+                route_sym.has_resource_id = has_res_id;
+                symbols.push(route_sym);
             }
         }
     }
@@ -907,18 +1202,21 @@ fn extract_node(
             {
                 let line_start = node.start_position().row + 1;
                 let line_end = node.end_position().row + 1;
-                symbols.push(SymbolInfo {
-                    id: format!("{}::route:{}", rel_path, line_start),
-                    rel_path: rel_path.to_string(),
-                    name: format!("DJANGO {}", rp),
-                    kind: SymbolKind::Route,
-                    sink_kind: None,
+                let has_res_id = crate::taint::has_resource_id_expr("", Some(&rp));
+                let mut route_sym = SymbolInfo::base(
+                    format!("{}::route:{}", rel_path, line_start),
+                    rel_path,
+                    format!("DJANGO {}", rp),
+                    SymbolKind::Route,
+                    None,
                     line_start,
                     line_end,
-                    guards: HashSet::new(),
+                    HashSet::new(),
                     calls,
-                    route_path: Some(rp),
-                });
+                    Some(rp),
+                );
+                route_sym.has_resource_id = has_res_id;
+                symbols.push(route_sym);
                 return;
             }
         }
@@ -932,6 +1230,23 @@ fn extract_node(
         let ftxt = node_text(func, src);
         let method = ftxt.rsplit('.').next().unwrap_or("");
         let method_upper = method.to_ascii_uppercase();
+        if (method == "Group" || method == "Use")
+            && let Some(args) = node.child_by_field_name("arguments")
+        {
+            let mut c = args.walk();
+            for arg in args.children(&mut c) {
+                let atxt = node_text(arg, src).trim();
+                if atxt.starts_with('"') || atxt.starts_with('`') {
+                    let unq = atxt.trim_matches(|ch| ch == '"' || ch == '`');
+                    if unq.starts_with('/')
+                        && unq.len() > 1
+                        && !route_prefixes.iter().any(|p| p == unq)
+                    {
+                        route_prefixes.push(unq.to_string());
+                    }
+                }
+            }
+        }
         if method == "Group" || method == "Use" {
             let gtxt = node_text(node, src);
             file_middleware_guards.extend(classify_guards(gtxt, cfg));
@@ -948,6 +1263,7 @@ fn extract_node(
             let mut calls = Vec::new();
             let mut guards = file_middleware_guards.clone();
             let mut seen_handler = false;
+            let mut route_taints = Vec::new();
             let line_start = node.start_position().row + 1;
             let line_end = node.end_position().row + 1;
 
@@ -960,6 +1276,50 @@ fn extract_node(
                 let atxt = node_text(arg, src).trim();
                 if (atxt.starts_with('"') || atxt.starts_with('`')) && route_path.is_none() {
                     route_path = Some(atxt.trim_matches(|ch| ch == '"' || ch == '`').to_string());
+                } else if ak == "func_literal" {
+                    seen_handler = true;
+                    let inline_body = node_text(arg, src);
+                    guards.extend(classify_fn_guards_cfg(arg, src, cfg));
+                    collect_calls(arg, src, &mut calls);
+                    let handler_label = route_path
+                        .as_deref()
+                        .map(|rp| format!("{} {}", method_upper, rp))
+                        .unwrap_or_else(|| format!("go_inline_{}", line_start));
+                    let t_inline = crate::taint::analyze_function_taint(
+                        arg,
+                        src,
+                        rel_path,
+                        lang,
+                        &handler_label,
+                        route_path.as_deref(),
+                    );
+                    if let Some(sk) =
+                        classify_sink(route_path.as_deref().unwrap_or("inline"), inline_body)
+                    {
+                        let inline_name = format!("inline_sink_{}", line_start);
+                        let mut inline_calls = Vec::new();
+                        collect_calls(arg, src, &mut inline_calls);
+                        let mut sink_sym = SymbolInfo::base(
+                            format!("{}::inline_sink:{}", rel_path, line_start),
+                            rel_path,
+                            inline_name.clone(),
+                            SymbolKind::Sink,
+                            Some(sk),
+                            arg.start_position().row + 1,
+                            arg.end_position().row + 1,
+                            classify_fn_guards_cfg(arg, src, cfg),
+                            inline_calls,
+                            None,
+                        );
+                        sink_sym.has_db_crud_sink = t_inline.has_db_crud_sink;
+                        sink_sym.db_crud_line = t_inline.db_crud_line;
+                        sink_sym.has_resource_id = t_inline.has_resource_id;
+                        sink_sym.has_taint_source = t_inline.has_taint_source;
+                        sink_sym.guards.extend(t_inline.guards.iter().copied());
+                        symbols.push(sink_sym);
+                        calls.push(inline_name);
+                    }
+                    route_taints.push(t_inline);
                 } else {
                     let short = atxt
                         .split('(')
@@ -987,18 +1347,24 @@ fn extract_node(
                 } else {
                     method_upper
                 };
-                symbols.push(SymbolInfo {
-                    id: format!("{}::route:{}", rel_path, line_start),
-                    rel_path: rel_path.to_string(),
-                    name: format!("{} {}", label_method, rp),
-                    kind: SymbolKind::Route,
-                    sink_kind: None,
+                let has_res_id = crate::taint::has_resource_id_expr("", Some(&rp));
+                let mut route_sym = SymbolInfo::base(
+                    format!("{}::route:{}", rel_path, line_start),
+                    rel_path,
+                    format!("{} {}", label_method, rp),
+                    SymbolKind::Route,
+                    None,
                     line_start,
                     line_end,
                     guards,
                     calls,
-                    route_path: Some(rp),
-                });
+                    Some(rp),
+                );
+                route_sym.has_resource_id = has_res_id;
+                for t in route_taints {
+                    route_sym.apply_taint(t);
+                }
+                symbols.push(route_sym);
                 return;
             }
         }
@@ -1029,18 +1395,21 @@ fn extract_node(
             );
             let line_start = node.start_position().row + 1;
             let line_end = node.end_position().row + 1;
-            symbols.push(SymbolInfo {
-                id: format!("{}::route:{}", rel_path, line_start),
-                rel_path: rel_path.to_string(),
-                name: format!("{} {}", fn_name, route_p),
-                kind: SymbolKind::Route,
-                sink_kind: None,
+            let has_res_id = crate::taint::has_resource_id_expr("", Some(&route_p));
+            let mut route_sym = SymbolInfo::base(
+                format!("{}::route:{}", rel_path, line_start),
+                rel_path,
+                format!("{} {}", fn_name, route_p),
+                SymbolKind::Route,
+                None,
                 line_start,
                 line_end,
-                guards: HashSet::new(),
-                calls: vec![fn_name],
-                route_path: Some(route_p),
-            });
+                HashSet::new(),
+                vec![fn_name],
+                Some(route_p),
+            );
+            route_sym.has_resource_id = has_res_id;
+            symbols.push(route_sym);
         }
     }
 
@@ -1060,18 +1429,21 @@ fn extract_node(
                         let fn_name = node_text(name_node, src).trim().to_string();
                         let line_start = next_fn.start_position().row + 1;
                         let line_end = next_fn.end_position().row + 1;
-                        symbols.push(SymbolInfo {
-                            id: format!("{}::route:{}", rel_path, line_start),
-                            rel_path: rel_path.to_string(),
-                            name: format!("{} {}", m.to_ascii_uppercase(), rp),
-                            kind: SymbolKind::Route,
-                            sink_kind: None,
+                        let has_res_id = crate::taint::has_resource_id_expr("", Some(&rp));
+                        let mut route_sym = SymbolInfo::base(
+                            format!("{}::route:{}", rel_path, line_start),
+                            rel_path,
+                            format!("{} {}", m.to_ascii_uppercase(), rp),
+                            SymbolKind::Route,
+                            None,
                             line_start,
                             line_end,
-                            guards: HashSet::new(),
-                            calls: vec![fn_name],
-                            route_path: Some(rp),
-                        });
+                            HashSet::new(),
+                            vec![fn_name],
+                            Some(rp),
+                        );
+                        route_sym.has_resource_id = has_res_id;
+                        symbols.push(route_sym);
                     }
                 }
             }
@@ -1099,18 +1471,22 @@ fn extract_node(
         } else {
             SymbolKind::Function
         };
-        symbols.push(SymbolInfo {
-            id: format!("{}::{}", rel_path, name),
-            rel_path: rel_path.to_string(),
-            name,
-            kind: sym_kind,
+        let mut sym = SymbolInfo::base(
+            format!("{}::{}", rel_path, name),
+            rel_path,
+            name.clone(),
+            sym_kind,
             sink_kind,
-            line_start: node.start_position().row + 1,
-            line_end: node.end_position().row + 1,
+            node.start_position().row + 1,
+            node.end_position().row + 1,
             guards,
             calls,
-            route_path: None,
-        });
+            None,
+        );
+        sym.apply_taint(crate::taint::analyze_function_taint(
+            node, src, rel_path, lang, &name, None,
+        ));
+        symbols.push(sym);
     }
 
     // 4. Arrow functions assigned to const/let: const foo = async (...) => { ... }
@@ -1132,18 +1508,22 @@ fn extract_node(
         } else {
             SymbolKind::Function
         };
-        symbols.push(SymbolInfo {
-            id: format!("{}::{}", rel_path, name),
-            rel_path: rel_path.to_string(),
-            name,
-            kind: sym_kind,
+        let mut sym = SymbolInfo::base(
+            format!("{}::{}", rel_path, name),
+            rel_path,
+            name.clone(),
+            sym_kind,
             sink_kind,
-            line_start: node.start_position().row + 1,
-            line_end: node.end_position().row + 1,
+            node.start_position().row + 1,
+            node.end_position().row + 1,
             guards,
             calls,
-            route_path: None,
-        });
+            None,
+        );
+        sym.apply_taint(crate::taint::analyze_function_taint(
+            val_node, src, rel_path, lang, &name, None,
+        ));
+        symbols.push(sym);
         return;
     }
 
@@ -1158,6 +1538,7 @@ fn extract_node(
             file_middleware_guards,
             imports,
             symbols,
+            route_prefixes,
         );
     }
 }
@@ -1341,6 +1722,7 @@ mod tests {
         let mut mw = HashSet::new();
         let mut imports = Vec::new();
         let mut symbols = Vec::new();
+        let mut route_prefixes = Vec::new();
         extract_node(
             tree.root_node(),
             code.as_bytes(),
@@ -1350,11 +1732,26 @@ mod tests {
             &mut mw,
             &mut imports,
             &mut symbols,
+            &mut route_prefixes,
+        );
+        let mut frontend_calls = Vec::new();
+        let mut static_findings = Vec::new();
+        crate::taint::extract_frontend_calls_and_bugs(
+            tree.root_node(),
+            code.as_bytes(),
+            "test.ts",
+            Language::TypeScript,
+            &mut frontend_calls,
+            &mut static_findings,
         );
         FileAstSummary {
             rel_path: "test.ts".into(),
             imports,
             symbols,
+            static_findings,
+            frontend_calls,
+            route_prefixes,
+            ..Default::default()
         }
     }
 
@@ -1429,6 +1826,7 @@ def withdraw(amount: int):
         let mut mw = HashSet::new();
         let mut imports = Vec::new();
         let mut symbols = Vec::new();
+        let mut route_prefixes = Vec::new();
         extract_node(
             tree.root_node(),
             py_code.as_bytes(),
@@ -1438,6 +1836,7 @@ def withdraw(amount: int):
             &mut mw,
             &mut imports,
             &mut symbols,
+            &mut route_prefixes,
         );
         assert!(
             symbols
@@ -1470,13 +1869,14 @@ def withdraw(amount: int):
             Language::Rust => tree_sitter_rust::LANGUAGE.into(),
             Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
             Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-            Language::Sql => unreachable!(),
+            Language::Sql | Language::Config | Language::Manifest => unreachable!(),
         };
         parser.set_language(&ts_lang).unwrap();
         let tree = parser.parse(code, None).unwrap();
         let mut mw = HashSet::new();
         let mut imports = Vec::new();
         let mut symbols = Vec::new();
+        let mut route_prefixes = Vec::new();
         extract_node(
             tree.root_node(),
             code.as_bytes(),
@@ -1486,11 +1886,26 @@ def withdraw(amount: int):
             &mut mw,
             &mut imports,
             &mut symbols,
+            &mut route_prefixes,
+        );
+        let mut frontend_calls = Vec::new();
+        let mut static_findings = Vec::new();
+        crate::taint::extract_frontend_calls_and_bugs(
+            tree.root_node(),
+            code.as_bytes(),
+            rel_path,
+            lang,
+            &mut frontend_calls,
+            &mut static_findings,
         );
         FileAstSummary {
             rel_path: rel_path.into(),
             imports,
             symbols,
+            static_findings,
+            frontend_calls,
+            route_prefixes,
+            ..Default::default()
         }
     }
 
@@ -1675,6 +2090,83 @@ app.post('/api/v1/auth/2fa/confirm', async (req, res) => {
         assert!(
             res.findings.iter().any(|f| f.rule_id == "VF-RACE-001"),
             "public_routes must still report VF-RACE-001 if unlocked"
+        );
+    }
+
+    #[test]
+    fn test_phase2_taint_idor_and_frontend_extraction() {
+        let cfg = VeriForgeConfig::default();
+        let backend = r#"
+app.get('/api/users/:id', requireAuth, async (req, res) => {
+    const id = req.params.id;
+    return await db.query(`SELECT * FROM users WHERE id = ${id}`);
+});
+app.post('/api/exec', requireAuth, async (req, res) => {
+    const host = req.body.host;
+    exec("ping -c 1 " + host);
+});
+function readSafeFile(req: any) {
+    const safe = path.basename(req.query.name);
+    return fs.readFileSync('/var/data/' + safe);
+}
+app.post('/api/proxy', requireAuth, async (req, res) => {
+    const u = req.body.url;
+    await fetch(u);
+});
+"#;
+        let b_ast = parse_inline_file("routes.ts", backend, &cfg);
+        let hits: Vec<_> = b_ast
+            .symbols
+            .iter()
+            .flat_map(|s| s.local_taint_hits.iter())
+            .collect();
+        assert!(
+            hits.iter().any(|h| h.rule_id == "VF-SQLI-001"),
+            "Must detect SQLi in interpolated query"
+        );
+        assert!(
+            hits.iter().any(|h| h.rule_id == "VF-CMDI-001"),
+            "Must detect CMDi in exec()"
+        );
+        assert!(
+            !hits.iter().any(|h| h.rule_id == "VF-PATH-001"),
+            "path.basename sanitizer must clear VF-PATH-001"
+        );
+        assert!(
+            hits.iter().any(|h| h.rule_id == "VF-SSRF-001"),
+            "Must detect SSRF in outbound fetch(u)"
+        );
+
+        let user_route = b_ast
+            .symbols
+            .iter()
+            .find(|s| s.name == "GET /api/users/:id")
+            .unwrap();
+        assert!(user_route.has_resource_id);
+        assert!(user_route.has_db_crud_sink);
+
+        let fe = r#"
+export async function loadProfile(id: string) {
+    try {
+        await fetch(`/api/profile/${id}`);
+    } catch (e) {}
+    try {
+        await fetch(`/api/users/${id}`);
+    } catch (e) {
+        console.log(e);
+    }
+}
+"#;
+        let fe_ast = parse_inline_file("web/profile.tsx", fe, &cfg);
+        assert_eq!(fe_ast.frontend_calls.len(), 2);
+        assert!(
+            fe_ast
+                .static_findings
+                .iter()
+                .filter(|f| f.rule_id == "VF-FE-ERR")
+                .count()
+                >= 2,
+            "Must flag empty catch and console-only catch as VF-FE-ERR"
         );
     }
 }

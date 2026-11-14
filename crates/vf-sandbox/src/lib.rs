@@ -67,22 +67,30 @@ pub fn verify_findings_in_sandbox(
 
         let mut results = Vec::with_capacity(findings.len());
         // B-NET + B-DRAIN: When bwrap is available, run BOTH the target server AND `veriforge __probe-netns`
-        // inside a single `--unshare-all` (including `--unshare-net`!) namespace for each finding!
+        // inside a single `--unshare-all` (including `--unshare-net`!) namespace for each dynamic Auth/Race finding!
         if use_bwrap {
             for f in findings {
-                let res =
-                    run_finding_in_isolated_netns(project_root, boot_cmd, port, f, concurrency)?;
+                let res = if matches!(f.missing_guard, vf_graph::GuardKind::Auth | vf_graph::GuardKind::TxLock) {
+                    run_finding_in_isolated_netns(project_root, boot_cmd, port, f, concurrency)?
+                } else {
+                    verifier::verify_finding(port, f, concurrency).await?
+                };
                 results.push(res);
             }
             return Ok((true, results));
         }
 
         for f in findings {
-            let guard =
-                spawn_sandboxed_server(project_root, boot_cmd, port, allow_unsafe_host_fallback)
-                    .await?;
-            let res = verify_finding(port, f, concurrency).await?;
-            drop(guard);
+            let res = if matches!(f.missing_guard, vf_graph::GuardKind::Auth | vf_graph::GuardKind::TxLock) {
+                let guard =
+                    spawn_sandboxed_server(project_root, boot_cmd, port, allow_unsafe_host_fallback)
+                        .await?;
+                let out = verify_finding(port, f, concurrency).await?;
+                drop(guard);
+                out
+            } else {
+                verify_finding(port, f, concurrency).await?
+            };
             results.push(res);
         }
 
