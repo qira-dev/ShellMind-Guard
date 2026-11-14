@@ -12,7 +12,7 @@ use vf_report::{to_html_graph, to_sarif_json};
 use vf_sandbox::{
     VerificationStatus, VerifiedFinding, verify_finding_blocking, verify_findings_in_sandbox,
 };
-use vf_tui::run_tui;
+use vf_tui::{TuiLaunchConfig, run_tui};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -428,11 +428,11 @@ fn main() -> Result<ExitCode> {
             let (delta, _) = store.sync_files(&summary.files)?;
             let graph_res = analyze_codebase_cached(&summary.files, &cfg, &mut store)?;
             let effective_boot = boot_cmd.or_else(|| cfg.sandbox.boot_cmd.clone());
-            let verified_list = if let Some(cmd) = effective_boot {
+            let verified_list = if let Some(ref cmd) = effective_boot {
                 if !graph_res.findings.is_empty() {
                     verify_findings_in_sandbox(
                         &path,
-                        &cmd,
+                        cmd,
                         port,
                         &graph_res.findings,
                         sync_race,
@@ -452,7 +452,18 @@ fn main() -> Result<ExitCode> {
                 &verified_list,
             )?;
             let total_ms = t0.elapsed().as_millis();
-            run_tui(&path, &graph_res, &verified_list, total_ms)?;
+            run_tui(
+                &path,
+                graph_res,
+                verified_list,
+                total_ms,
+                TuiLaunchConfig {
+                    boot_cmd: effective_boot,
+                    port,
+                    sync_race,
+                    unsafe_host_fallback,
+                },
+            )?;
         }
         Commands::ProbeNetns { port, sync_race } => {
             let finding_json = std::env::var("VF_FINDING_JSON")?;
