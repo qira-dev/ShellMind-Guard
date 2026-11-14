@@ -540,7 +540,7 @@ fn classify_sink(name: &str, body: &str) -> Option<SinkKind> {
     if (low_body.contains("update ") && low_body.contains("set "))
         || low_body.contains("insert into ")
         || low_body.contains("delete from ")
-        || (low_body.contains("prisma.")
+        || ((low_body.contains("prisma.") || low_body.contains("db."))
             && (low_body.contains(".create(")
                 || low_body.contains(".update(")
                 || low_body.contains(".upsert(")

@@ -176,26 +176,45 @@ jobs:
 }
 
 fn finding_matches_layer(f: &LatticeFinding, layer: &str) -> bool {
-    match layer.trim().to_ascii_lowercase().as_str() {
+    let norm = layer.trim().to_ascii_lowercase();
+    match norm.as_str() {
+        "all" | "*" => true,
+        "1" | "layer1" => matches!(f.missing_guard, GuardKind::Auth | GuardKind::SecretPolicy),
+        "2" | "layer2" => matches!(
+            f.missing_guard,
+            GuardKind::SqlSanitizer
+                | GuardKind::CmdSanitizer
+                | GuardKind::PathSanitizer
+                | GuardKind::SsrfSanitizer
+                | GuardKind::OwnershipCheck
+                | GuardKind::FrontendContract
+        ),
+        "3" | "layer3" | "deps" | "dep" | "dependencies" => {
+            f.missing_guard == GuardKind::DependencyPolicy
+        }
+        "4" | "layer4" | "config" | "misconfig" => f.missing_guard == GuardKind::ConfigPolicy,
+        "5" | "layer5" | "6" | "layer6" | "race" | "concurrency" => {
+            f.missing_guard == GuardKind::TxLock
+        }
         "auth" => f.missing_guard == GuardKind::Auth,
-        "race" | "concurrency" => f.missing_guard == GuardKind::TxLock,
-        "taint" => matches!(
+        "taint" | "injection" => matches!(
             f.missing_guard,
             GuardKind::SqlSanitizer
                 | GuardKind::CmdSanitizer
                 | GuardKind::PathSanitizer
                 | GuardKind::SsrfSanitizer
         ),
-        "sqli" => f.missing_guard == GuardKind::SqlSanitizer,
-        "cmdi" => f.missing_guard == GuardKind::CmdSanitizer,
+        "sql" | "sqli" => f.missing_guard == GuardKind::SqlSanitizer,
+        "cmd" | "cmdi" => f.missing_guard == GuardKind::CmdSanitizer,
         "path" => f.missing_guard == GuardKind::PathSanitizer,
         "ssrf" => f.missing_guard == GuardKind::SsrfSanitizer,
         "idor" => f.missing_guard == GuardKind::OwnershipCheck,
         "secrets" | "secret" => f.missing_guard == GuardKind::SecretPolicy,
-        "config" | "misconfig" => f.missing_guard == GuardKind::ConfigPolicy,
-        "deps" | "dep" | "dependencies" => f.missing_guard == GuardKind::DependencyPolicy,
         "frontend" | "fe" | "contract" => f.missing_guard == GuardKind::FrontendContract,
-        _ => true,
+        other => {
+            f.rule_id.to_ascii_lowercase().contains(other)
+                || f.id.to_ascii_lowercase().contains(other)
+        }
     }
 }
 
@@ -235,6 +254,22 @@ pub(crate) fn execute_scan_pipeline(opts: ScanRunOptions<'_>) -> Result<ScanOutc
         .as_ref()
         .map(|(_, v)| v.clone())
         .unwrap_or_default();
+
+    if !verified_list.is_empty() {
+        let ver_map: HashMap<&str, &VerificationStatus> = verified_list
+            .iter()
+            .map(|v| (v.finding_id.as_str(), &v.status))
+            .collect();
+        for f in &mut graph_res.findings {
+            if let Some(st) = ver_map.get(f.id.as_str()) {
+                match st {
+                    VerificationStatus::Proven => f.status = "PROVEN".into(),
+                    VerificationStatus::Mitigated => f.status = "MITIGATED".into(),
+                    VerificationStatus::SuspectUnverified => {}
+                }
+            }
+        }
+    }
 
     persist_scan_findings(
         &mut store,
@@ -312,10 +347,16 @@ fn resolve_finding_for_replay(
     let summary = scan_repository(path, cfg)?;
     let _ = store.sync_files(&summary.files)?;
     let graph_res = analyze_codebase_cached(&summary.files, cfg, store)?;
-    graph_res
-        .findings
-        .into_iter()
+    let findings = graph_res.findings;
+    findings
+        .iter()
         .find(|f| f.id.eq_ignore_ascii_case(finding_id))
+        .or_else(|| {
+            findings
+                .iter()
+                .find(|f| f.rule_id.eq_ignore_ascii_case(finding_id))
+        })
+        .cloned()
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "Finding '{}' not found in current source of {}",
@@ -445,6 +486,8 @@ fn main() -> Result<ExitCode> {
                         serde_json::to_string_pretty(&serde_json::json!({
                             "ok": true,
                             "elapsed_ms": outcome.elapsed_ms,
+                            "findings_count": outcome.graph.findings.len(),
+                            "findings": outcome.graph.findings,
                             "delta": outcome.delta,
                             "graph": outcome.graph,
                             "sandbox_verification": outcome.sandbox.as_ref().map(|(bwrap, res)| serde_json::json!({
@@ -529,16 +572,12 @@ fn main() -> Result<ExitCode> {
             }
 
             if ci {
-                let has_proven = verified_list
-                    .iter()
-                    .any(|v| v.status == VerificationStatus::Proven);
-                let has_static_high_or_crit = outcome.sandbox.is_none()
-                    && outcome
-                        .graph
-                        .findings
-                        .iter()
-                        .any(|f| f.severity == "CRITICAL" || f.severity == "HIGH");
-                if has_proven || has_static_high_or_crit {
+                let has_proven_or_unmitigated_high = outcome.graph.findings.iter().any(|f| {
+                    f.status == "PROVEN"
+                        || (f.status != "MITIGATED"
+                            && (f.severity == "CRITICAL" || f.severity == "HIGH"))
+                });
+                if has_proven_or_unmitigated_high {
                     return Ok(ExitCode::from(2));
                 }
             }

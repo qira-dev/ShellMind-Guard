@@ -255,11 +255,20 @@ pub fn solve_guard_lattice_with_public(
     let lock_parents = build_unguarded_bfs_tree(&graph, GuardKind::TxLock);
     let route_parents = build_any_route_bfs_tree(&graph);
 
-    // O(V + E) Taint Propagation across function boundaries (`tainted_calls` -> `param_forwarding_calls`)
+    // O(V + E) Taint Propagation across function boundaries (`Route` handlers + `tainted_calls` -> `param_forwarding_calls`)
     let mut taint_parents: Vec<Option<NodeIndex>> = vec![None; node_count];
     let mut taint_q = VecDeque::new();
     for u in graph.node_indices() {
-        for callee in &graph[u].tainted_calls {
+        let is_route_entry = graph[u].kind == SymbolKind::Route;
+        let seed_iter = graph[u].tainted_calls.iter().chain(
+            if is_route_entry {
+                graph[u].calls.as_slice()
+            } else {
+                &[]
+            }
+            .iter(),
+        );
+        for callee in seed_iter {
             if let Some(&v) = resolved_callee_map.get(&(u.index(), callee.clone()))
                 && taint_parents[v.index()].is_none()
             {
@@ -999,5 +1008,34 @@ export async function syncData() {
         );
         // Ensure FrontendApiCall import stays used cleanly
         let _dummy = std::mem::size_of::<FrontendApiCall>();
+    }
+
+    #[test]
+    fn test_fastapi_route_param_injection_taint_propagation() {
+        let py_src = r#"
+from fastapi import FastAPI
+app = FastAPI()
+
+@app.get("/users/{user_id}")
+def get_user(user_id: str):
+    cursor.execute(f"SELECT * FROM users WHERE id = '{user_id}'")
+"#;
+        let cfg = VeriForgeConfig::default();
+        let file = IndexedFile {
+            abs_path: "api.py".into(),
+            rel_path: "api.py".into(),
+            language: Language::Python,
+            size_bytes: py_src.len() as u64,
+            mtime_ns: 0,
+            blake3_hash: String::new(),
+            cached_bytes: Some(py_src.as_bytes().to_vec()),
+        };
+        let summary = parse_file_ast(&file, &cfg).unwrap();
+        let res = solve_guard_lattice(&[summary]);
+        assert!(
+            res.findings.iter().any(|f| f.rule_id == "VF-SQLI-001"),
+            "FastAPI route handler parameter user_id must propagate taint to SQL sink: {:?}",
+            res.findings
+        );
     }
 }

@@ -381,11 +381,14 @@ fn is_db_crud_stmt(code: &str) -> bool {
         || low.contains(".objects.filter(")
         || low.contains("cursor.execute(")
         || low.contains("session.query(")
-        || (low.contains("prisma.")
+        || ((low.contains("prisma.") || low.contains("db."))
             && (low.contains(".findunique(")
                 || low.contains(".findfirst(")
+                || low.contains(".findmany(")
                 || low.contains(".update(")
-                || low.contains(".delete(")))
+                || low.contains(".updatemany(")
+                || low.contains(".delete(")
+                || low.contains(".deletemany(")))
     {
         return true;
     }
@@ -458,7 +461,11 @@ fn has_dynamic_sql_interpolation(node: Node, src: &[u8]) -> bool {
         && let Some(func) = node.child_by_field_name("function")
     {
         let ftxt = node_text(func, src).trim();
-        if ftxt == "fmt.Sprintf" || ftxt.ends_with(".Sprintf") || ftxt.ends_with(".format") {
+        if ftxt == "fmt.Sprintf"
+            || ftxt.ends_with(".Sprintf")
+            || ftxt.ends_with(".format")
+            || ftxt.ends_with(".concat")
+        {
             return true;
         }
     }
@@ -487,7 +494,7 @@ fn has_dynamic_sql_interpolation(node: Node, src: &[u8]) -> bool {
             let ck = ch.kind();
             if matches!(
                 ck,
-                "string" | "string_literal" | "interpreted_string_literal"
+                "string" | "string_literal" | "interpreted_string_literal" | "raw_string_literal"
             ) {
                 if sql_verb_re().is_match(node_text(ch, src)) {
                     has_sql_lit = true;

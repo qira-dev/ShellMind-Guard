@@ -45,6 +45,9 @@ pub fn build_minimal_patch_prompt(
     if let Some(v) = verified {
         prompt.push_str(&format!("Sandbox Evidence: {}\n", v.evidence));
     }
+    if !finding.remediation.is_empty() {
+        prompt.push_str(&format!("Remediation: {}\n", finding.remediation));
+    }
 
     prompt.push_str("\nRelevant Witness Hops:\n");
     for (idx, hop) in finding.witness_path.iter().enumerate() {

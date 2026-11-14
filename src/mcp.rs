@@ -250,6 +250,8 @@ fn handle_tool_call(params: &Value) -> Result<Value> {
             json!({
                 "ok": true,
                 "elapsed_ms": outcome.elapsed_ms,
+                "findings_count": outcome.graph.findings.len(),
+                "findings": outcome.graph.findings,
                 "delta": outcome.delta,
                 "graph": outcome.graph,
                 "sandbox_verification": outcome.sandbox.as_ref().map(|(bwrap, res)| json!({
@@ -269,10 +271,16 @@ fn handle_tool_call(params: &Value) -> Result<Value> {
             let mut store = StateStore::open(&root)?;
             let _ = store.sync_files(&summary.files)?;
             let graph = analyze_codebase_cached(&summary.files, &cfg, &mut store)?;
-            let finding = graph
-                .findings
-                .into_iter()
+            let findings = graph.findings;
+            let finding = findings
+                .iter()
                 .find(|f| f.id.eq_ignore_ascii_case(finding_id))
+                .or_else(|| {
+                    findings
+                        .iter()
+                        .find(|f| f.rule_id.eq_ignore_ascii_case(finding_id))
+                })
+                .cloned()
                 .ok_or_else(|| {
                     anyhow::anyhow!("Finding `{}` not found in {}", finding_id, root.display())
                 })?;
@@ -281,6 +289,7 @@ fn handle_tool_call(params: &Value) -> Result<Value> {
             json!({
                 "ok": true,
                 "finding": finding,
+                "remediation": finding.remediation,
                 "source_context": prompt_excerpt,
                 "replay_cmd": format!("veriforge replay {}", finding.id),
             })
