@@ -693,7 +693,9 @@ fn resolve_finding_for_replay(
     let summary = scan_repository(path, cfg)?;
     let _ = store.sync_files(&summary.files)?;
     let graph_res = analyze_codebase_cached(&summary.files, cfg, store)?;
-    let findings = graph_res.findings;
+    let deep_findings = collect_deep_schema_findings(&graph_res);
+    let mut findings = graph_res.findings;
+    findings.extend(deep_findings);
     findings
         .iter()
         .find(|f| f.id.eq_ignore_ascii_case(finding_id))
@@ -1263,32 +1265,127 @@ fn main() -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+fn split_shell_commands(cmd_str: &str) -> Vec<Vec<String>> {
+    let mut commands = Vec::new();
+    let mut cur_tokens: Vec<String> = Vec::new();
+    let mut cur_tok = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let chars: Vec<char> = cmd_str.chars().collect();
+    let mut i = 0usize;
+
+    let flush_tok = |tok: &mut String, toks: &mut Vec<String>| {
+        if !tok.is_empty() {
+            toks.push(std::mem::take(tok));
+        }
+    };
+    let flush_cmd = |toks: &mut Vec<String>, cmds: &mut Vec<Vec<String>>| {
+        if !toks.is_empty() {
+            cmds.push(std::mem::take(toks));
+        }
+    };
+
+    while i < chars.len() {
+        let ch = chars[i];
+        if escaped {
+            cur_tok.push(ch);
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        if in_single {
+            if ch == '\'' {
+                in_single = false;
+            } else {
+                cur_tok.push(ch);
+            }
+            i += 1;
+            continue;
+        }
+        if in_double {
+            if ch == '"' {
+                in_double = false;
+            } else if ch == '\\'
+                && i + 1 < chars.len()
+                && matches!(chars[i + 1], '"' | '\\' | '$' | '`')
+            {
+                escaped = true;
+            } else {
+                cur_tok.push(ch);
+            }
+            i += 1;
+            continue;
+        }
+
+        match ch {
+            '\\' => {
+                // Only treat backslash as escape on Unix paths/shells if followed by shell meta/space
+                if i + 1 < chars.len()
+                    && matches!(
+                        chars[i + 1],
+                        ' ' | '\t' | '"' | '\'' | ';' | '&' | '|' | '(' | ')' | '`' | '\\'
+                    )
+                {
+                    escaped = true;
+                } else {
+                    cur_tok.push(ch);
+                }
+            }
+            '\'' => in_single = true,
+            '"' => in_double = true,
+            ' ' | '\t' | '\r' => flush_tok(&mut cur_tok, &mut cur_tokens),
+            ';' | '\n' | '(' | ')' | '`' => {
+                flush_tok(&mut cur_tok, &mut cur_tokens);
+                flush_cmd(&mut cur_tokens, &mut commands);
+            }
+            '&' | '|' => {
+                flush_tok(&mut cur_tok, &mut cur_tokens);
+                flush_cmd(&mut cur_tokens, &mut commands);
+                if i + 1 < chars.len() && chars[i + 1] == ch {
+                    i += 1;
+                }
+            }
+            _ => cur_tok.push(ch),
+        }
+        i += 1;
+    }
+    flush_tok(&mut cur_tok, &mut cur_tokens);
+    flush_cmd(&mut cur_tokens, &mut commands);
+    commands
+}
+
 fn parse_git_commit_invocation(cmd_str: &str) -> Option<PathBuf> {
     let mut current_cd: Option<PathBuf> = None;
-    for seg in cmd_str.split([';', '&', '|', '\n', '(', ')', '`']) {
-        let mut tokens: Vec<&str> = seg.split_whitespace().collect();
-        while let Some(&first) = tokens.first() {
-            let unquoted = first.trim_matches(|c| c == '"' || c == '\'');
-            let is_env_assign = unquoted.contains('=')
-                && !unquoted.starts_with('-')
-                && !unquoted.starts_with('/')
-                && !unquoted.starts_with('.');
-            if is_env_assign || matches!(unquoted, "sudo" | "env" | "command" | "nohup" | "$") {
+    for mut tokens in split_shell_commands(cmd_str) {
+        while let Some(first) = tokens.first() {
+            let is_env_assign = first.contains('=')
+                && !first.starts_with('-')
+                && !first.starts_with('/')
+                && !first.starts_with('.');
+            if is_env_assign
+                || matches!(
+                    first.as_str(),
+                    "sudo" | "env" | "command" | "nohup" | "$" | "&"
+                )
+            {
                 tokens.remove(0);
             } else {
                 break;
             }
         }
-        let Some(&cmd_tok) = tokens.first() else {
+        let Some(cmd_clean) = tokens.first().map(|s| s.as_str()) else {
             continue;
         };
-        let cmd_clean = cmd_tok.trim_matches(|c| c == '"' || c == '\'');
-        if cmd_clean == "cd" {
-            if let Some(&dir_tok) = tokens.get(1) {
-                let dir_clean = dir_tok.trim_matches(|c| c == '"' || c == '\'');
-                if !dir_clean.is_empty() && !dir_clean.starts_with('-') {
-                    current_cd = Some(PathBuf::from(dir_clean));
-                }
+        if matches!(
+            cmd_clean.to_ascii_lowercase().as_str(),
+            "cd" | "pushd" | "set-location" | "push-location" | "sl"
+        ) {
+            if let Some(dir_clean) = tokens.get(1)
+                && !dir_clean.is_empty()
+                && !dir_clean.starts_with('-')
+            {
+                current_cd = Some(PathBuf::from(dir_clean));
             }
             continue;
         }
@@ -1305,10 +1402,9 @@ fn parse_git_commit_invocation(cmd_str: &str) -> Option<PathBuf> {
         let mut subcmd: Option<&str> = None;
         let mut i = 1usize;
         while i < tokens.len() {
-            let t = tokens[i].trim_matches(|c| c == '"' || c == '\'');
+            let t = tokens[i].as_str();
             if t == "-C" || t == "--work-tree" {
-                if let Some(&dir_arg) = tokens.get(i + 1) {
-                    let clean_dir = dir_arg.trim_matches(|c| c == '"' || c == '\'');
+                if let Some(clean_dir) = tokens.get(i + 1) {
                     git_dir_override = Some(PathBuf::from(clean_dir));
                 }
                 i += 2;
@@ -1349,27 +1445,72 @@ fn parse_git_commit_invocation(cmd_str: &str) -> Option<PathBuf> {
     None
 }
 
+fn resolve_hook_scan_path(target_repo: &Path, hook_cwd: Option<&Path>) -> Option<PathBuf> {
+    if target_repo == Path::new(".") {
+        let base = hook_cwd.unwrap_or_else(|| Path::new("."));
+        return base.exists().then(|| base.to_path_buf());
+    }
+    let candidate = if target_repo.is_relative() {
+        if let Some(cwd) = hook_cwd {
+            cwd.join(target_repo)
+        } else {
+            target_repo.to_path_buf()
+        }
+    } else {
+        target_repo.to_path_buf()
+    };
+    candidate.exists().then_some(candidate)
+}
+
 fn handle_claude_pre_commit() -> Result<ExitCode> {
     use std::io::Read;
     let mut stdin_buf = String::new();
     let _ = std::io::stdin().read_to_string(&mut stdin_buf);
-    let cmd_str = serde_json::from_str::<serde_json::Value>(&stdin_buf)
-        .ok()
+    let payload_opt = serde_json::from_str::<serde_json::Value>(&stdin_buf).ok();
+
+    let is_antigravity = payload_opt
+        .as_ref()
+        .is_some_and(|v| v.get("toolCall").is_some() && v.get("tool_input").is_none());
+
+    let cmd_str = payload_opt
+        .as_ref()
         .and_then(|v| {
             v.get("tool_input")
                 .and_then(|ti| ti.get("command"))
                 .and_then(|c| c.as_str())
+                .or_else(|| {
+                    v.get("toolCall")
+                        .and_then(|tc| tc.get("args"))
+                        .and_then(|a| a.get("CommandLine"))
+                        .and_then(|c| c.as_str())
+                })
                 .map(|s| s.to_string())
         })
         .unwrap_or_default();
 
+    let hook_cwd = payload_opt.as_ref().and_then(|v| {
+        v.get("cwd")
+            .and_then(|c| c.as_str())
+            .or_else(|| {
+                v.get("workspacePaths")
+                    .and_then(|wp| wp.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|s| s.as_str())
+            })
+            .map(PathBuf::from)
+    });
+
     let Some(target_repo) = parse_git_commit_invocation(&cmd_str) else {
+        if is_antigravity {
+            println!("{}", serde_json::json!({ "decision": "allow" }));
+        }
         return Ok(ExitCode::SUCCESS);
     };
-    let scan_path = if target_repo.exists() {
-        target_repo
-    } else {
-        PathBuf::from(".")
+    let Some(scan_path) = resolve_hook_scan_path(&target_repo, hook_cwd.as_deref()) else {
+        if is_antigravity {
+            println!("{}", serde_json::json!({ "decision": "allow" }));
+        }
+        return Ok(ExitCode::SUCCESS);
     };
 
     let layers = vec!["secrets".to_string(), "config".to_string()];
@@ -1390,6 +1531,29 @@ fn handle_claude_pre_commit() -> Result<ExitCode> {
     })?;
 
     if should_fail_gate(&outcome.graph.findings, true, None) {
+        if is_antigravity {
+            let summary = outcome
+                .graph
+                .findings
+                .iter()
+                .take(5)
+                .map(|f| format!("[{}] {} ({}:{})", f.severity, f.id, f.file, f.line))
+                .collect::<Vec<_>>()
+                .join("; ");
+            let reason = format!(
+                "[ShellMind Guard] Blocked git commit: {} secret/config issue(s) found ({}).",
+                outcome.graph.findings.len(),
+                summary
+            );
+            println!(
+                "{}",
+                serde_json::json!({
+                    "decision": "deny",
+                    "reason": reason
+                })
+            );
+            return Ok(ExitCode::SUCCESS);
+        }
         eprintln!(
             "[ShellMind Guard] Blocked git commit: {} secret/config issue(s) found.",
             outcome.graph.findings.len()
@@ -1401,6 +1565,9 @@ fn handle_claude_pre_commit() -> Result<ExitCode> {
             );
         }
         return Ok(ExitCode::from(2));
+    }
+    if is_antigravity {
+        println!("{}", serde_json::json!({ "decision": "allow" }));
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -1436,7 +1603,7 @@ fn resolve_git_hooks_dir(root: &Path) -> Result<PathBuf> {
     Ok(git_dir.join("hooks"))
 }
 
-fn install_git_hook(root: &Path) -> Result<PathBuf> {
+pub(crate) fn install_git_hook(root: &Path) -> Result<PathBuf> {
     let hooks_dir = resolve_git_hooks_dir(root)?;
     fs::create_dir_all(&hooks_dir)?;
     let hook_path = hooks_dir.join("pre-commit");
@@ -1662,6 +1829,22 @@ fn render_scan_output(
     Ok(())
 }
 
+fn binary_on_path(bin: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    let exe_name = if cfg!(windows) {
+        format!("{bin}.exe")
+    } else {
+        bin.to_string()
+    };
+    for dir in std::env::split_paths(&path_var) {
+        let cand = dir.join(&exe_name);
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
+    None
+}
+
 fn run_doctor(path: &Path) {
     println!(
         "ShellMind Guard Doctor | v{} ({}/{})",
@@ -1689,12 +1872,41 @@ fn run_doctor(path: &Path) {
             "using built-in defaults (run `shellmind-guard init` to customize)"
         }
     );
+    let osv_db = sh_core::default_advisories_db_path();
+    let osv_status = if osv_db.exists() {
+        match sh_core::AdvisoryStore::open_at(&osv_db, true).and_then(|s| s.stats()) {
+            Ok((total, _)) => format!("{} ({} cached advisories)", osv_db.display(), total),
+            Err(_) => format!("{} (unreadable)", osv_db.display()),
+        }
+    } else {
+        format!(
+            "not initialized ({}; run `shellmind-guard deps sync`)",
+            osv_db.display()
+        )
+    };
+    println!("  Offline OSV DB  : {}", osv_status);
     println!(
         "  Git Pre-Commit  : {}",
         if git_hook_status(path) {
             "ACTIVE"
         } else {
             "not installed (run `shellmind-guard hook install` for zero-AI commit protection)"
+        }
+    );
+    let on_path = binary_on_path("shellmind-guard");
+    let has_plugin = path.join(".claude-plugin").join("plugin.json").exists();
+    let has_mcp = path.join(".mcp.json").exists();
+    println!(
+        "  CLI / Plugin    : {}{}",
+        match &on_path {
+            Some(p) => format!("on PATH ({})", p.display()),
+            None =>
+                "NOT on PATH (required for `.mcp.json` and plugin `hooks/hooks.json`)".to_string(),
+        },
+        if has_plugin || has_mcp {
+            format!(" [plugin_manifest={}, mcp_config={}]", has_plugin, has_mcp)
+        } else {
+            String::new()
         }
     );
 }
@@ -1797,7 +2009,11 @@ fn verify_patch_apply_check(params: &ApplyCheckParams<'_>) -> Result<ApplyCheckO
     let report = apply_unified_diff_safely(&temp_root, params.raw_diff)?;
 
     let post_summary = scan_repository(&temp_root, params.cfg)?;
-    let post_graph = analyze_codebase(&post_summary.files, params.cfg)?;
+    let mut post_graph = analyze_codebase(&post_summary.files, params.cfg)?;
+    if params.finding.rule_id.starts_with("VF-FUZZ-") {
+        let deep_post = collect_deep_schema_findings(&post_graph);
+        post_graph.findings.extend(deep_post);
+    }
 
     let Some(remaining) = finding_still_present(&post_graph.findings, params.finding) else {
         return Ok(ApplyCheckOutcome {
@@ -1912,7 +2128,56 @@ mod main_tests {
             parse_git_commit_invocation("cd services/api && (git commit -am 'msg')"),
             Some(PathBuf::from("services/api"))
         );
+        assert_eq!(
+            parse_git_commit_invocation("git -C \"sub repo\" commit -m \"fix & deploy\""),
+            Some(PathBuf::from("sub repo"))
+        );
+        assert_eq!(
+            parse_git_commit_invocation("cd \"sub dir\"; git commit -m \"ok\""),
+            Some(PathBuf::from("sub dir"))
+        );
+        assert_eq!(
+            parse_git_commit_invocation("echo \"cd /tmp && git commit -m fake\""),
+            None
+        );
         assert_eq!(parse_git_commit_invocation("git status && git diff"), None);
+    }
+
+    #[test]
+    fn test_resolve_hook_scan_path_and_deep_replay_lookup() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let tmp = std::env::temp_dir().join(format!("smg_hook_cwd_{}", nanos));
+        let _cleanup = TempDirCleanup(tmp.clone());
+        let sub = tmp.join("apps/api");
+        fs::create_dir_all(&sub).unwrap();
+
+        assert_eq!(
+            resolve_hook_scan_path(Path::new("."), Some(&tmp)),
+            Some(tmp.clone())
+        );
+        assert_eq!(
+            resolve_hook_scan_path(Path::new("apps/api"), Some(&tmp)),
+            Some(sub.clone())
+        );
+        assert_eq!(
+            resolve_hook_scan_path(Path::new("does-not-exist"), Some(&tmp)),
+            None
+        );
+
+        fs::create_dir_all(sub.join("src")).unwrap();
+        fs::write(
+            sub.join("src/pay.ts"),
+            "app.post('/api/pay', (req, res) => { const amount = req.body.amount; res.json({ amount }); });",
+        )
+        .unwrap();
+        let cfg = ShellMindGuardConfig::default();
+        let mut store = StateStore::open(&sub).unwrap();
+        let resolved =
+            resolve_finding_for_replay(&sub, "VF-FUZZ-SCHEMA", &cfg, &mut store).unwrap();
+        assert_eq!(resolved.rule_id, "VF-FUZZ-SCHEMA");
     }
 
     #[test]

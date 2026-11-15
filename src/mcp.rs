@@ -3,7 +3,7 @@ use anyhow::Result;
 use serde_json::{Value, json};
 use sh_ai::build_minimal_patch_prompt;
 use sh_core::{ShellMindGuardConfig, StateStore, scan_repository};
-use sh_graph::analyze_codebase_cached;
+use sh_graph::{analyze_codebase_cached, collect_deep_schema_findings};
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
@@ -130,7 +130,7 @@ fn tool_definitions() -> Value {
     json!([
         {
             "name": "shellmind_guard_scan",
-            "description": "Scan a repository across ShellMind Guard's 6 deterministic layers (Auth & Secrets, Taint/Injection/IDOR/Frontend Contract, Offline Dependencies, Security Misconfigs, and Concurrency Race Conditions).",
+            "description": "Scan a repository across ShellMind Guard's deterministic 16-language engine (Secrets, Config/IaC/SQL, Offline OSV Deps, SQL/NoSQL/XSS/CSRF/CMDi/SSTI/Path/SSRF Taint, Auth/IDOR/Race Lattice, Frontend Contract, Engine Deadlocks/Leaks/Memory, Mobile Security, and optional Phase 10 --deep Schema Checks).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -141,7 +141,7 @@ fn tool_definitions() -> Value {
                     "layers": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Optional layer filters: auth, race, taint, sqli, cmdi, path, ssrf, xss, csrf, idor, secrets, config, deps, frontend, engine, memory, mobile"
+                        "description": "Optional layer filters: auth, race, taint, sqli, cmdi, path, ssrf, xss, csrf, idor, secrets, config, deps, frontend, engine, memory, mobile, deep"
                     },
                     "min_confidence": {
                         "type": "string",
@@ -157,14 +157,14 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "shellmind_guard_explain_finding",
-            "description": "Inspect a specific finding ID (e.g. VF-RACE-002, VF-SQLI-001) and return its full cross-file trace hops, source code excerpt, remediation, and replay command.",
+            "description": "Inspect a specific finding ID (e.g. VF-RACE-002, VF-SQLI-001, VF-FUZZ-001) and return its full cross-file trace hops, source code excerpt, remediation, and replay command.",
             "inputSchema": {
                 "type": "object",
                 "required": ["finding_id"],
                 "properties": {
                     "finding_id": {
                         "type": "string",
-                        "description": "Finding ID returned by shellmind_guard_scan (e.g. VF-AUTH-001)"
+                        "description": "Finding ID or rule ID returned by shellmind_guard_scan (e.g. VF-AUTH-001, VF-FUZZ-SCHEMA)"
                     },
                     "path": {
                         "type": "string",
@@ -175,7 +175,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "shellmind_guard_init",
-            "description": "Auto-detect project languages and frameworks to generate .shellmind-guard.toml (and optionally .github/workflows/shellmind-guard.yml).",
+            "description": "Auto-detect project languages and frameworks to generate .shellmind-guard.toml (and optionally .github/workflows/shellmind-guard.yml or .git/hooks/pre-commit).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -186,6 +186,10 @@ fn tool_definitions() -> Value {
                     "ci": {
                         "type": "boolean",
                         "description": "Also generate .github/workflows/shellmind-guard.yml GitHub Actions SARIF workflow"
+                    },
+                    "hook": {
+                        "type": "boolean",
+                        "description": "Also install standalone Git pre-commit hook (.git/hooks/pre-commit)"
                     },
                     "overwrite": {
                         "type": "boolean",
@@ -334,7 +338,9 @@ fn handle_tool_call(params: &Value) -> Result<Value> {
             let mut store = StateStore::open(&root)?;
             let _ = store.sync_files(&summary.files)?;
             let graph = analyze_codebase_cached(&summary.files, &cfg, &mut store)?;
-            let findings = graph.findings;
+            let deep_findings = collect_deep_schema_findings(&graph);
+            let mut findings = graph.findings;
+            findings.extend(deep_findings);
             let finding = findings
                 .iter()
                 .find(|f| f.id.eq_ignore_ascii_case(finding_id))
@@ -361,6 +367,7 @@ fn handle_tool_call(params: &Value) -> Result<Value> {
             let root =
                 validate_mcp_target_path(args.get("path").and_then(|v| v.as_str()).unwrap_or("."))?;
             let ci = args.get("ci").and_then(|v| v.as_bool()).unwrap_or(false);
+            let hook = args.get("hook").and_then(|v| v.as_bool()).unwrap_or(false);
             let overwrite = args
                 .get("overwrite")
                 .and_then(|v| v.as_bool())
@@ -378,11 +385,17 @@ fn handle_tool_call(params: &Value) -> Result<Value> {
             } else {
                 None
             };
+            let hook_path = if hook {
+                Some(crate::install_git_hook(&root)?)
+            } else {
+                None
+            };
             json!({
                 "ok": true,
                 "detected": detected,
                 "config_path": config_path.display().to_string(),
                 "ci_workflow_path": ci_path.map(|p| p.display().to_string()),
+                "hook_path": hook_path.map(|p| p.display().to_string()),
             })
         }
         other => anyhow::bail!("Unknown MCP tool `{}`", other),
@@ -489,6 +502,54 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(exp_txt.contains("SELECT * FROM t"));
+
+        // Verify schema consistency (`deep` layer + `hook` init) and VF-FUZZ-SCHEMA resolution via explain_finding
+        let defs = tool_definitions();
+        let tools = defs.as_array().unwrap();
+        let scan_schema_desc = tools[0]["inputSchema"]["properties"]["layers"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(scan_schema_desc.contains("deep"));
+        assert!(tools[2]["inputSchema"]["properties"]["hook"].is_object());
+
+        fs::write(
+            dir.join("src/pay.ts"),
+            "app.post('/api/pay', (req, res) => { const amount = req.body.amount; res.json({ amount }); });",
+        )
+        .unwrap();
+        let deep_scan_req = json!({
+            "jsonrpc": "2.0",
+            "id": 12,
+            "method": "tools/call",
+            "params": {
+                "name": "shellmind_guard_scan",
+                "arguments": { "path": dir.display().to_string(), "deep": true }
+            }
+        });
+        let deep_resp = handle_jsonrpc_line(&deep_scan_req.to_string()).unwrap();
+        let deep_parsed: Value =
+            serde_json::from_str(deep_resp["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        let fuzz_obj = deep_parsed["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["rule_id"] == "VF-FUZZ-SCHEMA")
+            .expect("deep MCP scan must emit VF-FUZZ-SCHEMA");
+        let explain_fuzz = json!({
+            "jsonrpc": "2.0",
+            "id": 13,
+            "method": "tools/call",
+            "params": {
+                "name": "shellmind_guard_explain_finding",
+                "arguments": {
+                    "path": dir.display().to_string(),
+                    "finding_id": fuzz_obj["id"].as_str().unwrap()
+                }
+            }
+        });
+        let explain_fuzz_resp = handle_jsonrpc_line(&explain_fuzz.to_string()).unwrap();
+        assert_eq!(explain_fuzz_resp["result"]["isError"], false);
 
         let _ = fs::remove_dir_all(&dir);
     }

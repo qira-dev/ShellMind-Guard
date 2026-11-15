@@ -163,8 +163,20 @@ curl -fsSL https://raw.githubusercontent.com/qira-dev/ShellMind-Guard/main/insta
 irm https://raw.githubusercontent.com/qira-dev/ShellMind-Guard/main/install.ps1 | iex
 ```
 
-**Load as an AI Coding Plugin (Claude Code / MCP + Skills + Commit Hook):**
+**Use Standalone CLI or Load as an AI Coding Plugin (Claude Code / MCP + Skills + Commit Hook):**
+
 ```bash
+# 1. Verify binary, sandbox backend, advisory cache & git hook readiness (Standalone)
+shellmind-guard doctor .
+
+# 2. Install standalone Git pre-commit hook (blocks high/critical secrets & misconfigs locally)
+shellmind-guard hook install .
+
+# 3. Install as a Claude Code plugin from GitHub Marketplace (Claude Code 2.1.275+)
+/plugin marketplace add qira-dev/ShellMind-Guard
+/plugin install shellmind-guard@shellmind-guard
+
+# Or load a local clone directly (provides MCP tools, /shellmind-guard:guard-scan, /shellmind-guard:guard-fix & PreToolUse hook)
 claude --plugin-dir /path/to/ShellMind-Guard
 ```
 
@@ -293,9 +305,9 @@ Add the following to your `.mcp.json`, `~/.claude.json`, or `.cursor/mcp.json`:
 
 | Tool Name | Input Schema | Description |
 | :--- | :--- | :--- |
-| `shellmind_guard_scan` | `{ "path"?: string, "layers"?: string[], "min_confidence"?: "proven"\|"confirmed"\|"heuristic", "deep"?: boolean }` | Runs the multi-layer AST + Guard-Set Lattice scan (plus optional Phase 10 `deep` schema checks) and returns structured JSON findings with confidence, witness hops, and remediation. |
-| `shellmind_guard_explain_finding` | `{ "path"?: string, "finding_id": string }` | Resolves a finding by `id` (e.g. `VF-RACE-002`) or `rule_id` (e.g. `VF-SQLI-001`) and returns exact source lines around every hop in `witness_path`, a <= 2 KB patch prompt, and concrete remediation guidance. |
-| `shellmind_guard_init` | `{ "path"?: string, "ci"?: boolean }` | Detects the repository language stack, writes `.shellmind-guard.toml`, and optionally scaffolds `.github/workflows/shellmind-guard.yml`. |
+| `shellmind_guard_scan` | `{ "path"?: string, "layers"?: string[], "min_confidence"?: "proven"\|"confirmed"\|"heuristic", "deep"?: boolean }` | Runs the 16-language AST + Guard-Set Lattice scan (plus optional `deep` schema checks and `engine`/`memory`/`mobile` layers) and returns structured JSON findings with confidence, witness hops, and remediation. |
+| `shellmind_guard_explain_finding` | `{ "path"?: string, "finding_id": string }` | Resolves a finding by `id` (e.g. `VF-RACE-002`, `VF-FUZZ-001`) or `rule_id` (e.g. `VF-SQLI-001`) and returns exact source lines around every hop in `witness_path`, a <= 2 KB patch prompt, and concrete remediation guidance. |
+| `shellmind_guard_init` | `{ "path"?: string, "ci"?: boolean, "hook"?: boolean, "overwrite"?: boolean }` | Detects the repository language stack, writes `.shellmind-guard.toml`, and optionally scaffolds `.github/workflows/shellmind-guard.yml` or installs `.git/hooks/pre-commit`. |
 
 ---
 
@@ -360,8 +372,16 @@ ShellMind Guard is organized as a modular, 100% pure-Rust Cargo workspace:
 ```text
 ShellMind-Guard/
 ├── Cargo.toml                     # Workspace root (Rust 2024 Edition)
+├── .claude-plugin/
+│   ├── plugin.json                # Claude Code / agent plugin manifest & icon
+│   └── marketplace.json           # GitHub marketplace index (`qira-dev/ShellMind-Guard`)
+├── .mcp.json                      # Standalone & plugin stdio MCP configuration (`shellmind-guard mcp`)
+├── hooks/hooks.json               # PreToolUse `Bash|PowerShell` secret/config commit guard hook
+├── skills/
+│   ├── guard-scan/SKILL.md        # `/shellmind-guard:guard-scan` MCP + CLI workflow
+│   └── guard-fix/SKILL.md         # `/shellmind-guard:guard-fix` all-rule remediation + `--apply-check`
 ├── src/
-│   ├── main.rs                    # Unified CLI (`init`, `index`, `scan`, `deps`, `replay`, `ui`, `mcp`)
+│   ├── main.rs                    # Unified CLI (`init`, `index`, `scan`, `deps`, `replay`, `ui`, `mcp`, `hook`, `doctor`)
 │   ├── deps_sync.rs               # Explicit opt-in OSV `/v1/querybatch` + `--from-file` advisory sync
 │   └── mcp.rs                     # Stdio JSON-RPC 2.0 Model Context Protocol server
 ├── crates/

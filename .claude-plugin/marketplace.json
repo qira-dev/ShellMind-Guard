@@ -1,0 +1,34 @@
+{
+  "name": "shellmind-guard",
+  "owner": {
+    "name": "Qira-Dev",
+    "url": "https://github.com/qira-dev"
+  },
+  "metadata": {
+    "description": "ShellMind Guard deterministic multi-file security, business-logic & concurrency verifier plugin and standalone MCP tools"
+  },
+  "plugins": [
+    {
+      "name": "shellmind-guard",
+      "source": "./",
+      "description": "Deterministic 16-language security verifier: cross-file Auth/IDOR/CSRF/Race lattice, taint injection, engine deadlocks & memory bounds, mobile security, --deep schema fuzzing, Bubblewrap exploit proof & stdio MCP.",
+      "version": "0.1.0",
+      "author": {
+        "name": "Qira-Dev",
+        "url": "https://github.com/qira-dev/ShellMind-Guard"
+      },
+      "homepage": "https://github.com/qira-dev/ShellMind-Guard",
+      "repository": "https://github.com/qira-dev/ShellMind-Guard",
+      "license": "Apache-2.0",
+      "category": "security",
+      "keywords": [
+        "security",
+        "sast",
+        "taint-analysis",
+        "race-condition",
+        "mcp",
+        "bubblewrap"
+      ]
+    }
+  ]
+}

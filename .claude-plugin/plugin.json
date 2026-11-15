@@ -1,11 +1,26 @@
 {
   "name": "shellmind-guard",
   "version": "0.1.0",
-  "description": "6-layer Rust security & bug-hunting plugin: cross-file Auth/IDOR/Race lattice, taint injection (SQLi/CMDi/Path/SSRF), secrets, misconfigs, offline deps, Bubblewrap exploit proof & stdio MCP.",
+  "description": "Zero-AI multi-file security, business-logic & concurrency verifier across 16 languages: Auth/IDOR/CSRF/Race lattice, SQL/NoSQL/XSS/CMDi/SSTI/Path/SSRF taint, secrets, SQL/Terraform IaC, offline OSV deps, engine deadlocks/memory, mobile security, --deep schema fuzzing, Bubblewrap exploit proof & stdio MCP.",
   "author": {
     "name": "Qira-Dev",
     "url": "https://github.com/qira-dev/ShellMind-Guard"
   },
+  "homepage": "https://github.com/qira-dev/ShellMind-Guard",
   "repository": "https://github.com/qira-dev/ShellMind-Guard",
-  "license": "Apache-2.0"
+  "license": "Apache-2.0",
+  "keywords": [
+    "security",
+    "sast",
+    "taint-analysis",
+    "race-condition",
+    "idor",
+    "mcp",
+    "bubblewrap",
+    "rust",
+    "sarif"
+  ],
+  "skills": [
+    "./skills/"
+  ]
 }

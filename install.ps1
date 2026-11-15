@@ -1,5 +1,6 @@
 param(
     [string]$Version = "latest",
+    [string]$Prefix = $(if ($env:SHELLMIND_GUARD_BIN_DIR) { $env:SHELLMIND_GUARD_BIN_DIR } else { Join-Path $env:LOCALAPPDATA "ShellMind-Guard\bin" }),
     [switch]$FromSource
 )
 
@@ -8,7 +9,7 @@ $ErrorActionPreference = "Stop"
 # ShellMind Guard — 1-Command Windows Installer
 $Repo = "qira-dev/ShellMind-Guard"
 $Asset = "shellmind-guard-windows-x86_64.zip"
-$InstallDir = Join-Path $env:LOCALAPPDATA "ShellMind-Guard\bin"
+$InstallDir = $Prefix
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 
 function Install-FromSource {
@@ -17,8 +18,14 @@ function Install-FromSource {
     }
     $CargoRoot = Join-Path $env:TEMP ("smg-cargo-" + [guid]::NewGuid().ToString("N"))
     try {
-        Write-Host "[ShellMind Guard] Building from source via cargo..."
-        cargo install --git "https://github.com/$Repo.git" --root $CargoRoot --locked
+        $LocalManifest = if ($PSScriptRoot) { Join-Path $PSScriptRoot "Cargo.toml" } else { "" }
+        if ($LocalManifest -and (Test-Path $LocalManifest) -and ((Get-Content $LocalManifest -Raw) -match 'name\s*=\s*"shellmind-guard"')) {
+            Write-Host "[ShellMind Guard] Building from local source..."
+            cargo install --path $PSScriptRoot --root $CargoRoot --locked
+        } else {
+            Write-Host "[ShellMind Guard] Building from GitHub repository via cargo..."
+            cargo install --git "https://github.com/$Repo.git" --root $CargoRoot --locked
+        }
         if ($LASTEXITCODE -ne 0) {
             throw "cargo install exited with code $LASTEXITCODE"
         }

@@ -2,11 +2,12 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash",
+        "matcher": "Bash|PowerShell",
         "hooks": [
           {
             "type": "command",
-            "command": "shellmind-guard hook claude-pre-commit"
+            "command": "shellmind-guard hook claude-pre-commit",
+            "timeout": 15
           }
         ]
       }
