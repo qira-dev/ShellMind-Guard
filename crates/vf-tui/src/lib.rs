@@ -565,6 +565,26 @@ fn render_findings_queue(f: &mut Frame, area: Rect, state: &TuiState) {
                         SEM_BRAND_CYAN,
                         "Frontend Contract / UI Bug",
                     ),
+                    GuardKind::LockOrdering => (
+                        "[CRIT · ENGINE]",
+                        SEM_RACE_PURPLE,
+                        "Deadlock / Lock Inversion",
+                    ),
+                    GuardKind::ResourceCleanup => (
+                        "[HIGH · ENGINE]",
+                        SEM_SUSPECT_AMBER,
+                        "Unclosed Resource / Handle Leak",
+                    ),
+                    GuardKind::MemoryBounds => (
+                        "[CRIT · MEMORY]",
+                        SEM_PROVEN_RED,
+                        "Buffer Bounds / Int Overflow",
+                    ),
+                    GuardKind::MobilePolicy => (
+                        "[HIGH · MOBILE]",
+                        SEM_AUTH_CORAL,
+                        "Mobile Storage / IPC / TLS",
+                    ),
                 };
 
                 let sink_hop = item.witness_path.last();
@@ -759,6 +779,22 @@ fn render_pipeline_card(f: &mut Frame, area: Rect, state: &TuiState) {
             (GuardKind::DependencyPolicy, sk) => ("Pinned Patched Dependency", format!("{:?}", sk)),
             (GuardKind::FrontendContract, sk) => (
                 "Matching Backend Route & Error Handling",
+                format!("{:?}", sk),
+            ),
+            (GuardKind::LockOrdering, sk) => (
+                "Canonical Lock Hierarchy / Drop Before .await",
+                format!("{:?}", sk),
+            ),
+            (GuardKind::ResourceCleanup, sk) => (
+                "RAII / defer / finally Resource Cleanup",
+                format!("{:?}", sk),
+            ),
+            (GuardKind::MemoryBounds, sk) => (
+                "Bounds & Overflow Checks (checked_mul / sizeof)",
+                format!("{:?}", sk),
+            ),
+            (GuardKind::MobilePolicy, sk) => (
+                "Keystore/Keychain, Export Permission & TLS Pinning",
                 format!("{:?}", sk),
             ),
         };
@@ -1552,6 +1588,7 @@ mod tests {
             symbol_count: 8,
             edge_count: 6,
             route_entries: 2,
+            active_domains: vec!["web".to_string()],
             findings: vec![LatticeFinding {
                 id: "VF-RACE-002".into(),
                 rule_id: "VF-RACE-001".into(),

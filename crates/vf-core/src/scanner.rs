@@ -75,6 +75,10 @@ impl Language {
         if fname == ".gitignore"
             || fname == "Dockerfile"
             || fname.starts_with("Dockerfile.")
+            || matches!(
+                fname,
+                "AndroidManifest.xml" | "network_security_config.xml" | "Info.plist" | "Podfile"
+            )
             || (fname == ".env"
                 || (fname.starts_with(".env.")
                     && !matches!(

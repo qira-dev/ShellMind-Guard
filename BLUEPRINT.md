@@ -43,12 +43,14 @@ The current repository (`d21223c`) already delivers a complete, tested determini
 |  Tree-sitter (16 AST languages): TS/TSX, JS/JSX, Rust, Python, Go (`ast.rs`) +             |
 |    modular `langs/`: PHP, Java, C#, Kotlin, Swift, Dart, C, C++, Ruby, Bash, HCL/Terraform|
 |  Deep scanners: .sql migrations, Dockerfile/.env/TLS/JWT/XXE/Proto, lockfiles & manifests|
+|  Domain Routing (web, system_engine, mobile) + AndroidManifest.xml / Info.plist          |
 |                                                                                          |
 |  GuardKind Lattice + Cross-File BFS Witness Extractor (trace hops):                      |
 |   - VF-AUTH-001 (Auth)         - VF-RACE-001 (TxLock)     - VF-IDOR-001 (OwnershipCheck) |
 |   - VF-SQLI* (SQL/NoSQL/Mass) - VF-CMDI* (Cmd/SSTI/Deser) - VF-PATH-001 / VF-SSRF*       |
 |   - VF-SEC-* (Secrets/Env/UI) - VF-CFG-* (SQL/JWT/Proto/XXE) - VF-FE-* / VF-XSS-001      |
-|   - VF-DEP-001 (Offline SQLite OSV cache `advisories.db` + 26 fallback advisories; 9 manifests)|
+|   - VF-ENG-* (ABBA Deadlock/.await/Leak/Int) - VF-MEM-BOUNDS - VF-MOB-* (Storage/IPC/TLS)|
+|   - VF-DEP-001 (Offline SQLite OSV cache + 26 fallback advisories; 9 manifests)          |
 +==========================================================================================+
                                               |
                 +-----------------------------+-----------------------------+

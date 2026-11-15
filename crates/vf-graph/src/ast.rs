@@ -60,6 +60,11 @@ pub enum SinkKind {
     Misconfiguration,
     DependencyRisk,
     FrontendContract,
+    ConcurrencyHazard,
+    ResourceLeak,
+    MemorySafety,
+    IntegerOverflow,
+    MobileSecurity,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -77,6 +82,10 @@ pub enum GuardKind {
     ConfigPolicy,
     DependencyPolicy,
     FrontendContract,
+    LockOrdering,
+    ResourceCleanup,
+    MemoryBounds,
+    MobilePolicy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,6 +120,27 @@ pub struct ImportRef {
     pub from_specifier: String,
     #[serde(default)]
     pub remote_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LockOrderEdge {
+    pub first: String,
+    pub second: String,
+    pub line: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LockHeldCall {
+    pub lock_name: String,
+    pub callee: String,
+    pub line: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DomainHints {
+    pub web: bool,
+    pub system_engine: bool,
+    pub mobile: bool,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -149,6 +179,12 @@ pub struct SymbolInfo {
     pub has_bearer_header_auth: bool,
     #[serde(default)]
     pub csrf_exempt: bool,
+    #[serde(default)]
+    pub lock_pairs: Vec<LockOrderEdge>,
+    #[serde(default)]
+    pub locks_held_calls: Vec<LockHeldCall>,
+    #[serde(default)]
+    pub locks_acquired: Vec<(String, usize)>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -172,6 +208,8 @@ pub struct FileAstSummary {
     pub has_bearer_auth_setup: bool,
     #[serde(default)]
     pub has_global_csrf_guard: bool,
+    #[serde(default)]
+    pub domain_hints: DomainHints,
 }
 
 impl SymbolInfo {
@@ -211,6 +249,9 @@ impl SymbolInfo {
             has_cookie_session_auth: false,
             has_bearer_header_auth: false,
             csrf_exempt: false,
+            lock_pairs: Vec::new(),
+            locks_held_calls: Vec::new(),
+            locks_acquired: Vec::new(),
         }
     }
 
@@ -295,11 +336,16 @@ pub fn parse_file_ast_with_hash(
     if matches!(file.language, Language::Sql) {
         static_findings.extend(crate::deep_stack::scan_sql_file(&file.rel_path, source));
     }
+    if matches!(file.language, Language::Config) {
+        static_findings.extend(crate::phase9::scan_mobile_config(&file.rel_path, source));
+    }
 
     if matches!(
         file.language,
         Language::Config | Language::Manifest | Language::Sql
     ) {
+        let domain_hints =
+            crate::phase9::detect_domain_hints(file.language, &file.rel_path, source, &[]);
         return Some((
             actual_hash,
             FileAstSummary {
@@ -307,6 +353,7 @@ pub fn parse_file_ast_with_hash(
                 static_findings,
                 gitignore_lines,
                 is_sensitive_env_or_pem: is_sensitive,
+                domain_hints,
                 ..Default::default()
             },
         ));
@@ -411,6 +458,18 @@ pub fn parse_file_ast_with_hash(
         &mut static_findings,
     );
 
+    crate::phase9::analyze_ast_phase9(
+        root,
+        src_bytes,
+        &file.rel_path,
+        file.language,
+        &mut symbols,
+        &mut static_findings,
+    );
+
+    let domain_hints =
+        crate::phase9::detect_domain_hints(file.language, &file.rel_path, source, &symbols);
+
     let code_only = strip_comments(source);
     let has_cookie_session_setup = crate::taint::has_cookie_session_expr(&code_only);
     let has_bearer_auth_setup = crate::taint::has_bearer_header_expr(&code_only);
@@ -431,6 +490,7 @@ pub fn parse_file_ast_with_hash(
             has_cookie_session_setup,
             has_bearer_auth_setup,
             has_global_csrf_guard,
+            domain_hints,
         },
     ))
 }

@@ -49,20 +49,20 @@ The initial 5-phase v0.1 build is **done, verified, and must not be broken**:
 
 ---
 
-## Phase 9: Complex Core-Engine, Desktop Software & Mobile Logic Rules
+## Phase 9: Complex Core-Engine, Desktop Software & Mobile Logic Rules (Completed)
 **Goal:** Move beyond web/payment routes so complex software cores (e.g., cross-OS desktop engines, native libraries, mobile apps) catch reliability, concurrency, and memory hazards accurately.
 
-- **Deliverables:**
-  1. **Domain-Aware Analyzer Routing:** Automatically activate Web/API checks for web backends, System/Engine checks for native software cores, and Mobile checks for Android/iOS trees—never running irrelevant rules blindly.
+- **Delivered:**
+  1. **Domain-Aware Analyzer Routing:** [`detect_domain_hints`](crates/vf-graph/src/phase9/mod.rs) & [`resolve_repo_domains`](crates/vf-graph/src/phase9/mod.rs) automatically detect and activate `web`, `system_engine`, and `mobile` domains (`active_domains`), ensuring mobile rules stay dormant on pure backend servers and C/C++ memory rules target native code.
   2. **Core Engine Concurrency & Resource Invariants:**
-     - `VF-ENG-DEADLOCK`: Cross-function inconsistent lock acquisition ordering / lock held across blocking or async `.await` calls.
-     - `VF-ENG-LEAK`: Unclosed file/socket/DB handles on error-return paths (missing `defer`/`Drop`/RAII/`finally`).
+     - `VF-ENG-DEADLOCK`: Cross-function `A->B / B->A` lock-order inversion graph solver ([`solve_cross_function_deadlocks`](crates/vf-graph/src/phase9/concurrency.rs)), synchronous mutex guards held across `.await`/blocking sleeps, re-entrant self-deadlocks, and un-released manual locks on early returns (while honoring `std::scoped_lock`, `defer Unlock()`, `tokio::sync::Mutex`, and scoped drops).
+     - `VF-ENG-LEAK`: Unclosed file/socket/DB handles on early error-return paths across C/C++, Go, Python, Java/Kotlin, and JS/TS (skipping factory returns, `if (!fp) return`, RAII, `defer Close()`, `with`, `.use`, and `try/finally`).
   3. **Native Memory & Boundary Safety (C/C++/Unsafe Rust):**
-     - `VF-MEM-BOUNDS`: Unbounded string/buffer copies (`strcpy`, `sprintf`, `memcpy` with untrusted/unchecked length) and unchecked `unsafe` pointer/slice offsets.
-     - `VF-ENG-INT`: Untrusted arithmetic leading to allocation size or buffer-index integer overflow.
-  4. **Mobile App Security Rules (`Kotlin`/`Swift`/`Dart`):**
-     - `VF-MOB-STORAGE` (unencrypted sensitive storage in `SharedPreferences` / plain `UserDefaults`), `VF-MOB-IPC` (exported Android components without permissions), `VF-MOB-TLS` (custom trust-all cert verifiers).
-- **Verification Gate:** Dedicated fixture test suites for C++ core-engine concurrency/memory bugs and Kotlin/Swift mobile issues with strict low-false-positive validation.
+     - `VF-MEM-BOUNDS`: Unbounded C/C++ copies (`gets`/`strcpy`/`strcat`/`sprintf`/`scanf("%s")`), unchecked variable-length `memcpy`/`memmove`/`strncpy`/`read`/`recv`, and unguarded Rust `unsafe` slice/pointer operations (`get_unchecked`, `from_raw_parts`, `copy_nonoverlapping`, `.offset`).
+     - `VF-ENG-INT`: Unchecked arithmetic in `malloc`/`realloc`/`new[]`/`alloca`, Rust `wrapping_mul`/`wrapping_add` near allocations, and raw multiplication in `unsafe` memory sizing.
+  4. **Mobile App Security Rules (`Kotlin`/`Java`/`Swift`/`Dart` + `AndroidManifest.xml`/`network_security_config.xml`/`Info.plist`):**
+     - `VF-MOB-STORAGE` (plaintext `SharedPreferences` / `UserDefaults` credentials, `android:allowBackup="true"`), `VF-MOB-IPC` (exported permissionless components, dynamic `registerReceiver`, WebView bridges & unvalidated iOS deep links), and `VF-MOB-TLS` (empty `X509TrustManager`, `HostnameVerifier => true`, `SslErrorHandler.proceed()`, iOS `NSAllowsArbitraryLoads` / `URLCredential(trust:)`, Flutter `badCertificateCallback => true`).
+- **Verification Gate:** Dedicated Phase 9 test suite covering C++ cross-function deadlocks, C/Go resource leaks, C++/Rust memory bounds & overflows, Android/iOS/Flutter mobile vulnerabilities, and domain isolation with zero false positives on hardened fixtures.
 
 ---
 

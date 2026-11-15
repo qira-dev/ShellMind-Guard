@@ -141,7 +141,7 @@ fn tool_definitions() -> Value {
                     "layers": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Optional layer filters: auth, race, taint, sqli, cmdi, path, ssrf, xss, csrf, idor, secrets, config, deps, frontend"
+                        "description": "Optional layer filters: auth, race, taint, sqli, cmdi, path, ssrf, xss, csrf, idor, secrets, config, deps, frontend, engine, memory, mobile"
                     },
                     "min_confidence": {
                         "type": "string",

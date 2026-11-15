@@ -161,7 +161,7 @@ enum Commands {
         #[arg(
             long,
             value_delimiter = ',',
-            help = "Filter active layers (auth,race,taint,sqli,cmdi,path,ssrf,xss,csrf,idor,secrets,config,deps,frontend)"
+            help = "Filter active layers (auth,race,taint,sqli,cmdi,path,ssrf,xss,csrf,idor,secrets,config,deps,frontend,engine,memory,mobile)"
         )]
         layers: Vec<String>,
         #[arg(
@@ -327,8 +327,19 @@ fn finding_matches_layer(f: &LatticeFinding, layer: &str) -> bool {
             f.missing_guard == GuardKind::DependencyPolicy
         }
         "4" | "layer4" | "config" | "misconfig" => f.missing_guard == GuardKind::ConfigPolicy,
-        "5" | "layer5" | "6" | "layer6" | "race" | "concurrency" => {
-            f.missing_guard == GuardKind::TxLock
+        "5" | "layer5" | "6" | "layer6" | "race" => f.missing_guard == GuardKind::TxLock,
+        "concurrency" => matches!(f.missing_guard, GuardKind::TxLock | GuardKind::LockOrdering),
+        "engine" | "deadlock" | "leak" | "int" => {
+            matches!(
+                f.missing_guard,
+                GuardKind::LockOrdering | GuardKind::ResourceCleanup
+            ) || f.rule_id.starts_with("VF-ENG-")
+        }
+        "memory" | "mem" | "bounds" => {
+            f.missing_guard == GuardKind::MemoryBounds || f.rule_id.starts_with("VF-MEM-")
+        }
+        "mobile" | "mob" | "android" | "ios" | "flutter" => {
+            f.missing_guard == GuardKind::MobilePolicy || f.rule_id.starts_with("VF-MOB-")
         }
         "auth" => f.missing_guard == GuardKind::Auth,
         "taint" | "injection" => matches!(

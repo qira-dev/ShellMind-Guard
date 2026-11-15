@@ -43,6 +43,8 @@ pub struct GraphAnalysisResult {
     pub symbol_count: usize,
     pub edge_count: usize,
     pub route_entries: usize,
+    #[serde(default)]
+    pub active_domains: Vec<String>,
     pub findings: Vec<LatticeFinding>,
 }
 
@@ -166,6 +168,18 @@ fn remediation_for_guard(g: GuardKind) -> &'static str {
         GuardKind::FrontendContract => {
             "Align frontend request paths/methods with registered backend endpoints and handle errors/empty callbacks cleanly."
         }
+        GuardKind::LockOrdering => {
+            "Enforce a single canonical lock acquisition order (`std::scoped_lock`), drop lock guards before `.await`, and release manual locks on error returns."
+        }
+        GuardKind::ResourceCleanup => {
+            "Ensure every opened handle/socket/DB connection is freed on all error-return paths using RAII, `defer`, `try/finally`, or `goto cleanup`."
+        }
+        GuardKind::MemoryBounds => {
+            "Validate buffer lengths (`<= sizeof(dst)`), use bounded copy APIs (`snprintf`/`fgets`), check integer multiplication overflow (`checked_mul`/`__builtin_mul_overflow`), and guard `unsafe` slices."
+        }
+        GuardKind::MobilePolicy => {
+            "Harden mobile storage (Android Keystore/EncryptedSharedPreferences, iOS Keychain, FlutterSecureStorage), restrict exported IPC components, and enforce TLS certificate pinning."
+        }
     }
 }
 
@@ -194,6 +208,10 @@ fn prefix_for_guard(g: GuardKind) -> &'static str {
         GuardKind::ConfigPolicy => "VF-CFG",
         GuardKind::DependencyPolicy => "VF-DEP",
         GuardKind::FrontendContract => "VF-FE",
+        GuardKind::LockOrdering => "VF-ENG",
+        GuardKind::ResourceCleanup => "VF-ENG",
+        GuardKind::MemoryBounds => "VF-MEM",
+        GuardKind::MobilePolicy => "VF-MOB",
     }
 }
 
@@ -977,7 +995,16 @@ pub fn solve_guard_lattice_with_public(
         }
     }
 
-    // Layer 1 (Secrets), Layer 3 (Deps), Layer 4 (Misconfigs), & Layer 2 UI Bugs (`VF-FE-ERR`)
+    // Phase 9: Domain-Aware Analyzer Routing + Cross-Function Lock-Order Deadlock Solver
+    let active_domains = crate::phase9::resolve_repo_domains(summaries);
+    let active_domain_set: HashSet<&str> = active_domains.iter().map(|s| s.as_str()).collect();
+    for deadlock_hit in
+        crate::phase9::concurrency::solve_cross_function_deadlocks(&graph, &resolved_callee_map)
+    {
+        insert_shorter(&mut best_by_key, deadlock_hit);
+    }
+
+    // Layer 1 (Secrets), Layer 3 (Deps), Layer 4 (Misconfigs), Layer 2 UI Bugs (`VF-FE-ERR`), & Phase 9 Domain Rules
     let mut sensitive_files: Vec<&str> = Vec::new();
     let mut gitignore_files: Vec<(&str, &[String])> = Vec::new();
     for f in summaries {
@@ -988,7 +1015,9 @@ pub fn solve_guard_lattice_with_public(
             gitignore_files.push((&f.rel_path, lines.as_slice()));
         }
         for sf in &f.static_findings {
-            insert_static_finding(&mut best_by_key, sf);
+            if crate::phase9::should_keep_finding_for_domain(sf, &active_domain_set) {
+                insert_static_finding(&mut best_by_key, sf);
+            }
         }
     }
     for env_hit in
@@ -1053,6 +1082,7 @@ pub fn solve_guard_lattice_with_public(
         symbol_count: graph.node_count(),
         edge_count: graph.edge_count(),
         route_entries,
+        active_domains,
         findings: deduped,
     }
 }
