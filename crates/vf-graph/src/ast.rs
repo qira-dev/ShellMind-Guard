@@ -292,6 +292,9 @@ pub fn parse_file_ast_with_hash(
     if matches!(file.language, Language::Manifest) {
         static_findings.extend(crate::deps::scan_dependencies(&file.rel_path, source));
     }
+    if matches!(file.language, Language::Sql) {
+        static_findings.extend(crate::deep_stack::scan_sql_file(&file.rel_path, source));
+    }
 
     if matches!(
         file.language,
@@ -396,6 +399,15 @@ pub fn parse_file_ast_with_hash(
         &file.rel_path,
         file.language,
         &mut frontend_calls,
+        &mut static_findings,
+    );
+
+    crate::deep_stack::scan_ast_deep(
+        root,
+        src_bytes,
+        &file.rel_path,
+        file.language,
+        &mut symbols,
         &mut static_findings,
     );
 

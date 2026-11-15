@@ -342,6 +342,13 @@ pub fn has_taint_source_expr(text: &str) -> bool {
         "c.req.param",
         "c.req.json",
         "searchParams.get",
+        "window.location.search",
+        "window.location.hash",
+        "location.search",
+        "location.hash",
+        "document.URL",
+        "document.referrer",
+        "URLSearchParams",
         "web::Query",
         "web::Path",
         "web::Json",
@@ -1472,13 +1479,22 @@ fn check_call_taint_sinks(
             "db.query"
                 | "db.queryRow"
                 | "db.exec"
+                | "db.prepare"
+                | "db.raw"
                 | "tx.query"
                 | "tx.exec"
                 | "pool.query"
+                | "pool.execute"
                 | "client.query"
                 | "cursor.execute"
                 | "session.execute"
                 | "conn.execute"
+                | "conn.fetch"
+                | "knex.raw"
+                | "sequelize.query"
+                | "queryRunner.query"
+                | "entityManager.query"
+                | "sql.unsafe"
                 | "sqlx::query"
         ) || ftxt.ends_with(".$queryRawUnsafe")
             || ftxt.ends_with(".$executeRawUnsafe");
@@ -2223,6 +2239,12 @@ fn is_likely_frontend_file(rel_path: &str, src: &[u8]) -> bool {
         || text.contains("document.")
         || text.contains("useState(")
         || text.contains("useEffect(")
+        || text.contains("dangerouslySetInnerHTML")
+        || text.contains("localStorage.")
+        || text.contains("sessionStorage.")
+        || text.contains("postMessage(")
+        || text.contains("$fetch(")
+        || text.contains("useFetch(")
         || text.contains("fetch('/api")
         || text.contains("fetch(\"/api")
         || text.contains("fetch(`/api")
@@ -2284,16 +2306,25 @@ pub fn extract_frontend_calls_and_bugs(
         }
     }
 
-    // 2. Frontend `fetch('/api/...')` / `axios.<method>('/api/...')` contract extraction
+    // 2. Frontend `fetch('/api/...')` / `axios.<method>('/api/...')` / `$fetch` / `useFetch` / Angular `this.http` contract extraction
     if kind == "call_expression"
         && let Some(func) = node.child_by_field_name("function")
     {
         let ftxt = node_text(func, src).trim();
-        let is_fetch = ftxt == "fetch";
+        let is_fetch = matches!(ftxt, "fetch" | "$fetch" | "useFetch");
         let is_axios = ftxt == "axios"
             || matches!(
                 ftxt,
-                "axios.get" | "axios.post" | "axios.put" | "axios.patch" | "axios.delete"
+                "axios.get"
+                    | "axios.post"
+                    | "axios.put"
+                    | "axios.patch"
+                    | "axios.delete"
+                    | "this.http.get"
+                    | "this.http.post"
+                    | "this.http.put"
+                    | "this.http.patch"
+                    | "this.http.delete"
             );
         if (is_fetch || is_axios)
             && let Some(args) = node.child_by_field_name("arguments")
@@ -2323,7 +2354,9 @@ pub fn extract_frontend_calls_and_bugs(
                         .to_string()
                 };
                 if raw_arg.starts_with("/api/") || raw_arg == "/api" {
-                    let method = if let Some(m) = ftxt.strip_prefix("axios.") {
+                    let method = if let Some(m) = ftxt.rsplit('.').next()
+                        && matches!(m, "get" | "post" | "put" | "patch" | "delete")
+                    {
                         m.to_ascii_uppercase()
                     } else {
                         let args_txt = node_text(args, src).to_ascii_uppercase();

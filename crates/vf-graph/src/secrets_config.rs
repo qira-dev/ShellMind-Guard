@@ -54,6 +54,16 @@ fn db_uri_re() -> &'static Regex {
     })
 }
 
+fn client_secret_env_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r#"\b((?:NEXT_PUBLIC|VITE|REACT_APP|NUXT_PUBLIC)_[A-Z0-9_]*(?:SECRET|PRIVATE_KEY|SERVICE_ROLE(?:_KEY)?|DATABASE_URL|DB_PASSWORD|JWT_SECRET|ENCRYPTION_KEY|MASTER_KEY)[A-Z0-9_]*)\b"#,
+        )
+        .expect("valid client secret env regex")
+    })
+}
+
 fn jwt_js_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -548,7 +558,31 @@ pub fn scan_secrets_and_config(rel_path: &str, content: &str) -> Vec<LocalStatic
         }
 
         let check_jwt_literal = |secret: &str, findings: &mut Vec<LocalStaticFinding>| {
-            if secret.len() >= 6 && !is_placeholder_secret(secret) && shannon_entropy(secret) >= 2.2
+            let low_sec = secret.trim().to_ascii_lowercase();
+            let weak_jwt_default = matches!(
+                low_sec.as_str(),
+                "secret"
+                    | "mysecret"
+                    | "jwtsecret"
+                    | "jwt-secret"
+                    | "changeme"
+                    | "password"
+                    | "dev-secret"
+                    | "123456"
+                    | "supersecret"
+            );
+            if weak_jwt_default {
+                findings.push(make_cfg_finding(
+                    "VF-CFG-JWT-LOGIC",
+                    "CRITICAL",
+                    "JWT signs tokens with a weak predictable hardcoded secret literal".into(),
+                    rel_path,
+                    ln,
+                    "Replace weak hardcoded JWT secrets with a high-entropy 256-bit key loaded from environment/KMS.",
+                ));
+            } else if secret.len() >= 6
+                && !is_placeholder_secret(secret)
+                && shannon_entropy(secret) >= 2.2
             {
                 findings.push(make_sec_finding(
                     "VF-SEC-JWT",
@@ -589,6 +623,27 @@ pub fn scan_secrets_and_config(rel_path: &str, content: &str) -> Vec<LocalStatic
         // Skip comment lines for configuration/misconfiguration checks
         if is_comment_line(trimmed) {
             continue;
+        }
+
+        // Public browser-bundle env prefixes (`NEXT_PUBLIC_`, `VITE_`, `REACT_APP_`, `NUXT_PUBLIC_`) exposing private secrets
+        if !is_rust
+            && (line.contains("NEXT_PUBLIC_")
+                || line.contains("VITE_")
+                || line.contains("REACT_APP_")
+                || line.contains("NUXT_PUBLIC_"))
+            && let Some(cap) = client_secret_env_re().captures(line)
+        {
+            findings.push(make_sec_finding(
+                "VF-SEC-CLIENT-ENV",
+                "CRITICAL",
+                format!(
+                    "Client-exposed frontend env variable `{}` leaks server secret into browser bundle",
+                    &cap[1]
+                ),
+                rel_path,
+                ln,
+                "Remove the public browser prefix (`NEXT_PUBLIC_`/`VITE_`/`REACT_APP_`) and keep secrets strictly server-side.",
+            ));
         }
 
         // --- Layer 1b: Security Misconfiguration Rules (VF-CFG-*) ---
@@ -846,7 +901,12 @@ fn scan_jwt_logic_flaws(
         || low_path.ends_with(".jsx")
         || low_path.ends_with(".py")
         || low_path.ends_with(".go")
-        || low_path.ends_with(".rs");
+        || low_path.ends_with(".rs")
+        || low_path.ends_with(".php")
+        || low_path.ends_with(".rb")
+        || low_path.ends_with(".java")
+        || low_path.ends_with(".kt")
+        || low_path.ends_with(".cs");
     if !is_code {
         return;
     }
