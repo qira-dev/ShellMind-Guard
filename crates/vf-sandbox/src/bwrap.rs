@@ -263,19 +263,43 @@ mod imp {
     }
 
     fn apply_rlimit_as_io(mem_mb: u64) -> std::io::Result<()> {
-        let limit_bytes = mem_mb.checked_mul(1024 * 1024).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "RLIMIT_AS overflow")
-        })?;
-        let lim = libc::rlimit {
-            rlim_cur: limit_bytes as libc::rlim_t,
-            rlim_max: limit_bytes as libc::rlim_t,
-        };
-        // SAFETY: `lim` lives on the stack with a valid initialized `libc::rlimit` layout for RLIMIT_AS.
-        let rc = unsafe { libc::setrlimit(libc::RLIMIT_AS, &lim) };
-        if rc != 0 {
-            return Err(std::io::Error::last_os_error());
+        #[cfg(target_os = "linux")]
+        {
+            let limit_bytes = mem_mb.checked_mul(1024 * 1024).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "RLIMIT_AS overflow")
+            })?;
+            let requested = limit_bytes as libc::rlim_t;
+            let mut cur = libc::rlimit {
+                rlim_cur: requested,
+                rlim_max: requested,
+            };
+            // Clamp against any pre-existing container hard limit to avoid EPERM.
+            // SAFETY: `cur` is a valid initialized `libc::rlimit` struct for `getrlimit`.
+            let capped = if unsafe { libc::getrlimit(libc::RLIMIT_AS, &mut cur) } == 0
+                && cur.rlim_max != libc::RLIM_INFINITY
+            {
+                requested.min(cur.rlim_max)
+            } else {
+                requested
+            };
+            let lim = libc::rlimit {
+                rlim_cur: capped,
+                rlim_max: capped,
+            };
+            // SAFETY: `lim` lives on the stack with a valid initialized `libc::rlimit` layout for RLIMIT_AS.
+            let rc = unsafe { libc::setrlimit(libc::RLIMIT_AS, &lim) };
+            if rc != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
         }
-        Ok(())
+        #[cfg(not(target_os = "linux"))]
+        {
+            // XNU/macOS and several BSDs reject `RLIMIT_AS` in forked children with EINVAL;
+            // Linux enforces `RLIMIT_AS` + cgroups v2, while macOS isolates via Seatbelt profiles.
+            let _ = mem_mb;
+            Ok(())
+        }
     }
 
     /// Applies an explicit virtual-address-space (`RLIMIT_AS`) cap in MiB to the current process.
@@ -674,6 +698,12 @@ mod imp {
     pub struct SandboxGuard {
         pub port: u16,
         pub isolated_bwrap: bool,
+    }
+
+    impl Drop for SandboxGuard {
+        fn drop(&mut self) {
+            let _ = (self.port, self.isolated_bwrap);
+        }
     }
 
     pub fn kill_active_sandbox_pgid() {}

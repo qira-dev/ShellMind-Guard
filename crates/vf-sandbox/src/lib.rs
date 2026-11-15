@@ -43,7 +43,38 @@ fn is_process_dead_or_zombie(pid: u32) -> bool {
     false
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
+fn is_process_dead_or_zombie(pid: u32) -> bool {
+    let Ok(raw_pid) = libc::pid_t::try_from(pid) else {
+        return true;
+    };
+    if raw_pid <= 0 {
+        return true;
+    }
+    // SAFETY: `kill(pid, 0)` only queries signal deliverability for `raw_pid`.
+    let rc = unsafe { libc::kill(raw_pid, 0) };
+    if rc != 0 {
+        return std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+    }
+    // `kill(pid, 0) == 0` succeeds for zombies (`Z`); query `ps` without calling `waitpid`
+    // so we never reap another caller's `Child` handle.
+    let ps_bin = if Path::new("/bin/ps").exists() {
+        "/bin/ps"
+    } else {
+        "ps"
+    };
+    if let Ok(out) = std::process::Command::new(ps_bin)
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+    {
+        let state = String::from_utf8_lossy(&out.stdout);
+        let trimmed = state.trim();
+        return trimmed.is_empty() || trimmed.starts_with('Z');
+    }
+    false
+}
+
+#[cfg(not(unix))]
 fn is_process_dead_or_zombie(_pid: u32) -> bool {
     false
 }
@@ -425,10 +456,25 @@ pub fn verify_deep_fuzz_in_sandbox(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
 
     #[test]
+    fn test_boot_log_snippet_and_self_pid_monitor_cross_os() {
+        assert!(!is_process_dead_or_zombie(std::process::id()));
+        let dir = std::env::temp_dir().join(format!("vf-bootlog-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("boot.log");
+        std::fs::write(&log_path, "Error: ECONNREFUSED 127.0.0.1:5432 DATABASE_URL").unwrap();
+        let snippet = read_boot_log_snippet(Some(&log_path));
+        let msg = classify_boot_failure(&snippet);
+        assert!(msg.contains("UNBOOTABLE:"));
+        assert!(msg.contains("PostgreSQL") || msg.contains("ECONNREFUSED"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn test_unbootable_external_db_classified_fast_without_timeout() {
+        use std::time::{Duration, Instant};
         let dir = std::env::temp_dir().join(format!("vf-unbootable-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let log_path = dir.join("boot.log");
