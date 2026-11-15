@@ -23,6 +23,9 @@ pub enum Language {
     Dart,
     C,
     Cpp,
+    Ruby,
+    Bash,
+    Hcl,
     Sql,
     Config,
     Manifest,
@@ -44,6 +47,9 @@ impl Language {
             Language::Dart => "dart",
             Language::C => "c",
             Language::Cpp => "cpp",
+            Language::Ruby => "ruby",
+            Language::Bash => "bash",
+            Language::Hcl => "hcl",
             Language::Sql => "sql",
             Language::Config => "config",
             Language::Manifest => "manifest",
@@ -94,9 +100,12 @@ impl Language {
             "dart" => Some(Language::Dart),
             "c" | "h" => Some(Language::C),
             "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => Some(Language::Cpp),
+            "rb" | "rake" | "ru" => Some(Language::Ruby),
+            "sh" | "bash" | "zsh" => Some(Language::Bash),
+            "tf" | "tfvars" => Some(Language::Hcl),
             "sql" => Some(Language::Sql),
             "dockerfile" | "yml" | "yaml" | "toml" | "json" | "ini" | "cfg" | "conf"
-            | "properties" | "pem" | "key" | "sh" | "bash" | "zsh" => Some(Language::Config),
+            | "properties" | "pem" | "key" => Some(Language::Config),
             _ => None,
         }
     }
@@ -246,6 +255,10 @@ pub fn scan_repository(root: &Path, cfg: &ShellMindGuardConfig) -> Result<ScanSu
             || fname.ends_with("_test.c")
             || fname.ends_with("_test.cpp")
             || fname.ends_with("_test.cc")
+            || fname.ends_with("_spec.rb")
+            || fname.ends_with("_test.rb")
+            || fname.ends_with("_test.sh")
+            || fname.ends_with(".bats")
         {
             skipped.fetch_add(1, Ordering::Relaxed);
             continue;

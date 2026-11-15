@@ -384,6 +384,7 @@ pub fn parse_file_ast_with_hash(
             &mut imports,
             &mut symbols,
             &mut route_prefixes,
+            &mut static_findings,
         );
     }
     route_prefixes.retain(|p| !p.starts_with("__AUTH_PREFIX__:"));
@@ -2091,6 +2092,12 @@ pub fn resolve_import_target(
             ".c",
             ".cpp",
             ".cc",
+            ".rb",
+            ".rake",
+            ".ru",
+            ".sh",
+            ".bash",
+            ".zsh",
             "/index.ts",
             "/index.js",
         ] {
@@ -2150,16 +2157,36 @@ fn resolve_extension_import(
             "kt" => &["kt", "kts"],
             "swift" => &["swift"],
             "dart" => &["dart"],
+            "rb" => &["rb", "rake", "ru"],
+            "sh" => &["sh", "bash", "zsh"],
+            "hcl" => &["tf", "tfvars"],
             _ => return None,
         };
-        let clean = body.trim().trim_end_matches("/*").trim_end_matches('/');
+        let clean = body
+            .trim()
+            .trim_start_matches("./")
+            .trim_end_matches("/*")
+            .trim_end_matches('/');
         if clean.is_empty() {
             return None;
+        }
+        if prefix == "hcl" && (body.trim().starts_with('.') || !body.contains("://")) {
+            let parent = Path::new(from_file)
+                .parent()
+                .unwrap_or_else(|| Path::new(""));
+            let rel_dir = normalize_rel_path(&parent.join(body.trim()));
+            if !rel_dir.is_empty() {
+                for cand in [format!("{}/main.tf", rel_dir), format!("{}.tf", rel_dir)] {
+                    if known_files.contains(&cand) {
+                        return Some(cand);
+                    }
+                }
+            }
         }
         if let Some(hit) = find_known_suffix(clean, exts, known_files) {
             return Some(hit);
         }
-        // Namespace / package import (e.g. C# `using App.Services;`) — match file inside matching folder
+        // Namespace / package import (e.g. C# `using App.Services;` or Terraform `./modules/vpc`) — match file inside matching folder
         let seg_needle = format!("/{}/", clean.to_ascii_lowercase());
         let mut dir_matches: Vec<&String> = known_files
             .iter()
@@ -2170,18 +2197,29 @@ fn resolve_extension_import(
             })
             .collect();
         dir_matches.sort();
-        if dir_matches.len() == 1 {
+        if prefix == "hcl" {
+            if let Some(main_tf) = dir_matches.iter().find(|f| {
+                f.replace('\\', "/")
+                    .to_ascii_lowercase()
+                    .ends_with("/main.tf")
+            }) {
+                return Some((*main_tf).clone());
+            }
+            if let Some(first) = dir_matches.first() {
+                return Some((*first).clone());
+            }
+        } else if dir_matches.len() == 1 {
             return Some(dir_matches[0].clone());
         }
         return None;
     }
 
-    // Bare relative requires in PHP / Dart (e.g. `require 'ledger.php';`, `import 'ledger.dart';`)
+    // Bare relative requires in PHP / Dart / Ruby / Shell (e.g. `require 'ledger.php';`, `require_relative 'ledger'`, `source lib.sh`)
     let from_ext = Path::new(from_file)
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("");
-    if matches!(from_ext, "php" | "phtml" | "dart")
+    if matches!(from_ext, "php" | "phtml" | "dart" | "rb" | "sh" | "bash")
         && !spec.starts_with('.')
         && !spec.contains("://")
     {

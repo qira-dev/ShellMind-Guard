@@ -258,6 +258,14 @@ fn is_phase8_pkg_scoped(rel_path: &str) -> bool {
                 | "hpp"
                 | "hh"
                 | "hxx"
+                | "rb"
+                | "rake"
+                | "ru"
+                | "sh"
+                | "bash"
+                | "zsh"
+                | "tf"
+                | "tfvars"
         )
     )
 }

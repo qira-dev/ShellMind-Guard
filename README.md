@@ -4,7 +4,7 @@
 
 **Compiler-Grade Multi-File Security, Business-Logic & Concurrency Verifier**
 
-*Traces cross-file taint and guard invariants via an $O(V + E)$ Guard-Set Lattice across 13 languages (TypeScript, JavaScript, Go, Python, Rust, PHP, Java, C#, Kotlin, Swift, Dart, C, and C++)—then mathematically proves exploitability inside an unprivileged Linux Bubblewrap (`bwrap`) sandbox with zero AI API cost.*
+*Traces cross-file taint and guard invariants via an $O(V + E)$ Guard-Set Lattice across 16 languages (TypeScript, JavaScript, Go, Python, Rust, PHP, Java, C#, Kotlin, Swift, Dart, C, C++, Ruby, Bash/Shell, and Terraform/HCL)—then mathematically proves exploitability inside an unprivileged Linux Bubblewrap (`bwrap`) sandbox with zero AI API cost.*
 
 [![CI](https://github.com/qira-dev/ShellMind-Guard/actions/workflows/ci.yml/badge.svg)](https://github.com/qira-dev/ShellMind-Guard/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
@@ -56,8 +56,8 @@ flowchart TD
     end
 
     subgraph S2["Stage 2: Polyglot AST & O(V+E) Guard-Set Lattice (vf-graph)"]
-        C1["Rayon Parallel Tree-sitter AST (13 Languages)\nTS/JS · Go · Python · Rust · PHP · Java · C# · Kotlin · Swift · Dart · C/C++"]
-        C2["Cross-File Module & Package Linker\ntsconfig paths · barrels · Go/Java/Kotlin/C#/PHP/Dart/C++ headers"]
+        C1["Rayon Parallel Tree-sitter AST (16 Languages)\nTS/JS · Go · Python · Rust · PHP · Java · C# · Kotlin · Swift · Dart · C/C++ · Ruby · Bash · HCL"]
+        C2["Cross-File Module, Header & IaC Linker\ntsconfig paths · barrels · Go/Java/Kotlin/C#/PHP/Dart/Ruby/Bash/C++ headers · Terraform modules"]
         C3["6-Layer Guard-Set Lattice & Sink-Typed Bitmask Taint\nG(v) = ⋂ (G(p) ∪ EdgeGuards(p → v))"]
         C1 --> C2 --> C3
     end
@@ -128,6 +128,9 @@ ShellMind Guard executes all 6 verification layers in a single unified pass:
 | **Swift** (`.swift`) | `tree-sitter-swift` | **Vapor** (`app.get/post`, `app.grouped(User.authenticator())`, `req.db.transaction`, `sql.raw` + `binds:`), **iOS** (`URLSession`, `FileManager`, `sqlite3_exec` vs `sqlite3_prepare`) |
 | **Dart** (`.dart`) | `tree-sitter-dart` | **Dart Frog** (`routes/**` `onRequest`), **Shelf** (`shelf_router` `router.get/post`), `rawQuery`/`rawUpdate`/`Process.run` |
 | **C / C++** (`.c`, `.h`, `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hh`, `.hxx`) | `tree-sitter-c`, `tree-sitter-cpp` | Native engines & libraries (`#include` header-to-implementation edge resolution), **Crow** (`CROW_ROUTE(...).methods(...)`), **cpp-httplib** (`svr.Get/Post`), `sqlite3_prepare_v2`, `std::lock_guard` / `std::mutex` |
+| **Ruby** (`.rb`, `.rake`, `.ru`) | `tree-sitter-ruby` | **Ruby on Rails** (`routes.rb` `to: 'ctrl#act'`, `resources`, `before_action :authenticate_user!`, `skip_before_action :verify_authenticity_token`, ActiveRecord `.transaction` / `.where`), **Sinatra** (`get`/`post` blocks), `require_relative`, `Shellwords.escape` |
+| **Bash / Shell** (`.sh`, `.bash`, `.zsh`) | `tree-sitter-bash` | `source`/`.` cross-file linking, `eval` / `sh -c` / `curl \| bash` (`VF-CMDI-001`), `psql`/`mysql`/`sqlite3` SQLi, dynamic `curl`/`wget` SSRF, `rm -rf` path taint (clean on `mktemp`/`printf '%q'`/regex guards) |
+| **Terraform / HCL** (`.tf`, `.tfvars`) | `tree-sitter-hcl` | Local `module` `source` linking, public S3/GCS/RDS exposure (`VF-CFG-IAC-PUBLIC`), `0.0.0.0/0` non-web SG/firewall ingress (`VF-CFG-IAC-NET`), disabled encryption / TLS < 1.2 (`VF-CFG-IAC-CRYPTO`), IAM `*/*` wildcards (`VF-CFG-IAC-IAM`) |
 
 ---
 
@@ -358,9 +361,9 @@ ShellMind-Guard/
 ├── crates/
 │   ├── vf-core/                   # .shellmind-guard.toml config, ignore::WalkParallel + BLAKE3 scanner,
 │   │                              # XDG SQLite WAL + FTS5 AST/findings store & local `advisories.db` index
-│   ├── vf-graph/                  # Parallel Tree-sitter AST across 13 languages (TS/JS/Go/Python/Rust
-│   │                              # + modular langs/ extractors for PHP/Java/C#/Kotlin/Swift/Dart/C/C++),
-│   │                              # cross-file module/package resolver & O(V+E) Guard-Set Lattice
+│   ├── vf-graph/                  # Parallel Tree-sitter AST across 16 languages (TS/JS/Go/Python/Rust
+│   │                              # + modular langs/ for PHP/Java/C#/Kotlin/Swift/Dart/C/C++/Ruby/Bash/HCL),
+│   │                              # cross-file module/package/IaC resolver & O(V+E) Guard-Set Lattice
 │   ├── vf-sandbox/                # Linux Bubblewrap (--unshare-all) runner, inner namespace probe,
 │   │                              # Auth/IDOR probers & 12-way Barrier + JoinSet concurrent race verifier
 │   ├── vf-report/                 # SARIF 2.1.0 & self-contained Carbon-Slate HTML/SVG graph exporter

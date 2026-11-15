@@ -526,7 +526,284 @@ int query_user(sqlite3* db, const char* id) {
 }
 
 #[test]
-fn test_phase8_scanner_discovers_8_languages_and_ignores_test_files() {
+fn test_phase8_ruby_rails_and_sinatra_vulnerable_vs_safe() {
+    let vuln = analyze_inline(&[
+        (
+            "config/routes.rb",
+            r#"Rails.application.routes.draw do
+  post '/transfer', to: 'orders#transfer'
+  get '/search', to: 'orders#search'
+end
+"#,
+        ),
+        (
+            "app/controllers/orders_controller.rb",
+            r#"require_relative '../services/ledger_service'
+
+class OrdersController < ApplicationController
+  def transfer
+    LedgerService.new.debit(params[:id])
+    render json: { ok: true }
+  end
+
+  def search
+    q = params[:q]
+    @users = User.where("name = #{q}")
+    system("echo #{q}")
+    render json: @users
+  end
+end
+"#,
+        ),
+        (
+            "app/services/ledger_service.rb",
+            r#"class LedgerService
+  def debit(account_id)
+    acct = Account.find(account_id)
+    balance = acct.balance - 10
+    acct.update!(balance: balance)
+  end
+end
+"#,
+        ),
+        (
+            "app/sinatra_admin.rb",
+            r#"require 'sinatra'
+
+post '/admin/exec' do
+  cmd = params[:cmd]
+  system("ls #{cmd}")
+end
+"#,
+        ),
+    ]);
+    let rules: Vec<&str> = vuln.findings.iter().map(|f| f.rule_id.as_str()).collect();
+    assert!(rules.contains(&"VF-AUTH-001"), "got {:?}", rules);
+    assert!(rules.contains(&"VF-RACE-001"), "got {:?}", rules);
+    assert!(rules.contains(&"VF-SQLI-001"), "got {:?}", rules);
+    assert!(rules.contains(&"VF-CMDI-001"), "got {:?}", rules);
+
+    let safe = analyze_inline(&[
+        (
+            "config/routes.rb",
+            r#"Rails.application.routes.draw do
+  post '/safe_transfer', to: 'safe_orders#transfer'
+end
+"#,
+        ),
+        (
+            "app/controllers/safe_orders_controller.rb",
+            r#"class SafeOrdersController < ApplicationController
+  before_action :authenticate_user!
+  protect_from_forgery with: :exception
+
+  def transfer
+    id = params[:id].to_i
+    ActiveRecord::Base.transaction do
+      rows = User.where("id = ?", id)
+      safe_arg = Shellwords.escape(params[:tag].to_s)
+      system("git tag #{safe_arg}")
+      render json: rows
+    end
+  end
+end
+"#,
+        ),
+    ]);
+    assert!(
+        safe.findings.is_empty(),
+        "expected 0 findings on guarded/parameterized Rails route, got: {:#?}",
+        safe.findings
+    );
+}
+
+#[test]
+fn test_phase8_bash_vulnerable_cross_file_vs_safe_and_install_sh() {
+    let vuln = analyze_inline(&[
+        (
+            "scripts/lib.sh",
+            r#"#!/usr/bin/env bash
+run_cmd() {
+    local c="$1"
+    eval "$c"
+}
+
+run_sql() {
+    psql -c "SELECT * FROM users WHERE id = '$1'"
+}
+"#,
+        ),
+        (
+            "scripts/deploy.sh",
+            r#"#!/usr/bin/env bash
+source ./lib.sh
+
+target="$QUERY_STRING"
+run_cmd "$target"
+run_sql "$target"
+curl -sL "https://get.example.com/install.sh" | bash
+curl -s "$target"
+rm -rf "$target"
+"#,
+        ),
+    ]);
+    let rules: Vec<&str> = vuln.findings.iter().map(|f| f.rule_id.as_str()).collect();
+    assert!(rules.contains(&"VF-CMDI-001"), "got {:?}", rules);
+    assert!(rules.contains(&"VF-SQLI-001"), "got {:?}", rules);
+    assert!(rules.contains(&"VF-SSRF-001"), "got {:?}", rules);
+    assert!(rules.contains(&"VF-PATH-001"), "got {:?}", rules);
+
+    let safe = analyze_inline(&[(
+        "scripts/safe.sh",
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+work_dir="$(mktemp -d)"
+trap 'rm -rf "${work_dir}"' EXIT
+
+user_id="$USER_INPUT"
+if [[ "$user_id" =~ ^[0-9]+$ ]]; then
+  psql -v uid="$user_id" -c "SELECT * FROM users WHERE id = :'uid'"
+fi
+run_cmd "git status"
+base_url="https://github.com/qira-dev/ShellMind-Guard/releases/download/v0.1.0"
+curl -fsSL "${base_url}/shellmind-guard-linux-x86_64.tar.gz" -o "${work_dir}/app.tar.gz"
+"#,
+    )]);
+    assert!(
+        safe.findings.is_empty(),
+        "expected 0 findings on safe bash script, got: {:#?}",
+        safe.findings
+    );
+
+    let real_install = analyze_inline(&[("install.sh", include_str!("../../../../install.sh"))]);
+    assert!(
+        real_install.findings.is_empty(),
+        "expected 0 false positives on real install.sh, got: {:#?}",
+        real_install.findings
+    );
+}
+
+#[test]
+fn test_phase8_terraform_hcl_iac_vulnerable_vs_hardened() {
+    let vuln = analyze_inline(&[
+        (
+            "infra/modules/vpc/main.tf",
+            r#"resource "aws_security_group" "ssh_world" {
+  name = "allow_ssh_all"
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+"#,
+        ),
+        (
+            "infra/main.tf",
+            r#"module "vpc" {
+  source = "./modules/vpc"
+}
+
+resource "aws_s3_bucket_acl" "assets" {
+  bucket = "prod-assets"
+  acl    = "public-read"
+}
+
+resource "aws_s3_bucket_public_access_block" "assets" {
+  bucket                  = "prod-assets"
+  block_public_acls       = false
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_db_instance" "main" {
+  identifier          = "prod-db"
+  publicly_accessible = true
+  storage_encrypted   = false
+}
+
+resource "aws_lb_listener" "tls" {
+  port       = 443
+  protocol   = "HTTPS"
+  ssl_policy = "ELBSecurityPolicy-2016-08"
+}
+
+resource "aws_iam_policy" "admin" {
+  name   = "overprivileged"
+  policy = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"*\",\"Resource\":\"*\"}]}"
+}
+"#,
+        ),
+    ]);
+    let rules: Vec<&str> = vuln.findings.iter().map(|f| f.rule_id.as_str()).collect();
+    assert!(rules.contains(&"VF-CFG-IAC-PUBLIC"), "got {:?}", rules);
+    assert!(rules.contains(&"VF-CFG-IAC-NET"), "got {:?}", rules);
+    assert!(rules.contains(&"VF-CFG-IAC-CRYPTO"), "got {:?}", rules);
+    assert!(rules.contains(&"VF-CFG-IAC-IAM"), "got {:?}", rules);
+
+    let hardened = analyze_inline(&[(
+        "infra/hardened.tf",
+        r#"resource "aws_s3_bucket_acl" "assets" {
+  bucket = "prod-assets"
+  acl    = "private"
+}
+
+resource "aws_s3_bucket_public_access_block" "assets" {
+  bucket                  = "prod-assets"
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_security_group" "alb_https" {
+  name = "allow_https_world"
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["10.0.0.0/8"]
+  }
+}
+
+resource "aws_db_instance" "main" {
+  identifier          = "prod-db"
+  publicly_accessible = false
+  storage_encrypted   = true
+}
+
+resource "aws_lb_listener" "tls" {
+  port       = 443
+  protocol   = "HTTPS"
+  ssl_policy = "ELBSecurityPolicy-TLS13-1-2-2021-06"
+}
+
+data "aws_iam_policy_document" "readonly_s3" {
+  statement {
+    effect    = "Allow"
+    actions   = ["s3:GetObject"]
+    resources = ["arn:aws:s3:::prod-assets/*"]
+  }
+}
+"#,
+    )]);
+    assert!(
+        hardened.findings.is_empty(),
+        "expected 0 findings on hardened Terraform config, got: {:#?}",
+        hardened.findings
+    );
+}
+
+#[test]
+fn test_phase8_scanner_discovers_11_extension_languages_and_ignores_test_files() {
     let dir = std::env::temp_dir().join(format!("smg_phase8_scanner_test_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("src")).unwrap();
@@ -541,9 +818,12 @@ fn test_phase8_scanner_discovers_8_languages_and_ignores_test_files() {
         ("src/main.dart", Language::Dart),
         ("src/engine.c", Language::C),
         ("src/server.cpp", Language::Cpp),
+        ("src/app.rb", Language::Ruby),
+        ("src/deploy.sh", Language::Bash),
+        ("src/main.tf", Language::Hcl),
     ];
     for (rel, _) in &prod_files {
-        std::fs::write(dir.join(rel), "// phase8 source\n").unwrap();
+        std::fs::write(dir.join(rel), "# phase8 extension source\n").unwrap();
     }
 
     let test_files = [
@@ -555,10 +835,14 @@ fn test_phase8_scanner_discovers_8_languages_and_ignores_test_files() {
         "src/widget_test.dart",
         "src/engine_test.c",
         "src/server_test.cpp",
+        "src/orders_spec.rb",
+        "src/ledger_test.rb",
+        "src/deploy_test.sh",
+        "src/deploy.bats",
         "__tests__/smoke.java",
     ];
     for rel in &test_files {
-        std::fs::write(dir.join(rel), "// should be filtered\n").unwrap();
+        std::fs::write(dir.join(rel), "# should be filtered\n").unwrap();
     }
 
     let summary = scan_repository(&dir, &ShellMindGuardConfig::default()).unwrap();
@@ -567,7 +851,7 @@ fn test_phase8_scanner_discovers_8_languages_and_ignores_test_files() {
     assert_eq!(
         summary.files.len(),
         prod_files.len(),
-        "expected exact 8 source files and all test files skipped, got: {:?}",
+        "expected exact 11 extension source files and all test files skipped, got: {:?}",
         summary
             .files
             .iter()

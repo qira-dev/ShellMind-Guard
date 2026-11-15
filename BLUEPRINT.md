@@ -40,8 +40,8 @@ The current repository (`d21223c`) already delivers a complete, tested determini
 +==========================================================================================+
 |           STAGE 2: 6-LAYER AST + O(V + E) GUARD-SET LATTICE (crates/vf-graph)            |
 +==========================================================================================+
-|  Tree-sitter (13 AST languages): TS/TSX, JS/JSX, Rust, Python, Go (`ast.rs`) +             |
-|    modular `langs/`: PHP, Java, C#, Kotlin, Swift, Dart, C, C++                            |
+|  Tree-sitter (16 AST languages): TS/TSX, JS/JSX, Rust, Python, Go (`ast.rs`) +             |
+|    modular `langs/`: PHP, Java, C#, Kotlin, Swift, Dart, C, C++, Ruby, Bash, HCL/Terraform|
 |  Text/Config/Manifest scanners: .sql, Dockerfile/.env/configs, lockfiles & manifests     |
 |                                                                                          |
 |  GuardKind Lattice + Cross-File BFS Witness Extractor (trace hops):                      |

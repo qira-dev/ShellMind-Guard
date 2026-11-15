@@ -1,9 +1,12 @@
+pub mod bash;
 pub mod c_cpp;
 pub mod csharp;
 pub mod dart;
+pub mod hcl;
 pub mod java;
 pub mod kotlin;
 pub mod php;
+pub mod ruby;
 pub mod swift;
 
 use crate::ast::{
@@ -55,6 +58,9 @@ pub fn ts_language_for(lang: Language) -> Option<tree_sitter::Language> {
         Language::Dart => Some(tree_sitter_dart::LANGUAGE.into()),
         Language::C => Some(tree_sitter_c::LANGUAGE.into()),
         Language::Cpp => Some(tree_sitter_cpp::LANGUAGE.into()),
+        Language::Ruby => Some(tree_sitter_ruby::LANGUAGE.into()),
+        Language::Bash => Some(tree_sitter_bash::LANGUAGE.into()),
+        Language::Hcl => Some(tree_sitter_hcl::LANGUAGE.into()),
         Language::TypeScript
         | Language::JavaScript
         | Language::Rust
@@ -78,6 +84,7 @@ pub(crate) fn extract_extension_language(
     imports: &mut Vec<ImportRef>,
     symbols: &mut Vec<SymbolInfo>,
     route_prefixes: &mut Vec<String>,
+    static_findings: &mut Vec<LocalStaticFinding>,
 ) {
     let mut ctx = ExtractContext {
         src,
@@ -87,6 +94,7 @@ pub(crate) fn extract_extension_language(
         imports,
         symbols,
         route_prefixes,
+        static_findings,
     };
     match lang {
         Language::Php => php::extract(root, &mut ctx),
@@ -96,6 +104,9 @@ pub(crate) fn extract_extension_language(
         Language::Swift => swift::extract(root, &mut ctx),
         Language::Dart => dart::extract(root, &mut ctx),
         Language::C | Language::Cpp => c_cpp::extract(root, &mut ctx),
+        Language::Ruby => ruby::extract(root, &mut ctx),
+        Language::Bash => bash::extract(root, &mut ctx),
+        Language::Hcl => hcl::extract(root, &mut ctx),
         Language::TypeScript
         | Language::JavaScript
         | Language::Rust
@@ -115,6 +126,7 @@ pub(crate) struct ExtractContext<'a> {
     pub imports: &'a mut Vec<ImportRef>,
     pub symbols: &'a mut Vec<SymbolInfo>,
     pub route_prefixes: &'a mut Vec<String>,
+    pub static_findings: &'a mut Vec<LocalStaticFinding>,
 }
 
 fn ident_re() -> &'static Regex {
@@ -209,6 +221,9 @@ pub(crate) fn collect_calls_generic(node: Node, src: &[u8], out: &mut Vec<String
         "member_call_expression" | "scoped_call_expression" => {
             node.child_by_field_name("name").map(|n| node_text(n, src))
         }
+        "call" => node
+            .child_by_field_name("method")
+            .map(|n| node_text(n, src)),
         "object_creation_expression" => node.child_by_field_name("type").map(|n| node_text(n, src)),
         _ => None,
     };
@@ -435,6 +450,7 @@ fn is_dynamic_sql_stmt(stmt: &str, has_sql_var_taint: bool) -> bool {
         || stmt.contains(" . ")
         || stmt.contains(".$")
         || stmt.contains("\\(")
+        || stmt.contains("#{")
         || stmt.contains("sprintf")
         || stmt.contains("snprintf")
         || stmt.contains("string.format")
@@ -445,7 +461,8 @@ fn is_dynamic_sql_stmt(stmt: &str, has_sql_var_taint: bool) -> bool {
         || stmt.contains("@id")
         || stmt.contains(":id")
         || stmt.contains("$1");
-    if has_param_placeholder && !stmt.contains('+') && !stmt.contains(". ") {
+    if has_param_placeholder && !stmt.contains('+') && !stmt.contains(". ") && !stmt.contains("#{")
+    {
         return false;
     }
     (sql_verb_re().is_match(stmt) || has_sql_var_taint) && has_concat_or_interp
@@ -742,9 +759,7 @@ pub(crate) fn build_analyzed_symbol(
             if c == &name {
                 continue;
             }
-            let call_pat = format!("{}(", c);
-            if let Some(pos) = stmt.find(&call_pat) {
-                let after = &stmt[pos + call_pat.len()..];
+            if let Some(after) = find_call_args_slice(stmt, c) {
                 let call_taint = (expr_direct_source_mask(after, profile, &[])
                     | expr_var_taint(after, &tainted_vars))
                     & !stmt_san;
@@ -765,6 +780,25 @@ pub(crate) fn build_analyzed_symbol(
     }
 
     sym
+}
+
+fn find_call_args_slice<'a>(stmt: &'a str, callee: &str) -> Option<&'a str> {
+    let call_pat = format!("{}(", callee);
+    if let Some(pos) = stmt.find(&call_pat) {
+        return Some(&stmt[pos + call_pat.len()..]);
+    }
+    let space_pat = format!("{} ", callee);
+    let bytes = stmt.as_bytes();
+    let mut offset = 0usize;
+    while let Some(rel) = stmt[offset..].find(&space_pat) {
+        let pos = offset + rel;
+        let prev_ok = pos == 0 || !bytes[pos - 1].is_ascii_alphanumeric() && bytes[pos - 1] != b'_';
+        if prev_ok {
+            return Some(&stmt[pos + space_pat.len()..]);
+        }
+        offset = pos + callee.len();
+    }
+    None
 }
 
 fn split_assignment(stmt: &str) -> Option<(&str, &str)> {
