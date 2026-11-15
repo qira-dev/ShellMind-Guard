@@ -38,14 +38,14 @@ The initial 5-phase v0.1 build is **done, verified, and must not be broken**:
 
 ---
 
-## Phase 8: Language & Ecosystem Expansion (Modular AST Plugin Split)
+## Phase 8: Language & Ecosystem Expansion (Modular AST Plugin Split — Completed)
 **Goal:** Expand reach to **Mobile Apps, Enterprise Backends, and Native Core Software** while preserving fast compile times and maintainable `vf-graph` modules.
 
-- **Deliverables:**
-  1. **Preserve Working 5-Language Core + Modular Trait for New Languages:** Keep the existing 5-language `ast.rs` parser (`TS/JS, Rust, Python, Go`) intact and covered by regression tests, while introducing a clean per-language extractor module (`crates/vf-graph/src/langs/`) feeding the shared `FileAstSummary` and `solve_guard_lattice`.
-  2. **Web & Enterprise Expansion:** Add `tree-sitter` extractors for **PHP** (Laravel/Symfony), **Java** (Spring Boot), and **C#** (.NET minimal APIs/controllers).
-  3. **Mobile & Native Core Languages:** Add `tree-sitter` extractors for **Kotlin** (Android/Ktor), **Swift** (iOS/Vapor), **Dart** (Flutter), and **C / C++** (native engines, desktop cores, shared libraries).
-- **Verification Gate:** Each new language adds parity fixture tests (`routes/functions/imports/sinks/guards`) and keeps incremental delta scans bounded via `max_threads`.
+- **Delivered:**
+  1. **Preserved 5-Language Core + Modular Language Plugin Layer:** Kept the existing 5-language `ast.rs` parser (`TS/JS, Rust, Python, Go`) intact with full regression stability, while adding `crates/vf-graph/src/langs/` (`LangProfile`, `build_analyzed_symbol`, and per-language extractors) feeding the shared `FileAstSummary`, cross-file package/header linker, and `solve_guard_lattice`.
+  2. **Web & Enterprise Expansion:** Added `tree-sitter` extractors and parity test suites for **PHP** (`tree-sitter-php`: Laravel/Symfony), **Java** (`tree-sitter-java`: Spring Boot/JAX-RS), and **C#** (`tree-sitter-c-sharp`: ASP.NET Core MVC + Minimal APIs).
+  3. **Mobile & Native Core Languages:** Added `tree-sitter` extractors and parity test suites for **Kotlin** (`tree-sitter-kotlin-ng`: Android/Ktor/Spring), **Swift** (`tree-sitter-swift`: iOS/Vapor), **Dart** (`tree-sitter-dart`: Flutter/Shelf/Dart Frog), and **C / C++** (`tree-sitter-c` + `tree-sitter-cpp`: native engines, Crow, cpp-httplib, `#include` header-to-source edge resolution), alongside test-file exclusion in `vf-core` and bounded `max_threads` delta scans.
+- **Verification Gate:** All 13 languages covered by regression tests (`routes/functions/imports/sinks/guards` + clean/sanitized zero-false-positive fixtures) with `cargo test --workspace --locked` passing.
 
 ---
 

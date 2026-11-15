@@ -1,5 +1,6 @@
 pub mod ast;
 pub mod deps;
+pub mod langs;
 pub mod lattice;
 pub mod secrets_config;
 pub mod taint;
@@ -50,7 +51,7 @@ pub fn analyze_codebase_cached(
     let cfg_json = serde_json::to_string(&cfg.guards).unwrap_or_default();
     let adv_stamp = vf_core::advisories_db_stamp();
     let versioned_cfg = format!(
-        "v7-sprint3-advisories-{}|{}|{}",
+        "v8-langs-advisories-{}|{}|{}",
         env!("CARGO_PKG_VERSION"),
         adv_stamp,
         cfg_json

@@ -4,7 +4,7 @@
 
 **Compiler-Grade Multi-File Security, Business-Logic & Concurrency Verifier**
 
-*Traces cross-file taint and guard invariants via an $O(V + E)$ Guard-Set Lattice across TypeScript, JavaScript, Go, Python, and Rust—then mathematically proves exploitability inside an unprivileged Linux Bubblewrap (`bwrap`) sandbox with zero AI API cost.*
+*Traces cross-file taint and guard invariants via an $O(V + E)$ Guard-Set Lattice across 13 languages (TypeScript, JavaScript, Go, Python, Rust, PHP, Java, C#, Kotlin, Swift, Dart, C, and C++)—then mathematically proves exploitability inside an unprivileged Linux Bubblewrap (`bwrap`) sandbox with zero AI API cost.*
 
 [![CI](https://github.com/qira-dev/ShellMind-Guard/actions/workflows/ci.yml/badge.svg)](https://github.com/qira-dev/ShellMind-Guard/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
@@ -56,8 +56,8 @@ flowchart TD
     end
 
     subgraph S2["Stage 2: Polyglot AST & O(V+E) Guard-Set Lattice (vf-graph)"]
-        C1["Rayon Parallel Tree-sitter AST\nTS/TSX · JS/JSX · Go · Python · Rust"]
-        C2["Cross-File Module Linker\ntsconfig paths · barrels · Go pkgs · Rust mod · Python rel"]
+        C1["Rayon Parallel Tree-sitter AST (13 Languages)\nTS/JS · Go · Python · Rust · PHP · Java · C# · Kotlin · Swift · Dart · C/C++"]
+        C2["Cross-File Module & Package Linker\ntsconfig paths · barrels · Go/Java/Kotlin/C#/PHP/Dart/C++ headers"]
         C3["6-Layer Guard-Set Lattice & Sink-Typed Bitmask Taint\nG(v) = ⋂ (G(p) ∪ EdgeGuards(p → v))"]
         C1 --> C2 --> C3
     end
@@ -121,6 +121,13 @@ ShellMind Guard executes all 6 verification layers in a single unified pass:
 | **Go** (`.go`) | `tree-sitter-go` | `net/http` (`http.HandleFunc`, `mux.HandleFunc`), **Gin** (`r.GET`, `r.Group`, `.Use`), **Echo**, **Chi**, `database/sql` (`db.Query`, `db.Exec`, `tx.Exec`), `os/exec` |
 | **Python** (`.py`) | `tree-sitter-python` | **FastAPI** (`@app.get`, `@router.post`, `Depends`), **Flask** (`@app.route`, `request.args`), **Django** (`path()`, `@login_required`, `.objects.get/filter`), `cursor.execute`, `subprocess` |
 | **Rust** (`.rs`) | `tree-sitter-rust` | **Axum** (`Router::new().route()`, `.layer()`), **Actix-Web** (`#[get("/...")]`, `#[post("/...")]`, `web::Path`, `web::Query`), `sqlx`, `tokio::process::Command` |
+| **PHP** (`.php`, `.phtml`) | `tree-sitter-php` | **Laravel** (`Route::get/post/...`, `middleware('auth')`, `DB::transaction`, `DB::select`), **Symfony** (`#[Route]`, `#[IsGranted]`), PDO `prepare()`, PSR-4 `use` resolution |
+| **Java** (`.java`) | `tree-sitter-java` | **Spring Boot / MVC** (`@RestController`, `@RequestMapping`, `@GetMapping`/`@PostMapping`, `@PreAuthorize`, `@Transactional`), **JAX-RS** (`@Path`, `@GET`/`@POST`), JDBC `PreparedStatement` |
+| **C#** (`.cs`) | `tree-sitter-c-sharp` | **ASP.NET Core MVC** (`[Route]`, `[HttpGet]`/`[HttpPost]`, `[Authorize]`, `[ValidateAntiForgeryToken]`) & **Minimal APIs** (`app.MapGet`/`MapPost`, `.RequireAuthorization()`), Entity Framework (`FromSqlRaw` vs `FromSqlInterpolated`) |
+| **Kotlin** (`.kt`, `.kts`) | `tree-sitter-kotlin-ng` | **Ktor** (`routing { get/post }`, `authenticate("...")`, `call.parameters`), **Spring Boot Kotlin** (`@RestController`, `@PreAuthorize`), **Android** (`Intent`, `rawQuery`, `execSQL`) |
+| **Swift** (`.swift`) | `tree-sitter-swift` | **Vapor** (`app.get/post`, `app.grouped(User.authenticator())`, `req.db.transaction`, `sql.raw` + `binds:`), **iOS** (`URLSession`, `FileManager`, `sqlite3_exec` vs `sqlite3_prepare`) |
+| **Dart** (`.dart`) | `tree-sitter-dart` | **Dart Frog** (`routes/**` `onRequest`), **Shelf** (`shelf_router` `router.get/post`), `rawQuery`/`rawUpdate`/`Process.run` |
+| **C / C++** (`.c`, `.h`, `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hh`, `.hxx`) | `tree-sitter-c`, `tree-sitter-cpp` | Native engines & libraries (`#include` header-to-implementation edge resolution), **Crow** (`CROW_ROUTE(...).methods(...)`), **cpp-httplib** (`svr.Get/Post`), `sqlite3_prepare_v2`, `std::lock_guard` / `std::mutex` |
 
 ---
 
@@ -351,8 +358,9 @@ ShellMind-Guard/
 ├── crates/
 │   ├── vf-core/                   # .shellmind-guard.toml config, ignore::WalkParallel + BLAKE3 scanner,
 │   │                              # XDG SQLite WAL + FTS5 AST/findings store & local `advisories.db` index
-│   ├── vf-graph/                  # Parallel Tree-sitter AST (TS/JS/Go/Python/Rust), cross-file
-│   │                              # module resolver, 6-layer bitmask taint & O(V+E) Guard-Set Lattice
+│   ├── vf-graph/                  # Parallel Tree-sitter AST across 13 languages (TS/JS/Go/Python/Rust
+│   │                              # + modular langs/ extractors for PHP/Java/C#/Kotlin/Swift/Dart/C/C++),
+│   │                              # cross-file module/package resolver & O(V+E) Guard-Set Lattice
 │   ├── vf-sandbox/                # Linux Bubblewrap (--unshare-all) runner, inner namespace probe,
 │   │                              # Auth/IDOR probers & 12-way Barrier + JoinSet concurrent race verifier
 │   ├── vf-report/                 # SARIF 2.1.0 & self-contained Carbon-Slate HTML/SVG graph exporter

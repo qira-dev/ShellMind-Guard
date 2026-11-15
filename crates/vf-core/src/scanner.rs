@@ -15,6 +15,14 @@ pub enum Language {
     Rust,
     Python,
     Go,
+    Php,
+    Java,
+    CSharp,
+    Kotlin,
+    Swift,
+    Dart,
+    C,
+    Cpp,
     Sql,
     Config,
     Manifest,
@@ -28,6 +36,14 @@ impl Language {
             Language::Rust => "rust",
             Language::Python => "python",
             Language::Go => "go",
+            Language::Php => "php",
+            Language::Java => "java",
+            Language::CSharp => "csharp",
+            Language::Kotlin => "kotlin",
+            Language::Swift => "swift",
+            Language::Dart => "dart",
+            Language::C => "c",
+            Language::Cpp => "cpp",
             Language::Sql => "sql",
             Language::Config => "config",
             Language::Manifest => "manifest",
@@ -70,6 +86,14 @@ impl Language {
             "rs" => Some(Language::Rust),
             "py" => Some(Language::Python),
             "go" => Some(Language::Go),
+            "php" | "phtml" => Some(Language::Php),
+            "java" => Some(Language::Java),
+            "cs" => Some(Language::CSharp),
+            "kt" | "kts" => Some(Language::Kotlin),
+            "swift" => Some(Language::Swift),
+            "dart" => Some(Language::Dart),
+            "c" | "h" => Some(Language::C),
+            "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => Some(Language::Cpp),
             "sql" => Some(Language::Sql),
             "dockerfile" | "yml" | "yaml" | "toml" | "json" | "ini" | "cfg" | "conf"
             | "properties" | "pem" | "key" | "sh" | "bash" | "zsh" => Some(Language::Config),
@@ -209,6 +233,19 @@ pub fn scan_repository(root: &Path, cfg: &ShellMindGuardConfig) -> Result<ScanSu
             || fname.ends_with("_test.rs")
             || fname.ends_with("_test.py")
             || (fname.starts_with("test_") && fname.ends_with(".py"))
+            || fname.ends_with("Test.java")
+            || fname.ends_with("Tests.java")
+            || fname.ends_with("Test.kt")
+            || fname.ends_with("Tests.kt")
+            || fname.ends_with("Test.cs")
+            || fname.ends_with("Tests.cs")
+            || fname.ends_with("Test.php")
+            || fname.ends_with("Tests.php")
+            || fname.ends_with("_test.dart")
+            || fname.ends_with("Tests.swift")
+            || fname.ends_with("_test.c")
+            || fname.ends_with("_test.cpp")
+            || fname.ends_with("_test.cc")
         {
             skipped.fetch_add(1, Ordering::Relaxed);
             continue;

@@ -7,6 +7,7 @@ use petgraph::Direction;
 use petgraph::graph::{DiGraph, NodeIndex};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceHop {
@@ -234,6 +235,33 @@ fn push_taint_edges(
     }
 }
 
+fn is_phase8_pkg_scoped(rel_path: &str) -> bool {
+    matches!(
+        Path::new(rel_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref(),
+        Some(
+            "php"
+                | "java"
+                | "cs"
+                | "kt"
+                | "kts"
+                | "swift"
+                | "dart"
+                | "c"
+                | "h"
+                | "cpp"
+                | "cc"
+                | "cxx"
+                | "hpp"
+                | "hh"
+                | "hxx"
+        )
+    )
+}
+
 /// Global Cross-File Call Graph + True O(V + E) Guard-Set Lattice, Taint & 6-Layer Witness Solver
 pub fn solve_guard_lattice_with_public(
     summaries: &[FileAstSummary],
@@ -243,13 +271,15 @@ pub fn solve_guard_lattice_with_public(
     let mut id_to_idx: HashMap<String, NodeIndex> = HashMap::new();
     let mut file_symbols_map: HashMap<(String, String), Vec<NodeIndex>> = HashMap::new();
     let mut go_dir_map: HashMap<(String, String), Vec<NodeIndex>> = HashMap::new();
+    let mut pkg_dir_map: HashMap<(String, String), Vec<NodeIndex>> = HashMap::new();
     let mut go_exported_map: HashMap<String, Vec<NodeIndex>> = HashMap::new();
     let mut known_files: HashSet<String> = HashSet::new();
 
     for f in summaries {
         known_files.insert(f.rel_path.clone());
         let is_go = f.rel_path.ends_with(".go");
-        let go_dir = if is_go {
+        let is_pkg = is_phase8_pkg_scoped(&f.rel_path);
+        let dir_key = if is_go || is_pkg {
             go_parent_dir(&f.rel_path)
         } else {
             String::new()
@@ -263,7 +293,7 @@ pub fn solve_guard_lattice_with_public(
                 .push(idx);
             if is_go {
                 go_dir_map
-                    .entry((go_dir.clone(), sym.name.clone()))
+                    .entry((dir_key.clone(), sym.name.clone()))
                     .or_default()
                     .push(idx);
                 if sym.name.chars().next().is_some_and(|c| c.is_uppercase()) {
@@ -272,6 +302,11 @@ pub fn solve_guard_lattice_with_public(
                         .or_default()
                         .push(idx);
                 }
+            } else if is_pkg {
+                pkg_dir_map
+                    .entry((dir_key.clone(), sym.name.clone()))
+                    .or_default()
+                    .push(idx);
             }
         }
     }
@@ -365,6 +400,12 @@ pub fn solve_guard_lattice_with_public(
                     {
                         dst_indices.extend(exp_idxs.iter().copied());
                     }
+                } else if dst_indices.is_empty()
+                    && is_phase8_pkg_scoped(&f.rel_path)
+                    && let Some(same_dir_idxs) =
+                        pkg_dir_map.get(&(go_parent_dir(&f.rel_path), callee.clone()))
+                {
+                    dst_indices.extend(same_dir_idxs.iter().copied());
                 }
 
                 for dst_idx in dst_indices {

@@ -176,7 +176,7 @@ pub struct FileAstSummary {
 
 impl SymbolInfo {
     #[allow(clippy::too_many_arguments)]
-    fn base(
+    pub(crate) fn base(
         id: String,
         rel_path: &str,
         name: String,
@@ -339,7 +339,10 @@ pub fn parse_file_ast_with_hash(
         Language::Go => {
             parser.set_language(&tree_sitter_go::LANGUAGE.into()).ok()?;
         }
-        Language::Sql | Language::Config | Language::Manifest => unreachable!(),
+        other => {
+            let ts_lang = crate::langs::ts_language_for(other)?;
+            parser.set_language(&ts_lang).ok()?;
+        }
     }
 
     let tree = parser.parse(source, None)?;
@@ -351,17 +354,38 @@ pub fn parse_file_ast_with_hash(
     let mut route_prefixes = Vec::new();
 
     let mut file_middleware_guards = HashSet::new();
-    extract_node(
-        root,
-        src_bytes,
-        &file.rel_path,
+    if matches!(
         file.language,
-        cfg,
-        &mut file_middleware_guards,
-        &mut imports,
-        &mut symbols,
-        &mut route_prefixes,
-    );
+        Language::TypeScript
+            | Language::JavaScript
+            | Language::Rust
+            | Language::Python
+            | Language::Go
+    ) {
+        extract_node(
+            root,
+            src_bytes,
+            &file.rel_path,
+            file.language,
+            cfg,
+            &mut file_middleware_guards,
+            &mut imports,
+            &mut symbols,
+            &mut route_prefixes,
+        );
+    } else {
+        crate::langs::extract_extension_language(
+            root,
+            src_bytes,
+            &file.rel_path,
+            file.language,
+            cfg,
+            &mut file_middleware_guards,
+            &mut imports,
+            &mut symbols,
+            &mut route_prefixes,
+        );
+    }
     route_prefixes.retain(|p| !p.starts_with("__AUTH_PREFIX__:"));
 
     let mut frontend_calls = Vec::new();
@@ -402,15 +426,15 @@ pub fn parse_file_ast(file: &IndexedFile, cfg: &ShellMindGuardConfig) -> Option<
     parse_file_ast_with_hash(file, cfg).map(|(_, s)| s)
 }
 
-fn node_text<'a>(node: Node, src: &'a [u8]) -> &'a str {
+pub(crate) fn node_text<'a>(node: Node, src: &'a [u8]) -> &'a str {
     node.utf8_text(src).unwrap_or("")
 }
 
-fn strip_comments(src: &str) -> String {
+pub(crate) fn strip_comments(src: &str) -> String {
     crate::taint::strip_comments_simple(src)
 }
 
-fn is_auth_guard_ident(name: &str, cfg: &ShellMindGuardConfig) -> bool {
+pub(crate) fn is_auth_guard_ident(name: &str, cfg: &ShellMindGuardConfig) -> bool {
     let low = name.to_ascii_lowercase();
     if low.contains("unauthenticated") || low.contains("allowanonymous") {
         return false;
@@ -421,7 +445,7 @@ fn is_auth_guard_ident(name: &str, cfg: &ShellMindGuardConfig) -> bool {
     })
 }
 
-fn is_lock_guard_ident(name: &str, cfg: &ShellMindGuardConfig) -> bool {
+pub(crate) fn is_lock_guard_ident(name: &str, cfg: &ShellMindGuardConfig) -> bool {
     let low = name.to_ascii_lowercase();
     cfg.guards.lock_guards.iter().any(|pat| {
         let p = pat.to_ascii_lowercase();
@@ -429,7 +453,7 @@ fn is_lock_guard_ident(name: &str, cfg: &ShellMindGuardConfig) -> bool {
     })
 }
 
-fn contains_guard_pattern(low_text: &str, pat_low: &str) -> bool {
+pub(crate) fn contains_guard_pattern(low_text: &str, pat_low: &str) -> bool {
     if pat_low == "authenticate" && low_text.contains("unauthenticated") {
         let cleaned = low_text.replace("unauthenticated", "");
         return cleaned.contains("authenticate");
@@ -444,7 +468,7 @@ fn contains_guard_pattern(low_text: &str, pat_low: &str) -> bool {
     low_text.contains(pat_low)
 }
 
-fn classify_guards(text: &str, cfg: &ShellMindGuardConfig) -> HashSet<GuardKind> {
+pub(crate) fn classify_guards(text: &str, cfg: &ShellMindGuardConfig) -> HashSet<GuardKind> {
     let mut g = HashSet::new();
     let code_only = strip_comments(text);
     let low = code_only.to_ascii_lowercase();
@@ -595,7 +619,7 @@ fn classify_fn_guards_cfg(
     guards
 }
 
-fn classify_sink(name: &str, body: &str) -> Option<SinkKind> {
+pub(crate) fn classify_sink(name: &str, body: &str) -> Option<SinkKind> {
     let low_name = name.to_ascii_lowercase();
     let low_body = strip_comments(body).to_ascii_lowercase();
 
@@ -2027,6 +2051,11 @@ pub fn resolve_import_target(
         return None;
     }
 
+    // 3b. Extension language imports (PHP, Java, C#, Kotlin, Swift, Dart, C/C++)
+    if let Some(resolved) = resolve_extension_import(from_file, spec, known_files) {
+        return Some(resolved);
+    }
+
     // 4. Relative `./` or `../` imports (including NodeNext `.js` -> `.ts` resolution)
     if !spec.starts_with('.') {
         return None;
@@ -2049,10 +2078,168 @@ pub fn resolve_import_target(
         .or_else(|| base.strip_suffix(".mjs"))
         .unwrap_or(&base);
     for stem in [base.as_str(), stripped_js] {
-        for ext in ["", ".ts", ".tsx", ".js", ".jsx", "/index.ts", "/index.js"] {
+        for ext in [
+            "",
+            ".ts",
+            ".tsx",
+            ".js",
+            ".jsx",
+            ".php",
+            ".dart",
+            ".h",
+            ".hpp",
+            ".c",
+            ".cpp",
+            ".cc",
+            "/index.ts",
+            "/index.js",
+        ] {
             let cand = format!("{}{}", stem, ext);
             if known_files.contains(&cand) {
                 return Some(cand);
+            }
+        }
+    }
+    None
+}
+
+fn resolve_extension_import(
+    from_file: &str,
+    spec: &str,
+    known_files: &HashSet<String>,
+) -> Option<String> {
+    if let Some(inc) = spec.strip_prefix("cpp::") {
+        let clean = inc.trim().replace('\\', "/");
+        if clean.is_empty() {
+            return None;
+        }
+        let parent = Path::new(from_file)
+            .parent()
+            .unwrap_or_else(|| Path::new(""));
+        let stem = clean
+            .strip_suffix(".hpp")
+            .or_else(|| clean.strip_suffix(".hxx"))
+            .or_else(|| clean.strip_suffix(".hh"))
+            .or_else(|| clean.strip_suffix(".h"))
+            .unwrap_or(&clean);
+        // Prefer corresponding implementation file (.cpp/.c/...) so calls resolve to definitions
+        let mut impl_candidates = Vec::new();
+        for ext in ["cpp", "cc", "cxx", "c"] {
+            impl_candidates.push(format!("{}.{}", stem, ext));
+        }
+        impl_candidates.push(clean.clone());
+        for cand in &impl_candidates {
+            let joined = normalize_rel_path(&parent.join(cand));
+            if known_files.contains(&joined) {
+                return Some(joined);
+            }
+        }
+        for cand in &impl_candidates {
+            if let Some(hit) = find_known_suffix(cand, &[], known_files) {
+                return Some(hit);
+            }
+        }
+        return None;
+    }
+
+    if let Some((prefix, body)) = spec.split_once("::") {
+        let exts: &[&str] = match prefix {
+            "php" => &["php", "phtml"],
+            "java" => &["java"],
+            "cs" => &["cs"],
+            "kt" => &["kt", "kts"],
+            "swift" => &["swift"],
+            "dart" => &["dart"],
+            _ => return None,
+        };
+        let clean = body.trim().trim_end_matches("/*").trim_end_matches('/');
+        if clean.is_empty() {
+            return None;
+        }
+        if let Some(hit) = find_known_suffix(clean, exts, known_files) {
+            return Some(hit);
+        }
+        // Namespace / package import (e.g. C# `using App.Services;`) — match file inside matching folder
+        let seg_needle = format!("/{}/", clean.to_ascii_lowercase());
+        let mut dir_matches: Vec<&String> = known_files
+            .iter()
+            .filter(|f| {
+                let norm = format!("/{}", f.replace('\\', "/").to_ascii_lowercase());
+                let ext_ok = exts.iter().any(|e| norm.ends_with(&format!(".{}", e)));
+                ext_ok && norm.contains(&seg_needle)
+            })
+            .collect();
+        dir_matches.sort();
+        if dir_matches.len() == 1 {
+            return Some(dir_matches[0].clone());
+        }
+        return None;
+    }
+
+    // Bare relative requires in PHP / Dart (e.g. `require 'ledger.php';`, `import 'ledger.dart';`)
+    let from_ext = Path::new(from_file)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    if matches!(from_ext, "php" | "phtml" | "dart")
+        && !spec.starts_with('.')
+        && !spec.contains("://")
+    {
+        let parent = Path::new(from_file)
+            .parent()
+            .unwrap_or_else(|| Path::new(""));
+        let joined = normalize_rel_path(&parent.join(spec.trim_start_matches('/')));
+        if known_files.contains(&joined) {
+            return Some(joined);
+        }
+        return find_known_suffix(spec, &[from_ext], known_files);
+    }
+
+    None
+}
+
+fn normalize_rel_path(path: &Path) -> String {
+    let mut stack: Vec<String> = Vec::new();
+    for comp in path.components() {
+        match comp {
+            std::path::Component::Normal(s) => stack.push(s.to_string_lossy().to_string()),
+            std::path::Component::ParentDir => {
+                stack.pop();
+            }
+            _ => {}
+        }
+    }
+    stack.join("/")
+}
+
+fn find_known_suffix(rel: &str, exts: &[&str], known_files: &HashSet<String>) -> Option<String> {
+    let clean = rel.trim_start_matches("./").replace('\\', "/");
+    let parts: Vec<&str> = clean.split('/').filter(|s| !s.is_empty()).collect();
+    if parts.is_empty() {
+        return None;
+    }
+    let mut known_sorted: Vec<&String> = known_files.iter().collect();
+    known_sorted.sort();
+
+    for start in 0..parts.len() {
+        let tail = parts[start..].join("/").to_ascii_lowercase();
+        let candidates: Vec<String> = if exts.is_empty() {
+            vec![format!("/{}", tail)]
+        } else {
+            exts.iter()
+                .map(|e| {
+                    if tail.ends_with(&format!(".{}", e)) {
+                        format!("/{}", tail)
+                    } else {
+                        format!("/{}.{}", tail, e)
+                    }
+                })
+                .collect()
+        };
+        for f in &known_sorted {
+            let norm = format!("/{}", f.replace('\\', "/").to_ascii_lowercase());
+            if candidates.iter().any(|c| norm.ends_with(c)) {
+                return Some((*f).clone());
             }
         }
     }
@@ -2241,17 +2428,7 @@ def withdraw(amount: int):
     }
 
     fn parse_inline_file(rel_path: &str, code: &str, cfg: &ShellMindGuardConfig) -> FileAstSummary {
-        let lang = if rel_path.ends_with(".go") {
-            Language::Go
-        } else if rel_path.ends_with(".py") {
-            Language::Python
-        } else if rel_path.ends_with(".rs") {
-            Language::Rust
-        } else if rel_path.ends_with(".js") {
-            Language::JavaScript
-        } else {
-            Language::TypeScript
-        };
+        let lang = Language::from_path(Path::new(rel_path)).unwrap_or(Language::TypeScript);
         let mut parser = Parser::new();
         let ts_lang: tree_sitter::Language = match lang {
             Language::Go => tree_sitter_go::LANGUAGE.into(),
@@ -2260,6 +2437,7 @@ def withdraw(amount: int):
             Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
             Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             Language::Sql | Language::Config | Language::Manifest => unreachable!(),
+            other => crate::langs::ts_language_for(other).expect("supported tree-sitter language"),
         };
         parser.set_language(&ts_lang).unwrap();
         let tree = parser.parse(code, None).unwrap();
