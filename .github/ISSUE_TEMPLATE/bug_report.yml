@@ -13,11 +13,11 @@ body:
     attributes:
       label: Component
       options:
-        - "vf-core (Scanner / BLAKE3 / SQLite Cache / Config)"
-        - "vf-graph (Tree-sitter AST / Guard-Set Lattice / Taint / Secrets / Deps)"
-        - "vf-sandbox (Bubblewrap / Concurrent Race Prover)"
-        - "vf-report (SARIF 2.1.0 / HTML Graph)"
-        - "vf-tui (ratatui Terminal UI)"
+        - "sh-core (Scanner / BLAKE3 / SQLite Cache / Config)"
+        - "sh-graph (Tree-sitter AST / Guard-Set Lattice / Taint / Secrets / Deps)"
+        - "sh-sandbox (Bubblewrap / Concurrent Race Prover)"
+        - "sh-report (SARIF 2.1.0 / HTML Graph)"
+        - "sh-tui (ratatui Terminal UI)"
         - "shellmind-guard mcp (JSON-RPC 2.0 Stdio MCP Server)"
     validations:
       required: true

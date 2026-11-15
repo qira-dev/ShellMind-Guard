@@ -9,9 +9,9 @@
 [![CI](https://github.com/qira-dev/ShellMind-Guard/actions/workflows/ci.yml/badge.svg)](https://github.com/qira-dev/ShellMind-Guard/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Rust Edition](https://img.shields.io/badge/Rust-2024_Edition-orange.svg)](Cargo.toml)
-[![Sandbox](https://img.shields.io/badge/Sandbox-Bubblewrap_Namespaces-success.svg)](crates/vf-sandbox)
+[![Sandbox](https://img.shields.io/badge/Sandbox-Bubblewrap_Namespaces-success.svg)](crates/sh-sandbox)
 [![MCP Server](https://img.shields.io/badge/MCP-JSON--RPC_2.0_Stdio-purple.svg)](src/mcp.rs)
-[![SARIF](https://img.shields.io/badge/Output-SARIF_2.1.0_%7C_HTML_%7C_JSON-informational.svg)](crates/vf-report)
+[![SARIF](https://img.shields.io/badge/Output-SARIF_2.1.0_%7C_HTML_%7C_JSON-informational.svg)](crates/sh-report)
 
 [**Architecture**](#system-architecture) · [**6-Layer Engine**](#the-6-layer-universal-verification-engine) · [**Quickstart**](#quickstart) · [**AI Agent MCP**](#model-context-protocol-shellmind-guard-mcp) · [**Benchmarks**](#verified-performance-benchmarks) · [**Blueprint**](BLUEPRINT.md)
 
@@ -48,27 +48,27 @@ flowchart TD
         A3["Stdio MCP Server\nshellmind-guard mcp (JSON-RPC 2.0)"]
     end
 
-    subgraph S1["Stage 1: Two-Phase Incremental Ingestion (vf-core)"]
+    subgraph S1["Stage 1: Two-Phase Incremental Ingestion (sh-core)"]
         B1["ignore::WalkParallel\n(.gitignore + fast path filter)"]
         B2["BLAKE3 Content Fingerprinting\n+ mtime_ns Fast-Skip"]
         B3["SQLite WAL + FTS5 Store\n($XDG_CACHE_HOME/shellmind-guard/<hash>/state.db)"]
         B1 --> B2 --> B3
     end
 
-    subgraph S2["Stage 2: Polyglot AST & O(V+E) Guard-Set Lattice (vf-graph)"]
+    subgraph S2["Stage 2: Polyglot AST & O(V+E) Guard-Set Lattice (sh-graph)"]
         C1["Rayon Parallel Tree-sitter AST (16 Languages)\nTS/JS · Go · Python · Rust · PHP · Java · C# · Kotlin · Swift · Dart · C/C++ · Ruby · Bash · HCL"]
         C2["Cross-File Module, Header & IaC Linker\ntsconfig paths · barrels · Go/Java/Kotlin/C#/PHP/Dart/Ruby/Bash/C++ headers · Terraform modules"]
         C3["6-Layer Guard-Set Lattice & Sink-Typed Bitmask Taint\nG(v) = ⋂ (G(p) ∪ EdgeGuards(p → v))"]
         C1 --> C2 --> C3
     end
 
-    subgraph S3["Stage 3: OS-Isolated Runtime Prover (vf-sandbox)"]
+    subgraph S3["Stage 3: OS-Isolated Runtime Prover (sh-sandbox)"]
         D1["Linux Bubblewrap (/usr/bin/bwrap)\n--unshare-all · --ro-bind · --tmpfs · PGID Reaper"]
         D2["12-Way Barrier-Synchronized Prober\nAuth Bypass, Cross-Tenant IDOR & Last-Byte Sync Race"]
         D1 --> D2
     end
 
-    subgraph S4["Stage 4: Actionable Outputs (vf-report / vf-ai)"]
+    subgraph S4["Stage 4: Actionable Outputs (sh-report / sh-ai)"]
         E1["SARIF 2.1.0 + Confidence\nGitHub Code Scanning"]
         E2["Interactive HTML/SVG\nMulti-File Witness Graph"]
         E3["Minimal Patch Prompt (<= 2 KB) & --apply-check\nExact Witness Hops + Opt-In AI Patch Verifier"]
@@ -365,17 +365,17 @@ ShellMind-Guard/
 │   ├── deps_sync.rs               # Explicit opt-in OSV `/v1/querybatch` + `--from-file` advisory sync
 │   └── mcp.rs                     # Stdio JSON-RPC 2.0 Model Context Protocol server
 ├── crates/
-│   ├── vf-core/                   # .shellmind-guard.toml config, ignore::WalkParallel + BLAKE3 scanner,
+│   ├── sh-core/                   # .shellmind-guard.toml config, ignore::WalkParallel + BLAKE3 scanner,
 │   │                              # XDG SQLite WAL + FTS5 AST/findings store & local `advisories.db` index
-│   ├── vf-graph/                  # Parallel Tree-sitter AST across 16 languages (TS/JS/Go/Python/Rust
+│   ├── sh-graph/                  # Parallel Tree-sitter AST across 16 languages (TS/JS/Go/Python/Rust
 │   │                              # + modular langs/ for PHP/Java/C#/Kotlin/Swift/Dart/C/C++/Ruby/Bash/HCL),
 │   │                              # domain routing (`web`/`system_engine`/`mobile`), deep SQL/DOM/SSTI rules,
 │   │                              # Phase 9/10 cross-file field/closure taint, OpenAPI schemas & O(V+E) Lattice
-│   ├── vf-sandbox/                # Linux Bubblewrap (--unshare-all) + macOS/Windows sandbox helpers,
+│   ├── sh-sandbox/                # Linux Bubblewrap (--unshare-all) + macOS/Windows sandbox helpers,
 │   │                              # RLIMIT_AS/cgroups v2, rustls TLS loopback, mock shims & `--deep` fuzz prover
-│   ├── vf-report/                 # SARIF 2.1.0 & self-contained Carbon-Slate HTML/SVG graph exporter
-│   ├── vf-tui/                    # Panic-safe 60fps ratatui 3-pane workspace + ring-buffer log drawer
-│   └── vf-ai/                     # Opt-in minimal-context (<= 2 KB) HTTP/TLS patcher & safe diff applier
+│   ├── sh-report/                 # SARIF 2.1.0 & self-contained Carbon-Slate HTML/SVG graph exporter
+│   ├── sh-tui/                    # Panic-safe 60fps ratatui 3-pane workspace + ring-buffer log drawer
+│   └── sh-ai/                     # Opt-in minimal-context (<= 2 KB) HTTP/TLS patcher & safe diff applier
 └── fixtures/
     ├── vuln-payment-node/         # Runnable multi-file Node/TS double-spend race, SQLi & auth fixture
     └── vuln-auth-rust/            # Multi-file Rust Axum unauthenticated role-mutation fixture

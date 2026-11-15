@@ -1,11 +1,11 @@
 use crate::{ScanRunOptions, execute_scan_pipeline, write_ci_workflow};
 use anyhow::Result;
 use serde_json::{Value, json};
+use sh_ai::build_minimal_patch_prompt;
+use sh_core::{ShellMindGuardConfig, StateStore, scan_repository};
+use sh_graph::analyze_codebase_cached;
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use vf_ai::build_minimal_patch_prompt;
-use vf_core::{ShellMindGuardConfig, StateStore, scan_repository};
-use vf_graph::analyze_codebase_cached;
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 const MAX_MCP_LINE_BYTES: u64 = 4 * 1024 * 1024;
@@ -279,7 +279,7 @@ fn handle_tool_call(params: &Value) -> Result<Value> {
             let min_confidence = args
                 .get("min_confidence")
                 .and_then(|v| v.as_str())
-                .and_then(vf_graph::Confidence::parse);
+                .and_then(sh_graph::Confidence::parse);
 
             let deep = args.get("deep").and_then(|v| v.as_bool()).unwrap_or(false);
 
@@ -435,7 +435,7 @@ mod tests {
 
     #[test]
     fn test_mcp_shellmind_guard_scan_and_explain_end_to_end() {
-        let dir = std::env::temp_dir().join("vf_mcp_e2e_unit");
+        let dir = std::env::temp_dir().join("sh_mcp_e2e_unit");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("src")).unwrap();
         fs::write(

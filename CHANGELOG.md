@@ -9,12 +9,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [0.1.0] - 2026-11-14
 
 ### Added
-- **`vf-core` — Two-Phase Incremental Ingestion & Storage:**
+- **`sh-core` — Two-Phase Incremental Ingestion & Storage:**
   - Parallel `.gitignore`-aware directory walker (`ignore::WalkParallel`) with multi-segment `ignore_paths` and automatic test/fixture filtering.
   - Fast `(mtime_ns, size_bytes)` metadata pre-check + `BLAKE3` 128-bit content fingerprinting.
   - `SQLite WAL + FTS5` state store (`.shellmind-guard/state.db`) caching per-file `FileAstSummary` blobs (`ast_cache`) and scan findings.
   - Stack auto-detection (`shellmind-guard init [--ci]`) generating `.shellmind-guard.toml` and `.github/workflows/shellmind-guard.yml`.
-- **`vf-graph` — Polyglot `Tree-sitter` AST & 6-Layer Guard-Set Lattice Engine:**
+- **`sh-graph` — Polyglot `Tree-sitter` AST & 6-Layer Guard-Set Lattice Engine:**
   - Parallel `rayon` AST extraction for **TypeScript/TSX**, **JavaScript/JSX**, **Go**, **Python**, and **Rust**.
   - Universal route discovery for Express, Fastify, Hono, Koa, Next.js App Router, NestJS, tRPC, Go `net/http`/Gin/Echo/Chi, Python FastAPI/Flask/Django, and Rust Axum/Actix-Web.
   - Cross-file module resolver supporting `tsconfig.json` path aliases, barrel `index.ts` re-exports, Go package directories, Python relative imports, and Rust `mod`/`use` trees.
@@ -24,10 +24,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   - **Layer 4 (`lattice.rs`):** $O(V + E)$ monotone Guard-Set Lattice solver for missing authentication (`VF-AUTH-001`) and missing resource ownership filters (`VF-IDOR-001`).
   - **Layer 5 (`lattice.rs`):** Missing transaction/lock invariant detection (`VF-RACE-001`) on balance and payment mutations.
   - **Layer 6 (`taint.rs` + `lattice.rs`):** Frontend-to-backend route contract verifier (`VF-FE-404`) and unhandled async mutation / dead handler detector (`VF-FE-ERR`).
-- **`vf-sandbox` — OS-Isolated Bubblewrap (`bwrap`) & Concurrent Race Prover:**
+- **`sh-sandbox` — OS-Isolated Bubblewrap (`bwrap`) & Concurrent Race Prover:**
   - Unprivileged Linux namespace sandbox (`bwrap --unshare-all`, `--ro-bind`, `--tmpfs`, `RLIMIT_AS`, process-group `SIGKILL` reaper).
   - Synchronized 12-way concurrent HTTP burst prover (`tokio::sync::Barrier` + `tokio::task::JoinSet` Last-Byte Sync) upgrading static `VF-AUTH-*` and `VF-RACE-*` findings to `PROVEN` or `MITIGATED`.
-- **`vf-report`, `vf-tui`, `vf-ai` & `shellmind-guard mcp`:**
+- **`sh-report`, `sh-tui`, `sh-ai` & `shellmind-guard mcp`:**
   - Standard `SARIF 2.1.0` exporter and self-contained Carbon-Slate HTML/SVG witness graph generator.
   - Panic-safe 60fps 3-pane `ratatui` terminal UI (`shellmind-guard ui`).
   - Minimal (<4 KB) witness-hop patch context generator (`--patch`).

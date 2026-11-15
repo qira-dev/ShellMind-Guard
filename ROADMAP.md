@@ -7,10 +7,10 @@
 ## Baseline Completed (`v0.1.0` — Locked Foundation at `d21223c`)
 
 The initial 5-phase v0.1 build is **done, verified, and must not be broken**:
-- **Core & Delta Cache (`vf-core`):** `.shellmind-guard.toml` config, `ignore` + bounded `rayon` (`2..=6` threads) + `BLAKE3` walker, XDG SQLite WAL + FTS5 store (`ast_cache`).
-- **6-Layer Graph Engine (`vf-graph`):** `tree-sitter` across **TS/JS, Rust, Python, Go**; $O(V+E)$ Guard-Set Lattice (`Auth`, `TxLock`, `IDOR`, taint sinks `SQLI/CMDI/PATH/SSRF`, secrets, misconfigs, offline manifest advisories, frontend API mismatch/error contract).
-- **Isolated Runtime Prover (`vf-sandbox`):** Linux `/usr/bin/bwrap` `--unshare-all --unshare-net` execution, PGID reaper, cancel-safe Last-Byte Sync (`TxLock`) and `Auth` bypass invariant probers.
-- **Surfaces (`src/`, `vf-tui`, `vf-report`, `vf-ai`):** CLI, CI workflow generator, `--watch`, `--sarif`, `--html`, panic-safe `ratatui` TUI, Git & Claude `pre-commit` hooks, stdio MCP server (`scan`, `explain_finding`, `init`), and 2 KB root-confined patch prompt builder.
+- **Core & Delta Cache (`sh-core`):** `.shellmind-guard.toml` config, `ignore` + bounded `rayon` (`2..=6` threads) + `BLAKE3` walker, XDG SQLite WAL + FTS5 store (`ast_cache`).
+- **6-Layer Graph Engine (`sh-graph`):** `tree-sitter` across **TS/JS, Rust, Python, Go**; $O(V+E)$ Guard-Set Lattice (`Auth`, `TxLock`, `IDOR`, taint sinks `SQLI/CMDI/PATH/SSRF`, secrets, misconfigs, offline manifest advisories, frontend API mismatch/error contract).
+- **Isolated Runtime Prover (`sh-sandbox`):** Linux `/usr/bin/bwrap` `--unshare-all --unshare-net` execution, PGID reaper, cancel-safe Last-Byte Sync (`TxLock`) and `Auth` bypass invariant probers.
+- **Surfaces (`src/`, `sh-tui`, `sh-report`, `sh-ai`):** CLI, CI workflow generator, `--watch`, `--sarif`, `--html`, panic-safe `ratatui` TUI, Git & Claude `pre-commit` hooks, stdio MCP server (`scan`, `explain_finding`, `init`), and 2 KB root-confined patch prompt builder.
 
 ---
 
@@ -18,10 +18,10 @@ The initial 5-phase v0.1 build is **done, verified, and must not be broken**:
 **Goal:** Make Web & API scanning deeply reliable with lower false positives and real runtime proof expansion.
 
 - **Deliverables:**
-  1. **End-to-End Confidence & Verification Grading:** Propagate `PROVEN`, `CONFIRMED_STATIC`, and `HEURISTIC` levels consistently across `vf-graph`, `vf-core` (`store.rs` `findings`), `vf-report` (SARIF/HTML), `vf-tui`, `src/main.rs` (`--fail-on`), and `src/mcp.rs` so CI gates never block on noisy guesses.
+  1. **End-to-End Confidence & Verification Grading:** Propagate `PROVEN`, `CONFIRMED_STATIC`, and `HEURISTIC` levels consistently across `sh-graph`, `sh-core` (`store.rs` `findings`), `sh-report` (SARIF/HTML), `sh-tui`, `src/main.rs` (`--fail-on`), and `src/mcp.rs` so CI gates never block on noisy guesses.
   2. **AST-Level Web Security Rules:** Add sanitizer-aware `VF-XSS-001` (unsanitized DOM/HTML sinks), `VF-CSRF-001` (cookie-authenticated state mutations missing CSRF/SameSite guards), and `VF-CFG-JWT-LOGIC` (`alg: "none"`, skipped signature checks), cleanly wired into `--layers` (`xss,csrf`) and MCP tool schemas.
-  3. **Configurable Sandbox Profiles + Live `IDOR` Prover (`vf-core` + `vf-sandbox`):** Extend `.shellmind-guard.toml` `[sandbox]` (`base_url` wiring, custom `probe_body`, seeded `user_a_header` / `user_b_header`) and extend `verifier.rs` / `vf-sandbox/src/lib.rs` to prove cross-tenant `GuardKind::OwnershipCheck` (`VF-IDOR-001`) over loopback HTTP inside `bwrap`.
-  4. **Real Closed-Loop `vf-ai` Patcher (Opt-in Only):** Add a minimal HTTP client (`ureq` + `rustls` or equivalent zero-bloat crate) in `vf-ai` behind explicit opt-in config (`Disabled` by default), generate minimal unified diff patches, apply in `--tmpfs` inside Linux `bwrap`, and re-run `verify_finding` to confirm `[MITIGATED]`.
+  3. **Configurable Sandbox Profiles + Live `IDOR` Prover (`sh-core` + `sh-sandbox`):** Extend `.shellmind-guard.toml` `[sandbox]` (`base_url` wiring, custom `probe_body`, seeded `user_a_header` / `user_b_header`) and extend `verifier.rs` / `sh-sandbox/src/lib.rs` to prove cross-tenant `GuardKind::OwnershipCheck` (`VF-IDOR-001`) over loopback HTTP inside `bwrap`.
+  4. **Real Closed-Loop `sh-ai` Patcher (Opt-in Only):** Add a minimal HTTP client (`ureq` + `rustls` or equivalent zero-bloat crate) in `sh-ai` behind explicit opt-in config (`Disabled` by default), generate minimal unified diff patches, apply in `--tmpfs` inside Linux `bwrap`, and re-run `verify_finding` to confirm `[MITIGATED]`.
   5. **Docs & Repo Hygiene Sync:** Align `README.md` (`VF-SEC-JWT`, `pyproject.toml`, XDG cache path) and remove unused `symbols`/`edges` dead SQLite schema or `.veriforge` fixture cache remnants safely.
 - **Verification Gate:** `cargo test --workspace` + fixture regression proving live `IDOR` detection (`PROVEN` when vulnerable, `MITIGATED` when ownership-scoped) with zero impact on existing `Auth`/`TxLock` tests.
 
@@ -39,12 +39,12 @@ The initial 5-phase v0.1 build is **done, verified, and must not be broken**:
 ---
 
 ## Phase 8: Language & Ecosystem Expansion (Modular AST Plugin Split — Completed)
-**Goal:** Expand reach to **Mobile Apps, Enterprise Backends, and Native Core Software** while preserving fast compile times and maintainable `vf-graph` modules.
+**Goal:** Expand reach to **Mobile Apps, Enterprise Backends, and Native Core Software** while preserving fast compile times and maintainable `sh-graph` modules.
 
 - **Delivered:**
-  1. **Preserved 5-Language Core + Modular Language Plugin Layer:** Kept the existing 5-language `ast.rs` parser (`TS/JS, Rust, Python, Go`) intact with full regression stability, while adding `crates/vf-graph/src/langs/` (`LangProfile`, `build_analyzed_symbol`, and per-language extractors) feeding the shared `FileAstSummary`, cross-file package/header linker, and `solve_guard_lattice`.
+  1. **Preserved 5-Language Core + Modular Language Plugin Layer:** Kept the existing 5-language `ast.rs` parser (`TS/JS, Rust, Python, Go`) intact with full regression stability, while adding `crates/sh-graph/src/langs/` (`LangProfile`, `build_analyzed_symbol`, and per-language extractors) feeding the shared `FileAstSummary`, cross-file package/header linker, and `solve_guard_lattice`.
   2. **Web & Enterprise Expansion:** Added `tree-sitter` extractors and parity test suites for **PHP** (`tree-sitter-php`: Laravel/Symfony), **Java** (`tree-sitter-java`: Spring Boot/JAX-RS), and **C#** (`tree-sitter-c-sharp`: ASP.NET Core MVC + Minimal APIs).
-  3. **Mobile, Native Core, Scripting & Infrastructure-as-Code:** Added `tree-sitter` extractors and parity test suites for **Kotlin** (`tree-sitter-kotlin-ng`: Android/Ktor/Spring), **Swift** (`tree-sitter-swift`: iOS/Vapor), **Dart** (`tree-sitter-dart`: Flutter/Shelf/Dart Frog), **C / C++** (`tree-sitter-c` + `tree-sitter-cpp`: native engines, Crow, cpp-httplib, `#include` header-to-source edge resolution), **Ruby** (`tree-sitter-ruby`: Rails/Sinatra/ActiveRecord), **Bash / Shell** (`tree-sitter-bash`: `eval`/`sh -c`/`curl|bash`/DB CLI/SSRF/destructive path taint + `source` resolution), and **Terraform / HCL** (`tree-sitter-hcl`: `VF-CFG-IAC-*` public storage, `0.0.0.0/0` network ingress, weak TLS/unencrypted storage, IAM `*` wildcards, and module edge resolution), alongside test-file exclusion in `vf-core` and bounded `max_threads` delta scans.
+  3. **Mobile, Native Core, Scripting & Infrastructure-as-Code:** Added `tree-sitter` extractors and parity test suites for **Kotlin** (`tree-sitter-kotlin-ng`: Android/Ktor/Spring), **Swift** (`tree-sitter-swift`: iOS/Vapor), **Dart** (`tree-sitter-dart`: Flutter/Shelf/Dart Frog), **C / C++** (`tree-sitter-c` + `tree-sitter-cpp`: native engines, Crow, cpp-httplib, `#include` header-to-source edge resolution), **Ruby** (`tree-sitter-ruby`: Rails/Sinatra/ActiveRecord), **Bash / Shell** (`tree-sitter-bash`: `eval`/`sh -c`/`curl|bash`/DB CLI/SSRF/destructive path taint + `source` resolution), and **Terraform / HCL** (`tree-sitter-hcl`: `VF-CFG-IAC-*` public storage, `0.0.0.0/0` network ingress, weak TLS/unencrypted storage, IAM `*` wildcards, and module edge resolution), alongside test-file exclusion in `sh-core` and bounded `max_threads` delta scans.
 - **Verification Gate:** All 16 languages covered by regression tests (`routes/functions/imports/sinks/guards/IaC` + clean/sanitized/real `install.sh` zero-false-positive fixtures) with `cargo test --workspace --locked` passing.
 
 ---
@@ -53,9 +53,9 @@ The initial 5-phase v0.1 build is **done, verified, and must not be broken**:
 **Goal:** Move beyond web/payment routes so complex software cores (e.g., cross-OS desktop engines, native libraries, mobile apps) catch reliability, concurrency, and memory hazards accurately.
 
 - **Delivered:**
-  1. **Domain-Aware Analyzer Routing:** [`detect_domain_hints`](crates/vf-graph/src/phase9/mod.rs) & [`resolve_repo_domains`](crates/vf-graph/src/phase9/mod.rs) automatically detect and activate `web`, `system_engine`, and `mobile` domains (`active_domains`), ensuring mobile rules stay dormant on pure backend servers and C/C++ memory rules target native code.
+  1. **Domain-Aware Analyzer Routing:** [`detect_domain_hints`](crates/sh-graph/src/phase9/mod.rs) & [`resolve_repo_domains`](crates/sh-graph/src/phase9/mod.rs) automatically detect and activate `web`, `system_engine`, and `mobile` domains (`active_domains`), ensuring mobile rules stay dormant on pure backend servers and C/C++ memory rules target native code.
   2. **Core Engine Concurrency & Resource Invariants:**
-     - `VF-ENG-DEADLOCK`: Cross-function `A->B / B->A` lock-order inversion graph solver ([`solve_cross_function_deadlocks`](crates/vf-graph/src/phase9/concurrency.rs)), synchronous mutex guards held across `.await`/blocking sleeps, re-entrant self-deadlocks, and un-released manual locks on early returns (while honoring `std::scoped_lock`, `defer Unlock()`, `tokio::sync::Mutex`, and scoped drops).
+     - `VF-ENG-DEADLOCK`: Cross-function `A->B / B->A` lock-order inversion graph solver ([`solve_cross_function_deadlocks`](crates/sh-graph/src/phase9/concurrency.rs)), synchronous mutex guards held across `.await`/blocking sleeps, re-entrant self-deadlocks, and un-released manual locks on early returns (while honoring `std::scoped_lock`, `defer Unlock()`, `tokio::sync::Mutex`, and scoped drops).
      - `VF-ENG-LEAK`: Unclosed file/socket/DB handles on early error-return paths across C/C++, Go, Python, Java/Kotlin, and JS/TS (skipping factory returns, `if (!fp) return`, RAII, `defer Close()`, `with`, `.use`, and `try/finally`).
   3. **Native Memory & Boundary Safety (C/C++/Unsafe Rust):**
      - `VF-MEM-BOUNDS`: Unbounded C/C++ copies (`gets`/`strcpy`/`strcat`/`sprintf`/`scanf("%s")`), unchecked variable-length `memcpy`/`memmove`/`strncpy`/`read`/`recv`, and unguarded Rust `unsafe` slice/pointer operations (`get_unchecked`, `from_raw_parts`, `copy_nonoverlapping`, `.offset`).

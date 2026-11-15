@@ -2,12 +2,12 @@
 resolver = "2"
 members = [
     ".",
-    "crates/vf-core",
-    "crates/vf-graph",
-    "crates/vf-sandbox",
-    "crates/vf-tui",
-    "crates/vf-report",
-    "crates/vf-ai",
+    "crates/sh-core",
+    "crates/sh-graph",
+    "crates/sh-sandbox",
+    "crates/sh-tui",
+    "crates/sh-report",
+    "crates/sh-ai",
 ]
 
 [workspace.package]
@@ -67,12 +67,12 @@ serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-vf-core = { path = "crates/vf-core" }
-vf-graph = { path = "crates/vf-graph" }
-vf-sandbox = { path = "crates/vf-sandbox" }
-vf-tui = { path = "crates/vf-tui" }
-vf-report = { path = "crates/vf-report" }
-vf-ai = { path = "crates/vf-ai" }
+sh-core = { path = "crates/sh-core" }
+sh-graph = { path = "crates/sh-graph" }
+sh-sandbox = { path = "crates/sh-sandbox" }
+sh-tui = { path = "crates/sh-tui" }
+sh-report = { path = "crates/sh-report" }
+sh-ai = { path = "crates/sh-ai" }
 
 [profile.release]
 codegen-units = 16

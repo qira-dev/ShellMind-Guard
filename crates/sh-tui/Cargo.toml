@@ -1,0 +1,15 @@
+[package]
+name = "sh-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+crossterm = "0.28"
+ratatui = "0.29"
+sh-ai = { path = "../sh-ai" }
+sh-core = { path = "../sh-core" }
+sh-graph = { path = "../sh-graph" }
+sh-report = { path = "../sh-report" }
+sh-sandbox = { path = "../sh-sandbox" }

@@ -4,28 +4,28 @@ mod mcp;
 use anyhow::Context;
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
+use sh_ai::{
+    apply_unified_diff_safely, build_minimal_patch_prompt, generate_patch_plan,
+    provider_from_config,
+};
+use sh_core::{DeltaStats, ShellMindGuardConfig, StateStore, scan_repository};
+use sh_graph::{
+    Confidence, GraphAnalysisResult, GuardKind, LatticeFinding, analyze_codebase,
+    analyze_codebase_cached, collect_deep_schema_findings,
+};
+use sh_report::{to_html_graph, to_sarif_json};
+use sh_sandbox::{
+    SandboxProbeConfig, VerificationStatus, VerifiedFinding, detect_sandbox_backend,
+    verify_deep_fuzz_blocking_with_config, verify_deep_fuzz_in_sandbox,
+    verify_finding_blocking_with_config, verify_findings_in_sandbox_with_config,
+};
+use sh_tui::{TuiLaunchConfig, run_tui};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use vf_ai::{
-    apply_unified_diff_safely, build_minimal_patch_prompt, generate_patch_plan,
-    provider_from_config,
-};
-use vf_core::{DeltaStats, ShellMindGuardConfig, StateStore, scan_repository};
-use vf_graph::{
-    Confidence, GraphAnalysisResult, GuardKind, LatticeFinding, analyze_codebase,
-    analyze_codebase_cached, collect_deep_schema_findings,
-};
-use vf_report::{to_html_graph, to_sarif_json};
-use vf_sandbox::{
-    SandboxProbeConfig, VerificationStatus, VerifiedFinding, detect_sandbox_backend,
-    verify_deep_fuzz_blocking_with_config, verify_deep_fuzz_in_sandbox,
-    verify_finding_blocking_with_config, verify_findings_in_sandbox_with_config,
-};
-use vf_tui::{TuiLaunchConfig, run_tui};
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Default)]
 enum OutputFormat {
@@ -427,7 +427,7 @@ fn probe_config_from_cfg(cfg: &ShellMindGuardConfig) -> SandboxProbeConfig {
 fn probe_config_from_opts(
     cfg: &ShellMindGuardConfig,
     opts: &ScanRunOptions<'_>,
-    fuzz_routes: Vec<vf_graph::RouteSchema>,
+    fuzz_routes: Vec<sh_graph::RouteSchema>,
 ) -> SandboxProbeConfig {
     let mut probe_cfg = probe_config_from_cfg(cfg);
     if let Some(mb) = opts.sandbox_mem_mb {
@@ -1175,8 +1175,8 @@ fn main() -> Result<ExitCode> {
                 osv_url,
                 from_file,
             } => {
-                let db_path = vf_core::default_advisories_db_path();
-                let mut store = vf_core::AdvisoryStore::open_default()?;
+                let db_path = sh_core::default_advisories_db_path();
+                let mut store = sh_core::AdvisoryStore::open_default()?;
                 if let Some(ref osv_file) = from_file {
                     let imported = deps_sync::import_osv_file_to_store(osv_file, &mut store)?;
                     let (total, _) = store.stats()?;
@@ -1210,14 +1210,14 @@ fn main() -> Result<ExitCode> {
                 }
             }
             DepsAction::Status => {
-                let db_path = vf_core::default_advisories_db_path();
+                let db_path = sh_core::default_advisories_db_path();
                 if !db_path.exists() {
                     println!(
                         "ShellMind Guard Deps | DB: {} | Status: NOT INITIALIZED (0 advisories; run `shellmind-guard deps sync`)",
                         db_path.display()
                     );
                 } else {
-                    let store = vf_core::AdvisoryStore::open_at(&db_path, true)?;
+                    let store = sh_core::AdvisoryStore::open_at(&db_path, true)?;
                     let (total, last_updated) = store.stats()?;
                     let ts_str = last_updated
                         .map(|ts| ts.to_string())
@@ -1259,7 +1259,7 @@ fn main() -> Result<ExitCode> {
         }
     }
 
-    vf_sandbox::kill_active_sandbox_pgid();
+    sh_sandbox::kill_active_sandbox_pgid();
     Ok(ExitCode::SUCCESS)
 }
 
@@ -1670,7 +1670,7 @@ fn run_doctor(path: &Path) {
         std::env::consts::ARCH
     );
     let backend = detect_sandbox_backend();
-    let bwrap_ok = vf_sandbox::has_bwrap();
+    let bwrap_ok = sh_sandbox::has_bwrap();
     println!("  Sandbox Backend : {}", backend.label());
     println!(
         "  Sandbox (bwrap) : {}",
@@ -1927,7 +1927,7 @@ mod main_tests {
             entry_route: "app.ts:1".into(),
             file: "app.ts".into(),
             line: 1,
-            sink_kind: vf_graph::SinkKind::SqlWrite,
+            sink_kind: sh_graph::SinkKind::SqlWrite,
             missing_guard: GuardKind::Auth,
             witness_path: vec![],
             remediation: String::new(),

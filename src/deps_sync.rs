@@ -1,16 +1,16 @@
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
+use sh_core::{
+    AdvisoryRecord, AdvisoryStore, Language, ShellMindGuardConfig, parse_osv_value_into_records,
+    scan_repository,
+};
+use sh_graph::deps::{ResolvedDependency, extract_resolved_dependencies};
 use std::collections::BTreeSet;
 use std::fs;
 use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Once;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use vf_core::{
-    AdvisoryRecord, AdvisoryStore, Language, ShellMindGuardConfig, parse_osv_value_into_records,
-    scan_repository,
-};
-use vf_graph::deps::{ResolvedDependency, extract_resolved_dependencies};
 
 pub const DEFAULT_OSV_BASE_URL: &str = "https://api.osv.dev";
 const QUERYBATCH_CHUNK_SIZE: usize = 500;
@@ -257,10 +257,10 @@ pub fn import_osv_file_to_store(file: &Path, store: &mut AdvisoryStore) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sh_graph::deps::scan_dependencies_with_store;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
-    use vf_graph::deps::scan_dependencies_with_store;
 
     fn read_http_request(stream: &mut std::net::TcpStream) -> String {
         let mut buf = Vec::new();
