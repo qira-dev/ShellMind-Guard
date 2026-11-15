@@ -47,7 +47,7 @@ The current repository (`d21223c`) already delivers a complete, tested determini
 |   - VF-AUTH-001 (Auth)         - VF-RACE-001 (TxLock)     - VF-IDOR-001 (OwnershipCheck) |
 |   - VF-SQLI / CMDI / PATH / SSRF (Taint + Sanitizers)     - VF-FE-404 / VF-FE-ERR (UI)   |
 |   - VF-SEC-* (Secrets & .env)  - VF-CFG-* (CORS/TLS/Docker/Crypto/Debug/Cookie)          |
-|   - VF-DEP-001 (Offline manifest/lockfile audit; 26 built-in OFFLINE_ADVISORIES + 7 manifests)|
+|   - VF-DEP-001 (Offline SQLite OSV cache `advisories.db` + 26 fallback advisories; 9 manifests)|
 +==========================================================================================+
                                               |
                 +-----------------------------+-----------------------------+

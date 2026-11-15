@@ -27,13 +27,13 @@ The initial 5-phase v0.1 build is **done, verified, and must not be broken**:
 
 ---
 
-## Phase 7: High-Speed Offline-First CVE & Advisory Cache (`VF-DEP` Upgrade)
+## Phase 7: High-Speed Offline-First CVE & Advisory Cache (`VF-DEP` Upgrade — Completed)
 **Goal:** Replace the 26-entry hardcoded `OFFLINE_ADVISORIES` limit without adding network latency or memory bloat to `scan`.
 
-- **Deliverables:**
-  1. **Local SQLite Advisory Index (`~/.cache/shellmind-guard/advisories.db`):** Compact indexed lookup by `(ecosystem, package, version_range)` built with Zstd/OSV feeds.
-  2. **Explicit Opt-In Sync (`shellmind-guard deps sync`):** Fetches/updates OSV advisory bundles separately on demand. Regular `shellmind-guard scan` stays **100% offline** and fast.
-  3. **Strict Semver/Lockfile Matching:** Parse exact resolved versions from `package-lock.json`, `Cargo.lock`, `go.mod`, and pinned `requirements.txt` / poetry / uv lockfiles to minimize false dependency alerts.
+- **Delivered:**
+  1. **Local SQLite Advisory Index (`$XDG_CACHE_HOME/shellmind-guard/advisories.db`):** Compact indexed lookup by `(ecosystem, package)` with strict semver range matching (`introduced <= installed < fixed`, `<= last_affected`, skipping Go pseudo-versions) and `advisories_db_stamp()` cache invalidation.
+  2. **Explicit Opt-In Sync (`shellmind-guard deps sync` / `deps sync --from-file` / `deps status`):** Fetches OSV `/v1/querybatch` + `/v1/vulns/<id>` over HTTPS/`rustls` (or imports offline OSV JSON files) separately on demand. Regular `shellmind-guard scan` stays **100% offline** and fast.
+  3. **Strict Semver/Lockfile Matching:** Parses exact resolved versions from `package-lock.json`, `Cargo.lock`, `go.mod`, `requirements.txt`, `pyproject.toml`, `poetry.lock`, and `uv.lock` alongside the built-in offline advisory fallback.
 - **Verification Gate:** Cold `scan` makes zero network calls; offline advisory lookups complete in `< 20 ms` across real lockfiles with deterministic regression fixtures.
 
 ---

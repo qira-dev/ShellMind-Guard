@@ -1,3 +1,4 @@
+mod deps_sync;
 mod mcp;
 
 use anyhow::Context;
@@ -78,6 +79,28 @@ enum HookAction {
     /// Internal handler for Claude Code PreToolUse Bash hook (reads JSON from stdin)
     #[command(name = "claude-pre-commit", hide = true)]
     ClaudePreCommit,
+}
+
+#[derive(Subcommand, Debug)]
+enum DepsAction {
+    /// Explicitly sync OSV CVE/advisory metadata into local offline SQLite cache
+    Sync {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        #[arg(
+            long,
+            default_value = deps_sync::DEFAULT_OSV_BASE_URL,
+            help = "OSV API base URL (https:// required for remote endpoints)"
+        )]
+        osv_url: String,
+        #[arg(
+            long,
+            help = "Import OSV advisory JSON bundle offline instead of querying OSV HTTP API"
+        )]
+        from_file: Option<PathBuf>,
+    },
+    /// Inspect local offline SQLite CVE/advisory cache path, record count, and sync state
+    Status,
 }
 
 pub(crate) struct ScanRunOptions<'a> {
@@ -229,6 +252,11 @@ enum Commands {
     Hook {
         #[command(subcommand)]
         action: HookAction,
+    },
+    /// Manage high-speed offline SQLite CVE & OSV advisory cache
+    Deps {
+        #[command(subcommand)]
+        action: DepsAction,
     },
     /// Inspect local environment, sandbox (`bwrap`), config, and hook readiness
     Doctor {
@@ -976,6 +1004,68 @@ fn main() -> Result<ExitCode> {
             }
             HookAction::ClaudePreCommit => {
                 return handle_claude_pre_commit();
+            }
+        },
+        Commands::Deps { action } => match action {
+            DepsAction::Sync {
+                path,
+                osv_url,
+                from_file,
+            } => {
+                let db_path = vf_core::default_advisories_db_path();
+                let mut store = vf_core::AdvisoryStore::open_default()?;
+                if let Some(ref osv_file) = from_file {
+                    let imported = deps_sync::import_osv_file_to_store(osv_file, &mut store)?;
+                    let (total, _) = store.stats()?;
+                    println!(
+                        "ShellMind Guard Deps | Imported {} advisory range(s) from {} into {} (total cached: {})",
+                        imported,
+                        osv_file.display(),
+                        db_path.display(),
+                        total
+                    );
+                } else {
+                    let cfg = ShellMindGuardConfig::load_from_dir(&path)?;
+                    let deps = deps_sync::extract_project_dependencies(&path, &cfg)?;
+                    if deps.is_empty() {
+                        println!(
+                            "ShellMind Guard Deps | No resolved lockfile/manifest dependencies found under {}; skipped network sync.",
+                            path.display()
+                        );
+                    } else {
+                        let summary = deps_sync::sync_osv_to_store(&osv_url, &deps, &mut store)?;
+                        let (total, _) = store.stats()?;
+                        println!(
+                            "ShellMind Guard Deps | Queried {} dep(s), fetched {} vuln(s), upserted {} range(s) into {} (total cached: {})",
+                            summary.dependencies_queried,
+                            summary.unique_vulns_fetched,
+                            summary.records_upserted,
+                            db_path.display(),
+                            total
+                        );
+                    }
+                }
+            }
+            DepsAction::Status => {
+                let db_path = vf_core::default_advisories_db_path();
+                if !db_path.exists() {
+                    println!(
+                        "ShellMind Guard Deps | DB: {} | Status: NOT INITIALIZED (0 advisories; run `shellmind-guard deps sync`)",
+                        db_path.display()
+                    );
+                } else {
+                    let store = vf_core::AdvisoryStore::open_at(&db_path, true)?;
+                    let (total, last_updated) = store.stats()?;
+                    let ts_str = last_updated
+                        .map(|ts| ts.to_string())
+                        .unwrap_or_else(|| "never".to_string());
+                    println!(
+                        "ShellMind Guard Deps | DB: {} | Advisories: {} | Last Sync (UNIX): {}",
+                        db_path.display(),
+                        total,
+                        ts_str
+                    );
+                }
             }
         },
         Commands::Doctor { path } => {

@@ -45,6 +45,8 @@ impl Language {
                 | "go.mod"
                 | "requirements.txt"
                 | "pyproject.toml"
+                | "poetry.lock"
+                | "uv.lock"
         ) {
             return Some(Language::Manifest);
         }

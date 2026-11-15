@@ -1,13 +1,36 @@
 use crate::ast::{Confidence, GuardKind, LocalStaticFinding, SinkKind};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use vf_core::advisories::{
+    AdvisoryRecord, AdvisoryStore, normalize_package_name, parse_semver_with_prerelease,
+    version_matches_range,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Ecosystem {
+pub enum Ecosystem {
     Npm,
     Cargo,
     Go,
     PyPi,
+}
+
+impl Ecosystem {
+    pub fn osv_name(self) -> &'static str {
+        match self {
+            Ecosystem::Npm => "npm",
+            Ecosystem::Cargo => "crates.io",
+            Ecosystem::Go => "Go",
+            Ecosystem::PyPi => "PyPI",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ResolvedDependency {
+    pub ecosystem: String,
+    pub name: String,
+    pub version: String,
+    pub line: usize,
 }
 
 struct Advisory {
@@ -208,38 +231,6 @@ const OFFLINE_ADVISORIES: &[Advisory] = &[
     },
 ];
 
-/// Returns `(major, minor, patch, is_release)` where `is_release` is `false` for pre-releases (`-alpha`, `-rc.1`)
-/// so `(1, 6, 0, false) < (1, 6, 0, true)`.
-fn parse_semver_with_prerelease(raw: &str) -> Option<(u64, u64, u64, bool)> {
-    let trimmed = raw
-        .trim()
-        .trim_start_matches(['v', 'V', '^', '~', '=', '>', '<', ' ']);
-    let without_meta = trimmed
-        .split(['+', ' ', ',', ';'])
-        .next()
-        .unwrap_or("")
-        .trim();
-    let (core, prerelease) = match without_meta.split_once('-') {
-        Some((c, pre)) => (c.trim(), Some(pre.trim())),
-        None => (without_meta, None),
-    };
-    if core.is_empty() || core.contains('*') {
-        return None;
-    }
-    let mut parts = core.split('.');
-    let major = parts.next()?.parse::<u64>().ok()?;
-    let minor = parts
-        .next()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(0);
-    let patch = parts
-        .next()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(0);
-    let is_release = prerelease.is_none_or(|p| p.is_empty());
-    Some((major, minor, patch, is_release))
-}
-
 fn has_explicit_patch(raw: &str) -> bool {
     let trimmed = raw
         .trim()
@@ -306,42 +297,109 @@ fn find_line_for_needle(lines: &[&str], needle: &str) -> usize {
     1
 }
 
-fn check_advisory(
+fn is_go_pseudo_version(ver: &str) -> bool {
+    let trimmed = ver.trim().trim_start_matches(['v', 'V']);
+    trimmed.starts_with("0.0.0-") && trimmed.len() >= 20
+}
+
+fn check_single_offline_advisory(
     ecosystem: Ecosystem,
-    pkg_name: &str,
-    version_str: &str,
+    entry: &(String, String, usize),
+    norm: &str,
     rel_path: &str,
-    line: usize,
+    db_recs: Option<&Vec<AdvisoryRecord>>,
     out: &mut Vec<LocalStaticFinding>,
 ) {
-    let norm = match ecosystem {
-        Ecosystem::PyPi => pkg_name.to_ascii_lowercase().replace('_', "-"),
-        _ => pkg_name.to_ascii_lowercase(),
-    };
+    let (pkg_name, version_str, line) = (entry.0.as_str(), entry.1.as_str(), entry.2);
+    let mut emitted_fixed_keys: HashSet<String> = HashSet::new();
+
+    if let Some(recs) = db_recs {
+        for rec in recs {
+            let skip_unpatched_range = ecosystem == Ecosystem::Cargo
+                && rel_path.ends_with("Cargo.toml")
+                && !version_str.trim().starts_with('=')
+                && !has_explicit_patch(version_str)
+                && !rec.fixed.is_empty()
+                && parse_semver_with_prerelease(version_str)
+                    .zip(parse_semver_with_prerelease(&rec.fixed))
+                    .is_some_and(|((maj, min, _, _), (fmaj, fmin, _, _))| {
+                        maj == fmaj && min == fmin
+                    });
+            if skip_unpatched_range {
+                continue;
+            }
+            if version_matches_range(
+                ecosystem.osv_name(),
+                version_str,
+                &rec.introduced,
+                &rec.fixed,
+                &rec.last_affected,
+            ) {
+                emitted_fixed_keys.insert(format!("{}:{}", rec.fixed, rec.id));
+                if !rec.fixed.is_empty() {
+                    emitted_fixed_keys.insert(format!("fixed:{}", rec.fixed));
+                }
+                let fix_hint = if !rec.fixed.is_empty() {
+                    format!("Upgrade `{}` to >= {}.", pkg_name, rec.fixed)
+                } else {
+                    format!(
+                        "Remove or replace vulnerable package `{}` ({}).",
+                        pkg_name, rec.id
+                    )
+                };
+                let mut hit = make_dep_finding(
+                    &rec.severity,
+                    format!(
+                        "High-risk dependency `{}@{}` [{}]: {}",
+                        pkg_name, version_str, rec.id, rec.summary
+                    ),
+                    rel_path,
+                    line,
+                    fix_hint,
+                );
+                hit.confidence = Confidence::Confirmed;
+                out.push(hit);
+            }
+        }
+    }
+
     for adv in OFFLINE_ADVISORIES {
         if adv.ecosystem != ecosystem || adv.package != norm {
             continue;
         }
+        let offline_fixed_key = adv
+            .fixed_below
+            .map(|(maj, min, pat)| format!("fixed:{}.{}.{}", maj, min, pat))
+            .unwrap_or_default();
+        if !offline_fixed_key.is_empty() && emitted_fixed_keys.contains(&offline_fixed_key) {
+            continue;
+        }
         let hit = match adv.fixed_below {
             None => true,
-            Some((min_maj, min_min, min_pat)) => match parse_semver_with_prerelease(version_str) {
-                Some((maj, min, pat, is_rel)) => {
-                    // In Cargo.toml, a 2-component spec like `"0.4"` (without `=`) is a caret range `^0.4.0`
-                    // that resolves to the latest 0.4.x in Cargo.lock; do not false-positive when min_safe shares (maj, min).
-                    if ecosystem == Ecosystem::Cargo
-                        && rel_path.ends_with("Cargo.toml")
-                        && !version_str.trim().starts_with('=')
-                        && !has_explicit_patch(version_str)
-                        && maj == min_maj
-                        && min == min_min
-                    {
-                        false
-                    } else {
-                        (maj, min, pat, is_rel) < (min_maj, min_min, min_pat, true)
+            Some((min_maj, min_min, min_pat)) => {
+                if ecosystem == Ecosystem::Go && is_go_pseudo_version(version_str) {
+                    false
+                } else {
+                    match parse_semver_with_prerelease(version_str) {
+                        Some((maj, min, pat, is_rel)) => {
+                            // In Cargo.toml, a 2-component spec like `"0.4"` (without `=`) is a caret range `^0.4.0`
+                            // that resolves to the latest 0.4.x in Cargo.lock; do not false-positive when min_safe shares (maj, min).
+                            if ecosystem == Ecosystem::Cargo
+                                && rel_path.ends_with("Cargo.toml")
+                                && !version_str.trim().starts_with('=')
+                                && !has_explicit_patch(version_str)
+                                && maj == min_maj
+                                && min == min_min
+                            {
+                                false
+                            } else {
+                                (maj, min, pat, is_rel) < (min_maj, min_min, min_pat, true)
+                            }
+                        }
+                        None => false,
                     }
                 }
-                None => false,
-            },
+            }
         };
         if hit {
             let fix_hint = match adv.fixed_below {
@@ -353,7 +411,7 @@ fn check_advisory(
                     pkg_name
                 ),
             };
-            let mut hit = make_dep_finding(
+            let mut finding = make_dep_finding(
                 adv.severity,
                 format!(
                     "High-risk dependency `{}@{}`: {}",
@@ -363,18 +421,68 @@ fn check_advisory(
                 line,
                 fix_hint,
             );
-            hit.confidence = Confidence::Confirmed;
-            out.push(hit);
+            finding.confidence = Confidence::Confirmed;
+            out.push(finding);
         }
     }
 }
 
-fn audit_package_json(rel_path: &str, content: &str) -> Vec<LocalStaticFinding> {
+fn check_advisories_batch(
+    ecosystem: Ecosystem,
+    entries: &[(String, String, usize)],
+    rel_path: &str,
+    lines_for_deferred: Option<(&[&str], &str)>,
+    store: Option<&AdvisoryStore>,
+    out: &mut Vec<LocalStaticFinding>,
+) {
+    if entries.is_empty() {
+        return;
+    }
+    let db_map = if let Some(st) = store {
+        let names: Vec<&str> = entries.iter().map(|(n, _, _)| n.as_str()).collect();
+        st.query_for_packages(ecosystem.osv_name(), &names)
+            .unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
+
+    for entry in entries {
+        let pkg_name = &entry.0;
+        let norm = normalize_package_name(ecosystem.osv_name(), pkg_name);
+        let db_recs = db_map.get(&norm);
+        let mut temp = Vec::new();
+        check_single_offline_advisory(ecosystem, entry, &norm, rel_path, db_recs, &mut temp);
+        if !temp.is_empty() {
+            if let Some((lines, needle_fmt)) = lines_for_deferred {
+                let needle = if needle_fmt == "toml_name" {
+                    format!("name = \"{}\"", pkg_name)
+                } else {
+                    pkg_name.clone()
+                };
+                let ln = find_line_for_needle(lines, &needle);
+                for mut item in temp {
+                    item.line = ln;
+                    item.symbol = format!("{}:{}", rel_path, ln);
+                    out.push(item);
+                }
+            } else {
+                out.extend(temp);
+            }
+        }
+    }
+}
+
+fn audit_package_json(
+    rel_path: &str,
+    content: &str,
+    store: Option<&AdvisoryStore>,
+) -> Vec<LocalStaticFinding> {
     let Ok(val) = serde_json::from_str::<serde_json::Value>(content) else {
         return Vec::new();
     };
     let lines: Vec<&str> = content.lines().collect();
     let mut out = Vec::new();
+    let mut adv_entries = Vec::new();
 
     for section in [
         "dependencies",
@@ -413,13 +521,25 @@ fn audit_package_json(rel_path: &str, content: &str) -> Vec<LocalStaticFinding> 
                     format!("Use an `https://` registry or tarball URL for `{}`.", pkg),
                 ));
             }
-            check_advisory(Ecosystem::Npm, pkg, ver, rel_path, ln, &mut out);
+            adv_entries.push((pkg.clone(), ver.to_string(), ln));
         }
     }
+    check_advisories_batch(
+        Ecosystem::Npm,
+        &adv_entries,
+        rel_path,
+        None,
+        store,
+        &mut out,
+    );
     out
 }
 
-fn audit_package_lock(rel_path: &str, content: &str) -> Vec<LocalStaticFinding> {
+fn audit_package_lock(
+    rel_path: &str,
+    content: &str,
+    store: Option<&AdvisoryStore>,
+) -> Vec<LocalStaticFinding> {
     let Ok(val) = serde_json::from_str::<serde_json::Value>(content) else {
         return Vec::new();
     };
@@ -475,29 +595,33 @@ fn audit_package_lock(rel_path: &str, content: &str) -> Vec<LocalStaticFinding> 
         }
     }
 
-    for (name, ver) in checked {
-        // Only perform line scan when an advisory matches to keep lockfile scanning O(n)
-        let mut temp = Vec::new();
-        check_advisory(Ecosystem::Npm, &name, &ver, rel_path, 1, &mut temp);
-        if !temp.is_empty() {
-            let ln = find_line_for_needle(&lines, &name);
-            for mut item in temp {
-                item.line = ln;
-                item.symbol = format!("{}:{}", rel_path, ln);
-                out.push(item);
-            }
-        }
-    }
+    let entries: Vec<(String, String, usize)> = checked
+        .into_iter()
+        .map(|(name, ver)| (name, ver, 1))
+        .collect();
+    check_advisories_batch(
+        Ecosystem::Npm,
+        &entries,
+        rel_path,
+        Some((&lines, "plain")),
+        store,
+        &mut out,
+    );
 
     out
 }
 
-fn audit_cargo_toml(rel_path: &str, content: &str) -> Vec<LocalStaticFinding> {
+fn audit_cargo_toml(
+    rel_path: &str,
+    content: &str,
+    store: Option<&AdvisoryStore>,
+) -> Vec<LocalStaticFinding> {
     let Ok(val) = toml::from_str::<toml::Value>(content) else {
         return Vec::new();
     };
     let lines: Vec<&str> = content.lines().collect();
     let mut out = Vec::new();
+    let mut adv_entries = Vec::new();
 
     let mut tables = Vec::new();
     for key in ["dependencies", "dev-dependencies", "build-dependencies"] {
@@ -530,7 +654,7 @@ fn audit_cargo_toml(rel_path: &str, content: &str) -> Vec<LocalStaticFinding> {
                             ),
                         ));
                     }
-                    check_advisory(Ecosystem::Cargo, pkg, ver, rel_path, ln, &mut out);
+                    adv_entries.push((pkg.clone(), ver.clone(), ln));
                 }
                 toml::Value::Table(dep_tbl) => {
                     if let Some(ver) = dep_tbl.get("version").and_then(|v| v.as_str()) {
@@ -546,7 +670,7 @@ fn audit_cargo_toml(rel_path: &str, content: &str) -> Vec<LocalStaticFinding> {
                                 ),
                             ));
                         }
-                        check_advisory(Ecosystem::Cargo, pkg, ver, rel_path, ln, &mut out);
+                        adv_entries.push((pkg.clone(), ver.to_string(), ln));
                     }
                     if let Some(git_url) = dep_tbl.get("git").and_then(|v| v.as_str())
                         && is_insecure_http_url(git_url)
@@ -564,10 +688,22 @@ fn audit_cargo_toml(rel_path: &str, content: &str) -> Vec<LocalStaticFinding> {
             }
         }
     }
+    check_advisories_batch(
+        Ecosystem::Cargo,
+        &adv_entries,
+        rel_path,
+        None,
+        store,
+        &mut out,
+    );
     out
 }
 
-fn audit_cargo_lock(rel_path: &str, content: &str) -> Vec<LocalStaticFinding> {
+fn audit_cargo_lock(
+    rel_path: &str,
+    content: &str,
+    store: Option<&AdvisoryStore>,
+) -> Vec<LocalStaticFinding> {
     let Ok(val) = toml::from_str::<toml::Value>(content) else {
         return Vec::new();
     };
@@ -576,6 +712,7 @@ fn audit_cargo_lock(rel_path: &str, content: &str) -> Vec<LocalStaticFinding> {
     };
     let lines: Vec<&str> = content.lines().collect();
     let mut out = Vec::new();
+    let mut entries = Vec::with_capacity(pkgs.len());
 
     for pkg in pkgs {
         let Some(name) = pkg.get("name").and_then(|v| v.as_str()) else {
@@ -597,23 +734,84 @@ fn audit_cargo_lock(rel_path: &str, content: &str) -> Vec<LocalStaticFinding> {
                 "Switch Cargo registry source to HTTPS.".into(),
             ));
         }
-        let mut temp = Vec::new();
-        check_advisory(Ecosystem::Cargo, name, ver, rel_path, 1, &mut temp);
-        if !temp.is_empty() {
-            let ln = find_line_for_needle(&lines, &format!("name = \"{}\"", name));
-            for mut item in temp {
-                item.line = ln;
-                item.symbol = format!("{}:{}", rel_path, ln);
-                out.push(item);
-            }
-        }
+        entries.push((name.to_string(), ver.to_string(), 1));
     }
+
+    check_advisories_batch(
+        Ecosystem::Cargo,
+        &entries,
+        rel_path,
+        Some((&lines, "toml_name")),
+        store,
+        &mut out,
+    );
     out
 }
 
-fn audit_go_mod(rel_path: &str, content: &str) -> Vec<LocalStaticFinding> {
+fn audit_python_toml_lock(
+    rel_path: &str,
+    content: &str,
+    store: Option<&AdvisoryStore>,
+) -> Vec<LocalStaticFinding> {
+    let Ok(val) = toml::from_str::<toml::Value>(content) else {
+        return Vec::new();
+    };
+    let Some(pkgs) = val.get("package").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let lines: Vec<&str> = content.lines().collect();
+    let mut out = Vec::new();
+    let mut entries = Vec::with_capacity(pkgs.len());
+
+    for pkg in pkgs {
+        let Some(name) = pkg.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let ver = pkg.get("version").and_then(|v| v.as_str()).unwrap_or("");
+        let source_url = pkg
+            .get("source")
+            .and_then(|s| s.get("url").or_else(|| s.get("registry")))
+            .and_then(|u| u.as_str());
+        if let Some(url) = source_url
+            && is_insecure_http_url(url)
+        {
+            let ln = find_line_for_needle(&lines, url);
+            out.push(make_dep_finding(
+                "HIGH",
+                format!(
+                    "Insecure `http://` package index in `{}` for `{}`",
+                    rel_path, name
+                ),
+                rel_path,
+                ln,
+                "Use an `https://` PyPI index in your Python lockfile.".into(),
+            ));
+        }
+        if !ver.is_empty() {
+            entries.push((name.to_string(), ver.to_string(), 1));
+        }
+    }
+
+    check_advisories_batch(
+        Ecosystem::PyPi,
+        &entries,
+        rel_path,
+        Some((&lines, "toml_name")),
+        store,
+        &mut out,
+    );
+    out
+}
+
+fn audit_go_mod(
+    rel_path: &str,
+    content: &str,
+    store: Option<&AdvisoryStore>,
+) -> Vec<LocalStaticFinding> {
     let mut out = Vec::new();
     let mut in_require_block = false;
+    let mut adv_entries = Vec::new();
+
     for (idx, line) in content.lines().enumerate() {
         let ln = idx + 1;
         let code = line.split("//").next().unwrap_or("").trim();
@@ -654,15 +852,21 @@ fn audit_go_mod(rel_path: &str, content: &str) -> Vec<LocalStaticFinding> {
                         "Pin Go modules to a tagged semantic version (`vX.Y.Z`) and verify `go.sum`.".into(),
                     ));
                 }
-                check_advisory(Ecosystem::Go, mod_path, ver, rel_path, ln, &mut out);
+                adv_entries.push((mod_path.to_string(), ver.to_string(), ln));
             }
         }
     }
+    check_advisories_batch(Ecosystem::Go, &adv_entries, rel_path, None, store, &mut out);
     out
 }
 
-fn audit_requirements_txt(rel_path: &str, content: &str) -> Vec<LocalStaticFinding> {
+fn audit_requirements_txt(
+    rel_path: &str,
+    content: &str,
+    store: Option<&AdvisoryStore>,
+) -> Vec<LocalStaticFinding> {
     let mut out = Vec::new();
+    let mut adv_entries = Vec::new();
     for (idx, line) in content.lines().enumerate() {
         let ln = idx + 1;
         let code = line.split('#').next().unwrap_or("").trim();
@@ -708,7 +912,7 @@ fn audit_requirements_txt(rel_path: &str, content: &str) -> Vec<LocalStaticFindi
                     format!("Pin `{}` to an exact version (`package==X.Y.Z`).", pkg_only),
                 ));
             } else {
-                check_advisory(Ecosystem::PyPi, pkg_only, ver, rel_path, ln, &mut out);
+                adv_entries.push((pkg_only.to_string(), ver.to_string(), ln));
             }
         } else if spec.contains('*') || spec.to_ascii_lowercase().contains("latest") {
             out.push(make_dep_finding(
@@ -718,7 +922,7 @@ fn audit_requirements_txt(rel_path: &str, content: &str) -> Vec<LocalStaticFindi
                 ln,
                 format!("Pin `{}` to an exact version (`package==X.Y.Z`).", pkg_only),
             ));
-            check_advisory(Ecosystem::PyPi, pkg_only, "", rel_path, ln, &mut out);
+            adv_entries.push((pkg_only.to_string(), String::new(), ln));
         } else {
             out.push(make_dep_finding(
                 "MEDIUM",
@@ -733,18 +937,31 @@ fn audit_requirements_txt(rel_path: &str, content: &str) -> Vec<LocalStaticFindi
                     pkg_only, pkg_only
                 ),
             ));
-            check_advisory(Ecosystem::PyPi, pkg_only, "", rel_path, ln, &mut out);
+            adv_entries.push((pkg_only.to_string(), String::new(), ln));
         }
     }
+    check_advisories_batch(
+        Ecosystem::PyPi,
+        &adv_entries,
+        rel_path,
+        None,
+        store,
+        &mut out,
+    );
     out
 }
 
-fn audit_pyproject_toml(rel_path: &str, content: &str) -> Vec<LocalStaticFinding> {
+fn audit_pyproject_toml(
+    rel_path: &str,
+    content: &str,
+    store: Option<&AdvisoryStore>,
+) -> Vec<LocalStaticFinding> {
     let Ok(val) = toml::from_str::<toml::Value>(content) else {
         return Vec::new();
     };
     let lines: Vec<&str> = content.lines().collect();
     let mut out = Vec::new();
+    let mut adv_entries = Vec::new();
 
     // PEP 621: [project] dependencies = ["pkg==1.2.3", ...]
     let mut pep621_specs: Vec<&str> = Vec::new();
@@ -775,7 +992,7 @@ fn audit_pyproject_toml(rel_path: &str, content: &str) -> Vec<LocalStaticFinding
 
     if !pep621_specs.is_empty() {
         let joined = pep621_specs.join("\n");
-        for mut finding in audit_requirements_txt(rel_path, &joined) {
+        for mut finding in audit_requirements_txt(rel_path, &joined, store) {
             let pkg_token = finding
                 .title
                 .split('`')
@@ -831,28 +1048,248 @@ fn audit_pyproject_toml(rel_path: &str, content: &str) -> Vec<LocalStaticFinding
                         format!("Pin `{}` to an exact version in `pyproject.toml`.", pkg),
                     ));
                 }
-                check_advisory(Ecosystem::PyPi, pkg, ver, rel_path, ln, &mut out);
+                adv_entries.push((pkg.clone(), ver.to_string(), ln));
             }
         }
+    }
+    check_advisories_batch(
+        Ecosystem::PyPi,
+        &adv_entries,
+        rel_path,
+        None,
+        store,
+        &mut out,
+    );
+
+    out
+}
+
+/// Extracts resolved `(ecosystem, package, version)` triples from manifests/lockfiles
+/// for explicit opt-in `shellmind-guard deps sync`.
+pub fn extract_resolved_dependencies(rel_path: &str, content: &str) -> Vec<ResolvedDependency> {
+    let fname = Path::new(rel_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    let mut out = Vec::new();
+    let clean_semver_str = |raw: &str| -> Option<String> {
+        let stripped = raw
+            .trim()
+            .trim_start_matches(['v', 'V', '^', '~', '=', '>', '<', ' ']);
+        let core = stripped.split([' ', ',', ';']).next().unwrap_or("").trim();
+        parse_semver_with_prerelease(core)?;
+        Some(core.to_string())
+    };
+
+    match fname {
+        "package-lock.json" => {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(content) {
+                let mut seen: HashMap<String, String> = HashMap::new();
+                if let Some(pkgs) = val.get("packages").and_then(|v| v.as_object()) {
+                    for (k, info) in pkgs {
+                        if k.is_empty() {
+                            continue;
+                        }
+                        let name = k.rsplit("node_modules/").next().unwrap_or(k);
+                        if let Some(ver) = info.get("version").and_then(|v| v.as_str()) {
+                            seen.entry(name.to_string())
+                                .or_insert_with(|| ver.to_string());
+                        }
+                    }
+                }
+                if let Some(deps) = val.get("dependencies").and_then(|v| v.as_object()) {
+                    for (name, info) in deps {
+                        if let Some(ver) = info.get("version").and_then(|v| v.as_str()) {
+                            seen.entry(name.clone()).or_insert_with(|| ver.to_string());
+                        }
+                    }
+                }
+                for (name, version) in seen {
+                    out.push(ResolvedDependency {
+                        ecosystem: "npm".into(),
+                        name,
+                        version,
+                        line: 1,
+                    });
+                }
+            }
+        }
+        "package.json" => {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(content) {
+                for sec in ["dependencies", "devDependencies", "peerDependencies"] {
+                    if let Some(obj) = val.get(sec).and_then(|v| v.as_object()) {
+                        for (name, vval) in obj {
+                            if let Some(raw) = vval.as_str()
+                                && let Some(ver) = clean_semver_str(raw)
+                            {
+                                out.push(ResolvedDependency {
+                                    ecosystem: "npm".into(),
+                                    name: name.clone(),
+                                    version: ver,
+                                    line: 1,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        "Cargo.lock" | "poetry.lock" | "uv.lock" => {
+            let eco = if fname == "Cargo.lock" {
+                "crates.io"
+            } else {
+                "PyPI"
+            };
+            if let Ok(val) = toml::from_str::<toml::Value>(content)
+                && let Some(pkgs) = val.get("package").and_then(|v| v.as_array())
+            {
+                for pkg in pkgs {
+                    if let (Some(name), Some(ver)) = (
+                        pkg.get("name").and_then(|v| v.as_str()),
+                        pkg.get("version").and_then(|v| v.as_str()),
+                    ) {
+                        out.push(ResolvedDependency {
+                            ecosystem: eco.into(),
+                            name: name.to_string(),
+                            version: ver.to_string(),
+                            line: 1,
+                        });
+                    }
+                }
+            }
+        }
+        "Cargo.toml" => {
+            if let Ok(val) = toml::from_str::<toml::Value>(content) {
+                for key in ["dependencies", "dev-dependencies"] {
+                    if let Some(tbl) = val.get(key).and_then(|v| v.as_table()) {
+                        for (pkg, spec) in tbl {
+                            let ver_raw = match spec {
+                                toml::Value::String(s) => Some(s.as_str()),
+                                toml::Value::Table(t) => t.get("version").and_then(|v| v.as_str()),
+                                _ => None,
+                            };
+                            if let Some(raw) = ver_raw
+                                && let Some(ver) = clean_semver_str(raw)
+                            {
+                                out.push(ResolvedDependency {
+                                    ecosystem: "crates.io".into(),
+                                    name: pkg.clone(),
+                                    version: ver,
+                                    line: 1,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        "go.mod" => {
+            let mut in_req = false;
+            for (idx, line) in content.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or("").trim();
+                if code.starts_with("require (") || code == "require(" {
+                    in_req = true;
+                    continue;
+                }
+                if in_req && code == ")" {
+                    in_req = false;
+                    continue;
+                }
+                let rl = if in_req {
+                    Some(code)
+                } else {
+                    code.strip_prefix("require ").map(str::trim)
+                };
+                if let Some(rl) = rl {
+                    let mut parts = rl.split_whitespace();
+                    if let (Some(mod_path), Some(ver)) = (parts.next(), parts.next())
+                        && !is_floating_version(ver)
+                        && !is_go_pseudo_version(ver)
+                    {
+                        out.push(ResolvedDependency {
+                            ecosystem: "Go".into(),
+                            name: mod_path.to_string(),
+                            version: ver.trim_start_matches('v').to_string(),
+                            line: idx + 1,
+                        });
+                    }
+                }
+            }
+        }
+        "requirements.txt" => {
+            for (idx, line) in content.lines().enumerate() {
+                let code = line.split('#').next().unwrap_or("").trim();
+                if code.is_empty() || code.starts_with('-') {
+                    continue;
+                }
+                let spec = code.split(';').next().unwrap_or(code).trim();
+                let pkg = spec
+                    .split(['=', '>', '<', '~', '!', '['])
+                    .next()
+                    .unwrap_or("")
+                    .trim();
+                if !pkg.is_empty()
+                    && let Some((_, ver_raw)) = spec.split_once("==")
+                    && let Some(ver) = clean_semver_str(ver_raw)
+                {
+                    out.push(ResolvedDependency {
+                        ecosystem: "PyPI".into(),
+                        name: pkg.to_string(),
+                        version: ver,
+                        line: idx + 1,
+                    });
+                }
+            }
+        }
+        "pyproject.toml" => {
+            if let Ok(val) = toml::from_str::<toml::Value>(content)
+                && let Some(deps) = val
+                    .get("project")
+                    .and_then(|p| p.get("dependencies"))
+                    .and_then(|d| d.as_array())
+            {
+                let req_lines: String = deps
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                out.extend(extract_resolved_dependencies(
+                    "requirements.txt",
+                    &req_lines,
+                ));
+            }
+        }
+        _ => {}
     }
 
     out
 }
 
-/// Offline-first dependency and lockfile audit executed in-memory with zero network calls.
+/// Offline-first dependency and lockfile audit executed in-memory with zero network calls,
+/// automatically querying `~/.cache/shellmind-guard/advisories.db` when present on disk.
 pub fn scan_dependencies(rel_path: &str, content: &str) -> Vec<LocalStaticFinding> {
+    let store = AdvisoryStore::open_default_readonly_if_exists();
+    scan_dependencies_with_store(rel_path, content, store.as_ref())
+}
+
+pub fn scan_dependencies_with_store(
+    rel_path: &str,
+    content: &str,
+    store: Option<&AdvisoryStore>,
+) -> Vec<LocalStaticFinding> {
     let fname = Path::new(rel_path)
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("");
     match fname {
-        "package.json" => audit_package_json(rel_path, content),
-        "package-lock.json" => audit_package_lock(rel_path, content),
-        "Cargo.toml" => audit_cargo_toml(rel_path, content),
-        "Cargo.lock" => audit_cargo_lock(rel_path, content),
-        "go.mod" => audit_go_mod(rel_path, content),
-        "requirements.txt" => audit_requirements_txt(rel_path, content),
-        "pyproject.toml" => audit_pyproject_toml(rel_path, content),
+        "package.json" => audit_package_json(rel_path, content, store),
+        "package-lock.json" => audit_package_lock(rel_path, content, store),
+        "Cargo.toml" => audit_cargo_toml(rel_path, content, store),
+        "Cargo.lock" => audit_cargo_lock(rel_path, content, store),
+        "go.mod" => audit_go_mod(rel_path, content, store),
+        "requirements.txt" => audit_requirements_txt(rel_path, content, store),
+        "pyproject.toml" => audit_pyproject_toml(rel_path, content, store),
+        "poetry.lock" | "uv.lock" => audit_python_toml_lock(rel_path, content, store),
         _ => Vec::new(),
     }
 }
@@ -860,6 +1297,7 @@ pub fn scan_dependencies(rel_path: &str, content: &str) -> Vec<LocalStaticFindin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     #[test]
     fn test_npm_and_lockfile_audit() {
@@ -872,7 +1310,7 @@ mod tests {
     "evil-http": "http://insecure.example.com/pkg.tgz"
   }
 }"#;
-        let hits = scan_dependencies("package.json", pkg_json);
+        let hits = scan_dependencies_with_store("package.json", pkg_json, None);
         assert!(
             hits.iter()
                 .any(|h| h.title.contains("lodash") && h.title.contains("*"))
@@ -890,7 +1328,7 @@ mod tests {
     }
   }
 }"#;
-        let lock_hits = scan_dependencies("package-lock.json", lock);
+        let lock_hits = scan_dependencies_with_store("package-lock.json", lock, None);
         assert!(lock_hits.iter().any(|h| h.title.contains("http://")));
         assert!(lock_hits.iter().any(|h| h.title.contains("minimist@1.2.5")));
     }
@@ -898,7 +1336,7 @@ mod tests {
     #[test]
     fn test_cargo_go_python_manifests() {
         let cargo = "[dependencies]\nserde_yaml = \"0.9\"\nchrono = \"0.4\"\nwildcard = \"*\"\n";
-        let c_hits = scan_dependencies("Cargo.toml", cargo);
+        let c_hits = scan_dependencies_with_store("Cargo.toml", cargo, None);
         assert!(c_hits.iter().any(|h| h.title.contains("serde_yaml")));
         assert!(
             !c_hits.iter().any(|h| h.title.contains("chrono")),
@@ -907,12 +1345,12 @@ mod tests {
         assert!(c_hits.iter().any(|h| h.title.contains("wildcard")));
 
         let gomod = "module example.com/app\nrequire (\n  github.com/dgrijalva/jwt-go v3.2.0\n  golang.org/x/net latest\n)\n";
-        let g_hits = scan_dependencies("go.mod", gomod);
+        let g_hits = scan_dependencies_with_store("go.mod", gomod, None);
         assert!(g_hits.iter().any(|h| h.title.contains("jwt-go")));
         assert!(g_hits.iter().any(|h| h.title.contains("latest")));
 
         let reqs = "pyyaml>=5.3.1\nflask\n--extra-index-url http://pypi.insecure.local/simple\n";
-        let p_hits = scan_dependencies("requirements.txt", reqs);
+        let p_hits = scan_dependencies_with_store("requirements.txt", reqs, None);
         assert!(p_hits.iter().any(|h| h.title.contains("pyyaml@5.3.1")));
         assert!(
             p_hits
@@ -929,17 +1367,123 @@ dependencies = ["pyyaml==5.3.1", "requests>=2.31.0"]
 python = "^3.11"
 urllib3 = "1.26.4"
 "#;
-        let pp_hits = scan_dependencies("pyproject.toml", pyproj);
+        let pp_hits = scan_dependencies_with_store("pyproject.toml", pyproj, None);
         assert!(pp_hits.iter().any(|h| h.title.contains("pyyaml@5.3.1")));
         assert!(pp_hits.iter().any(|h| h.title.contains("urllib3@1.26.4")));
 
         let pre_pkg = r#"{"dependencies": {"axios": "1.6.0-alpha.1"}}"#;
-        let pre_hits = scan_dependencies("package.json", pre_pkg);
+        let pre_hits = scan_dependencies_with_store("package.json", pre_pkg, None);
         assert!(
             pre_hits
                 .iter()
                 .any(|h| h.title.contains("axios@1.6.0-alpha.1")),
             "Pre-release 1.6.0-alpha.1 is < 1.6.0 and must be flagged"
         );
+    }
+
+    #[test]
+    fn test_phase7_advisory_db_lookup_and_poetry_uv_lockfiles() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let db_path = std::env::temp_dir().join(format!("smg_deps_p7_{}.db", nanos));
+        let mut store = AdvisoryStore::open_at(&db_path, false).unwrap();
+
+        store
+            .upsert_advisories(&[
+                AdvisoryRecord {
+                    id: "GHSA-custom-uv-001".into(),
+                    ecosystem: "PyPI".into(),
+                    package: "starlette".into(),
+                    introduced: "0.20.0".into(),
+                    fixed: "0.36.2".into(),
+                    last_affected: String::new(),
+                    severity: "HIGH".into(),
+                    summary: "Multipart DoS in Starlette (< 0.36.2)".into(),
+                    source: "osv".into(),
+                    updated_at: 1_700_000_000,
+                },
+                AdvisoryRecord {
+                    id: "CVE-2023-45857".into(),
+                    ecosystem: "npm".into(),
+                    package: "axios".into(),
+                    introduced: "0.8.1".into(),
+                    fixed: "1.6.0".into(),
+                    last_affected: String::new(),
+                    severity: "HIGH".into(),
+                    summary: "Cross-site request forgery in axios".into(),
+                    source: "osv".into(),
+                    updated_at: 1_700_000_000,
+                },
+            ])
+            .unwrap();
+
+        let ro = AdvisoryStore::open_at(&db_path, true).unwrap();
+
+        let uv_lock = r#"
+version = 1
+
+[[package]]
+name = "starlette"
+version = "0.35.0"
+
+[[package]]
+name = "fastapi"
+version = "0.111.0"
+"#;
+        let t0 = Instant::now();
+        let uv_hits = scan_dependencies_with_store("uv.lock", uv_lock, Some(&ro));
+        assert!(
+            t0.elapsed().as_millis() < 20,
+            "uv.lock DB advisory scan must complete in < 20ms"
+        );
+        assert!(
+            uv_hits
+                .iter()
+                .any(|h| h.title.contains("starlette@0.35.0")
+                    && h.title.contains("GHSA-custom-uv-001")),
+            "Expected synced OSV hit in uv.lock: {:?}",
+            uv_hits
+        );
+        assert!(
+            !uv_hits.iter().any(|h| h.title.contains("fastapi")),
+            "Clean fastapi must not trigger false positive"
+        );
+
+        let poetry_lock = r#"
+[[package]]
+name = "starlette"
+version = "0.37.0"
+"#;
+        let poetry_hits = scan_dependencies_with_store("poetry.lock", poetry_lock, Some(&ro));
+        assert!(
+            poetry_hits.is_empty(),
+            "Fixed starlette 0.37.0 >= 0.36.2 must NOT trigger false positive: {:?}",
+            poetry_hits
+        );
+
+        // Verify axios@1.5.0 deduplication between DB & built-in OFFLINE_ADVISORIES
+        let pkg_lock =
+            r#"{"lockfileVersion":3,"packages":{"node_modules/axios":{"version":"1.5.0"}}}"#;
+        let npm_hits = scan_dependencies_with_store("package-lock.json", pkg_lock, Some(&ro));
+        assert_eq!(
+            npm_hits
+                .iter()
+                .filter(|h| h.title.contains("axios@1.5.0"))
+                .count(),
+            1,
+            "Duplicate offline+OSV alert for axios must be deduplicated: {:?}",
+            npm_hits
+        );
+
+        // Verify extract_resolved_dependencies picks up uv.lock and go.mod cleanly
+        let resolved_uv = extract_resolved_dependencies("uv.lock", uv_lock);
+        assert_eq!(resolved_uv.len(), 2);
+        assert_eq!(resolved_uv[0].ecosystem, "PyPI");
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
     }
 }

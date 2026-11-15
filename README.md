@@ -101,7 +101,7 @@ ShellMind Guard executes all 6 verification layers in a single unified pass:
 | **1** | `VF-SEC-AWS`<br>`VF-SEC-STRIPE`<br>`VF-SEC-GITHUB`<br>`VF-SEC-OPENAI`<br>`VF-SEC-ANTHROPIC`<br>`VF-SEC-GOOGLE`<br>`VF-SEC-SLACK`<br>`VF-SEC-JWT`<br>`VF-SEC-PRIVKEY`<br>`VF-SEC-DBURL`<br>`VF-SEC-ENTROPY` | `CRITICAL`<br>`HIGH` | **Secrets & Credential Exposure:** Provider-prefixed tokens, hardcoded JWT secrets (`VF-SEC-JWT`), PEM private keys, inline credentials in `postgres://`/`mysql://`/`mongodb://`/`redis://` URLs, and Shannon entropy ($H > 4.3$) secret literals. | Excluded on lockfiles, test fixtures, example placeholders (`EXAMPLE`, `YOUR_API_KEY`, `changeme`), URLs/SQL, and non-assignment strings. |
 | **1** | `VF-SEC-ENV` | `HIGH` | **Unignored `.env` File:** `.env` or `.env.production` containing live secrets is not covered by `.gitignore`. | Add `.env` / `.env.*` to `.gitignore`. |
 | **1** | `VF-CFG-CORS`<br>`VF-CFG-JWT-LOGIC`<br>`VF-CFG-TLS`<br>`VF-CFG-DEBUG`<br>`VF-CFG-COOKIE`<br>`VF-CFG-DOCKER` | `CRITICAL`<br>`HIGH`<br>`MEDIUM` | **Security Misconfigurations:** Wildcard CORS (`origin: "*"`) with `credentials: true`, JWT verification bypasses (`alg: "none"`, `verify_signature: False`, unverified `jwt.decode`), `NODE_TLS_REJECT_UNAUTHORIZED=0` / `InsecureSkipVerify: true` / `verify=False`, production `DEBUG=True`, insecure session cookies, and `Dockerfile` missing non-root `USER`. | Restrict CORS origins, enforce strong verified JWT algorithms, keep TLS verification enabled, enforce `httpOnly: true, secure: true`, add `USER <non-root>`. |
-| **2** | `VF-DEP-001` | `HIGH`<br>`MEDIUM` | **Offline-First Dependency & Lockfile Audit:** Parses `package.json`, `package-lock.json`, `Cargo.toml`, `Cargo.lock`, `go.mod`, `requirements.txt`, and `pyproject.toml` for unpinned `*`/`latest` versions, `http://` tarball registries, and embedded high-risk advisories. | Pin deterministic semver ranges and upgrade affected packages (zero external network calls). |
+| **2** | `VF-DEP-001` | `HIGH`<br>`MEDIUM` | **Offline-First Dependency & Lockfile Audit:** Parses `package.json`, `package-lock.json`, `Cargo.toml`, `Cargo.lock`, `go.mod`, `requirements.txt`, `pyproject.toml`, `poetry.lock`, and `uv.lock` for unpinned `*`/`latest` versions, `http://` tarball registries, embedded high-risk advisories, and local SQLite OSV advisory index (`$XDG_CACHE_HOME/shellmind-guard/advisories.db`) synced opt-in via `shellmind-guard deps sync`. | Pin deterministic semver ranges and upgrade affected packages (scans stay 100% offline with zero network calls). |
 | **3** | `VF-SQLI-001` | `CRITICAL` | **Cross-File SQL Injection:** Untrusted HTTP input (`req.query`, `req.params`, `req.body`, `c.Query`, `r.URL.Query`/`FormValue`, FastAPI/NestJS route params) flows into dynamic SQL (`${...}`, `fmt.Sprintf`, `f"SELECT..."`, `%`, `+`, `.concat()`). | Parameterized queries (`$1`, `?`), safe tagged templates (`prisma.$queryRaw\`...\``), or integer/UUID/Zod parsers (`strconv.Atoi`, `parseInt`, `z.object`). |
 | **3** | `VF-XSS-001` | `HIGH` | **Cross-Site Scripting (XSS):** Untrusted HTTP input flows into `dangerouslySetInnerHTML`, `innerHTML`, `res.send`/`html` responses, `template.HTML(...)`, Python `Markup(...)`/`render_template_string`, or unsafe raw HTML without an XSS sanitizer bit in the taint lattice. | HTML escaping/sanitization (`DOMPurify.sanitize`, `bluemonday`, `bleach.clean`, `ammonia::clean`, `html.escape`) matching the XSS sink bit. |
 | **3** | `VF-CMDI-001` | `CRITICAL` | **Command Injection:** Tainted input reaches `exec`, `execSync`, `spawn(..., { shell: true })`, `os.system`, `subprocess.run(..., shell=True)`, `exec.Command("sh", "-c", ...)`, or `Command::new("sh")`. | Argument array execution without shell, `shlex.quote`, `shellEscape`, or strict allowlist/numeric parser. |
@@ -187,6 +187,11 @@ shellmind-guard scan /path/to/your/repo --format sarif
 
 # Filter specific layers or enforce a minimum confidence threshold (proven | confirmed | heuristic)
 shellmind-guard scan /path/to/your/repo --layers secrets,sqli,xss,csrf,idor,race --min-confidence confirmed
+
+# Opt-in sync of local offline SQLite OSV advisory DB (or import offline JSON bundle) & check status
+shellmind-guard deps sync /path/to/your/repo
+shellmind-guard deps sync --from-file /path/to/osv.json
+shellmind-guard deps status
 ```
 
 ### 4. Prove Exploits in the Isolated Bubblewrap Sandbox
@@ -340,11 +345,12 @@ ShellMind Guard is organized as a modular, 100% pure-Rust Cargo workspace:
 ShellMind-Guard/
 ├── Cargo.toml                     # Workspace root (Rust 2024 Edition)
 ├── src/
-│   ├── main.rs                    # Unified CLI (`init`, `index`, `scan`, `replay`, `ui`, `mcp`)
+│   ├── main.rs                    # Unified CLI (`init`, `index`, `scan`, `deps`, `replay`, `ui`, `mcp`)
+│   ├── deps_sync.rs               # Explicit opt-in OSV `/v1/querybatch` + `--from-file` advisory sync
 │   └── mcp.rs                     # Stdio JSON-RPC 2.0 Model Context Protocol server
 ├── crates/
 │   ├── vf-core/                   # .shellmind-guard.toml config, ignore::WalkParallel + BLAKE3 scanner,
-│   │                              # XDG SQLite WAL + FTS5 Two-Phase AST & findings store
+│   │                              # XDG SQLite WAL + FTS5 AST/findings store & local `advisories.db` index
 │   ├── vf-graph/                  # Parallel Tree-sitter AST (TS/JS/Go/Python/Rust), cross-file
 │   │                              # module resolver, 6-layer bitmask taint & O(V+E) Guard-Set Lattice
 │   ├── vf-sandbox/                # Linux Bubblewrap (--unshare-all) runner, inner namespace probe,

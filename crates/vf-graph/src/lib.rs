@@ -48,9 +48,11 @@ pub fn analyze_codebase_cached(
     store: &mut StateStore,
 ) -> Result<GraphAnalysisResult> {
     let cfg_json = serde_json::to_string(&cfg.guards).unwrap_or_default();
+    let adv_stamp = vf_core::advisories_db_stamp();
     let versioned_cfg = format!(
-        "v6-sprint2-bitmask-csrf-ast-{}|{}",
+        "v7-sprint3-advisories-{}|{}|{}",
         env!("CARGO_PKG_VERSION"),
+        adv_stamp,
         cfg_json
     );
     let cfg_hash = blake3::hash(versioned_cfg.as_bytes()).to_hex().to_string();

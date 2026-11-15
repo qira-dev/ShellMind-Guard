@@ -4,7 +4,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeltaStats {
@@ -27,6 +27,18 @@ pub struct StoredFinding {
     pub poc_cmd: String,
 }
 
+/// Resolves the per-user XDG / local cache base directory (`$XDG_CACHE_HOME` or `~/.cache`).
+pub fn cache_base_dir() -> PathBuf {
+    std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .map(|h| std::path::PathBuf::from(h).join(".cache"))
+        })
+        .unwrap_or_else(std::env::temp_dir)
+}
+
 pub struct StateStore {
     conn: Connection,
 }
@@ -35,15 +47,7 @@ impl StateStore {
     pub fn open(project_root: &Path) -> Result<Self> {
         let canon = fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
         let repo_key = blake3::hash(canon.to_string_lossy().as_bytes()).to_hex();
-        let cache_base = std::env::var_os("XDG_CACHE_HOME")
-            .map(std::path::PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("HOME")
-                    .or_else(|| std::env::var_os("USERPROFILE"))
-                    .map(|h| std::path::PathBuf::from(h).join(".cache"))
-            })
-            .unwrap_or_else(std::env::temp_dir);
-        let vf_dir = cache_base
+        let vf_dir = cache_base_dir()
             .join("shellmind-guard")
             .join(&repo_key.as_str()[..16]);
         fs::create_dir_all(&vf_dir)?;

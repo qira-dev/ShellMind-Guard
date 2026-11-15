@@ -1520,6 +1520,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "reqwest",
+ "rustls",
+ "serde",
  "serde_json",
  "tracing",
  "tracing-subscriber",
@@ -2128,6 +2131,7 @@ dependencies = [
  "rayon",
  "rusqlite",
  "serde",
+ "serde_json",
  "toml",
  "tracing",
 ]
