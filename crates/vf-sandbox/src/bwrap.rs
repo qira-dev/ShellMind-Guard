@@ -74,8 +74,17 @@ mod imp {
         find_bwrap_path().is_some()
     }
 
+    fn build_sandbox_path() -> String {
+        let base = "/usr/local/bin:/usr/bin:/bin";
+        match std::env::var("PATH") {
+            Ok(host_path) if !host_path.trim().is_empty() => format!("{}:{}", host_path, base),
+            _ => base.to_string(),
+        }
+    }
+
     fn build_base_bwrap_cmd(bwrap_bin: &Path, abs_root: &Path, port: u16) -> Command {
         let mut cmd = Command::new(bwrap_bin);
+        let sandbox_path = build_sandbox_path();
         cmd.process_group(0);
         cmd.args([
             "--unshare-all",
@@ -86,7 +95,7 @@ mod imp {
             "--clearenv",
             "--setenv",
             "PATH",
-            "/usr/local/bin:/usr/bin:/bin",
+            &sandbox_path,
             "--setenv",
             "HOME",
             "/tmp",
@@ -109,21 +118,20 @@ mod imp {
             "/bin",
             "/bin",
         ]);
-        if Path::new("/lib64").exists() {
-            cmd.args(["--ro-bind", "/lib64", "/lib64"]);
-        }
-        if Path::new("/etc").exists() {
-            cmd.args(["--ro-bind", "/etc", "/etc"]);
+        for opt_sys_dir in ["/lib64", "/etc", "/opt", "/run/current-system", "/nix"] {
+            if Path::new(opt_sys_dir).exists() {
+                cmd.args(["--ro-bind", opt_sys_dir, opt_sys_dir]);
+            }
         }
         if let Ok(home) = std::env::var("HOME") {
-            let local_bin = format!("{}/.local/bin", home);
-            if Path::new(&local_bin).exists() {
-                cmd.args(["--ro-bind", &local_bin, &local_bin]);
-                cmd.args([
-                    "--setenv",
-                    "PATH",
-                    &format!("{}:/usr/local/bin:/usr/bin:/bin", local_bin),
-                ]);
+            for sub in [
+                ".local", ".cargo", ".rustup", ".nvm", ".fnm", ".volta", ".bun", ".deno", ".pyenv",
+                ".asdf", ".sdkman", "go",
+            ] {
+                let dir = format!("{}/{}", home, sub);
+                if Path::new(&dir).exists() {
+                    cmd.args(["--ro-bind", &dir, &dir]);
+                }
             }
         }
         cmd.args([
@@ -170,7 +178,7 @@ mod imp {
             "/bin/sh",
             "-c",
             &format!(
-                "ulimit -d 1048576 2>/dev/null || true; ({boot_cmd}) >/dev/null 2>&1 & SRV_PID=$!; trap 'kill -9 $SRV_PID 2>/dev/null || true' EXIT; /tmp/vf-probe __probe-netns --port {port} --sync-race {concurrency}; EC=$?; kill -9 $SRV_PID 2>/dev/null || true; exit $EC"
+                "({boot_cmd}) >/dev/null 2>&1 & SRV_PID=$!; trap 'kill -9 $SRV_PID 2>/dev/null || true' EXIT; /tmp/vf-probe __probe-netns --port {port} --sync-race {concurrency}; EC=$?; kill -9 $SRV_PID 2>/dev/null || true; exit $EC"
             ),
         ]);
 
@@ -180,6 +188,24 @@ mod imp {
 
         let mut child = cmd.spawn().context("Failed to spawn --unshare-all bwrap")?;
         ACTIVE_SANDBOX_PGID.store(child.id() as i32, Ordering::SeqCst);
+
+        // Drain stdout and stderr concurrently on background threads so >64 KiB pipe output never deadlocks `try_wait()`
+        let stdout_handle = child.stdout.take().map(|out| {
+            std::thread::spawn(move || {
+                use std::io::Read;
+                let mut s = String::new();
+                let _ = out.take(256 * 1024).read_to_string(&mut s);
+                s
+            })
+        });
+        let stderr_handle = child.stderr.take().map(|err| {
+            std::thread::spawn(move || {
+                use std::io::Read;
+                let mut s = String::new();
+                let _ = err.take(256 * 1024).read_to_string(&mut s);
+                s
+            })
+        });
 
         let deadline = Instant::now() + Duration::from_secs(20);
         let status = loop {
@@ -202,16 +228,12 @@ mod imp {
         };
         ACTIVE_SANDBOX_PGID.store(0, Ordering::SeqCst);
 
-        let mut stdout_str = String::new();
-        let mut stderr_str = String::new();
-        if let Some(mut out) = child.stdout.take() {
-            use std::io::Read;
-            let _ = out.read_to_string(&mut stdout_str);
-        }
-        if let Some(mut err) = child.stderr.take() {
-            use std::io::Read;
-            let _ = err.read_to_string(&mut stderr_str);
-        }
+        let stdout_str = stdout_handle
+            .and_then(|h| h.join().ok())
+            .unwrap_or_default();
+        let stderr_str = stderr_handle
+            .and_then(|h| h.join().ok())
+            .unwrap_or_default();
 
         if !status.success() {
             anyhow::bail!(
@@ -258,7 +280,7 @@ mod imp {
             );
         }
 
-        let wrapped_cmd = format!("ulimit -d 1048576 2>/dev/null || true; ({})", boot_cmd);
+        let wrapped_cmd = format!("({})", boot_cmd);
 
         let child = if let Some(bin) = bwrap_bin {
             let mut cmd = build_base_bwrap_cmd(&bin, &abs_root, port);
@@ -271,7 +293,7 @@ mod imp {
             let mut cmd = Command::new("/bin/sh");
             cmd.process_group(0)
                 .env_clear()
-                .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+                .env("PATH", build_sandbox_path())
                 .env("HOME", "/tmp")
                 .env("PORT", port.to_string())
                 .env("HOST", "127.0.0.1")

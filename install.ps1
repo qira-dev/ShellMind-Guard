@@ -15,8 +15,18 @@ function Install-FromSource {
     if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
         Write-Error "Rust/cargo not found and no prebuilt release is available. Install Rust from https://rustup.rs"
     }
-    Write-Host "[ShellMind Guard] Building from source via cargo..."
-    cargo install --git "https://github.com/$Repo.git" --locked
+    $CargoRoot = Join-Path $env:TEMP ("smg-cargo-" + [guid]::NewGuid().ToString("N"))
+    try {
+        Write-Host "[ShellMind Guard] Building from source via cargo..."
+        cargo install --git "https://github.com/$Repo.git" --root $CargoRoot --locked
+        if ($LASTEXITCODE -ne 0) {
+            throw "cargo install exited with code $LASTEXITCODE"
+        }
+        $BuiltExe = Join-Path $CargoRoot "bin\shellmind-guard.exe"
+        Copy-Item -Path $BuiltExe -Destination (Join-Path $InstallDir "shellmind-guard.exe") -Force
+    } finally {
+        Remove-Item -Recurse -Force $CargoRoot -ErrorAction SilentlyContinue
+    }
 }
 
 if (-not $FromSource) {

@@ -180,6 +180,15 @@ fn is_failure_envelope(status: u16, body: &str) -> bool {
         if v.get("success").and_then(|b| b.as_bool()) == Some(false) {
             return true;
         }
+        if let Some(code_num) = v
+            .get("statusCode")
+            .or_else(|| v.get("status_code"))
+            .or_else(|| v.get("code"))
+            .and_then(|c| c.as_u64())
+            && (400..600).contains(&code_num)
+        {
+            return true;
+        }
         if let Some(st) = v.get("status").and_then(|s| s.as_str())
             && matches!(
                 st.to_ascii_lowercase().as_str(),
@@ -204,16 +213,35 @@ fn is_failure_envelope(status: u16, body: &str) -> bool {
 }
 
 fn substitute_route_params(path: &str) -> String {
-    path.split('/')
+    let joined = path
+        .split('/')
         .map(|seg| {
-            if seg.starts_with(':') || (seg.starts_with('{') && seg.ends_with('}')) {
+            if seg.starts_with(':')
+                || (seg.starts_with('{') && seg.ends_with('}'))
+                || (seg.starts_with('[') && seg.ends_with(']'))
+                || (seg.starts_with('<') && seg.ends_with('>'))
+                || seg == "*"
+            {
                 "1"
             } else {
                 seg
             }
         })
         .collect::<Vec<_>>()
-        .join("/")
+        .join("/");
+    let sanitized: String = joined
+        .chars()
+        .filter(|c| !c.is_control() && *c != ' ')
+        .collect();
+    if sanitized.starts_with('/') {
+        sanitized
+    } else {
+        format!("/{}", sanitized)
+    }
+}
+
+fn shell_quote_single(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// Checks whether an unauthenticated request to the flagged route is blocked (401/403)
@@ -267,6 +295,7 @@ pub async fn verify_auth_invariant(port: u16, finding: &LatticeFinding) -> Resul
         )
     };
 
+    let url = format!("http://127.0.0.1:{}{}", port, path);
     Ok(VerifiedFinding {
         finding_id: finding.id.clone(),
         rule_id: finding.rule_id.clone(),
@@ -274,8 +303,10 @@ pub async fn verify_auth_invariant(port: u16, finding: &LatticeFinding) -> Resul
         status,
         evidence,
         replay_cmd: format!(
-            "curl -i -X {} http://127.0.0.1:{}{} -H 'Content-Type: application/json' -d '{}'",
-            method, port, path, body
+            "curl -i -X {} {} -H 'Content-Type: application/json' -d {}",
+            shell_quote_single(method),
+            shell_quote_single(&url),
+            shell_quote_single(body)
         ),
     })
 }

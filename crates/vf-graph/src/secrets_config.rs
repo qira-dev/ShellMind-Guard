@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 
 fn aws_key_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"\b(AKIA[0-9A-Z]{16})\b").expect("valid aws regex"))
+    RE.get_or_init(|| Regex::new(r"\b((?:AKIA|ASIA)[0-9A-Z]{16})\b").expect("valid aws regex"))
 }
 
 fn stripe_key_re() -> &'static Regex {
@@ -19,8 +19,18 @@ fn stripe_key_re() -> &'static Regex {
 fn github_pat_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"\b(ghp_[0-9A-Za-z]{16,}|github_pat_[0-9A-Za-z_]{16,})\b")
+        Regex::new(r"\b(gh[pousr]_[0-9A-Za-z]{16,}|github_pat_[0-9A-Za-z_]{16,})\b")
             .expect("valid github regex")
+    })
+}
+
+fn ai_or_cloud_key_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"\b(sk-proj-[0-9A-Za-z_-]{20,}|sk-ant-api[0-9A-Za-z_-]{20,}|xox[baprs]-[0-9A-Za-z-]{16,}|AIza[0-9A-Za-z_-]{35})\b",
+        )
+        .expect("valid ai/cloud key regex")
     })
 }
 
@@ -284,6 +294,12 @@ pub fn is_sensitive_env_or_pem(rel_path: &str) -> bool {
     {
         return true;
     }
+    if matches!(
+        low.as_str(),
+        "cacert.pem" | "ca-bundle.pem" | "ca-certificates.pem" | "public.pem" | "pubkey.pem"
+    ) {
+        return false;
+    }
     low.ends_with(".pem")
 }
 
@@ -353,6 +369,7 @@ pub fn scan_secrets_and_config(rel_path: &str, content: &str) -> Vec<LocalStatic
     // Pre-scan Rust test module start so #[cfg(test)] blocks don't emit test-fixture false positives
     let mut in_cfg_test = false;
     let mut test_brace_depth: i32 = 0;
+    let mut test_saw_open_brace = false;
 
     // Track CORS wildcard origins and credentials lines for block-level pairing
     let mut cors_origin_lines: Vec<usize> = Vec::new();
@@ -371,26 +388,48 @@ pub fn scan_secrets_and_config(rel_path: &str, content: &str) -> Vec<LocalStatic
             if trimmed.starts_with("#[cfg(test)]") {
                 in_cfg_test = true;
                 test_brace_depth = 0;
-                continue;
+                test_saw_open_brace = false;
             }
             if in_cfg_test {
+                let mut in_str = false;
+                let mut escaped = false;
                 for ch in line.chars() {
-                    if ch == '{' {
+                    if in_str {
+                        if escaped {
+                            escaped = false;
+                        } else if ch == '\\' {
+                            escaped = true;
+                        } else if ch == '"' {
+                            in_str = false;
+                        }
+                        continue;
+                    }
+                    if ch == '"' {
+                        in_str = true;
+                    } else if ch == '{' {
                         test_brace_depth += 1;
+                        test_saw_open_brace = true;
                     } else if ch == '}' {
                         test_brace_depth -= 1;
-                        if test_brace_depth <= 0 {
+                        if test_saw_open_brace && test_brace_depth <= 0 {
                             in_cfg_test = false;
                             break;
                         }
                     }
+                }
+                if !test_saw_open_brace
+                    && !trimmed.starts_with("#[")
+                    && !trimmed.is_empty()
+                    && trimmed.ends_with(';')
+                {
+                    in_cfg_test = false;
                 }
                 continue;
             }
         }
 
         // --- Layer 1a: Secrets & Credential Leak Rules (VF-SEC-*) ---
-        if line.contains("AKIA") {
+        if line.contains("AKIA") || line.contains("ASIA") {
             for cap in aws_key_re().captures_iter(line) {
                 let tok = &cap[1];
                 let suffix = &tok[4..];
@@ -424,21 +463,48 @@ pub fn scan_secrets_and_config(rel_path: &str, content: &str) -> Vec<LocalStatic
             }
         }
 
-        if line.contains("ghp_") || line.contains("github_pat_") {
+        if line.contains("ghp_")
+            || line.contains("gho_")
+            || line.contains("ghu_")
+            || line.contains("ghs_")
+            || line.contains("ghr_")
+            || line.contains("github_pat_")
+        {
             for cap in github_pat_re().captures_iter(line) {
                 let tok = &cap[1];
                 let suffix = tok
                     .strip_prefix("github_pat_")
-                    .or_else(|| tok.strip_prefix("ghp_"))
+                    .or_else(|| tok.get(4..))
                     .unwrap_or(tok);
                 if !is_placeholder_secret(suffix) && shannon_entropy(suffix) >= 2.5 {
                     findings.push(make_sec_finding(
                         "VF-SEC-GITHUB",
                         "CRITICAL",
-                        format!("Hardcoded GitHub Personal Access Token ({})", redact_token(tok)),
+                        format!("Hardcoded GitHub Access Token ({})", redact_token(tok)),
                         rel_path,
                         ln,
                         "Revoke the GitHub token immediately and inject credentials via CI/runtime secrets or `GITHUB_TOKEN`.",
+                    ));
+                }
+            }
+        }
+
+        if line.contains("sk-proj-")
+            || line.contains("sk-ant-api")
+            || line.contains("xoxb-")
+            || line.contains("xoxp-")
+            || line.contains("AIza")
+        {
+            for cap in ai_or_cloud_key_re().captures_iter(line) {
+                let tok = &cap[1];
+                if !is_placeholder_secret(tok) && shannon_entropy(tok) >= 3.0 {
+                    findings.push(make_sec_finding(
+                        "VF-SEC-APIKEY",
+                        "CRITICAL",
+                        format!("Hardcoded API/Cloud Token ({})", redact_token(tok)),
+                        rel_path,
+                        ln,
+                        "Revoke the leaked API token immediately and load secrets from environment variables or a secret manager.",
                     ));
                 }
             }
@@ -667,6 +733,8 @@ pub fn scan_secrets_and_config(rel_path: &str, content: &str) -> Vec<LocalStatic
         if is_docker {
             if let Some(cap) = docker_from_re().captures(line) {
                 let img = cap[1].trim().to_ascii_lowercase();
+                docker_root_lines.clear();
+                docker_last_non_root_line = None;
                 if img != "scratch" && !img.ends_with(":nonroot") && !img.ends_with("-nonroot") {
                     docker_from_line = Some(ln);
                 } else {
@@ -915,6 +983,20 @@ const pwHash = crypto.createHash('md5').update(password).digest('hex');
         let missing_user_docker = "FROM node:20\nCMD [\"node\", \"server.js\"]\n";
         let mhits = scan_secrets_and_config("Dockerfile", missing_user_docker);
         assert!(mhits.iter().any(|h| h.rule_id == "VF-CFG-DOCKER"));
+
+        let multistage_unsafe = "FROM golang:1.22 AS builder\nUSER nonroot\nFROM debian:bookworm-slim\nCMD [\"/app\"]\n";
+        assert!(
+            scan_secrets_and_config("Dockerfile", multistage_unsafe)
+                .iter()
+                .any(|h| h.rule_id == "VF-CFG-DOCKER"),
+            "Final stage in multi-stage Dockerfile without USER must be flagged even if builder stage had USER"
+        );
+
+        let multistage_safe = "FROM golang:1.22 AS builder\nUSER root\nFROM gcr.io/distroless/static:nonroot\nCMD [\"/app\"]\n";
+        assert!(
+            scan_secrets_and_config("Dockerfile", multistage_safe).is_empty(),
+            "Final nonroot stage must not be flagged because builder stage used USER root"
+        );
 
         let self_src = include_str!("secrets_config.rs");
         assert!(

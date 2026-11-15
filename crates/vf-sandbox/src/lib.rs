@@ -58,10 +58,16 @@ pub fn verify_findings_in_sandbox(
             }
         });
 
+        let has_dynamic_findings = findings.iter().any(|f| {
+            matches!(
+                f.missing_guard,
+                vf_graph::GuardKind::Auth | vf_graph::GuardKind::TxLock
+            )
+        });
         let use_bwrap = has_bwrap();
-        if !use_bwrap && !allow_unsafe_host_fallback {
+        if has_dynamic_findings && !use_bwrap && !allow_unsafe_host_fallback {
             anyhow::bail!(
-                "/usr/bin/bwrap is unavailable. Refusing fail-open host execution (pass --unsafe-host-fallback to override)."
+                "bwrap is unavailable. Refusing fail-open host execution (pass --unsafe-host-fallback to override)."
             );
         }
 
@@ -70,8 +76,27 @@ pub fn verify_findings_in_sandbox(
         // inside a single `--unshare-all` (including `--unshare-net`!) namespace for each dynamic Auth/Race finding!
         if use_bwrap {
             for f in findings {
-                let res = if matches!(f.missing_guard, vf_graph::GuardKind::Auth | vf_graph::GuardKind::TxLock) {
-                    run_finding_in_isolated_netns(project_root, boot_cmd, port, f, concurrency)?
+                let res = if matches!(
+                    f.missing_guard,
+                    vf_graph::GuardKind::Auth | vf_graph::GuardKind::TxLock
+                ) {
+                    match run_finding_in_isolated_netns(
+                        project_root,
+                        boot_cmd,
+                        port,
+                        f,
+                        concurrency,
+                    ) {
+                        Ok(vf) => vf,
+                        Err(e) => VerifiedFinding {
+                            finding_id: f.id.clone(),
+                            rule_id: f.rule_id.clone(),
+                            entry_route: f.entry_route.clone(),
+                            status: VerificationStatus::SuspectUnverified,
+                            evidence: format!("Sandbox verification inconclusive: {}", e),
+                            replay_cmd: format!("shellmind-guard replay {}", f.id),
+                        },
+                    }
                 } else {
                     verifier::verify_finding(port, f, concurrency).await?
                 };
@@ -81,13 +106,42 @@ pub fn verify_findings_in_sandbox(
         }
 
         for f in findings {
-            let res = if matches!(f.missing_guard, vf_graph::GuardKind::Auth | vf_graph::GuardKind::TxLock) {
-                let guard =
-                    spawn_sandboxed_server(project_root, boot_cmd, port, allow_unsafe_host_fallback)
-                        .await?;
-                let out = verify_finding(port, f, concurrency).await?;
-                drop(guard);
-                out
+            let res = if matches!(
+                f.missing_guard,
+                vf_graph::GuardKind::Auth | vf_graph::GuardKind::TxLock
+            ) {
+                match spawn_sandboxed_server(
+                    project_root,
+                    boot_cmd,
+                    port,
+                    allow_unsafe_host_fallback,
+                )
+                .await
+                {
+                    Ok(guard) => {
+                        let out = match verify_finding(port, f, concurrency).await {
+                            Ok(vf) => vf,
+                            Err(e) => VerifiedFinding {
+                                finding_id: f.id.clone(),
+                                rule_id: f.rule_id.clone(),
+                                entry_route: f.entry_route.clone(),
+                                status: VerificationStatus::SuspectUnverified,
+                                evidence: format!("Sandbox probe error: {}", e),
+                                replay_cmd: format!("shellmind-guard replay {}", f.id),
+                            },
+                        };
+                        drop(guard);
+                        out
+                    }
+                    Err(e) => VerifiedFinding {
+                        finding_id: f.id.clone(),
+                        rule_id: f.rule_id.clone(),
+                        entry_route: f.entry_route.clone(),
+                        status: VerificationStatus::SuspectUnverified,
+                        evidence: format!("Sandbox server boot inconclusive: {}", e),
+                        replay_cmd: format!("shellmind-guard replay {}", f.id),
+                    },
+                }
             } else {
                 verify_finding(port, f, concurrency).await?
             };

@@ -44,6 +44,7 @@ impl Language {
                 | "Cargo.lock"
                 | "go.mod"
                 | "requirements.txt"
+                | "pyproject.toml"
         ) {
             return Some(Language::Manifest);
         }
@@ -115,24 +116,66 @@ pub fn scan_repository(root: &Path, cfg: &ShellMindGuardConfig) -> Result<ScanSu
     let walker = WalkBuilder::new(&canon_root)
         .hidden(false)
         .require_git(false)
+        .ignore(true)
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
         .threads(cfg.scan.max_threads)
         .filter_entry(move |entry| {
             let name = entry.file_name().to_string_lossy();
-            if name == ".git"
-                || name == ".shellmind-guard"
-                || name == "node_modules"
-                || name == "target"
-            {
-                return false;
-            }
-            if ignore_set.iter().any(|ig| ig == name.as_ref()) {
+            if matches!(
+                name.as_ref(),
+                ".git"
+                    | ".hg"
+                    | ".svn"
+                    | ".shellmind-guard"
+                    | "node_modules"
+                    | "__pycache__"
+                    | ".pytest_cache"
+                    | ".mypy_cache"
+                    | ".venv"
+                    | "venv"
+                    | ".next"
+                    | ".nuxt"
+                    | "__tests__"
+                    | "testdata"
+            ) {
                 return false;
             }
             if let Ok(rel) = entry.path().strip_prefix(&root_for_filter) {
                 let rel_norm = rel.to_string_lossy().replace('\\', "/");
+                if rel_norm.is_empty() {
+                    return true;
+                }
+                let parent_is_source_pkg = rel_norm
+                    .rsplit_once('/')
+                    .map(|(parent, _)| {
+                        parent.split('/').any(|seg| {
+                            matches!(
+                                seg,
+                                "src"
+                                    | "internal"
+                                    | "pkg"
+                                    | "cmd"
+                                    | "lib"
+                                    | "app"
+                                    | "controllers"
+                                    | "services"
+                                    | "routes"
+                                    | "handlers"
+                                    | "domain"
+                                    | "core"
+                                    | "models"
+                            )
+                        })
+                    })
+                    .unwrap_or(false);
+
+                if !parent_is_source_pkg
+                    && (name == "target" || ignore_set.iter().any(|ig| ig == name.as_ref()))
+                {
+                    return false;
+                }
                 if ignore_set.iter().any(|ig| {
                     let clean = ig.trim_matches('/');
                     !clean.is_empty()
@@ -209,6 +252,11 @@ pub fn scan_repository(root: &Path, cfg: &ShellMindGuardConfig) -> Result<ScanSu
 
                 let bytes = fs::read(&abs_path).ok()?;
                 let hash = blake3::hash(&bytes).to_hex().to_string();
+                let cached_bytes = if bytes.len() <= 256 * 1024 {
+                    Some(bytes)
+                } else {
+                    None
+                };
 
                 Some(IndexedFile {
                     rel_path,
@@ -217,7 +265,7 @@ pub fn scan_repository(root: &Path, cfg: &ShellMindGuardConfig) -> Result<ScanSu
                     blake3_hash: hash,
                     mtime_ns,
                     size_bytes,
-                    cached_bytes: Some(bytes),
+                    cached_bytes,
                 })
             })
             .collect()
@@ -230,4 +278,46 @@ pub fn scan_repository(root: &Path, cfg: &ShellMindGuardConfig) -> Result<ScanSu
         elapsed_ms: start.elapsed().as_millis(),
         files,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_scanner_keeps_nested_source_build_dir_and_pyproject() {
+        let tmp = std::env::temp_dir().join(format!("vf_scanner_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join("src/internal/build")).unwrap();
+        fs::create_dir_all(tmp.join("build")).unwrap();
+        fs::write(tmp.join("src/internal/build/handler.go"), "package build\n").unwrap();
+        fs::write(tmp.join("build/bundle.js"), "console.log(1);\n").unwrap();
+        fs::write(
+            tmp.join("pyproject.toml"),
+            "[project]\ndependencies = [\"pyyaml==5.3\"]\n",
+        )
+        .unwrap();
+
+        let cfg = ShellMindGuardConfig::default();
+        let res = scan_repository(&tmp, &cfg).unwrap();
+        let rels: Vec<&str> = res.files.iter().map(|f| f.rel_path.as_str()).collect();
+        assert!(
+            rels.contains(&"src/internal/build/handler.go"),
+            "Nested source package src/internal/build must not be skipped: {:?}",
+            rels
+        );
+        assert!(
+            !rels.contains(&"build/bundle.js"),
+            "Top-level build/ output directory must be skipped: {:?}",
+            rels
+        );
+        let pyproj = res
+            .files
+            .iter()
+            .find(|f| f.rel_path == "pyproject.toml")
+            .expect("pyproject.toml must be indexed");
+        assert_eq!(pyproj.language, Language::Manifest);
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
 }

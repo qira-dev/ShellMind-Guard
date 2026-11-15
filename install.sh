@@ -42,17 +42,21 @@ install_from_source() {
     echo "Install Rust from https://rustup.rs and re-run." >&2
     exit 1
   fi
+  local cargo_root
+  cargo_root="$(mktemp -d)"
   local script_dir=""
   if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
     script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
   fi
   if [[ -n "${script_dir}" && -f "${script_dir}/Cargo.toml" ]] && grep -q 'name = "shellmind-guard"' "${script_dir}/Cargo.toml"; then
     echo "[ShellMind Guard] Building from local source..."
-    cargo install --path "${script_dir}" --locked
+    cargo install --path "${script_dir}" --root "${cargo_root}" --locked
   else
     echo "[ShellMind Guard] Building from GitHub repository..."
-    cargo install --git "https://github.com/${REPO}.git" --locked
+    cargo install --git "https://github.com/${REPO}.git" --root "${cargo_root}" --locked
   fi
+  install -m 0755 "${cargo_root}/bin/${BIN_NAME}" "${INSTALL_DIR}/${BIN_NAME}"
+  rm -rf "${cargo_root}"
 }
 
 if [[ "${FROM_SOURCE}" -eq 0 ]] && asset="$(detect_asset)"; then

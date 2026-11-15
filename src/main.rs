@@ -285,6 +285,7 @@ pub(crate) fn execute_scan_pipeline(opts: ScanRunOptions<'_>) -> Result<ScanOutc
     let mut store = StateStore::open(opts.path)?;
     let (delta, _) = store.sync_files(&summary.files)?;
     let mut graph_res = analyze_codebase_cached(&summary.files, &cfg, &mut store)?;
+    let mut all_findings = graph_res.findings.clone();
 
     if !opts.layers.is_empty() {
         graph_res
@@ -343,14 +344,18 @@ pub(crate) fn execute_scan_pipeline(opts: ScanRunOptions<'_>) -> Result<ScanOutc
                 }
             }
         }
+        for f in &mut all_findings {
+            if let Some(st) = ver_map.get(f.id.as_str()) {
+                match st {
+                    VerificationStatus::Proven => f.status = "PROVEN".into(),
+                    VerificationStatus::Mitigated => f.status = "MITIGATED".into(),
+                    VerificationStatus::SuspectUnverified => {}
+                }
+            }
+        }
     }
 
-    persist_scan_findings(
-        &mut store,
-        delta.scan_id,
-        &graph_res.findings,
-        &verified_list,
-    )?;
+    persist_scan_findings(&mut store, delta.scan_id, &all_findings, &verified_list)?;
 
     Ok(ScanOutcome {
         elapsed_ms: t0.elapsed().as_millis(),
@@ -449,7 +454,12 @@ fn main() -> Result<ExitCode> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Init { path, ci, hook } => {
-            let (detected, out_path) = ShellMindGuardConfig::detect_and_write_init(&path)?;
+            let existing_cfg = path.join(".shellmind-guard.toml");
+            let (detected, out_path) = if existing_cfg.exists() {
+                (vec!["existing config preserved".to_string()], existing_cfg)
+            } else {
+                ShellMindGuardConfig::detect_and_write_init(&path)?
+            };
             let mut extras = Vec::new();
             if ci {
                 let ci_path = write_ci_workflow(&path)?;
@@ -461,13 +471,13 @@ fn main() -> Result<ExitCode> {
             }
             if extras.is_empty() {
                 println!(
-                    "ShellMind Guard Init | Detected: {} | Wrote {}",
+                    "ShellMind Guard Init | Detected: {} | Config: {}",
                     detected.join(", "),
                     out_path.display()
                 );
             } else {
                 println!(
-                    "ShellMind Guard Init | Detected: {} | Wrote {} and {}",
+                    "ShellMind Guard Init | Detected: {} | Config: {} and {}",
                     detected.join(", "),
                     out_path.display(),
                     extras.join(", ")
@@ -553,14 +563,14 @@ fn main() -> Result<ExitCode> {
                 }
                 fs::write(sarif_path, payload)?;
             }
-            if let Some(html_path) = html {
+            if let Some(ref html_path) = html {
                 if let Some(parent) = html_path.parent()
                     && !parent.as_os_str().is_empty()
                 {
                     fs::create_dir_all(parent)?;
                 }
                 fs::write(
-                    &html_path,
+                    html_path,
                     to_html_graph(&path.display().to_string(), &outcome.graph, &verified_list),
                 )?;
             }
@@ -579,13 +589,24 @@ fn main() -> Result<ExitCode> {
                     "[ShellMind Guard] Watching {} for changes (Ctrl+C to stop)...",
                     path.display()
                 );
-                let cfg = ShellMindGuardConfig::load_from_dir(&path)?;
-                let mut store = StateStore::open(&path)?;
+                let init_cfg = ShellMindGuardConfig::load_from_dir(&path)?;
+                let init_summary = scan_repository(&path, &init_cfg)?;
+                let mut prev_sig: Vec<(String, i64, u64)> = init_summary
+                    .files
+                    .iter()
+                    .map(|f| (f.rel_path.clone(), f.mtime_ns, f.size_bytes))
+                    .collect();
                 loop {
                     std::thread::sleep(std::time::Duration::from_millis(800));
+                    let cfg = ShellMindGuardConfig::load_from_dir(&path)?;
                     let summary = scan_repository(&path, &cfg)?;
-                    let (delta, _) = store.sync_files(&summary.files)?;
-                    if delta.added_or_modified > 0 || delta.removed > 0 {
+                    let cur_sig: Vec<(String, i64, u64)> = summary
+                        .files
+                        .iter()
+                        .map(|f| (f.rel_path.clone(), f.mtime_ns, f.size_bytes))
+                        .collect();
+                    if cur_sig != prev_sig {
+                        prev_sig = cur_sig;
                         let next_outcome = execute_scan_pipeline(ScanRunOptions {
                             path: &path,
                             layers: &layers,
@@ -600,12 +621,33 @@ fn main() -> Result<ExitCode> {
                             .as_ref()
                             .map(|(_, v)| v.clone())
                             .unwrap_or_default();
+                        let next_sarif =
+                            if sarif.is_some() || effective_format == OutputFormat::Sarif {
+                                Some(to_sarif_json(&next_outcome.graph.findings, &next_verified))
+                            } else {
+                                None
+                            };
+                        if let Some(ref sarif_path) = sarif
+                            && let Some(ref payload) = next_sarif
+                        {
+                            let _ = fs::write(sarif_path, payload);
+                        }
+                        if let Some(ref html_path) = html {
+                            let _ = fs::write(
+                                html_path,
+                                to_html_graph(
+                                    &path.display().to_string(),
+                                    &next_outcome.graph,
+                                    &next_verified,
+                                ),
+                            );
+                        }
                         render_scan_output(
                             &path,
                             effective_format,
                             &next_outcome,
                             &next_verified,
-                            None,
+                            next_sarif.as_deref(),
                             patch,
                         )?;
                     }
@@ -771,6 +813,92 @@ fn main() -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+fn parse_git_commit_invocation(cmd_str: &str) -> Option<PathBuf> {
+    let mut current_cd: Option<PathBuf> = None;
+    for seg in cmd_str.split([';', '&', '|', '\n', '(', ')', '`']) {
+        let mut tokens: Vec<&str> = seg.split_whitespace().collect();
+        while let Some(&first) = tokens.first() {
+            let unquoted = first.trim_matches(|c| c == '"' || c == '\'');
+            let is_env_assign = unquoted.contains('=')
+                && !unquoted.starts_with('-')
+                && !unquoted.starts_with('/')
+                && !unquoted.starts_with('.');
+            if is_env_assign || matches!(unquoted, "sudo" | "env" | "command" | "nohup" | "$") {
+                tokens.remove(0);
+            } else {
+                break;
+            }
+        }
+        let Some(&cmd_tok) = tokens.first() else {
+            continue;
+        };
+        let cmd_clean = cmd_tok.trim_matches(|c| c == '"' || c == '\'');
+        if cmd_clean == "cd" {
+            if let Some(&dir_tok) = tokens.get(1) {
+                let dir_clean = dir_tok.trim_matches(|c| c == '"' || c == '\'');
+                if !dir_clean.is_empty() && !dir_clean.starts_with('-') {
+                    current_cd = Some(PathBuf::from(dir_clean));
+                }
+            }
+            continue;
+        }
+        let is_git = cmd_clean == "git"
+            || cmd_clean.ends_with("/git")
+            || cmd_clean.ends_with("\\git")
+            || cmd_clean.ends_with("/git.exe")
+            || cmd_clean.ends_with("\\git.exe");
+        if !is_git {
+            continue;
+        }
+
+        let mut git_dir_override: Option<PathBuf> = None;
+        let mut subcmd: Option<&str> = None;
+        let mut i = 1usize;
+        while i < tokens.len() {
+            let t = tokens[i].trim_matches(|c| c == '"' || c == '\'');
+            if t == "-C" || t == "--work-tree" {
+                if let Some(&dir_arg) = tokens.get(i + 1) {
+                    let clean_dir = dir_arg.trim_matches(|c| c == '"' || c == '\'');
+                    git_dir_override = Some(PathBuf::from(clean_dir));
+                }
+                i += 2;
+                continue;
+            }
+            if let Some(rest) = t.strip_prefix("-C").filter(|r| !r.is_empty()) {
+                git_dir_override = Some(PathBuf::from(rest));
+                i += 1;
+                continue;
+            }
+            if let Some(rest) = t.strip_prefix("--work-tree=") {
+                git_dir_override = Some(PathBuf::from(rest));
+                i += 1;
+                continue;
+            }
+            if matches!(t, "-c" | "--git-dir" | "--namespace" | "--exec-path") {
+                i += 2;
+                continue;
+            }
+            if t.starts_with('-') {
+                i += 1;
+                continue;
+            }
+            subcmd = Some(t);
+            break;
+        }
+
+        if matches!(subcmd, Some("commit" | "ci")) {
+            let resolved = match (&current_cd, git_dir_override) {
+                (Some(cd), Some(ov)) if ov.is_relative() => cd.join(ov),
+                (_, Some(ov)) => ov,
+                (Some(cd), None) => cd.clone(),
+                (None, None) => PathBuf::from("."),
+            };
+            return Some(resolved);
+        }
+    }
+    None
+}
+
 fn handle_claude_pre_commit() -> Result<ExitCode> {
     use std::io::Read;
     let mut stdin_buf = String::new();
@@ -785,17 +913,18 @@ fn handle_claude_pre_commit() -> Result<ExitCode> {
         })
         .unwrap_or_default();
 
-    let is_git_commit = cmd_str.split([';', '&', '|', '\n']).any(|seg| {
-        let parts: Vec<&str> = seg.split_whitespace().collect();
-        parts.first() == Some(&"git") && parts.contains(&"commit")
-    });
-    if !is_git_commit {
+    let Some(target_repo) = parse_git_commit_invocation(&cmd_str) else {
         return Ok(ExitCode::SUCCESS);
-    }
+    };
+    let scan_path = if target_repo.exists() {
+        target_repo
+    } else {
+        PathBuf::from(".")
+    };
 
     let layers = vec!["secrets".to_string(), "config".to_string()];
     let outcome = execute_scan_pipeline(ScanRunOptions {
-        path: Path::new("."),
+        path: &scan_path,
         layers: &layers,
         boot_cmd: None,
         port: 39911,
@@ -904,11 +1033,14 @@ fn uninstall_git_hook(root: &Path) -> Result<bool> {
         );
     };
     let end_idx = start_idx + rel_end + HOOK_END.len();
-    let remaining = format!(
-        "{}{}",
-        existing[..start_idx].trim_end(),
-        existing[end_idx..].trim_start()
-    );
+    let before = existing[..start_idx].trim_end();
+    let after = existing[end_idx..].trim_start();
+    let remaining = match (before.is_empty(), after.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => before.to_string(),
+        (true, false) => after.to_string(),
+        (false, false) => format!("{}\n{}", before, after),
+    };
     let trimmed = remaining.trim();
     if trimmed.is_empty()
         || trimmed == "#!/usr/bin/env bash\nset -e"
@@ -1072,11 +1204,11 @@ fn run_doctor(path: &Path) {
         std::env::consts::OS,
         std::env::consts::ARCH
     );
-    let bwrap_ok = Path::new("/usr/bin/bwrap").exists();
+    let bwrap_ok = vf_sandbox::has_bwrap();
     println!(
         "  Sandbox (bwrap) : {}",
         if bwrap_ok {
-            "OK (/usr/bin/bwrap)"
+            "OK (bwrap available)"
         } else {
             "UNAVAILABLE (static 6-layer scan, TUI, SARIF & MCP work; live sandbox requires Linux bwrap)"
         }
@@ -1118,18 +1250,44 @@ mod main_tests {
         assert!(content.contains("echo 'custom hook'"));
         assert!(content.contains(HOOK_START));
 
+        // Append trailing line after our block to verify uninstall preserves newline separation
+        fs::write(&hook_file, format!("{}\necho 'after hook'\n", content)).unwrap();
+
         // Idempotent second install
         install_git_hook(&tmp).unwrap();
         let content2 = fs::read_to_string(&hook_file).unwrap();
         assert_eq!(content2.matches(HOOK_START).count(), 1);
 
-        // Uninstall preserves original custom hook
+        // Uninstall preserves original custom hook lines with newline separation
         assert!(uninstall_git_hook(&tmp).unwrap());
         assert!(!git_hook_status(&tmp));
         let after = fs::read_to_string(&hook_file).unwrap();
-        assert!(after.contains("echo 'custom hook'"));
+        assert!(after.contains("echo 'custom hook'\necho 'after hook'"));
         assert!(!after.contains(HOOK_START));
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_parse_git_commit_invocation_variants() {
+        assert_eq!(
+            parse_git_commit_invocation("git commit -m 'fix'"),
+            Some(PathBuf::from("."))
+        );
+        assert_eq!(
+            parse_git_commit_invocation(
+                "GIT_AUTHOR_NAME=a /usr/bin/git -c commit.gpgsign=false commit -m 'x'"
+            ),
+            Some(PathBuf::from("."))
+        );
+        assert_eq!(
+            parse_git_commit_invocation("git -C /tmp/subrepo commit -m 'x'"),
+            Some(PathBuf::from("/tmp/subrepo"))
+        );
+        assert_eq!(
+            parse_git_commit_invocation("cd services/api && (git commit -am 'msg')"),
+            Some(PathBuf::from("services/api"))
+        );
+        assert_eq!(parse_git_commit_invocation("git status && git diff"), None);
     }
 
     #[test]

@@ -31,7 +31,7 @@ fn params_mask_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r#"(?:req\.params\.[A-Za-z0-9_]+|c\.Param\s*\([^)]*\)|r\.PathValue\s*\([^)]*\))"#,
+            r#"(?:req(?:uest)?\.(?:params|query|body|args|json|form|values|data)(?:\.[A-Za-z0-9_]+|\[[^\]]*\])?|c\.(?:Param|Query|DefaultQuery|PostForm)\s*\([^)]*\)|r\.(?:PathValue|FormValue|PostFormValue)\s*\([^)]*\)|r\.URL\.Query\s*\(\s*\)\.Get\s*\([^)]*\)|chi\.URLParam\s*\([^)]*\)|mux\.Vars\s*\([^)]*\)\s*\[[^\]]*\])"#,
         )
         .expect("valid params mask regex")
     })
@@ -41,30 +41,87 @@ fn sql_verb_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r"(?is)\b(?:SELECT\s+[\s\S]+?\s+FROM|INSERT\s+INTO|UPDATE\s+\S+\s+SET|DELETE\s+FROM)\b",
+            r#"(?is)\b(?:SELECT\s+(?:\*|DISTINCT\b|COUNT\s*\(|SUM\s*\(|MAX\s*\(|MIN\s*\(|[A-Za-z0-9_`"'.]+(?:\s*,\s*[A-Za-z0-9_`"'.]+)*)\s+FROM\s+[A-Za-z0-9_`"'.]+|INSERT\s+INTO\s+[A-Za-z0-9_`"'.]+|UPDATE\s+[A-Za-z0-9_`"'.]+\s+SET\s+[A-Za-z0-9_`"'.]+\s*=|DELETE\s+FROM\s+[A-Za-z0-9_`"'.]+)\b"#,
         )
         .expect("valid sql verb regex")
     })
 }
 
-fn strip_comments_simple(src: &str) -> String {
-    let mut out = String::with_capacity(src.len());
-    for line in src.lines() {
-        let mut cut = line;
-        if let Some(pos) = cut.find("//")
-            && (pos == 0 || cut.as_bytes()[pos - 1] != b':')
-        {
-            cut = &cut[..pos];
+pub(crate) fn strip_comments_simple(src: &str) -> String {
+    let bytes = src.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    let mut in_block = false;
+    let mut in_line = false;
+    let mut str_delim: u8 = 0;
+    while i < bytes.len() {
+        if in_line {
+            if bytes[i] == b'\n' {
+                in_line = false;
+                out.push(b'\n');
+            }
+            i += 1;
+            continue;
         }
-        if let Some(pos) = cut.find('#')
-            && !cut[pos..].starts_with("#[")
-        {
-            cut = &cut[..pos];
+        if in_block {
+            if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                in_block = false;
+                i += 2;
+            } else {
+                if bytes[i] == b'\n' {
+                    out.push(b'\n');
+                }
+                i += 1;
+            }
+            continue;
         }
-        out.push_str(cut);
-        out.push('\n');
+        if str_delim != 0 {
+            if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                out.push(bytes[i]);
+                out.push(bytes[i + 1]);
+                i += 2;
+                continue;
+            }
+            if bytes[i] == str_delim {
+                str_delim = 0;
+            }
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        if matches!(bytes[i], b'"' | b'\'' | b'`') {
+            str_delim = bytes[i];
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            in_block = true;
+            i += 2;
+            continue;
+        }
+        if i + 1 < bytes.len()
+            && bytes[i] == b'/'
+            && bytes[i + 1] == b'/'
+            && (i == 0 || bytes[i - 1] != b':')
+        {
+            in_line = true;
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'#'
+            && !src[i..].starts_with("#[")
+            && !src[i..].starts_with("#![")
+            && (i == 0 || matches!(bytes[i - 1], b' ' | b'\t' | b'\n' | b'\r'))
+        {
+            in_line = true;
+            i += 1;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
     }
-    out
+    String::from_utf8(out).unwrap_or_else(|_| src.to_string())
 }
 
 pub fn has_taint_source_expr(text: &str) -> bool {
@@ -73,23 +130,39 @@ pub fn has_taint_source_expr(text: &str) -> bool {
         "req.query",
         "req.params",
         "req.headers",
+        "req.cookies",
+        "req.json(",
         "request.body",
         "request.query",
         "request.params",
+        "request.cookies",
         "request.args",
         "request.json",
+        "request.get_json(",
         "request.form",
         "request.values",
         "request.data",
+        "request.GET",
+        "request.POST",
+        "request.COOKIES",
+        "request.FILES",
+        "request.headers",
         "c.Param(",
+        "c.Params(",
         "c.Query(",
         "c.DefaultQuery(",
         "c.PostForm(",
         "c.BindJSON(",
         "c.ShouldBindJSON(",
+        "c.BodyParser(",
+        "c.QueryParser(",
         "r.URL.Query(",
         "r.FormValue(",
+        "r.PostFormValue(",
         "r.PathValue(",
+        "r.Header.Get(",
+        "chi.URLParam(",
+        "mux.Vars(",
         "ctx.query",
         "ctx.params",
         "ctx.request.body",
@@ -100,6 +173,10 @@ pub fn has_taint_source_expr(text: &str) -> bool {
         "web::Query",
         "web::Path",
         "web::Json",
+        "web::Form",
+        "axum::extract::Path",
+        "axum::extract::Query",
+        "axum::extract::Json",
     ];
     SOURCES.iter().any(|s| text.contains(s))
 }
@@ -114,54 +191,74 @@ pub fn has_resource_id_expr(text: &str, route_path: Option<&str>) -> bool {
         "req.params.",
         "req.params[",
         "c.Param(",
+        "c.Params(",
         "r.PathValue(",
+        "chi.URLParam(",
+        "mux.Vars(",
         "request.view_args",
         "Path<",
+        "Path(",
         "web::Path",
     ];
     ID_SOURCES.iter().any(|s| text.contains(s))
 }
 
+fn ownership_col_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)\b(?:owner_id|ownerid|tenant_id|tenantid|org_id|orgid|created_by|user_id|userid|account_id|accountid)\s*(?:=|:)\s*([^\s,);\n}]+)",
+        )
+        .expect("valid ownership col regex")
+    })
+}
+
+fn ownership_cmp_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)(?:(?:==|!=|===|!==)\s*(?:req\.user|request\.user|session\.user|current_user|currentuser|auth\.uid|claims\.)|(?:req\.user|request\.user|session\.user|current_user|currentuser|auth\.uid|claims\.)[^\n;]*?(?:==|!=|===|!==))",
+        )
+        .expect("valid ownership cmp regex")
+    })
+}
+
 pub fn has_ownership_filter(code: &str) -> bool {
     let cleaned = strip_comments_simple(code);
-    let masked = params_mask_re().replace_all(&cleaned, "");
+    let masked = params_mask_re().replace_all(&cleaned, "__UNTRUSTED_INPUT__");
     let low = masked.to_ascii_lowercase();
-    const OWNERSHIP_TOKENS: &[&str] = &[
-        "req.user",
-        "request.user",
-        "session.user",
-        "current_user",
-        "currentuser",
-        "auth.uid",
-        "claims.",
-        "owner_id =",
-        "owner_id=",
-        "owner_id:",
-        "ownerid:",
-        "tenant_id =",
-        "tenant_id=",
-        "tenant_id:",
-        "tenantid:",
-        "org_id =",
-        "org_id=",
-        "org_id:",
-        "orgid:",
-        "created_by =",
-        "created_by=",
-        "user_id =",
-        "user_id=",
-        "user_id:",
-        "userid:",
-        "account_id =",
-        "account_id=",
-        "account_id:",
-        "accountid:",
-        "and user_id",
-        "and userid",
-        "and owner_id",
-        "and tenant_id",
-    ];
-    OWNERSHIP_TOKENS.iter().any(|t| low.contains(t))
+
+    for cap in ownership_col_re().captures_iter(&low) {
+        let rhs = cap[1].trim_matches(|c: char| matches!(c, '\'' | '"' | '`'));
+        if !rhs.contains("__untrusted_input__") {
+            return true;
+        }
+    }
+    if low.contains("and user_id")
+        || low.contains("and userid")
+        || low.contains("and owner_id")
+        || low.contains("and tenant_id")
+    {
+        return true;
+    }
+    if ownership_cmp_re().is_match(&low) {
+        return true;
+    }
+    // Check if an authenticated user principal is passed directly into a DB CRUD statement
+    for stmt in low.lines() {
+        if is_db_crud_stmt(stmt)
+            && (stmt.contains("req.user")
+                || stmt.contains("request.user")
+                || stmt.contains("session.user")
+                || stmt.contains("current_user")
+                || stmt.contains("currentuser")
+                || stmt.contains("auth.uid")
+                || stmt.contains("claims."))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn is_universal_sanitizer(expr: &str) -> bool {
@@ -169,35 +266,44 @@ fn is_universal_sanitizer(expr: &str) -> bool {
         "strconv.Atoi(",
         "strconv.ParseInt(",
         "strconv.ParseUint(",
+        "strconv.ParseFloat(",
         "parseInt(",
+        "parseFloat(",
         "Number(",
-        "z.object(",
-        "z.string(",
+        "BigInt(",
+        "Boolean(",
         "z.number(",
-        ".safeParse(",
-        ".parse(",
-        "Joi.",
-        ".validate(",
-        "validateOrReject(",
+        "z.coerce.number(",
         "Uuid::parse_str(",
+        "uuid.Parse(",
+        "uuid.MustParse(",
+        "uuid.UUID(",
         ".parse::<i",
         ".parse::<u",
+        ".parse::<f",
+        ".parse::<bool",
+        ".parse::<Uuid",
     ];
     SANITIZERS.iter().any(|s| expr.contains(s))
 }
 
 fn expr_has_path_sanitizer(expr: &str) -> bool {
     const PATH_SAN: &[&str] = &[
-        "filepath.Clean(",
         "filepath.Base(",
         "path.basename(",
         "os.path.basename(",
-        "os.path.realpath(",
-        ".startsWith(",
-        "strings.HasPrefix(",
-        ".starts_with(",
+        ".file_name(",
     ];
     PATH_SAN.iter().any(|s| expr.contains(s)) || is_universal_sanitizer(expr)
+}
+
+fn stmt_is_path_prefix_guard(stmt: &str) -> bool {
+    let has_prefix_check = stmt.contains(".startsWith(")
+        || stmt.contains("strings.HasPrefix(")
+        || stmt.contains(".starts_with(")
+        || stmt.contains("os.path.commonpath(")
+        || stmt.contains("..\"");
+    has_prefix_check && (stmt.contains("if ") || stmt.contains("if(") || stmt.contains("ensure!"))
 }
 
 fn expr_has_ssrf_sanitizer(expr: &str) -> bool {
@@ -225,7 +331,32 @@ fn extract_param_names(fn_node: Node, src: &[u8]) -> HashSet<String> {
     };
     collect_param_idents(params, src, &mut out);
     for fw in [
-        "req", "res", "next", "ctx", "c", "w", "r", "self", "request", "response", "err",
+        "req",
+        "res",
+        "next",
+        "ctx",
+        "c",
+        "w",
+        "r",
+        "self",
+        "cls",
+        "request",
+        "response",
+        "err",
+        "db",
+        "tx",
+        "pool",
+        "session",
+        "state",
+        "Path",
+        "Query",
+        "Json",
+        "Form",
+        "State",
+        "Extension",
+        "HeaderMap",
+        "Depends",
+        "Security",
     ] {
         out.remove(fw);
     }
@@ -234,8 +365,28 @@ fn extract_param_names(fn_node: Node, src: &[u8]) -> HashSet<String> {
 
 fn collect_param_idents(node: Node, src: &[u8], out: &mut HashSet<String>) {
     let k = node.kind();
+    let txt = node_text(node, src);
+    // Skip DI / server-state parameter nodes (`Depends(...)`, `Security(...)`, `State<...>`, `Extension<...>`, `Data<...>`)
+    if matches!(
+        k,
+        "default_parameter"
+            | "typed_default_parameter"
+            | "typed_parameter"
+            | "parameter"
+            | "required_parameter"
+    ) && (txt.contains("Depends(")
+        || txt.contains("Security(")
+        || txt.contains("State<")
+        || txt.contains("Extension<")
+        || txt.contains("web::Data<")
+        || txt.contains("BackgroundTasks")
+        || txt.contains(": Session")
+        || txt.contains(": AsyncSession"))
+    {
+        return;
+    }
     if matches!(k, "identifier" | "shorthand_property_identifier_pattern") {
-        let name = node_text(node, src).trim();
+        let name = txt.trim();
         if !name.is_empty() && name != "_" {
             out.insert(name.to_string());
         }
@@ -252,7 +403,7 @@ fn collect_param_idents(node: Node, src: &[u8], out: &mut HashSet<String>) {
     }
     if matches!(
         k,
-        "type_annotation" | "generic_type" | "pointer_type" | "qualified_type"
+        "type_annotation" | "generic_type" | "pointer_type" | "qualified_type" | "type"
     ) {
         return;
     }
@@ -274,7 +425,7 @@ fn expr_references_any(expr: &str, vars: &HashSet<String>) -> bool {
     false
 }
 
-fn extract_assigned_targets(stmt: Node, src: &[u8]) -> Option<(Vec<String>, String)> {
+fn extract_assigned_targets(stmt: Node, src: &[u8]) -> Option<(Vec<String>, String, bool)> {
     let k = stmt.kind();
     match k {
         "lexical_declaration" | "variable_declaration" => {
@@ -290,7 +441,7 @@ fn extract_assigned_targets(stmt: Node, src: &[u8]) -> Option<(Vec<String>, Stri
                     for cap in ident_re().captures_iter(node_text(n, src)) {
                         names.push(cap[1].to_string());
                     }
-                    return Some((names, node_text(v, src).to_string()));
+                    return Some((names, node_text(v, src).to_string(), false));
                 }
             }
             None
@@ -298,7 +449,11 @@ fn extract_assigned_targets(stmt: Node, src: &[u8]) -> Option<(Vec<String>, Stri
         "expression_statement" => {
             let mut c = stmt.walk();
             for ch in stmt.children(&mut c) {
-                if matches!(ch.kind(), "assignment_expression" | "assignment")
+                let is_aug = matches!(
+                    ch.kind(),
+                    "augmented_assignment_expression" | "augmented_assignment"
+                );
+                if (matches!(ch.kind(), "assignment_expression" | "assignment") || is_aug)
                     && let (Some(l), Some(r)) = (
                         ch.child_by_field_name("left"),
                         ch.child_by_field_name("right"),
@@ -308,12 +463,16 @@ fn extract_assigned_targets(stmt: Node, src: &[u8]) -> Option<(Vec<String>, Stri
                     for cap in ident_re().captures_iter(node_text(l, src)) {
                         names.push(cap[1].to_string());
                     }
-                    return Some((names, node_text(r, src).to_string()));
+                    return Some((names, node_text(r, src).to_string(), is_aug));
                 }
             }
             None
         }
-        "short_var_declaration" | "assignment_statement" | "assignment" => {
+        "short_var_declaration"
+        | "assignment_statement"
+        | "assignment"
+        | "augmented_assignment" => {
+            let is_aug = k == "augmented_assignment" || node_text(stmt, src).contains("+=");
             let left = stmt.child_by_field_name("left")?;
             let right = stmt.child_by_field_name("right")?;
             let mut names = Vec::new();
@@ -323,7 +482,7 @@ fn extract_assigned_targets(stmt: Node, src: &[u8]) -> Option<(Vec<String>, Stri
                     names.push(id.to_string());
                 }
             }
-            Some((names, node_text(right, src).to_string()))
+            Some((names, node_text(right, src).to_string(), is_aug))
         }
         "let_declaration" => {
             let pat = stmt.child_by_field_name("pattern")?;
@@ -334,7 +493,7 @@ fn extract_assigned_targets(stmt: Node, src: &[u8]) -> Option<(Vec<String>, Stri
                     names.push(cap[1].to_string());
                 }
             }
-            Some((names, node_text(val, src).to_string()))
+            Some((names, node_text(val, src).to_string(), false))
         }
         "var_declaration" => {
             let mut c = stmt.walk();
@@ -349,7 +508,7 @@ fn extract_assigned_targets(stmt: Node, src: &[u8]) -> Option<(Vec<String>, Stri
                     for cap in ident_re().captures_iter(node_text(n, src)) {
                         names.push(cap[1].to_string());
                     }
-                    return Some((names, node_text(v, src).to_string()));
+                    return Some((names, node_text(v, src).to_string(), false));
                 }
             }
             None
@@ -421,6 +580,15 @@ fn stmt_taint_status(
     }
 }
 
+fn push_unique_hit(list: &mut Vec<LocalStaticFinding>, hit: LocalStaticFinding) {
+    if !list
+        .iter()
+        .any(|existing| existing.rule_id == hit.rule_id && existing.line == hit.line)
+    {
+        list.push(hit);
+    }
+}
+
 fn is_safe_sql_tagged_template(node: Node, src: &[u8]) -> bool {
     if let Some(func) = node.child_by_field_name("function") {
         let ftxt = node_text(func, src).trim();
@@ -436,6 +604,18 @@ fn is_safe_sql_tagged_template(node: Node, src: &[u8]) -> bool {
         }
     }
     false
+}
+
+fn is_non_sql_log_or_ui_stmt(stmt_code: &str) -> bool {
+    let trimmed = stmt_code.trim();
+    trimmed.starts_with("console.")
+        || trimmed.starts_with("logger.")
+        || trimmed.starts_with("log.")
+        || trimmed.starts_with("res.send(")
+        || trimmed.starts_with("res.json(")
+        || trimmed.starts_with("return res.send(")
+        || trimmed.starts_with("return res.json(")
+        || trimmed.starts_with("throw new Error(")
 }
 
 fn has_dynamic_sql_interpolation(node: Node, src: &[u8]) -> bool {
@@ -510,6 +690,9 @@ fn has_dynamic_sql_interpolation(node: Node, src: &[u8]) -> bool {
 
     let mut c = node.walk();
     for ch in node.children(&mut c) {
+        if matches!(ch.kind(), "statement_block" | "block") {
+            continue;
+        }
         if has_dynamic_sql_interpolation(ch, src) {
             return true;
         }
@@ -537,14 +720,12 @@ fn check_call_taint_sinks(
         let ftxt = node_text(func, src).trim();
         let short = ftxt.rsplit('.').next().unwrap_or(ftxt);
         let short = short.rsplit("::").next().unwrap_or(short);
-        let args_txt = node
-            .child_by_field_name("arguments")
-            .map(|a| node_text(a, src))
-            .unwrap_or("");
+        let args_node = node.child_by_field_name("arguments");
+        let args_txt = args_node.map(|a| node_text(a, src)).unwrap_or("");
         let line = node.start_position().row + 1;
 
-        // Track tainted call-arg forwarding to other functions
-        if !short.is_empty() {
+        // Track tainted call-arg forwarding to other functions (only if arguments are not sanitized at call site!)
+        if !short.is_empty() && !is_universal_sanitizer(args_txt) {
             if has_taint_source_expr(args_txt) || expr_references_any(args_txt, tainted_vars) {
                 if !summary.tainted_calls.iter().any(|c| c == short) {
                     summary.tainted_calls.push(short.to_string());
@@ -553,6 +734,68 @@ fn check_call_taint_sinks(
                 && !summary.param_forwarding_calls.iter().any(|c| c == short)
             {
                 summary.param_forwarding_calls.push(short.to_string());
+            }
+        }
+
+        // 0. SQL Execution Sink with tainted first argument (`db.query(q)` where `q` is tainted variable)
+        let is_sql_exec_sink = matches!(
+            ftxt,
+            "db.query"
+                | "db.queryRow"
+                | "db.exec"
+                | "tx.query"
+                | "tx.exec"
+                | "pool.query"
+                | "client.query"
+                | "cursor.execute"
+                | "session.execute"
+                | "conn.execute"
+                | "sqlx::query"
+        ) || ftxt.ends_with(".$queryRawUnsafe")
+            || ftxt.ends_with(".$executeRawUnsafe");
+        if is_sql_exec_sink
+            && !fn_guards.contains(&GuardKind::SqlSanitizer)
+            && let Some(an) = args_node
+        {
+            let mut ac = an.walk();
+            if let Some(arg0) = an
+                .children(&mut ac)
+                .find(|a| !matches!(a.kind(), "(" | ")" | ","))
+            {
+                let arg0_txt = node_text(arg0, src).trim();
+                let is_plain_string_lit = matches!(
+                    arg0.kind(),
+                    "string"
+                        | "string_literal"
+                        | "interpreted_string_literal"
+                        | "raw_string_literal"
+                ) && !arg0_txt.starts_with("f\"")
+                    && !arg0_txt.starts_with("f'");
+                if !is_plain_string_lit
+                    && !is_universal_sanitizer(arg0_txt)
+                    && let Some(tkind) = stmt_taint_status(arg0_txt, tainted_vars, param_vars)
+                {
+                    let hit = LocalStaticFinding {
+                        rule_id: "VF-SQLI-001".into(),
+                        severity: "CRITICAL".into(),
+                        title: format!(
+                            "SQL Injection via tainted query argument in `{}`",
+                            symbol_name
+                        ),
+                        rel_path: rel_path.to_string(),
+                        line,
+                        symbol: symbol_name.to_string(),
+                        sink_kind: SinkKind::SqlInjection,
+                        missing_guard: GuardKind::SqlSanitizer,
+                        remediation: "Use parameterized queries (`$1`, `?`, or ORM query builders) instead of passing dynamically constructed or untrusted SQL strings.".into(),
+                    };
+                    match tkind {
+                        TaintSourceKind::Direct => {
+                            push_unique_hit(&mut summary.local_taint_hits, hit)
+                        }
+                        TaintSourceKind::Param => push_unique_hit(&mut summary.param_sinks, hit),
+                    }
+                }
             }
         }
 
@@ -595,8 +838,8 @@ fn check_call_taint_sinks(
                     remediation: "Avoid invoking a shell; use `execFile`/`spawn` with an argument array (`shell: false`) or strict input allowlisting.".into(),
                 };
             match tkind {
-                TaintSourceKind::Direct => summary.local_taint_hits.push(hit),
-                TaintSourceKind::Param => summary.param_sinks.push(hit),
+                TaintSourceKind::Direct => push_unique_hit(&mut summary.local_taint_hits, hit),
+                TaintSourceKind::Param => push_unique_hit(&mut summary.param_sinks, hit),
             }
         }
 
@@ -643,8 +886,8 @@ fn check_call_taint_sinks(
                     remediation: "Normalize the path with `path.basename` / `filepath.Base` and verify `resolvedPath.startsWith(baseDir)` before accessing the filesystem.".into(),
                 };
             match tkind {
-                TaintSourceKind::Direct => summary.local_taint_hits.push(hit),
-                TaintSourceKind::Param => summary.param_sinks.push(hit),
+                TaintSourceKind::Direct => push_unique_hit(&mut summary.local_taint_hits, hit),
+                TaintSourceKind::Param => push_unique_hit(&mut summary.param_sinks, hit),
             }
         }
 
@@ -692,14 +935,17 @@ fn check_call_taint_sinks(
                     remediation: "Parse the URL and enforce an explicit hostname allowlist while blocking loopback/private/link-local IP ranges (169.254.0.0/16, 10.0.0.0/8, 127.0.0.1).".into(),
                 };
             match tkind {
-                TaintSourceKind::Direct => summary.local_taint_hits.push(hit),
-                TaintSourceKind::Param => summary.param_sinks.push(hit),
+                TaintSourceKind::Direct => push_unique_hit(&mut summary.local_taint_hits, hit),
+                TaintSourceKind::Param => push_unique_hit(&mut summary.param_sinks, hit),
             }
         }
     }
 
     let mut c = node.walk();
     for ch in node.children(&mut c) {
+        if matches!(ch.kind(), "statement_block" | "block") {
+            continue;
+        }
         check_call_taint_sinks(
             ch,
             src,
@@ -723,6 +969,7 @@ fn analyze_statement_block(
     symbol_name: &str,
     tainted_vars: &mut HashSet<String>,
     param_vars: &mut HashSet<String>,
+    sql_vars: &mut HashSet<String>,
     summary: &mut FunctionTaintSummary,
 ) {
     let mut cursor = block.walk();
@@ -731,45 +978,69 @@ fn analyze_statement_block(
         if matches!(sk, "{" | "}" | "comment" | "line_comment" | "block_comment") {
             continue;
         }
+        let is_compound = matches!(
+            sk,
+            "if_statement"
+                | "else_clause"
+                | "try_statement"
+                | "catch_clause"
+                | "except_clause"
+                | "finally_clause"
+                | "for_statement"
+                | "for_in_statement"
+                | "while_statement"
+                | "with_statement"
+                | "match_expression"
+                | "switch_statement"
+                | "statement_block"
+                | "block"
+        );
+
         let stmt_txt = node_text(stmt, src);
         let stmt_code = strip_comments_simple(stmt_txt);
 
-        if has_taint_source_expr(&stmt_code) {
-            summary.has_taint_source = true;
-        }
-        if has_resource_id_expr(&stmt_code, None) {
-            summary.has_resource_id = true;
-        }
-        if has_ownership_filter(&stmt_code) {
-            summary.guards.insert(GuardKind::OwnershipCheck);
-        }
-        if expr_has_path_sanitizer(&stmt_code) {
-            summary.guards.insert(GuardKind::PathSanitizer);
-        }
-        if expr_has_ssrf_sanitizer(&stmt_code) {
-            summary.guards.insert(GuardKind::SsrfSanitizer);
-        }
-        if expr_has_cmd_sanitizer(&stmt_code) {
-            summary.guards.insert(GuardKind::CmdSanitizer);
-        }
-        if is_universal_sanitizer(&stmt_code) {
-            summary.guards.insert(GuardKind::SqlSanitizer);
-        }
-        if is_db_crud_stmt(&stmt_code) {
-            summary.has_db_crud_sink = true;
-            if summary.db_crud_line.is_none() {
-                summary.db_crud_line = Some(stmt.start_position().row + 1);
+        if !is_compound {
+            if has_taint_source_expr(&stmt_code) {
+                summary.has_taint_source = true;
+            }
+            if has_resource_id_expr(&stmt_code, None) {
+                summary.has_resource_id = true;
+            }
+            if has_ownership_filter(&stmt_code) {
+                summary.guards.insert(GuardKind::OwnershipCheck);
+            }
+            if is_db_crud_stmt(&stmt_code) {
+                summary.has_db_crud_sink = true;
+                if summary.db_crud_line.is_none() {
+                    summary.db_crud_line = Some(stmt.start_position().row + 1);
+                }
+            }
+        } else {
+            if stmt_is_path_prefix_guard(&stmt_code) {
+                summary.guards.insert(GuardKind::PathSanitizer);
+            }
+            if expr_has_ssrf_sanitizer(&stmt_code)
+                && (stmt_code.contains("if ") || stmt_code.contains("if("))
+                && !is_universal_sanitizer(&stmt_code)
+            {
+                summary.guards.insert(GuardKind::SsrfSanitizer);
             }
         }
 
-        // Check SQL injection dynamic construction in statement
-        if has_dynamic_sql_interpolation(stmt, src) && !is_universal_sanitizer(&stmt_code) {
+        // Check SQL injection dynamic construction in statement (ignoring non-SQL console/UI prose)
+        if !is_non_sql_log_or_ui_stmt(&stmt_code)
+            && has_dynamic_sql_interpolation(stmt, src)
+            && !is_universal_sanitizer(&stmt_code)
+        {
             let line = stmt.start_position().row + 1;
             if let Some(tkind) = stmt_taint_status(&stmt_code, tainted_vars, param_vars) {
                 let hit = LocalStaticFinding {
                     rule_id: "VF-SQLI-001".into(),
                     severity: "CRITICAL".into(),
-                    title: format!("SQL Injection via unsanitized string interpolation in `{}`", symbol_name),
+                    title: format!(
+                        "SQL Injection via unsanitized string interpolation in `{}`",
+                        symbol_name
+                    ),
                     rel_path: rel_path.to_string(),
                     line,
                     symbol: symbol_name.to_string(),
@@ -778,13 +1049,13 @@ fn analyze_statement_block(
                     remediation: "Use parameterized queries (`$1`, `?`, or ORM query builders) instead of interpolating untrusted input into SQL strings.".into(),
                 };
                 match tkind {
-                    TaintSourceKind::Direct => summary.local_taint_hits.push(hit),
-                    TaintSourceKind::Param => summary.param_sinks.push(hit),
+                    TaintSourceKind::Direct => push_unique_hit(&mut summary.local_taint_hits, hit),
+                    TaintSourceKind::Param => push_unique_hit(&mut summary.param_sinks, hit),
                 }
             }
         }
 
-        // Check CMDi, Path Traversal, SSRF, and tainted callee forwarding
+        // Check CMDi, Path Traversal, SSRF, SQL exec sinks, and tainted callee forwarding
         check_call_taint_sinks(
             stmt,
             src,
@@ -797,37 +1068,67 @@ fn analyze_statement_block(
             summary,
         );
 
-        // Update local variable taint state after evaluating RHS
-        if let Some((lhs_names, rhs_txt)) = extract_assigned_targets(stmt, src) {
-            if is_universal_sanitizer(&rhs_txt) {
+        // Update local variable taint state and multi-statement SQL builder state after evaluating RHS
+        if let Some((lhs_names, rhs_txt, is_aug)) = extract_assigned_targets(stmt, src) {
+            let rhs_has_sql = sql_verb_re().is_match(&rhs_txt);
+            if rhs_has_sql {
                 for n in &lhs_names {
-                    tainted_vars.remove(n);
-                    param_vars.remove(n);
+                    sql_vars.insert(n.clone());
                 }
-            } else if has_taint_source_expr(&rhs_txt) || expr_references_any(&rhs_txt, tainted_vars)
+            }
+            let touches_sql_var = lhs_names.iter().any(|n| sql_vars.contains(n))
+                || expr_references_any(&rhs_txt, sql_vars);
+
+            if is_universal_sanitizer(&rhs_txt)
+                || expr_has_path_sanitizer(&rhs_txt)
+                || expr_has_cmd_sanitizer(&rhs_txt)
+                || expr_has_ssrf_sanitizer(&rhs_txt)
             {
-                for n in lhs_names {
-                    tainted_vars.insert(n);
+                if !is_aug {
+                    for n in &lhs_names {
+                        tainted_vars.remove(n);
+                        param_vars.remove(n);
+                    }
                 }
-            } else if expr_references_any(&rhs_txt, param_vars) {
+            } else if let Some(tkind) = stmt_taint_status(&rhs_txt, tainted_vars, param_vars) {
+                if touches_sql_var && (is_aug || rhs_txt.contains('+') || rhs_txt.contains("${")) {
+                    let line = stmt.start_position().row + 1;
+                    let hit = LocalStaticFinding {
+                        rule_id: "VF-SQLI-001".into(),
+                        severity: "CRITICAL".into(),
+                        title: format!(
+                            "SQL Injection via multi-statement query concatenation in `{}`",
+                            symbol_name
+                        ),
+                        rel_path: rel_path.to_string(),
+                        line,
+                        symbol: symbol_name.to_string(),
+                        sink_kind: SinkKind::SqlInjection,
+                        missing_guard: GuardKind::SqlSanitizer,
+                        remediation: "Use parameterized queries (`$1`, `?`, or ORM query builders) instead of concatenating untrusted input into SQL strings.".into(),
+                    };
+                    match tkind {
+                        TaintSourceKind::Direct => {
+                            push_unique_hit(&mut summary.local_taint_hits, hit)
+                        }
+                        TaintSourceKind::Param => push_unique_hit(&mut summary.param_sinks, hit),
+                    }
+                }
                 for n in lhs_names {
-                    param_vars.insert(n);
+                    match tkind {
+                        TaintSourceKind::Direct => {
+                            tainted_vars.insert(n);
+                        }
+                        TaintSourceKind::Param => {
+                            param_vars.insert(n);
+                        }
+                    }
                 }
             }
         }
 
         // Recurse into control-flow sub-blocks (`if`, `else`, `try`, `for`, etc.)
-        if matches!(
-            sk,
-            "if_statement"
-                | "else_clause"
-                | "try_statement"
-                | "except_clause"
-                | "finally_clause"
-                | "for_statement"
-                | "while_statement"
-                | "block"
-        ) {
+        if is_compound {
             let mut sub = stmt.walk();
             for ch in stmt.children(&mut sub) {
                 if matches!(
@@ -840,6 +1141,11 @@ fn analyze_statement_block(
                         | "catch_clause"
                         | "except_clause"
                         | "finally_clause"
+                        | "switch_body"
+                        | "switch_case"
+                        | "switch_default"
+                        | "match_block"
+                        | "match_arm"
                 ) {
                     analyze_statement_block(
                         ch,
@@ -849,6 +1155,7 @@ fn analyze_statement_block(
                         symbol_name,
                         tainted_vars,
                         param_vars,
+                        sql_vars,
                         summary,
                     );
                 }
@@ -885,6 +1192,7 @@ pub fn analyze_function_taint(
 
     let mut tainted_vars = HashSet::new();
     let mut param_vars = extract_param_names(fn_node, src);
+    let mut sql_vars = HashSet::new();
 
     if let Some(body) = fn_node.child_by_field_name("body") {
         if matches!(body.kind(), "statement_block" | "block") {
@@ -896,6 +1204,7 @@ pub fn analyze_function_taint(
                 symbol_name,
                 &mut tainted_vars,
                 &mut param_vars,
+                &mut sql_vars,
                 &mut summary,
             );
         } else {
@@ -908,6 +1217,7 @@ pub fn analyze_function_taint(
                 symbol_name,
                 &mut tainted_vars,
                 &mut param_vars,
+                &mut sql_vars,
                 &mut summary,
             );
         }
@@ -975,6 +1285,38 @@ fn has_dot_catch_chain(node: Node, src: &[u8]) -> bool {
     false
 }
 
+fn is_likely_frontend_file(rel_path: &str, src: &[u8]) -> bool {
+    let low = rel_path.to_ascii_lowercase().replace('\\', "/");
+    if low.ends_with(".tsx") || low.ends_with(".jsx") {
+        return true;
+    }
+    if low.split('/').any(|seg| {
+        matches!(
+            seg,
+            "web"
+                | "client"
+                | "frontend"
+                | "ui"
+                | "components"
+                | "pages"
+                | "views"
+                | "hooks"
+                | "widgets"
+        )
+    }) {
+        return true;
+    }
+    let text = std::str::from_utf8(src).unwrap_or("");
+    text.contains("window.")
+        || text.contains("document.")
+        || text.contains("useState(")
+        || text.contains("useEffect(")
+        || text.contains("fetch('/api")
+        || text.contains("fetch(\"/api")
+        || text.contains("fetch(`/api")
+        || text.contains("axios.")
+}
+
 /// Extracts frontend `/api/...` calls (`VF-FE-404` candidates) and UI/async functional bugs (`VF-FE-ERR`).
 pub fn extract_frontend_calls_and_bugs(
     node: Node,
@@ -987,6 +1329,7 @@ pub fn extract_frontend_calls_and_bugs(
     if !matches!(lang, Language::TypeScript | Language::JavaScript) {
         return;
     }
+    let is_fe = is_likely_frontend_file(rel_path, src);
 
     let kind = node.kind();
 
@@ -1096,8 +1439,8 @@ pub fn extract_frontend_calls_and_bugs(
         }
     }
 
-    // 3. Unhandled async mutation missing `try/catch` or `.catch(...)`
-    if kind == "await_expression" {
+    // 3. Unhandled async mutation missing `try/catch` or `.catch(...)` (frontend files only)
+    if is_fe && kind == "await_expression" {
         let txt = node_text(node, src);
         let low = txt.to_ascii_lowercase();
         let is_mutation = low.contains("axios.post(")
@@ -1129,8 +1472,9 @@ pub fn extract_frontend_calls_and_bugs(
         }
     }
 
-    // 4. Swallowed or empty `catch (e) {}` / `catch (e) { console.log(e); }` error blocks
-    if kind == "catch_clause"
+    // 4. Swallowed or empty `catch (e) {}` / `catch (e) { console.log(e); }` error blocks (frontend files only)
+    if is_fe
+        && kind == "catch_clause"
         && let Some(body) = node.child_by_field_name("body")
     {
         let mut c = body.walk();

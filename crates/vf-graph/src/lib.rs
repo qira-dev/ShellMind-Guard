@@ -48,7 +48,7 @@ pub fn analyze_codebase_cached(
     store: &mut StateStore,
 ) -> Result<GraphAnalysisResult> {
     let cfg_json = serde_json::to_string(&cfg.guards).unwrap_or_default();
-    let versioned_cfg = format!("v3-6layer|{}", cfg_json);
+    let versioned_cfg = format!("v4-6layer-{}|{}", env!("CARGO_PKG_VERSION"), cfg_json);
     let cfg_hash = blake3::hash(versioned_cfg.as_bytes()).to_hex().to_string();
 
     let cached_map = store.load_ast_cache(&cfg_hash)?;

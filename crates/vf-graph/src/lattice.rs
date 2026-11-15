@@ -55,6 +55,72 @@ fn is_public_route(entry_route: &str, public_routes: &[String]) -> bool {
     })
 }
 
+fn is_admin_route(entry_route: &str) -> bool {
+    let path_part = entry_route.split_whitespace().nth(1).unwrap_or(entry_route);
+    path_part
+        .split('/')
+        .any(|seg| seg.eq_ignore_ascii_case("admin"))
+}
+
+fn go_parent_dir(rel_path: &str) -> String {
+    match rel_path.rfind('/') {
+        Some(idx) => rel_path[..idx].to_string(),
+        None => String::new(),
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn resolve_symbol_in_file(
+    target_file: &str,
+    symbol_name: &str,
+    file_symbols_map: &HashMap<(String, String), Vec<NodeIndex>>,
+    file_imports: &HashMap<String, Vec<(String, String, String)>>,
+    depth: usize,
+) -> Vec<NodeIndex> {
+    if let Some(indices) = file_symbols_map.get(&(target_file.to_string(), symbol_name.to_string()))
+        && !indices.is_empty()
+    {
+        return indices.clone();
+    }
+    if depth >= 3 {
+        return Vec::new();
+    }
+    let Some(imps) = file_imports.get(target_file) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (local_name, next_file, remote_name) in imps {
+        if local_name == symbol_name {
+            let resolved = resolve_symbol_in_file(
+                next_file,
+                remote_name,
+                file_symbols_map,
+                file_imports,
+                depth + 1,
+            );
+            for idx in resolved {
+                if !out.contains(&idx) {
+                    out.push(idx);
+                }
+            }
+        } else if local_name == "*" {
+            let resolved = resolve_symbol_in_file(
+                next_file,
+                symbol_name,
+                file_symbols_map,
+                file_imports,
+                depth + 1,
+            );
+            for idx in resolved {
+                if !out.contains(&idx) {
+                    out.push(idx);
+                }
+            }
+        }
+    }
+    out
+}
+
 fn remediation_for_guard(g: GuardKind) -> &'static str {
     match g {
         GuardKind::Auth => {
@@ -126,37 +192,72 @@ pub fn solve_guard_lattice_with_public(
 ) -> GraphAnalysisResult {
     let mut graph = DiGraph::<SymbolInfo, ()>::new();
     let mut id_to_idx: HashMap<String, NodeIndex> = HashMap::new();
-    let mut file_symbol_map: HashMap<(String, String), NodeIndex> = HashMap::new();
-    let mut go_exported_map: HashMap<String, NodeIndex> = HashMap::new();
+    let mut file_symbols_map: HashMap<(String, String), Vec<NodeIndex>> = HashMap::new();
+    let mut go_dir_map: HashMap<(String, String), Vec<NodeIndex>> = HashMap::new();
+    let mut go_exported_map: HashMap<String, Vec<NodeIndex>> = HashMap::new();
     let mut known_files: HashSet<String> = HashSet::new();
 
     for f in summaries {
         known_files.insert(f.rel_path.clone());
         let is_go = f.rel_path.ends_with(".go");
+        let go_dir = if is_go {
+            go_parent_dir(&f.rel_path)
+        } else {
+            String::new()
+        };
         for sym in &f.symbols {
             let idx = graph.add_node(sym.clone());
             id_to_idx.insert(sym.id.clone(), idx);
-            file_symbol_map.insert((f.rel_path.clone(), sym.name.clone()), idx);
-            if is_go && sym.name.chars().next().is_some_and(|c| c.is_uppercase()) {
-                go_exported_map.entry(sym.name.clone()).or_insert(idx);
+            file_symbols_map
+                .entry((f.rel_path.clone(), sym.name.clone()))
+                .or_default()
+                .push(idx);
+            if is_go {
+                go_dir_map
+                    .entry((go_dir.clone(), sym.name.clone()))
+                    .or_default()
+                    .push(idx);
+                if sym.name.chars().next().is_some_and(|c| c.is_uppercase()) {
+                    go_exported_map
+                        .entry(sym.name.clone())
+                        .or_default()
+                        .push(idx);
+                }
             }
+        }
+    }
+
+    let mut file_imports: HashMap<String, Vec<(String, String, String)>> = HashMap::new();
+    for f in summaries {
+        let mut imps = Vec::new();
+        for imp in &f.imports {
+            if let Some(target_file) =
+                resolve_import_target(&f.rel_path, &imp.from_specifier, &known_files)
+            {
+                let remote = imp
+                    .remote_name
+                    .as_deref()
+                    .unwrap_or(&imp.symbol_name)
+                    .to_string();
+                imps.push((imp.symbol_name.clone(), target_file, remote));
+            }
+        }
+        if !imps.is_empty() {
+            file_imports.insert(f.rel_path.clone(), imps);
         }
     }
 
     // B11: O(1) edge deduplication via HashSet<(usize, usize)> instead of petgraph::update_edge O(deg)
     let mut seen_edges: HashSet<(usize, usize)> = HashSet::new();
-    let mut resolved_callee_map: HashMap<(usize, String), NodeIndex> = HashMap::new();
+    let mut resolved_callee_map: HashMap<(usize, String), Vec<NodeIndex>> = HashMap::new();
 
     for f in summaries {
-        let mut imported_targets: HashMap<String, String> = HashMap::new();
-        for imp in &f.imports {
-            if let Some(target_file) =
-                resolve_import_target(&f.rel_path, &imp.from_specifier, &known_files)
-            {
-                imported_targets.insert(imp.symbol_name.clone(), target_file);
-            }
-        }
-
+        let is_go = f.rel_path.ends_with(".go");
+        let go_dir = if is_go {
+            go_parent_dir(&f.rel_path)
+        } else {
+            String::new()
+        };
         for sym in &f.symbols {
             let Some(&src_idx) = id_to_idx.get(&sym.id) else {
                 continue;
@@ -167,28 +268,67 @@ pub fn solve_guard_lattice_with_public(
                 .chain(sym.tainted_calls.iter())
                 .chain(sym.param_forwarding_calls.iter())
             {
-                let dst_opt = file_symbol_map
-                    .get(&(f.rel_path.clone(), callee.clone()))
-                    .copied()
-                    .or_else(|| {
-                        imported_targets
-                            .get(callee)
-                            .and_then(|tf| file_symbol_map.get(&(tf.clone(), callee.clone())))
-                            .copied()
-                    })
-                    .or_else(|| {
-                        if f.rel_path.ends_with(".go") {
-                            go_exported_map.get(callee).copied()
-                        } else {
-                            None
-                        }
-                    });
-                if let Some(dst_idx) = dst_opt
-                    && src_idx != dst_idx
+                let mut dst_indices: Vec<NodeIndex> = Vec::new();
+                if let Some(same_file_idxs) =
+                    file_symbols_map.get(&(f.rel_path.clone(), callee.clone()))
                 {
-                    resolved_callee_map.insert((src_idx.index(), callee.clone()), dst_idx);
-                    if seen_edges.insert((src_idx.index(), dst_idx.index())) {
-                        graph.add_edge(src_idx, dst_idx, ());
+                    dst_indices.extend(same_file_idxs.iter().copied());
+                }
+                if dst_indices.is_empty()
+                    && let Some(imps) = file_imports.get(&f.rel_path)
+                {
+                    for (local_name, target_file, remote_name) in imps {
+                        if local_name == callee {
+                            let resolved = resolve_symbol_in_file(
+                                target_file,
+                                remote_name,
+                                &file_symbols_map,
+                                &file_imports,
+                                0,
+                            );
+                            for idx in resolved {
+                                if !dst_indices.contains(&idx) {
+                                    dst_indices.push(idx);
+                                }
+                            }
+                        } else if local_name == "*" {
+                            let resolved = resolve_symbol_in_file(
+                                target_file,
+                                callee,
+                                &file_symbols_map,
+                                &file_imports,
+                                0,
+                            );
+                            for idx in resolved {
+                                if !dst_indices.contains(&idx) {
+                                    dst_indices.push(idx);
+                                }
+                            }
+                        }
+                    }
+                }
+                if dst_indices.is_empty() && is_go {
+                    if let Some(same_pkg_idxs) = go_dir_map.get(&(go_dir.clone(), callee.clone())) {
+                        dst_indices.extend(same_pkg_idxs.iter().copied());
+                    }
+                    if dst_indices.is_empty()
+                        && let Some(exp_idxs) = go_exported_map.get(callee)
+                    {
+                        dst_indices.extend(exp_idxs.iter().copied());
+                    }
+                }
+
+                for dst_idx in dst_indices {
+                    if src_idx != dst_idx {
+                        let entry = resolved_callee_map
+                            .entry((src_idx.index(), callee.clone()))
+                            .or_default();
+                        if !entry.contains(&dst_idx) {
+                            entry.push(dst_idx);
+                        }
+                        if seen_edges.insert((src_idx.index(), dst_idx.index())) {
+                            graph.add_edge(src_idx, dst_idx, ());
+                        }
                     }
                 }
             }
@@ -260,20 +400,35 @@ pub fn solve_guard_lattice_with_public(
     let mut taint_q = VecDeque::new();
     for u in graph.node_indices() {
         let is_route_entry = graph[u].kind == SymbolKind::Route;
-        let seed_iter = graph[u].tainted_calls.iter().chain(
-            if is_route_entry {
+        // Only fall back to seeding `calls` on a Route node if it is a delegating route registration
+        // without an inline body (`tainted_calls` & `param_forwarding_calls` empty, `!has_taint_source`,
+        // and `has_resource_id` present in URL).
+        let seed_delegated_route_calls = is_route_entry
+            && graph[u].tainted_calls.is_empty()
+            && graph[u].param_forwarding_calls.is_empty()
+            && !graph[u].has_taint_source
+            && graph[u].has_resource_id;
+        let seed_iter = graph[u]
+            .tainted_calls
+            .iter()
+            .chain(if is_route_entry {
+                graph[u].param_forwarding_calls.as_slice()
+            } else {
+                &[]
+            })
+            .chain(if seed_delegated_route_calls {
                 graph[u].calls.as_slice()
             } else {
                 &[]
-            }
-            .iter(),
-        );
+            });
         for callee in seed_iter {
-            if let Some(&v) = resolved_callee_map.get(&(u.index(), callee.clone()))
-                && taint_parents[v.index()].is_none()
-            {
-                taint_parents[v.index()] = Some(u);
-                taint_q.push_back(v);
+            if let Some(vs) = resolved_callee_map.get(&(u.index(), callee.clone())) {
+                for &v in vs {
+                    if taint_parents[v.index()].is_none() {
+                        taint_parents[v.index()] = Some(u);
+                        taint_q.push_back(v);
+                    }
+                }
             }
         }
     }
@@ -283,11 +438,13 @@ pub fn solve_guard_lattice_with_public(
             .iter()
             .chain(graph[w].param_forwarding_calls.iter())
         {
-            if let Some(&next_v) = resolved_callee_map.get(&(w.index(), callee.clone()))
-                && taint_parents[next_v.index()].is_none()
-            {
-                taint_parents[next_v.index()] = Some(w);
-                taint_q.push_back(next_v);
+            if let Some(vs) = resolved_callee_map.get(&(w.index(), callee.clone())) {
+                for &next_v in vs {
+                    if taint_parents[next_v.index()].is_none() {
+                        taint_parents[next_v.index()] = Some(w);
+                        taint_q.push_back(next_v);
+                    }
+                }
             }
         }
     }
@@ -324,6 +481,7 @@ pub fn solve_guard_lattice_with_public(
             && let Some(sink_kind) = sym.sink_kind
         {
             if !active_guards.contains(&GuardKind::Auth)
+                && can_improve_witness(&best_by_key, &graph, &auth_parents, idx, "VF-AUTH-001")
                 && let Some((entry_name, witness)) = reconstruct_witness(&graph, &auth_parents, idx)
                 && !is_public_route(&entry_name, public_routes)
             {
@@ -350,6 +508,7 @@ pub fn solve_guard_lattice_with_public(
                 sink_kind,
                 SinkKind::PaymentMutation | SinkKind::BalanceUpdate
             ) && !active_guards.contains(&GuardKind::TxLock)
+                && can_improve_witness(&best_by_key, &graph, &lock_parents, idx, "VF-RACE-001")
                 && let Some((entry_name, witness)) = reconstruct_witness(&graph, &lock_parents, idx)
             {
                 insert_shorter(
@@ -454,9 +613,11 @@ pub fn solve_guard_lattice_with_public(
             && active_guards.contains(&GuardKind::Auth)
             && res_id_reaches[vi]
             && !active_guards.contains(&GuardKind::OwnershipCheck)
+            && can_improve_witness(&best_by_key, &graph, &route_parents, idx, "VF-IDOR-001")
             && let Some((entry_name, mut witness)) =
                 reconstruct_witness(&graph, &route_parents, idx)
             && !is_public_route(&entry_name, public_routes)
+            && !is_admin_route(&entry_name)
         {
             if let Some(last) = witness.last_mut()
                 && let Some(ln) = sym.db_crud_line
@@ -491,7 +652,7 @@ pub fn solve_guard_lattice_with_public(
         let mut all_prefixes: Vec<String> = Vec::new();
         for f in summaries {
             for p in &f.route_prefixes {
-                if !all_prefixes.iter().any(|x| x == p) {
+                if !p.starts_with("__AUTH_PREFIX__:") && !all_prefixes.iter().any(|x| x == p) {
                     all_prefixes.push(p.clone());
                 }
             }
@@ -642,8 +803,8 @@ pub fn solve_guard_lattice_with_public(
         })
     });
 
-    let mut tier1_counts: HashMap<&'static str, usize> = HashMap::new();
-    for (i, item) in deduped.iter_mut().enumerate() {
+    let mut prefix_counts: HashMap<&'static str, usize> = HashMap::new();
+    for item in deduped.iter_mut() {
         if let Some(primary) = item
             .witness_path
             .last()
@@ -657,13 +818,9 @@ pub fn solve_guard_lattice_with_public(
             }
         }
         let prefix = prefix_for_guard(item.missing_guard);
-        if matches!(item.missing_guard, GuardKind::Auth | GuardKind::TxLock) {
-            item.id = format!("{}-{:03}", prefix, i + 1);
-        } else {
-            let c = tier1_counts.entry(prefix).or_insert(0);
-            *c += 1;
-            item.id = format!("{}-{:03}", prefix, *c);
-        }
+        let c = prefix_counts.entry(prefix).or_insert(0);
+        *c += 1;
+        item.id = format!("{}-{:03}", prefix, *c);
     }
 
     GraphAnalysisResult {
@@ -712,33 +869,70 @@ fn insert_static_finding(
     });
 }
 
+struct BfsTree {
+    parent: Vec<Option<NodeIndex>>,
+    root: Vec<Option<NodeIndex>>,
+    depth: Vec<usize>,
+}
+
+fn can_improve_witness(
+    best: &HashMap<(String, String), LatticeFinding>,
+    graph: &DiGraph<SymbolInfo, ()>,
+    tree: &BfsTree,
+    sink: NodeIndex,
+    rule_id: &str,
+) -> bool {
+    let si = sink.index();
+    let Some(root_idx) = tree.root[si] else {
+        return false;
+    };
+    let entry_name = &graph[root_idx].name;
+    let cand_len = tree.depth[si].min(graph.node_count().min(64));
+    match best.get(&(entry_name.clone(), rule_id.to_string())) {
+        Some(prev) => cand_len < prev.witness_path.len(),
+        None => true,
+    }
+}
+
 /// Single O(V + E) multi-source forward BFS from ALL `Route` entries (unblocked by guards).
-fn build_any_route_bfs_tree(graph: &DiGraph<SymbolInfo, ()>) -> Vec<Option<NodeIndex>> {
+fn build_any_route_bfs_tree(graph: &DiGraph<SymbolInfo, ()>) -> BfsTree {
     let n = graph.node_count();
     let mut parent = vec![None; n];
+    let mut root = vec![None; n];
+    let mut depth = vec![0usize; n];
     let mut q = VecDeque::new();
     for idx in graph.node_indices() {
         if graph[idx].kind == SymbolKind::Route {
-            parent[idx.index()] = Some(idx);
+            let i = idx.index();
+            parent[i] = Some(idx);
+            root[i] = Some(idx);
+            depth[i] = 1;
             q.push_back(idx);
         }
     }
     while let Some(u) = q.pop_front() {
+        let ui = u.index();
         for v in graph.neighbors_directed(u, Direction::Outgoing) {
             let vi = v.index();
             if parent[vi].is_none() {
                 parent[vi] = Some(u);
+                root[vi] = root[ui];
+                depth[vi] = depth[ui] + 1;
                 q.push_back(v);
             }
         }
     }
-    parent
+    BfsTree {
+        parent,
+        root,
+        depth,
+    }
 }
 
 fn reconstruct_taint_witness(
     graph: &DiGraph<SymbolInfo, ()>,
     taint_parents: &[Option<NodeIndex>],
-    route_parents: &[Option<NodeIndex>],
+    route_parents: &BfsTree,
     sink: NodeIndex,
 ) -> Option<(String, Vec<TraceHop>)> {
     let mut rev_taint = Vec::new();
@@ -779,45 +973,54 @@ fn reconstruct_taint_witness(
 }
 
 /// Single O(V + E) multi-source forward BFS from all unguarded `Route` entries.
-/// Returns `parent[node] = Some(prev_node)` (with `Some(node)` for root Routes).
-fn build_unguarded_bfs_tree(
-    graph: &DiGraph<SymbolInfo, ()>,
-    guard: GuardKind,
-) -> Vec<Option<NodeIndex>> {
+/// Returns `BfsTree` with `parent[node]`, `root[node]`, and `depth[node]` in O(1) per node.
+fn build_unguarded_bfs_tree(graph: &DiGraph<SymbolInfo, ()>, guard: GuardKind) -> BfsTree {
     let n = graph.node_count();
     let mut parent = vec![None; n];
+    let mut root = vec![None; n];
+    let mut depth = vec![0usize; n];
     let mut q = VecDeque::new();
 
     for idx in graph.node_indices() {
         if graph[idx].kind == SymbolKind::Route && !graph[idx].guards.contains(&guard) {
-            parent[idx.index()] = Some(idx);
+            let i = idx.index();
+            parent[i] = Some(idx);
+            root[i] = Some(idx);
+            depth[i] = 1;
             q.push_back(idx);
         }
     }
 
     while let Some(u) = q.pop_front() {
+        let ui = u.index();
         for v in graph.neighbors_directed(u, Direction::Outgoing) {
             let vi = v.index();
             if parent[vi].is_none() && !graph[v].guards.contains(&guard) {
                 parent[vi] = Some(u);
+                root[vi] = root[ui];
+                depth[vi] = depth[ui] + 1;
                 q.push_back(v);
             }
         }
     }
-    parent
+    BfsTree {
+        parent,
+        root,
+        depth,
+    }
 }
 
 fn reconstruct_witness(
     graph: &DiGraph<SymbolInfo, ()>,
-    parent: &[Option<NodeIndex>],
+    tree: &BfsTree,
     sink: NodeIndex,
 ) -> Option<(String, Vec<TraceHop>)> {
-    parent[sink.index()]?;
+    let root_idx = tree.root[sink.index()]?;
+    let entry_name = graph[root_idx].name.clone();
     let mut rev_hops = Vec::new();
     let mut cur = sink;
     let mut steps = 0usize;
     let max_steps = graph.node_count().min(64);
-    let entry_name;
 
     loop {
         let s = &graph[cur];
@@ -826,22 +1029,12 @@ fn reconstruct_witness(
             symbol: s.name.clone(),
             line: s.line_start,
         });
-        let p = parent[cur.index()]?;
+        let p = tree.parent[cur.index()]?;
         if p == cur {
-            entry_name = s.name.clone();
             break;
         }
         steps += 1;
         if steps >= max_steps {
-            // Walk directly to root entry name without blowing memory on huge chains
-            let mut root_cur = p;
-            while let Some(np) = parent[root_cur.index()] {
-                if np == root_cur {
-                    break;
-                }
-                root_cur = np;
-            }
-            entry_name = graph[root_cur].name.clone();
             break;
         }
         cur = p;
@@ -1035,6 +1228,111 @@ def get_user(user_id: str):
         assert!(
             res.findings.iter().any(|f| f.rule_id == "VF-SQLI-001"),
             "FastAPI route handler parameter user_id must propagate taint to SQL sink: {:?}",
+            res.findings
+        );
+    }
+
+    #[test]
+    fn test_aliased_barrel_imports_idor_masking_and_subpath_auth() {
+        let cfg = ShellMindGuardConfig::default();
+
+        let route_src = r#"
+import { executeUnsafeSql as runSql } from './barrel';
+
+app.use('/admin', requireAuth);
+
+app.post('/billing/charge', async (req, res) => {
+    const uid = req.body.userId;
+    await runSql(uid);
+});
+
+app.get('/orders/:id', requireAuth, async (req, res) => {
+    const order = await prisma.order.findFirst({
+        where: { id: req.params.id, user_id: req.query.user_id }
+    });
+    return res.json(order);
+});
+
+app.get('/admin/orders/:id', requireAuth, async (req, res) => {
+    const order = await prisma.order.findUnique({
+        where: { id: req.params.id }
+    });
+    return res.json(order);
+});
+"#;
+        let barrel_src = r#"
+export * from './db';
+"#;
+        let db_src = r#"
+export async function executeUnsafeSql(targetId: string) {
+    let q = "UPDATE balances SET amount = 0 WHERE user_id = '";
+    q += targetId;
+    return await db.query(q);
+}
+"#;
+        let f_route = IndexedFile {
+            abs_path: "src/routes.ts".into(),
+            rel_path: "src/routes.ts".into(),
+            language: Language::TypeScript,
+            size_bytes: route_src.len() as u64,
+            mtime_ns: 0,
+            blake3_hash: String::new(),
+            cached_bytes: Some(route_src.as_bytes().to_vec()),
+        };
+        let f_barrel = IndexedFile {
+            abs_path: "src/barrel.ts".into(),
+            rel_path: "src/barrel.ts".into(),
+            language: Language::TypeScript,
+            size_bytes: barrel_src.len() as u64,
+            mtime_ns: 0,
+            blake3_hash: String::new(),
+            cached_bytes: Some(barrel_src.as_bytes().to_vec()),
+        };
+        let f_db = IndexedFile {
+            abs_path: "src/db.ts".into(),
+            rel_path: "src/db.ts".into(),
+            language: Language::TypeScript,
+            size_bytes: db_src.len() as u64,
+            mtime_ns: 0,
+            blake3_hash: String::new(),
+            cached_bytes: Some(db_src.as_bytes().to_vec()),
+        };
+
+        let s1 = parse_file_ast(&f_route, &cfg).unwrap();
+        let s2 = parse_file_ast(&f_barrel, &cfg).unwrap();
+        let s3 = parse_file_ast(&f_db, &cfg).unwrap();
+        let res = solve_guard_lattice(&[s1, s2, s3]);
+
+        // 1. Sub-path middleware `/admin` must NOT protect `/billing/charge`, and aliased + barrel import must resolve
+        assert!(
+            res.findings
+                .iter()
+                .any(|f| f.rule_id == "VF-AUTH-001" && f.entry_route == "POST /billing/charge"),
+            "Sub-path /admin middleware must not protect POST /billing/charge: {:?}",
+            res.findings
+        );
+        // 2. Multi-statement SQL concatenation via aliased barrel import must trigger VF-SQLI-001
+        assert!(
+            res.findings
+                .iter()
+                .any(|f| f.rule_id == "VF-SQLI-001" && f.entry_route == "POST /billing/charge"),
+            "Aliased barrel import + multi-statement += SQLi must be detected: {:?}",
+            res.findings
+        );
+        // 3. `user_id: req.query.user_id` must NOT satisfy ownership check (must trigger VF-IDOR-001 on /orders/:id)
+        assert!(
+            res.findings
+                .iter()
+                .any(|f| f.rule_id == "VF-IDOR-001" && f.entry_route == "GET /orders/:id"),
+            "Tainted user_id: req.query.user_id must still trigger VF-IDOR-001: {:?}",
+            res.findings
+        );
+        // 4. Admin route `/admin/orders/:id` must NOT trigger VF-IDOR-001
+        assert!(
+            !res.findings
+                .iter()
+                .any(|f| f.rule_id == "VF-IDOR-001" && f.entry_route == "GET /admin/orders/:id"),
+            "Admin route GET /admin/orders/:id must not trigger VF-IDOR-001: {:?}",
             res.findings
         );
     }

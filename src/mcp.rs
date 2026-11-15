@@ -1,13 +1,14 @@
 use crate::{ScanRunOptions, execute_scan_pipeline, write_ci_workflow};
 use anyhow::Result;
 use serde_json::{Value, json};
-use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
+use std::io::{self, BufRead, Read, Write};
+use std::path::{Component, Path, PathBuf};
 use vf_ai::build_minimal_patch_prompt;
 use vf_core::{ShellMindGuardConfig, StateStore, scan_repository};
 use vf_graph::analyze_codebase_cached;
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
+const MAX_MCP_LINE_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Runs ShellMind Guard's stdio JSON-RPC 2.0 MCP server loop.
 /// Reads newline-delimited requests from `stdin` and writes single-line responses exclusively to `stdout`.
@@ -20,7 +21,9 @@ pub fn run_stdio_server() -> Result<()> {
 
     loop {
         line.clear();
-        let n = reader.read_line(&mut line)?;
+        let n = (&mut reader)
+            .take(MAX_MCP_LINE_BYTES)
+            .read_line(&mut line)?;
         if n == 0 {
             break;
         }
@@ -185,12 +188,51 @@ fn tool_definitions() -> Value {
     ])
 }
 
+fn normalize_and_resolve_path(base_cwd: &Path, raw_path: &Path) -> PathBuf {
+    let joined = if raw_path.is_absolute() {
+        raw_path.to_path_buf()
+    } else {
+        base_cwd.join(raw_path)
+    };
+    let mut normalized = PathBuf::new();
+    for comp in joined.components() {
+        match comp {
+            Component::Prefix(p) => normalized.push(p.as_os_str()),
+            Component::RootDir => normalized.push(comp.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(seg) => normalized.push(seg),
+        }
+    }
+    if let Ok(canon) = std::fs::canonicalize(&normalized) {
+        return canon;
+    }
+    // Walk up to the nearest existing ancestor directory, canonicalize it, and re-append non-existent tail components
+    let mut cur = normalized.as_path();
+    let mut tail = Vec::new();
+    while let Some(parent) = cur.parent() {
+        if let Some(name) = cur.file_name() {
+            tail.push(name.to_os_string());
+        }
+        if let Ok(canon_parent) = std::fs::canonicalize(parent) {
+            let mut out = canon_parent;
+            for seg in tail.into_iter().rev() {
+                out.push(seg);
+            }
+            return out;
+        }
+        cur = parent;
+    }
+    normalized
+}
+
 fn validate_mcp_target_path(raw_path: &str) -> Result<PathBuf> {
-    let p = PathBuf::from(raw_path);
-    let canon = std::fs::canonicalize(&p).unwrap_or_else(|_| p.clone());
     let cwd = std::fs::canonicalize(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
         .unwrap_or_else(|_| PathBuf::from("."));
     let tmp = std::fs::canonicalize(std::env::temp_dir()).unwrap_or_else(|_| std::env::temp_dir());
+    let canon = normalize_and_resolve_path(&cwd, Path::new(raw_path));
     if !canon.starts_with(&cwd) && !canon.starts_with(&tmp) {
         anyhow::bail!(
             "Refusing MCP access outside workspace root ({}) or temp dir: {}",

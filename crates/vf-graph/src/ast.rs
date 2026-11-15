@@ -69,10 +69,12 @@ pub struct FrontendApiCall {
     pub symbol: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ImportRef {
     pub symbol_name: String,
     pub from_specifier: String,
+    #[serde(default)]
+    pub remote_name: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -300,6 +302,7 @@ pub fn parse_file_ast_with_hash(
         &mut symbols,
         &mut route_prefixes,
     );
+    route_prefixes.retain(|p| !p.starts_with("__AUTH_PREFIX__:"));
 
     let mut frontend_calls = Vec::new();
     crate::taint::extract_frontend_calls_and_bugs(
@@ -334,54 +337,42 @@ fn node_text<'a>(node: Node, src: &'a [u8]) -> &'a str {
     node.utf8_text(src).unwrap_or("")
 }
 
-fn find_line_comment_start(line: &str) -> Option<usize> {
-    let bytes = line.as_bytes();
-    for i in 0..bytes.len().saturating_sub(1) {
-        if bytes[i] == b'/' && bytes[i + 1] == b'/' {
-            if i > 0 && bytes[i - 1] == b':' {
-                continue;
-            }
-            return Some(i);
-        }
-    }
-    None
-}
-
 fn strip_comments(src: &str) -> String {
-    let mut out = String::with_capacity(src.len());
-    for line in src.lines() {
-        let trimmed = if let Some(idx) = find_line_comment_start(line) {
-            &line[..idx]
-        } else {
-            line
-        };
-        let trimmed = if let Some(idx) = trimmed.find('#') {
-            if trimmed[idx..].starts_with("#[") {
-                trimmed
-            } else {
-                &trimmed[..idx]
-            }
-        } else {
-            trimmed
-        };
-        out.push_str(trimmed);
-        out.push('\n');
-    }
-    out
+    crate::taint::strip_comments_simple(src)
 }
 
 fn is_auth_guard_ident(name: &str, cfg: &ShellMindGuardConfig) -> bool {
     let low = name.to_ascii_lowercase();
+    if low.contains("unauthenticated") || low.contains("allowanonymous") {
+        return false;
+    }
     cfg.guards.auth_guards.iter().any(|pat| {
-        low == pat.to_ascii_lowercase() || low.ends_with(&format!(".{}", pat.to_ascii_lowercase()))
+        let p = pat.to_ascii_lowercase();
+        low == p || low.ends_with(&format!(".{}", p)) || low.starts_with(&format!("{}(", p))
     })
 }
 
 fn is_lock_guard_ident(name: &str, cfg: &ShellMindGuardConfig) -> bool {
     let low = name.to_ascii_lowercase();
     cfg.guards.lock_guards.iter().any(|pat| {
-        low == pat.to_ascii_lowercase() || low.ends_with(&format!(".{}", pat.to_ascii_lowercase()))
+        let p = pat.to_ascii_lowercase();
+        low == p || low.ends_with(&format!(".{}", p)) || low.starts_with(&format!("{}(", p))
     })
+}
+
+fn contains_guard_pattern(low_text: &str, pat_low: &str) -> bool {
+    if pat_low == "authenticate" && low_text.contains("unauthenticated") {
+        let cleaned = low_text.replace("unauthenticated", "");
+        return cleaned.contains("authenticate");
+    }
+    if pat_low == "useguards"
+        && (low_text.contains("throttlerguard") || low_text.contains("ratelimitguard"))
+    {
+        return low_text.contains("auth")
+            || low_text.contains("jwt")
+            || low_text.contains("session");
+    }
+    low_text.contains(pat_low)
 }
 
 fn classify_guards(text: &str, cfg: &ShellMindGuardConfig) -> HashSet<GuardKind> {
@@ -392,7 +383,7 @@ fn classify_guards(text: &str, cfg: &ShellMindGuardConfig) -> HashSet<GuardKind>
         .guards
         .auth_guards
         .iter()
-        .any(|pat| low.contains(&pat.to_ascii_lowercase()))
+        .any(|pat| contains_guard_pattern(&low, &pat.to_ascii_lowercase()))
     {
         g.insert(GuardKind::Auth);
     }
@@ -400,7 +391,7 @@ fn classify_guards(text: &str, cfg: &ShellMindGuardConfig) -> HashSet<GuardKind>
         .guards
         .lock_guards
         .iter()
-        .any(|pat| low.contains(&pat.to_ascii_lowercase()))
+        .any(|pat| contains_guard_pattern(&low, &pat.to_ascii_lowercase()))
     {
         g.insert(GuardKind::TxLock);
     }
@@ -423,9 +414,12 @@ fn collect_call_names_shallow(node: Node, src: &[u8], out: &mut Vec<String>) {
         && let Some(func) = node.child_by_field_name("function")
     {
         let txt = node_text(func, src).trim();
+        if !txt.is_empty() {
+            out.push(txt.to_string());
+        }
         let short = txt.rsplit('.').next().unwrap_or(txt);
         let short = short.rsplit("::").next().unwrap_or(short);
-        if !short.is_empty() {
+        if !short.is_empty() && short != txt {
             out.push(short.to_string());
         }
     }
@@ -469,6 +463,14 @@ fn classify_fn_guards_cfg(
         if matches!(sk, "{" | "}" | "comment" | "line_comment" | "block_comment") {
             continue;
         }
+        // Skip Python docstrings / standalone string literal statements
+        if sk == "expression_statement" {
+            let mut sc = stmt.walk();
+            let children: Vec<Node> = stmt.named_children(&mut sc).collect();
+            if children.len() == 1 && matches!(children[0].kind(), "string" | "string_literal") {
+                continue;
+            }
+        }
         // Skip conditional branches & uncalled nested functions for unconditional guard proof
         if matches!(
             sk,
@@ -499,9 +501,17 @@ fn classify_fn_guards_cfg(
             }
         }
 
-        // Also allow SQL-level `SELECT ... FOR UPDATE` inside an unconditional top-level statement before mutation
+        // Also allow SQL-level `SELECT ... FOR UPDATE` or Python `with transaction.atomic():` before mutation
         let stmt_code = strip_comments(node_text(stmt, src)).to_ascii_lowercase();
-        if !seen_mutation && stmt_code.contains("select ") && stmt_code.contains("for update") {
+        if !seen_mutation
+            && ((stmt_code.contains("select ") && stmt_code.contains("for update"))
+                || (sk == "with_statement"
+                    && cfg
+                        .guards
+                        .lock_guards
+                        .iter()
+                        .any(|pat| stmt_code.contains(&pat.to_ascii_lowercase()))))
+        {
             guards.insert(GuardKind::TxLock);
         }
 
@@ -582,6 +592,44 @@ fn collect_calls(node: Node, src: &[u8], calls: &mut Vec<String>) {
     }
 }
 
+fn find_inline_fn_node(arg: Node) -> Option<Node> {
+    if matches!(
+        arg.kind(),
+        "arrow_function" | "function_expression" | "func_literal"
+    ) {
+        return Some(arg);
+    }
+    if (arg.kind() == "call_expression" || arg.kind() == "call")
+        && let Some(inner_args) = arg.child_by_field_name("arguments")
+    {
+        let mut c = inner_args.walk();
+        for ch in inner_args.children(&mut c) {
+            if let Some(found) = find_inline_fn_node(ch) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+fn is_rust_test_item(node: Node, src: &[u8]) -> bool {
+    let mut prev = node.prev_sibling();
+    while let Some(p) = prev {
+        if p.kind() == "attribute_item" {
+            let txt = node_text(p, src);
+            if txt.contains("cfg(test)") || txt.contains("#[test]") || txt.contains("::test") {
+                return true;
+            }
+            prev = p.prev_sibling();
+        } else if matches!(p.kind(), "line_comment" | "block_comment") {
+            prev = p.prev_sibling();
+        } else {
+            break;
+        }
+    }
+    false
+}
+
 #[allow(clippy::too_many_arguments)]
 fn extract_node(
     node: Node,
@@ -595,22 +643,48 @@ fn extract_node(
     route_prefixes: &mut Vec<String>,
 ) {
     let kind = node.kind();
+    if lang == Language::Rust
+        && matches!(kind, "mod_item" | "function_item")
+        && is_rust_test_item(node, src)
+    {
+        return;
+    }
 
-    // 1a. Cross-file imports & re-exports (TS/JS: named, default, namespace `* as`)
+    // 1a. Cross-file imports & re-exports (TS/JS: named, aliased `a as b`, default, namespace `* as`, barrel `export * from`)
     if kind == "import_statement" || kind == "export_statement" {
         let txt = node_text(node, src);
         if let Some(spec_node) = node.child_by_field_name("source") {
             let spec = node_text(spec_node, src).trim_matches(|c| c == '\'' || c == '"');
             if let (Some(lbrace), Some(rbrace)) = (txt.find('{'), txt.find('}')) {
                 for item in txt[lbrace + 1..rbrace].split(',') {
-                    let sym = item.split(" as ").next().unwrap_or(item).trim();
-                    if !sym.is_empty() {
+                    let clean_item = item.trim().trim_start_matches("type ").trim();
+                    if clean_item.is_empty() {
+                        continue;
+                    }
+                    if let Some((orig, alias)) = clean_item.split_once(" as ") {
+                        let orig = orig.trim();
+                        let alias = alias.trim();
+                        if !alias.is_empty() && !orig.is_empty() {
+                            imports.push(ImportRef {
+                                symbol_name: alias.to_string(),
+                                from_specifier: spec.to_string(),
+                                remote_name: Some(orig.to_string()),
+                            });
+                        }
+                    } else {
                         imports.push(ImportRef {
-                            symbol_name: sym.to_string(),
+                            symbol_name: clean_item.to_string(),
                             from_specifier: spec.to_string(),
+                            remote_name: None,
                         });
                     }
                 }
+            } else if kind == "export_statement" && txt.contains('*') {
+                imports.push(ImportRef {
+                    symbol_name: "*".to_string(),
+                    from_specifier: spec.to_string(),
+                    remote_name: None,
+                });
             }
             // Also extract default import (`import foo from './y'`) or namespace (`import * as ns from './y'`)
             if let Some(clause) = txt
@@ -629,19 +703,21 @@ fn extract_node(
                         imports.push(ImportRef {
                             symbol_name: sym.to_string(),
                             from_specifier: spec.to_string(),
+                            remote_name: Some("*".to_string()),
                         });
                     }
                 } else if !before_brace.is_empty() && !before_brace.contains('*') {
                     imports.push(ImportRef {
                         symbol_name: before_brace.to_string(),
                         from_specifier: spec.to_string(),
+                        remote_name: None,
                     });
                 }
             }
         }
     }
 
-    // 1a-cjs. CommonJS `const { a, b } = require('./y')` or `const mod = require('./y')`
+    // 1a-cjs. CommonJS `const { a, b: alias } = require('./y')` or `const mod = require('./y')`
     if (lang == Language::TypeScript || lang == Language::JavaScript)
         && kind == "variable_declarator"
         && let (Some(name_node), Some(val_node)) = (
@@ -661,18 +737,32 @@ fn extract_node(
             let ntxt = node_text(name_node, src).trim();
             if let (Some(lbrace), Some(rbrace)) = (ntxt.find('{'), ntxt.find('}')) {
                 for item in ntxt[lbrace + 1..rbrace].split(',') {
-                    let sym = item.split(':').next().unwrap_or(item).trim();
-                    if !sym.is_empty() {
-                        imports.push(ImportRef {
-                            symbol_name: sym.to_string(),
-                            from_specifier: spec.to_string(),
-                        });
+                    if let Some((orig, alias)) = item.split_once(':') {
+                        let orig = orig.trim();
+                        let alias = alias.trim();
+                        if !alias.is_empty() {
+                            imports.push(ImportRef {
+                                symbol_name: alias.to_string(),
+                                from_specifier: spec.to_string(),
+                                remote_name: Some(orig.to_string()),
+                            });
+                        }
+                    } else {
+                        let sym = item.trim();
+                        if !sym.is_empty() {
+                            imports.push(ImportRef {
+                                symbol_name: sym.to_string(),
+                                from_specifier: spec.to_string(),
+                                remote_name: None,
+                            });
+                        }
                     }
                 }
             } else if !ntxt.is_empty() {
                 imports.push(ImportRef {
                     symbol_name: ntxt.to_string(),
                     from_specifier: spec.to_string(),
+                    remote_name: None,
                 });
             }
         }
@@ -691,22 +781,38 @@ fn extract_node(
                 for item in tail[1..tail.len() - 1].split(',') {
                     let sym = item.trim();
                     if !sym.is_empty() {
-                        imports.push(ImportRef {
-                            symbol_name: sym.to_string(),
-                            from_specifier: spec.clone(),
-                        });
+                        if let Some((orig, alias)) = sym.split_once(" as ") {
+                            imports.push(ImportRef {
+                                symbol_name: alias.trim().to_string(),
+                                from_specifier: spec.clone(),
+                                remote_name: Some(orig.trim().to_string()),
+                            });
+                        } else {
+                            imports.push(ImportRef {
+                                symbol_name: sym.to_string(),
+                                from_specifier: spec.clone(),
+                                remote_name: None,
+                            });
+                        }
                     }
                 }
+            } else if let Some((orig, alias)) = tail.split_once(" as ") {
+                imports.push(ImportRef {
+                    symbol_name: alias.trim().to_string(),
+                    from_specifier: spec,
+                    remote_name: Some(orig.trim().to_string()),
+                });
             } else {
                 imports.push(ImportRef {
                     symbol_name: tail.trim().to_string(),
                     from_specifier: spec,
+                    remote_name: None,
                 });
             }
         }
     }
 
-    // 1c. Python `from .services import foo, bar`
+    // 1c. Python `from .services import foo, bar as baz`
     if lang == Language::Python && kind == "import_from_statement" {
         let txt = node_text(node, src);
         if let Some(rest) = txt.strip_prefix("from ")
@@ -714,11 +820,21 @@ fn extract_node(
         {
             let spec = format!("py::{}", mod_part.trim());
             for item in imp_part.split(',') {
-                let sym = item.split(" as ").next().unwrap_or(item).trim();
-                if !sym.is_empty() {
+                let clean = item.trim().trim_matches(|c| c == '(' || c == ')').trim();
+                if clean.is_empty() {
+                    continue;
+                }
+                if let Some((orig, alias)) = clean.split_once(" as ") {
                     imports.push(ImportRef {
-                        symbol_name: sym.to_string(),
+                        symbol_name: alias.trim().to_string(),
                         from_specifier: spec.clone(),
+                        remote_name: Some(orig.trim().to_string()),
+                    });
+                } else {
+                    imports.push(ImportRef {
+                        symbol_name: clean.to_string(),
+                        from_specifier: spec.clone(),
+                        remote_name: None,
                     });
                 }
             }
@@ -734,20 +850,36 @@ fn extract_node(
         if ftxt.ends_with(".use")
             && let Some(args) = node.child_by_field_name("arguments")
         {
+            let mut use_prefix: Option<String> = None;
+            let mut has_auth_mw = false;
             let mut c = args.walk();
             for arg in args.children(&mut c) {
                 let atxt = node_text(arg, src).trim();
                 if atxt.starts_with('\'') || atxt.starts_with('"') {
                     let unq = atxt.trim_matches(|ch| ch == '\'' || ch == '"');
-                    if unq.starts_with('/')
-                        && unq.len() > 1
-                        && !route_prefixes.iter().any(|p| p == unq)
-                    {
-                        route_prefixes.push(unq.to_string());
+                    if unq.starts_with('/') {
+                        use_prefix = Some(unq.to_string());
+                        if unq.len() > 1 && !route_prefixes.iter().any(|p| p == unq) {
+                            route_prefixes.push(unq.to_string());
+                        }
                     }
                 }
-                if is_auth_guard_ident(atxt, cfg) {
-                    file_middleware_guards.insert(GuardKind::Auth);
+                let short_mw = atxt.split('(').next().unwrap_or(atxt).trim();
+                if is_auth_guard_ident(atxt, cfg) || is_auth_guard_ident(short_mw, cfg) {
+                    has_auth_mw = true;
+                }
+            }
+            if has_auth_mw {
+                match use_prefix.as_deref() {
+                    None | Some("/") | Some("/api") => {
+                        file_middleware_guards.insert(GuardKind::Auth);
+                    }
+                    Some(p) if p.starts_with("/api/v") => {
+                        file_middleware_guards.insert(GuardKind::Auth);
+                    }
+                    Some(sub) => {
+                        route_prefixes.push(format!("__AUTH_PREFIX__:{}", sub));
+                    }
                 }
             }
         }
@@ -775,6 +907,7 @@ fn extract_node(
 
     // 2a. Universal TS/JS HTTP Route entries (Express, Fastify, Hono, Koa, custom routers):
     // `<router>.(get|post|put|patch|delete)('/...', ...middlewares, handler)`
+    // Also supports chained `router.route('/...').post(handler)` and wrapped `asyncHandler(async (req, res) => ...)`
     if (lang == Language::TypeScript || lang == Language::JavaScript)
         && kind == "call_expression"
         && let Some(func) = node.child_by_field_name("function")
@@ -792,6 +925,19 @@ fn extract_node(
             && let Some(args) = node.child_by_field_name("arguments")
         {
             let mut route_path: Option<String> = None;
+            // Support Express chained `router.route('/api/pay').post(handler)`
+            if let Some(rpos) = ftxt.find(".route(") {
+                let rest = &ftxt[rpos + 7..];
+                if let Some(q1) = rest.find(['\'', '"']) {
+                    let qch = rest.as_bytes()[q1] as char;
+                    if let Some(q2) = rest[q1 + 1..].find(qch) {
+                        let cand = &rest[q1 + 1..q1 + 1 + q2];
+                        if cand.starts_with('/') {
+                            route_path = Some(cand.to_string());
+                        }
+                    }
+                }
+            }
             let mut calls = Vec::new();
             let mut guards = file_middleware_guards.clone();
             let mut seen_handler = false;
@@ -821,19 +967,19 @@ fn extract_node(
                             seen_handler = true;
                         }
                         calls.push(atxt.to_string());
-                    } else if matches!(ak, "arrow_function" | "function_expression") {
+                    } else if let Some(fn_arg) = find_inline_fn_node(arg) {
                         seen_handler = true;
-                        let inline_body = node_text(arg, src);
-                        let inline_guards = classify_fn_guards_cfg(arg, src, cfg);
+                        let inline_body = node_text(fn_arg, src);
+                        let inline_guards = classify_fn_guards_cfg(fn_arg, src, cfg);
                         guards.extend(inline_guards);
-                        collect_calls(arg, src, &mut calls);
+                        collect_calls(fn_arg, src, &mut calls);
 
                         let handler_label = route_path
                             .as_deref()
                             .map(|rp| format!("{} {}", method.to_ascii_uppercase(), rp))
                             .unwrap_or_else(|| format!("inline_{}", line_start));
                         let t_inline = crate::taint::analyze_function_taint(
-                            arg,
+                            fn_arg,
                             src,
                             rel_path,
                             lang,
@@ -847,16 +993,16 @@ fn extract_node(
                             let inline_id = format!("{}::inline_sink:{}", rel_path, line_start);
                             let inline_name = format!("inline_sink_{}", line_start);
                             let mut inline_calls = Vec::new();
-                            collect_calls(arg, src, &mut inline_calls);
+                            collect_calls(fn_arg, src, &mut inline_calls);
                             let mut sink_sym = SymbolInfo::base(
                                 inline_id,
                                 rel_path,
                                 inline_name.clone(),
                                 SymbolKind::Sink,
                                 Some(sk),
-                                arg.start_position().row + 1,
-                                arg.end_position().row + 1,
-                                classify_fn_guards_cfg(arg, src, cfg),
+                                fn_arg.start_position().row + 1,
+                                fn_arg.end_position().row + 1,
+                                classify_fn_guards_cfg(fn_arg, src, cfg),
                                 inline_calls,
                                 None,
                             );
@@ -870,14 +1016,30 @@ fn extract_node(
                         }
                         route_taints.push(t_inline);
                     } else {
-                        if !seen_handler && is_auth_guard_ident(atxt, cfg) {
+                        let short_call = atxt.split('(').next().unwrap_or(atxt).trim();
+                        if !seen_handler
+                            && (is_auth_guard_ident(atxt, cfg)
+                                || is_auth_guard_ident(short_call, cfg))
+                        {
                             guards.insert(GuardKind::Auth);
+                        } else if !seen_handler
+                            && (is_lock_guard_ident(atxt, cfg)
+                                || is_lock_guard_ident(short_call, cfg))
+                        {
+                            guards.insert(GuardKind::TxLock);
                         }
                         collect_calls(arg, src, &mut calls);
                     }
                 }
             }
             if let Some(rp) = route_path {
+                for marker in route_prefixes.iter() {
+                    if let Some(sub) = marker.strip_prefix("__AUTH_PREFIX__:")
+                        && (rp == sub || rp.starts_with(&format!("{}/", sub.trim_end_matches('/'))))
+                    {
+                        guards.insert(GuardKind::Auth);
+                    }
+                }
                 let r_label = format!("{} {}", method.to_ascii_uppercase(), rp);
                 let has_res_id = crate::taint::has_resource_id_expr("", Some(&rp));
                 let mut route_sym = SymbolInfo::base(
@@ -1045,7 +1207,7 @@ fn extract_node(
         }
     }
 
-    // 2c. Python Flask / FastAPI `@app.post("/api/...")` decorated_definition (B06)
+    // 2c. Python Flask / FastAPI `@app.post("/api/...")` or `@app.route("/api/...", methods=[...])` decorated_definition (B06)
     if lang == Language::Python && kind == "decorated_definition" {
         let mut route_method = None;
         let mut route_path = None;
@@ -1067,6 +1229,29 @@ fn extract_node(
                                 route_path = Some(rest[q1 + 1..q1 + 1 + q2].to_string());
                             }
                         }
+                    }
+                }
+                if route_method.is_none()
+                    && let Some(pos) = dtxt.find(".route(")
+                {
+                    let rest = &dtxt[pos + 7..];
+                    if let Some(q1) = rest.find(['\'', '"']) {
+                        let qch = rest.as_bytes()[q1] as char;
+                        if let Some(q2) = rest[q1 + 1..].find(qch) {
+                            route_path = Some(rest[q1 + 1..q1 + 1 + q2].to_string());
+                        }
+                    }
+                    let upper = dtxt.to_ascii_uppercase();
+                    if upper.contains("POST") {
+                        route_method = Some("POST".to_string());
+                    } else if upper.contains("PUT") {
+                        route_method = Some("PUT".to_string());
+                    } else if upper.contains("PATCH") {
+                        route_method = Some("PATCH".to_string());
+                    } else if upper.contains("DELETE") {
+                        route_method = Some("DELETE".to_string());
+                    } else {
+                        route_method = Some("GET".to_string());
                     }
                 }
                 dec_guards.extend(classify_guards(dtxt, cfg));
@@ -1173,7 +1358,7 @@ fn extract_node(
         }
     }
 
-    // 2c-django. Python Django `path("api/...", views.my_view)`
+    // 2c-django. Python Django `path("api/...", views.my_view)` or `path("api/...", MyView.as_view())`
     if lang == Language::Python
         && kind == "call"
         && let Some(func) = node.child_by_field_name("function")
@@ -1195,7 +1380,11 @@ fn extract_node(
                         format!("/{}", rp)
                     });
                 } else if !matches!(arg.kind(), "(" | ")" | "," | "keyword_argument") {
-                    let short = atxt.rsplit('.').next().unwrap_or(atxt).trim();
+                    let cleaned = atxt
+                        .strip_suffix(".as_view()")
+                        .or_else(|| atxt.split(".as_view(").next())
+                        .unwrap_or(atxt);
+                    let short = cleaned.rsplit('.').next().unwrap_or(cleaned).trim();
                     if !short.is_empty() {
                         calls.push(short.to_string());
                     }
@@ -1234,6 +1423,7 @@ fn extract_node(
         let ftxt = node_text(func, src);
         let method = ftxt.rsplit('.').next().unwrap_or("");
         let method_upper = method.to_ascii_uppercase();
+        let mut group_prefix: Option<String> = None;
         if (method == "Group" || method == "Use")
             && let Some(args) = node.child_by_field_name("arguments")
         {
@@ -1242,18 +1432,33 @@ fn extract_node(
                 let atxt = node_text(arg, src).trim();
                 if atxt.starts_with('"') || atxt.starts_with('`') {
                     let unq = atxt.trim_matches(|ch| ch == '"' || ch == '`');
-                    if unq.starts_with('/')
-                        && unq.len() > 1
-                        && !route_prefixes.iter().any(|p| p == unq)
-                    {
-                        route_prefixes.push(unq.to_string());
+                    if unq.starts_with('/') {
+                        group_prefix = Some(unq.to_string());
+                        if unq.len() > 1 && !route_prefixes.iter().any(|p| p == unq) {
+                            route_prefixes.push(unq.to_string());
+                        }
                     }
                 }
             }
         }
         if method == "Group" || method == "Use" {
             let gtxt = node_text(node, src);
-            file_middleware_guards.extend(classify_guards(gtxt, cfg));
+            let mw_guards = classify_guards(gtxt, cfg);
+            if !mw_guards.is_empty() {
+                match group_prefix.as_deref() {
+                    None | Some("/") | Some("/api") => {
+                        file_middleware_guards.extend(mw_guards);
+                    }
+                    Some(p) if p.starts_with("/api/v") => {
+                        file_middleware_guards.extend(mw_guards);
+                    }
+                    Some(sub) => {
+                        if mw_guards.contains(&GuardKind::Auth) {
+                            route_prefixes.push(format!("__AUTH_PREFIX__:{}", sub));
+                        }
+                    }
+                }
+            }
         }
         let is_go_http = matches!(
             method_upper.as_str(),
@@ -1265,7 +1470,11 @@ fn extract_node(
         {
             let mut route_path = None;
             let mut calls = Vec::new();
-            let mut guards = file_middleware_guards.clone();
+            let mut guards = if method_upper == "HANDLEFUNC" {
+                HashSet::new()
+            } else {
+                file_middleware_guards.clone()
+            };
             let mut seen_handler = false;
             let mut route_taints = Vec::new();
             let line_start = node.start_position().row + 1;
@@ -1346,6 +1555,13 @@ fn extract_node(
             }
 
             if let Some(rp) = route_path {
+                for marker in route_prefixes.iter() {
+                    if let Some(sub) = marker.strip_prefix("__AUTH_PREFIX__:")
+                        && (rp == sub || rp.starts_with(&format!("{}/", sub.trim_end_matches('/'))))
+                    {
+                        guards.insert(GuardKind::Auth);
+                    }
+                }
                 let label_method = if method_upper == "HANDLEFUNC" {
                     "HTTP".to_string()
                 } else {
@@ -1374,13 +1590,17 @@ fn extract_node(
         }
     }
 
-    // 2e. Next.js App Router (`app/**/route.ts|js`): exported GET/POST/PUT/PATCH/DELETE
+    // 2e. Next.js App Router (`app/**/route.ts|js`): exported GET/POST/PUT/PATCH/DELETE (function or const arrow)
     if (lang == Language::TypeScript || lang == Language::JavaScript)
         && (rel_path.ends_with("/route.ts")
             || rel_path.ends_with("/route.tsx")
             || rel_path.ends_with("/route.js")
             || rel_path == "route.ts")
-        && kind == "function_declaration"
+        && (kind == "function_declaration"
+            || (kind == "variable_declarator"
+                && node
+                    .child_by_field_name("value")
+                    .is_some_and(|v| matches!(v.kind(), "arrow_function" | "function_expression"))))
         && let Some(name_node) = node.child_by_field_name("name")
     {
         let fn_name = node_text(name_node, src).trim().to_string();
@@ -1388,15 +1608,19 @@ fn extract_node(
             fn_name.as_str(),
             "GET" | "POST" | "PUT" | "PATCH" | "DELETE"
         ) {
-            let route_p = format!(
-                "/{}",
-                rel_path
-                    .trim_start_matches("src/")
-                    .trim_start_matches("app/")
-                    .trim_end_matches("/route.ts")
-                    .trim_end_matches("/route.tsx")
-                    .trim_end_matches("/route.js")
-            );
+            let after_app = rel_path
+                .rsplit_once("app/")
+                .map(|(_, tail)| tail)
+                .unwrap_or_else(|| rel_path.trim_start_matches("src/"));
+            let trimmed_route = after_app
+                .trim_end_matches("/route.ts")
+                .trim_end_matches("/route.tsx")
+                .trim_end_matches("/route.js");
+            let clean_segs: Vec<&str> = trimmed_route
+                .split('/')
+                .filter(|seg| !seg.is_empty() && !(seg.starts_with('(') && seg.ends_with(')')))
+                .collect();
+            let route_p = format!("/{}", clean_segs.join("/"));
             let line_start = node.start_position().row + 1;
             let line_end = node.end_position().row + 1;
             let has_res_id = crate::taint::has_resource_id_expr("", Some(&route_p));
@@ -1475,13 +1699,14 @@ fn extract_node(
         } else {
             SymbolKind::Function
         };
+        let line_start = node.start_position().row + 1;
         let mut sym = SymbolInfo::base(
-            format!("{}::{}", rel_path, name),
+            format!("{}::{}:{}", rel_path, name, line_start),
             rel_path,
             name.clone(),
             sym_kind,
             sink_kind,
-            node.start_position().row + 1,
+            line_start,
             node.end_position().row + 1,
             guards,
             calls,
@@ -1512,13 +1737,14 @@ fn extract_node(
         } else {
             SymbolKind::Function
         };
+        let line_start = node.start_position().row + 1;
         let mut sym = SymbolInfo::base(
-            format!("{}::{}", rel_path, name),
+            format!("{}::{}:{}", rel_path, name, line_start),
             rel_path,
             name.clone(),
             sym_kind,
             sink_kind,
-            node.start_position().row + 1,
+            line_start,
             node.end_position().row + 1,
             guards,
             calls,
@@ -1588,7 +1814,17 @@ pub fn resolve_import_target(
         }
 
         let cleaned = rs_spec.strip_prefix("crate/").unwrap_or(rs_spec);
-        for prefix in ["src/", ""] {
+        // Check workspace crate root relative to `from_file` (e.g. `crates/foo/src/lib.rs`) as well as repo root `src/`
+        let crate_src_prefix = from_file
+            .rfind("/src/")
+            .map(|idx| format!("{}/src/", &from_file[..idx]));
+        let mut prefixes = vec!["src/".to_string(), String::new()];
+        if let Some(cp) = crate_src_prefix
+            && !prefixes.contains(&cp)
+        {
+            prefixes.insert(0, cp);
+        }
+        for prefix in &prefixes {
             for ext in [".rs", "/mod.rs"] {
                 let cand = format!("{}{}{}", prefix, cleaned, ext);
                 if known_files.contains(&cand) {
@@ -1636,18 +1872,24 @@ pub fn resolve_import_target(
 
     // 3. TS/JS `@/` or `~/` path aliases
     if let Some(alias_rest) = spec.strip_prefix("@/").or_else(|| spec.strip_prefix("~/")) {
+        let stripped_js = alias_rest
+            .strip_suffix(".js")
+            .or_else(|| alias_rest.strip_suffix(".mjs"))
+            .unwrap_or(alias_rest);
         for prefix in ["src/", ""] {
-            for ext in ["", ".ts", ".tsx", ".js", ".jsx", "/index.ts", "/index.js"] {
-                let cand = format!("{}{}{}", prefix, alias_rest, ext);
-                if known_files.contains(&cand) {
-                    return Some(cand);
+            for stem in [alias_rest, stripped_js] {
+                for ext in ["", ".ts", ".tsx", ".js", ".jsx", "/index.ts", "/index.js"] {
+                    let cand = format!("{}{}{}", prefix, stem, ext);
+                    if known_files.contains(&cand) {
+                        return Some(cand);
+                    }
                 }
             }
         }
         return None;
     }
 
-    // 4. Relative `./` or `../` imports
+    // 4. Relative `./` or `../` imports (including NodeNext `.js` -> `.ts` resolution)
     if !spec.starts_with('.') {
         return None;
     }
@@ -1664,10 +1906,16 @@ pub fn resolve_import_target(
         }
     }
     let base = stack.join("/");
-    for ext in ["", ".ts", ".tsx", ".js", ".jsx", "/index.ts", "/index.js"] {
-        let cand = format!("{}{}", base, ext);
-        if known_files.contains(&cand) {
-            return Some(cand);
+    let stripped_js = base
+        .strip_suffix(".js")
+        .or_else(|| base.strip_suffix(".mjs"))
+        .unwrap_or(&base);
+    for stem in [base.as_str(), stripped_js] {
+        for ext in ["", ".ts", ".tsx", ".js", ".jsx", "/index.ts", "/index.js"] {
+            let cand = format!("{}{}", stem, ext);
+            if known_files.contains(&cand) {
+                return Some(cand);
+            }
         }
     }
     None

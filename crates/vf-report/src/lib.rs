@@ -3,12 +3,56 @@ use std::collections::HashMap;
 use vf_graph::{GraphAnalysisResult, LatticeFinding};
 use vf_sandbox::{VerificationStatus, VerifiedFinding};
 
+fn security_severity_score(sev: &str) -> &'static str {
+    match sev {
+        "CRITICAL" => "9.0",
+        "HIGH" => "7.5",
+        "MEDIUM" => "5.0",
+        "LOW" => "2.5",
+        _ => "5.0",
+    }
+}
+
+fn fnv1a_hex(s: &str) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in s.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{:016x}", hash)
+}
+
 /// Exports findings in standard SARIF 2.1.0 format for GitHub Code Scanning & CI/CD.
 pub fn to_sarif_json(findings: &[LatticeFinding], verified: &[VerifiedFinding]) -> String {
     let ver_map: HashMap<&str, &VerifiedFinding> = verified
         .iter()
         .map(|v| (v.finding_id.as_str(), v))
         .collect();
+
+    let mut rules: Vec<serde_json::Value> = Vec::new();
+    let mut seen_rules: HashMap<String, usize> = HashMap::new();
+    for f in findings {
+        if !seen_rules.contains_key(&f.rule_id) {
+            let idx = rules.len();
+            seen_rules.insert(f.rule_id.clone(), idx);
+            rules.push(json!({
+                "id": f.rule_id,
+                "name": f.rule_id,
+                "shortDescription": { "text": f.title },
+                "help": {
+                    "text": if f.remediation.is_empty() {
+                        f.title.clone()
+                    } else {
+                        f.remediation.clone()
+                    }
+                },
+                "properties": {
+                    "security-severity": security_severity_score(&f.severity),
+                    "tags": ["security", "shellmind-guard"]
+                }
+            }));
+        }
+    }
 
     let results: Vec<serde_json::Value> = findings
         .iter()
@@ -28,9 +72,16 @@ pub fn to_sarif_json(findings: &[LatticeFinding], verified: &[VerifiedFinding]) 
             };
 
             let primary_hop = f.witness_path.last().or_else(|| f.witness_path.first());
-            let uri =
-                percent_encode_uri_path(primary_hop.map(|h| h.file.as_str()).unwrap_or("unknown"));
-            let start_line = primary_hop.map(|h| h.line.max(1)).unwrap_or(1);
+            let raw_file = primary_hop
+                .map(|h| h.file.as_str())
+                .filter(|s| !s.is_empty())
+                .or_else(|| (!f.file.is_empty()).then_some(f.file.as_str()))
+                .unwrap_or("unknown");
+            let uri = percent_encode_uri_path(raw_file);
+            let start_line = primary_hop
+                .map(|h| h.line)
+                .filter(|&l| l > 0)
+                .unwrap_or_else(|| f.line.max(1));
 
             let thread_locations: Vec<serde_json::Value> = f
                 .witness_path
@@ -60,10 +111,19 @@ pub fn to_sarif_json(findings: &[LatticeFinding], verified: &[VerifiedFinding]) 
                 None => format!("[{}] {}", status_tag, f.title),
             };
 
+            let fingerprint = fnv1a_hex(&format!(
+                "{}|{}|{}|{}",
+                f.rule_id, raw_file, start_line, f.entry_route
+            ));
+
             json!({
                 "ruleId": f.rule_id,
+                "ruleIndex": seen_rules.get(&f.rule_id).copied().unwrap_or(0),
                 "level": level,
                 "message": { "text": msg },
+                "partialFingerprints": {
+                    "primaryLocationLineHash": fingerprint
+                },
                 "locations": [{
                     "physicalLocation": {
                         "artifactLocation": { "uri": uri },
@@ -87,7 +147,8 @@ pub fn to_sarif_json(findings: &[LatticeFinding], verified: &[VerifiedFinding]) 
                 "driver": {
                     "name": "ShellMind Guard",
                     "informationUri": "https://github.com/qira-dev/ShellMind-Guard",
-                    "version": env!("CARGO_PKG_VERSION")
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "rules": rules
                 }
             },
             "results": results
