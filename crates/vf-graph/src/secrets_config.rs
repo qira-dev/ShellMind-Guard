@@ -1,4 +1,4 @@
-use crate::ast::{GuardKind, LocalStaticFinding, SinkKind};
+use crate::ast::{Confidence, GuardKind, LocalStaticFinding, SinkKind};
 use regex::Regex;
 use std::collections::HashMap;
 use std::path::Path;
@@ -320,6 +320,11 @@ fn make_sec_finding(
         symbol: format!("{}:{}", rel_path, line),
         sink_kind: SinkKind::SecretLeak,
         missing_guard: GuardKind::SecretPolicy,
+        confidence: if rule_id == "VF-SEC-ENTROPY" {
+            Confidence::Heuristic
+        } else {
+            Confidence::Confirmed
+        },
         remediation: remediation.to_string(),
     }
 }
@@ -341,6 +346,11 @@ fn make_cfg_finding(
         symbol: format!("{}:{}", rel_path, line),
         sink_kind: SinkKind::Misconfiguration,
         missing_guard: GuardKind::ConfigPolicy,
+        confidence: if rule_id == "VF-CFG-DEBUG" {
+            Confidence::Heuristic
+        } else {
+            Confidence::Confirmed
+        },
         remediation: remediation.to_string(),
     }
 }
@@ -796,7 +806,172 @@ pub fn scan_secrets_and_config(rel_path: &str, content: &str) -> Vec<LocalStatic
         ));
     }
 
+    scan_jwt_logic_flaws(rel_path, content, is_rust, &mut findings);
+
     findings
+}
+
+fn jwt_alg_none_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r#"(?i)(?:\b(?:alg|algorithm)\b\s*[:=]\s*["']none["']|\balgorithms\b\s*[:=]\s*\[[^\]]*["']none["']|\bSigningMethodNone\b|\bAlgorithm::None\b)"#,
+        )
+        .expect("valid jwt alg none regex")
+    })
+}
+
+fn jwt_unverified_sig_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r#"(?i)(?:\bverify\s*=\s*False\b|["']?verify_signature["']?\s*[:=]\s*(?:False|false)\b|\bParseUnverified\s*\(|\bdangerouslyDisableSignatureValidation\b|\bignoreSignature\s*[:=]\s*true\b)"#,
+        )
+        .expect("valid jwt verify false regex")
+    })
+}
+
+fn scan_jwt_logic_flaws(
+    rel_path: &str,
+    content: &str,
+    is_rust: bool,
+    findings: &mut Vec<LocalStaticFinding>,
+) {
+    let low_path = rel_path.to_ascii_lowercase();
+    let is_code = low_path.ends_with(".js")
+        || low_path.ends_with(".mjs")
+        || low_path.ends_with(".cjs")
+        || low_path.ends_with(".ts")
+        || low_path.ends_with(".tsx")
+        || low_path.ends_with(".jsx")
+        || low_path.ends_with(".py")
+        || low_path.ends_with(".go")
+        || low_path.ends_with(".rs");
+    if !is_code {
+        return;
+    }
+
+    let low_all = content.to_ascii_lowercase();
+    let has_jwt_context = low_all.contains("jwt")
+        || low_all.contains("jsonwebtoken")
+        || low_all.contains("jose")
+        || low_all.contains("pyjwt");
+    let has_js_verify = low_all.contains("jwt.verify(")
+        || low_all.contains("jwtverify(")
+        || low_all.contains("jsonwebtoken.verify(");
+
+    let mut in_cfg_test = false;
+    let mut test_brace_depth: i32 = 0;
+    let mut test_saw_open_brace = false;
+    let mut in_decode_call = false;
+    let mut decode_start_ln = 0usize;
+    let mut decode_window_buf = String::new();
+    let mut decode_lines_left = 0usize;
+
+    for (idx, line) in content.lines().enumerate() {
+        let ln = idx + 1;
+        let trimmed = line.trim();
+
+        if is_rust {
+            if trimmed.starts_with("#[cfg(test)]") {
+                in_cfg_test = true;
+                test_brace_depth = 0;
+                test_saw_open_brace = false;
+            }
+            if in_cfg_test {
+                for ch in line.chars() {
+                    if ch == '{' {
+                        test_brace_depth += 1;
+                        test_saw_open_brace = true;
+                    } else if ch == '}' {
+                        test_brace_depth -= 1;
+                        if test_saw_open_brace && test_brace_depth <= 0 {
+                            in_cfg_test = false;
+                            break;
+                        }
+                    }
+                }
+                if !test_saw_open_brace && trimmed.ends_with(';') {
+                    in_cfg_test = false;
+                }
+                continue;
+            }
+        }
+
+        if trimmed.is_empty()
+            || trimmed.starts_with("//")
+            || trimmed.starts_with('#')
+            || trimmed.starts_with("/*")
+            || trimmed.starts_with('*')
+        {
+            continue;
+        }
+        // Skip regex definition string literals inside source analyzers themselves
+        if trimmed.contains("Regex::new(") || trimmed.starts_with("r#\"") {
+            continue;
+        }
+
+        if has_jwt_context && jwt_alg_none_re().is_match(line) {
+            findings.push(make_cfg_finding(
+                "VF-CFG-JWT-LOGIC",
+                "CRITICAL",
+                "JWT accepts insecure unsigned 'none' algorithm (signature bypass risk)".into(),
+                rel_path,
+                ln,
+                "Reject unsigned 'none' JWT tokens and enforce an explicit asymmetric/HMAC algorithm allowlist (e.g., HS256 or RS256).",
+            ));
+        }
+
+        if has_jwt_context && jwt_unverified_sig_re().is_match(line) {
+            findings.push(make_cfg_finding(
+                "VF-CFG-JWT-LOGIC",
+                "CRITICAL",
+                "JWT verification disabled cryptographic signature validation".into(),
+                rel_path,
+                ln,
+                "Enable cryptographic signature verification (`jwt.verify` with pinned algorithm list) before trusting JWT claims.",
+            ));
+        }
+
+        // Track multi-line `jwt.decode(...)` calls in Python (for `options={"verify_signature": False}`) or JS unverified decode
+        if line.contains("jwt.decode(") {
+            in_decode_call = true;
+            decode_start_ln = ln;
+            decode_window_buf.clear();
+            decode_window_buf.push_str(line);
+            decode_lines_left = 6;
+
+            if (low_path.ends_with(".js")
+                || low_path.ends_with(".ts")
+                || low_path.ends_with(".mjs")
+                || low_path.ends_with(".cjs"))
+                && !has_js_verify
+                && !line.contains("complete: true")
+            {
+                let mut f = make_cfg_finding(
+                    "VF-CFG-JWT-LOGIC",
+                    "HIGH",
+                    "`jwt.decode()` decodes JWT payload without verifying signature (`jwt.verify()` missing)".into(),
+                    rel_path,
+                    ln,
+                    "Replace `jwt.decode()` with `jwt.verify(token, secret, { algorithms: [...] })` before trusting token claims.",
+                );
+                f.confidence = Confidence::Heuristic;
+                findings.push(f);
+            }
+        } else if in_decode_call && decode_lines_left > 0 {
+            decode_lines_left -= 1;
+            decode_window_buf.push(' ');
+            decode_window_buf.push_str(trimmed);
+            if jwt_unverified_sig_re().is_match(trimmed) {
+                // Already emitted at `ln` above; close window to prevent duplicates
+                in_decode_call = false;
+            } else if trimmed.contains(')') {
+                let _ = decode_start_ln;
+                in_decode_call = false;
+            }
+        }
+    }
 }
 
 fn glob_match(pattern: &str, text: &str) -> bool {

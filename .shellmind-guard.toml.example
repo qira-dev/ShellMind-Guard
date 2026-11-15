@@ -46,5 +46,17 @@ max_threads = 4
 max_file_bytes = 2097152
 
 [sandbox]
+# Default boot command and optional loopback base_url for live bwrap proofs
 # boot_cmd = "node server.mjs"
 # base_url = "http://127.0.0.1:3000"
+# Seeded dual-tenant headers for live VF-IDOR-001 verification inside bwrap
+# user_a_header = "Authorization: Bearer token-user-a"
+# user_b_header = "Authorization: Bearer token-user-b"
+# probe_body = '{"amount": 100}'
+
+[ai]
+# Opt-in only (disabled by default = zero network calls). Requires --trust-repo-config in CLI.
+# provider = "disabled"          # "disabled" | "ollama" | "openai_compatible"
+# endpoint = "http://127.0.0.1:11434"
+# model = "qwen2.5-coder:7b"
+# api_key_env = "OPENAI_API_KEY"

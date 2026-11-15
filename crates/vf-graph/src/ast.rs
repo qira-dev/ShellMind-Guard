@@ -13,6 +13,36 @@ pub enum SymbolKind {
     Sink,
 }
 
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum Confidence {
+    #[default]
+    Heuristic,
+    Confirmed,
+    Proven,
+}
+
+impl Confidence {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Confidence::Proven => "PROVEN",
+            Confidence::Confirmed => "CONFIRMED",
+            Confidence::Heuristic => "HEURISTIC",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_uppercase().as_str() {
+            "PROVEN" => Some(Confidence::Proven),
+            "CONFIRMED" => Some(Confidence::Confirmed),
+            "HEURISTIC" => Some(Confidence::Heuristic),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SinkKind {
     PaymentMutation,
@@ -23,6 +53,8 @@ pub enum SinkKind {
     CommandInjection,
     PathTraversal,
     Ssrf,
+    Xss,
+    Csrf,
     IdorDbAccess,
     SecretLeak,
     Misconfiguration,
@@ -38,6 +70,8 @@ pub enum GuardKind {
     CmdSanitizer,
     PathSanitizer,
     SsrfSanitizer,
+    XssSanitizer,
+    CsrfProtection,
     OwnershipCheck,
     SecretPolicy,
     ConfigPolicy,
@@ -55,6 +89,8 @@ pub struct LocalStaticFinding {
     pub symbol: String,
     pub sink_kind: SinkKind,
     pub missing_guard: GuardKind,
+    #[serde(default)]
+    pub confidence: Confidence,
     #[serde(default)]
     pub remediation: String,
 }
@@ -100,11 +136,19 @@ pub struct SymbolInfo {
     #[serde(default)]
     pub tainted_calls: Vec<String>,
     #[serde(default)]
+    pub tainted_call_masks: std::collections::HashMap<String, u8>,
+    #[serde(default)]
     pub param_forwarding_calls: Vec<String>,
     #[serde(default)]
     pub local_taint_hits: Vec<LocalStaticFinding>,
     #[serde(default)]
     pub param_sinks: Vec<LocalStaticFinding>,
+    #[serde(default)]
+    pub has_cookie_session_auth: bool,
+    #[serde(default)]
+    pub has_bearer_header_auth: bool,
+    #[serde(default)]
+    pub csrf_exempt: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -122,6 +166,12 @@ pub struct FileAstSummary {
     pub gitignore_lines: Option<Vec<String>>,
     #[serde(default)]
     pub is_sensitive_env_or_pem: bool,
+    #[serde(default)]
+    pub has_cookie_session_setup: bool,
+    #[serde(default)]
+    pub has_bearer_auth_setup: bool,
+    #[serde(default)]
+    pub has_global_csrf_guard: bool,
 }
 
 impl SymbolInfo {
@@ -154,9 +204,13 @@ impl SymbolInfo {
             has_db_crud_sink: false,
             db_crud_line: None,
             tainted_calls: Vec::new(),
+            tainted_call_masks: std::collections::HashMap::new(),
             param_forwarding_calls: Vec::new(),
             local_taint_hits: Vec::new(),
             param_sinks: Vec::new(),
+            has_cookie_session_auth: false,
+            has_bearer_header_auth: false,
+            csrf_exempt: false,
         }
     }
 
@@ -165,6 +219,12 @@ impl SymbolInfo {
         self.has_taint_source = self.has_taint_source || t.has_taint_source;
         self.has_resource_id = self.has_resource_id || t.has_resource_id;
         self.has_db_crud_sink = self.has_db_crud_sink || t.has_db_crud_sink;
+        self.has_cookie_session_auth = self.has_cookie_session_auth || t.has_cookie_session_auth;
+        self.has_bearer_header_auth = self.has_bearer_header_auth || t.has_bearer_header_auth;
+        self.csrf_exempt = self.csrf_exempt || t.csrf_exempt;
+        for (callee, mask) in t.tainted_call_masks {
+            *self.tainted_call_masks.entry(callee).or_insert(0) |= mask;
+        }
         if self.db_crud_line.is_none() {
             self.db_crud_line = t.db_crud_line;
         }
@@ -314,6 +374,12 @@ pub fn parse_file_ast_with_hash(
         &mut static_findings,
     );
 
+    let code_only = strip_comments(source);
+    let has_cookie_session_setup = crate::taint::has_cookie_session_expr(&code_only);
+    let has_bearer_auth_setup = crate::taint::has_bearer_header_expr(&code_only);
+    let has_global_csrf_guard = file_middleware_guards.contains(&GuardKind::CsrfProtection)
+        || crate::taint::has_global_csrf_middleware(&code_only);
+
     Some((
         actual_hash,
         FileAstSummary {
@@ -325,6 +391,9 @@ pub fn parse_file_ast_with_hash(
             route_prefixes,
             gitignore_lines,
             is_sensitive_env_or_pem: is_sensitive,
+            has_cookie_session_setup,
+            has_bearer_auth_setup,
+            has_global_csrf_guard,
         },
     ))
 }
@@ -394,6 +463,9 @@ fn classify_guards(text: &str, cfg: &ShellMindGuardConfig) -> HashSet<GuardKind>
         .any(|pat| contains_guard_pattern(&low, &pat.to_ascii_lowercase()))
     {
         g.insert(GuardKind::TxLock);
+    }
+    if crate::taint::has_csrf_guard_expr(&code_only) {
+        g.insert(GuardKind::CsrfProtection);
     }
     g
 }
@@ -852,6 +924,7 @@ fn extract_node(
         {
             let mut use_prefix: Option<String> = None;
             let mut has_auth_mw = false;
+            let mut has_csrf_mw = false;
             let mut c = args.walk();
             for arg in args.children(&mut c) {
                 let atxt = node_text(arg, src).trim();
@@ -868,6 +941,12 @@ fn extract_node(
                 if is_auth_guard_ident(atxt, cfg) || is_auth_guard_ident(short_mw, cfg) {
                     has_auth_mw = true;
                 }
+                if crate::taint::has_csrf_guard_expr(atxt) {
+                    has_csrf_mw = true;
+                }
+            }
+            if has_csrf_mw {
+                file_middleware_guards.insert(GuardKind::CsrfProtection);
             }
             if has_auth_mw {
                 match use_prefix.as_deref() {
@@ -1011,6 +1090,12 @@ fn extract_node(
                             sink_sym.has_resource_id = t_inline.has_resource_id;
                             sink_sym.has_taint_source = t_inline.has_taint_source;
                             sink_sym.guards.extend(t_inline.guards.iter().copied());
+                            for (callee, mask) in &t_inline.tainted_call_masks {
+                                *sink_sym
+                                    .tainted_call_masks
+                                    .entry(callee.clone())
+                                    .or_insert(0) |= *mask;
+                            }
                             symbols.push(sink_sym);
                             calls.push(inline_name);
                         }
@@ -1118,6 +1203,12 @@ fn extract_node(
                     sink_sym.has_resource_id = t.has_resource_id;
                     sink_sym.has_taint_source = t.has_taint_source;
                     sink_sym.guards.extend(t.guards.iter().copied());
+                    for (callee, mask) in &t.tainted_call_masks {
+                        *sink_sym
+                            .tainted_call_masks
+                            .entry(callee.clone())
+                            .or_insert(0) |= *mask;
+                    }
                 }
                 symbols.push(sink_sym);
                 calls.push(inline_name);
@@ -1212,12 +1303,16 @@ fn extract_node(
         let mut route_method = None;
         let mut route_path = None;
         let mut dec_guards = HashSet::new();
+        let mut dec_csrf_exempt = false;
         let mut fn_node = None;
 
         let mut cursor = node.walk();
         for ch in node.children(&mut cursor) {
             if ch.kind() == "decorator" {
                 let dtxt = node_text(ch, src);
+                if crate::taint::has_csrf_exempt_expr(dtxt) {
+                    dec_csrf_exempt = true;
+                }
                 for m in ["get", "post", "put", "patch", "delete"] {
                     let needle = format!(".{}(", m);
                     if let Some(pos) = dtxt.find(&needle) {
@@ -1280,6 +1375,7 @@ fn extract_node(
                 Some(rp),
             );
             route_sym.has_resource_id = has_res_id;
+            route_sym.csrf_exempt = dec_csrf_exempt;
             symbols.push(route_sym);
             // Continue into `fnode` to emit the Function / Sink symbol itself
             extract_node(
@@ -1293,6 +1389,42 @@ fn extract_node(
                 symbols,
                 route_prefixes,
             );
+            return;
+        } else if let Some(fnode) = fn_node
+            && (dec_csrf_exempt || !dec_guards.is_empty())
+            && let Some(name_node) = fnode.child_by_field_name("name")
+        {
+            // Decorated helper/Django view (e.g. `@csrf_exempt`, `@login_required`) without FastAPI/Flask route decorator
+            let name = node_text(name_node, src).trim().to_string();
+            let body = node_text(fnode, src);
+            let mut calls = Vec::new();
+            collect_calls(fnode, src, &mut calls);
+            let mut guards = classify_fn_guards_cfg(fnode, src, cfg);
+            guards.extend(dec_guards);
+            let sink_kind = classify_sink(&name, body);
+            let sym_kind = if sink_kind.is_some() {
+                SymbolKind::Sink
+            } else {
+                SymbolKind::Function
+            };
+            let line_start = fnode.start_position().row + 1;
+            let mut sym = SymbolInfo::base(
+                format!("{}::{}:{}", rel_path, name, line_start),
+                rel_path,
+                name.clone(),
+                sym_kind,
+                sink_kind,
+                line_start,
+                fnode.end_position().row + 1,
+                guards,
+                calls,
+                None,
+            );
+            sym.csrf_exempt = dec_csrf_exempt;
+            sym.apply_taint(crate::taint::analyze_function_taint(
+                fnode, src, rel_path, lang, &name, None,
+            ));
+            symbols.push(sym);
             return;
         }
     }
@@ -1529,6 +1661,12 @@ fn extract_node(
                         sink_sym.has_resource_id = t_inline.has_resource_id;
                         sink_sym.has_taint_source = t_inline.has_taint_source;
                         sink_sym.guards.extend(t_inline.guards.iter().copied());
+                        for (callee, mask) in &t_inline.tainted_call_masks {
+                            *sink_sym
+                                .tainted_call_masks
+                                .entry(callee.clone())
+                                .or_insert(0) |= *mask;
+                        }
                         symbols.push(sink_sym);
                         calls.push(inline_name);
                     }

@@ -1,18 +1,27 @@
 mod mcp;
 
+use anyhow::Context;
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Instant;
-use vf_ai::build_minimal_patch_prompt;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use vf_ai::{
+    apply_unified_diff_safely, build_minimal_patch_prompt, generate_patch_plan,
+    provider_from_config,
+};
 use vf_core::{DeltaStats, ShellMindGuardConfig, StateStore, scan_repository};
-use vf_graph::{GraphAnalysisResult, GuardKind, LatticeFinding, analyze_codebase_cached};
+use vf_graph::{
+    Confidence, GraphAnalysisResult, GuardKind, LatticeFinding, analyze_codebase,
+    analyze_codebase_cached,
+};
 use vf_report::{to_html_graph, to_sarif_json};
 use vf_sandbox::{
-    VerificationStatus, VerifiedFinding, verify_finding_blocking, verify_findings_in_sandbox,
+    SandboxProbeConfig, VerificationStatus, VerifiedFinding, verify_finding_blocking_with_config,
+    verify_findings_in_sandbox_with_config,
 };
 use vf_tui::{TuiLaunchConfig, run_tui};
 
@@ -30,6 +39,23 @@ enum FailSeverity {
     High,
     Medium,
     Low,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum MinConfidenceArg {
+    Proven,
+    Confirmed,
+    Heuristic,
+}
+
+impl MinConfidenceArg {
+    fn to_confidence(self) -> Confidence {
+        match self {
+            MinConfidenceArg::Proven => Confidence::Proven,
+            MinConfidenceArg::Confirmed => Confidence::Confirmed,
+            MinConfidenceArg::Heuristic => Confidence::Heuristic,
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -57,6 +83,7 @@ enum HookAction {
 pub(crate) struct ScanRunOptions<'a> {
     pub path: &'a Path,
     pub layers: &'a [String],
+    pub min_confidence: Option<Confidence>,
     pub boot_cmd: Option<String>,
     pub port: u16,
     pub sync_race: usize,
@@ -111,9 +138,15 @@ enum Commands {
         #[arg(
             long,
             value_delimiter = ',',
-            help = "Filter active layers (auth,race,taint,sqli,cmdi,path,ssrf,idor,secrets,config,deps,frontend)"
+            help = "Filter active layers (auth,race,taint,sqli,cmdi,path,ssrf,xss,csrf,idor,secrets,config,deps,frontend)"
         )]
         layers: Vec<String>,
+        #[arg(
+            long,
+            value_enum,
+            help = "Hide findings below this confidence tier (proven, confirmed, heuristic)"
+        )]
+        min_confidence: Option<MinConfidenceArg>,
         #[arg(long)]
         boot_cmd: Option<String>,
         #[arg(long, default_value_t = 39911)]
@@ -163,6 +196,17 @@ enum Commands {
         trust_repo_config: bool,
         #[arg(long)]
         patch: bool,
+        #[arg(
+            long,
+            value_name = "FILE",
+            help = "Apply an explicit unified diff file during --apply-check verification"
+        )]
+        patch_file: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "Apply the patch inside an isolated temporary workspace copy and re-verify before exiting"
+        )]
+        apply_check: bool,
     },
     /// Launch interactive panic-safe ratatui TUI workspace
     Ui {
@@ -246,6 +290,8 @@ fn finding_matches_layer(f: &LatticeFinding, layer: &str) -> bool {
                 | GuardKind::CmdSanitizer
                 | GuardKind::PathSanitizer
                 | GuardKind::SsrfSanitizer
+                | GuardKind::XssSanitizer
+                | GuardKind::CsrfProtection
                 | GuardKind::OwnershipCheck
                 | GuardKind::FrontendContract
         ),
@@ -263,11 +309,14 @@ fn finding_matches_layer(f: &LatticeFinding, layer: &str) -> bool {
                 | GuardKind::CmdSanitizer
                 | GuardKind::PathSanitizer
                 | GuardKind::SsrfSanitizer
+                | GuardKind::XssSanitizer
         ),
         "sql" | "sqli" => f.missing_guard == GuardKind::SqlSanitizer,
         "cmd" | "cmdi" => f.missing_guard == GuardKind::CmdSanitizer,
         "path" => f.missing_guard == GuardKind::PathSanitizer,
         "ssrf" => f.missing_guard == GuardKind::SsrfSanitizer,
+        "xss" => f.missing_guard == GuardKind::XssSanitizer,
+        "csrf" => f.missing_guard == GuardKind::CsrfProtection,
         "idor" => f.missing_guard == GuardKind::OwnershipCheck,
         "secrets" | "secret" => f.missing_guard == GuardKind::SecretPolicy,
         "frontend" | "fe" | "contract" => f.missing_guard == GuardKind::FrontendContract,
@@ -275,6 +324,22 @@ fn finding_matches_layer(f: &LatticeFinding, layer: &str) -> bool {
             f.rule_id.to_ascii_lowercase().contains(other)
                 || f.id.to_ascii_lowercase().contains(other)
         }
+    }
+}
+
+fn probe_config_from_cfg(cfg: &ShellMindGuardConfig) -> SandboxProbeConfig {
+    SandboxProbeConfig {
+        user_a_header: cfg.sandbox.user_a_header.clone(),
+        user_b_header: cfg.sandbox.user_b_header.clone(),
+        probe_body: cfg.sandbox.probe_body.clone(),
+    }
+}
+
+fn resolve_sandbox_port(cli_port: u16, cfg: &ShellMindGuardConfig) -> Result<u16> {
+    if cli_port != 39911 {
+        Ok(cli_port)
+    } else {
+        Ok(cfg.sandbox.loopback_port()?.unwrap_or(cli_port))
     }
 }
 
@@ -298,19 +363,24 @@ pub(crate) fn execute_scan_pipeline(opts: ScanRunOptions<'_>) -> Result<ScanOutc
             .then(|| cfg.sandbox.boot_cmd.clone())
             .flatten()
     });
-    let has_dynamic_targets = graph_res
-        .findings
-        .iter()
-        .any(|f| matches!(f.missing_guard, GuardKind::Auth | GuardKind::TxLock));
+    let effective_port = resolve_sandbox_port(opts.port, &cfg)?;
+    let probe_cfg = probe_config_from_cfg(&cfg);
+    let has_dynamic_targets = graph_res.findings.iter().any(|f| {
+        matches!(
+            f.missing_guard,
+            GuardKind::Auth | GuardKind::TxLock | GuardKind::OwnershipCheck
+        )
+    });
     let sandbox_res = if let Some(cmd) = effective_boot {
         if has_dynamic_targets {
-            match verify_findings_in_sandbox(
+            match verify_findings_in_sandbox_with_config(
                 opts.path,
                 &cmd,
-                opts.port,
+                effective_port,
                 &graph_res.findings,
                 opts.sync_race,
                 opts.unsafe_host_fallback,
+                &probe_cfg,
             ) {
                 Ok(res) => Some(res),
                 Err(e) => {
@@ -338,7 +408,10 @@ pub(crate) fn execute_scan_pipeline(opts: ScanRunOptions<'_>) -> Result<ScanOutc
         for f in &mut graph_res.findings {
             if let Some(st) = ver_map.get(f.id.as_str()) {
                 match st {
-                    VerificationStatus::Proven => f.status = "PROVEN".into(),
+                    VerificationStatus::Proven => {
+                        f.status = "PROVEN".into();
+                        f.confidence = Confidence::Proven;
+                    }
                     VerificationStatus::Mitigated => f.status = "MITIGATED".into(),
                     VerificationStatus::SuspectUnverified => {}
                 }
@@ -347,12 +420,19 @@ pub(crate) fn execute_scan_pipeline(opts: ScanRunOptions<'_>) -> Result<ScanOutc
         for f in &mut all_findings {
             if let Some(st) = ver_map.get(f.id.as_str()) {
                 match st {
-                    VerificationStatus::Proven => f.status = "PROVEN".into(),
+                    VerificationStatus::Proven => {
+                        f.status = "PROVEN".into();
+                        f.confidence = Confidence::Proven;
+                    }
                     VerificationStatus::Mitigated => f.status = "MITIGATED".into(),
                     VerificationStatus::SuspectUnverified => {}
                 }
             }
         }
+    }
+
+    if let Some(min_conf) = opts.min_confidence {
+        graph_res.findings.retain(|f| f.confidence >= min_conf);
     }
 
     persist_scan_findings(&mut store, delta.scan_id, &all_findings, &verified_list)?;
@@ -376,7 +456,7 @@ fn persist_scan_findings(
         .map(|v| (v.finding_id.as_str(), v))
         .collect();
 
-    let mut owned_rows: Vec<(String, String, String, String, String, String)> =
+    let mut owned_rows: Vec<(String, String, String, String, String, String, String)> =
         Vec::with_capacity(findings.len());
     for f in findings {
         let v_opt = ver_map.get(f.id.as_str()).copied();
@@ -384,6 +464,11 @@ fn persist_scan_findings(
             Some(VerificationStatus::Proven) => "PROVEN",
             Some(VerificationStatus::Mitigated) => "MITIGATED",
             _ => f.status.as_str(),
+        };
+        let conf_str = if status_str == "PROVEN" || f.confidence == Confidence::Proven {
+            Confidence::Proven.as_str()
+        } else {
+            f.confidence.as_str()
         };
         let trace_json = serde_json::to_string(f).unwrap_or_else(|_| "{}".into());
         let poc_cmd = v_opt
@@ -393,15 +478,16 @@ fn persist_scan_findings(
             f.id.clone(),
             f.rule_id.clone(),
             f.severity.clone(),
+            conf_str.to_string(),
             status_str.to_string(),
             trace_json,
             poc_cmd,
         ));
     }
 
-    let borrowed: Vec<(&str, &str, &str, &str, &str, &str)> = owned_rows
+    let borrowed: Vec<(&str, &str, &str, &str, &str, &str, &str)> = owned_rows
         .iter()
-        .map(|(a, b, c, d, e, f)| {
+        .map(|(a, b, c, d, e, f, g)| {
             (
                 a.as_str(),
                 b.as_str(),
@@ -409,6 +495,7 @@ fn persist_scan_findings(
                 d.as_str(),
                 e.as_str(),
                 f.as_str(),
+                g.as_str(),
             )
         })
         .collect();
@@ -519,6 +606,7 @@ fn main() -> Result<ExitCode> {
             json,
             format,
             layers,
+            min_confidence,
             boot_cmd,
             port,
             sync_race,
@@ -532,9 +620,11 @@ fn main() -> Result<ExitCode> {
             watch,
         } => {
             let effective_format = if json { OutputFormat::Json } else { format };
+            let min_conf = min_confidence.map(|m| m.to_confidence());
             let outcome = execute_scan_pipeline(ScanRunOptions {
                 path: &path,
                 layers: &layers,
+                min_confidence: min_conf,
                 boot_cmd: boot_cmd.clone(),
                 port,
                 sync_race,
@@ -610,6 +700,7 @@ fn main() -> Result<ExitCode> {
                         let next_outcome = execute_scan_pipeline(ScanRunOptions {
                             path: &path,
                             layers: &layers,
+                            min_confidence: min_conf,
                             boot_cmd: boot_cmd.clone(),
                             port,
                             sync_race,
@@ -667,45 +758,131 @@ fn main() -> Result<ExitCode> {
             unsafe_host_fallback,
             trust_repo_config,
             patch,
+            patch_file,
+            apply_check,
         } => {
             let cfg = ShellMindGuardConfig::load_from_dir(&path)?;
             let mut store = StateStore::open(&path)?;
             let finding = resolve_finding_for_replay(&path, &finding_id, &cfg, &mut store)?;
-            let effective_boot = boot_cmd
-                .or_else(|| trust_repo_config.then(|| cfg.sandbox.boot_cmd.clone()).flatten())
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "No --boot-cmd provided (pass --boot-cmd \"...\" or --trust-repo-config if .shellmind-guard.toml defines one)"
-                    )
+            let effective_boot = boot_cmd.or_else(|| {
+                trust_repo_config
+                    .then(|| cfg.sandbox.boot_cmd.clone())
+                    .flatten()
+            });
+
+            if !apply_check && effective_boot.is_none() {
+                anyhow::bail!(
+                    "No --boot-cmd provided (pass --boot-cmd \"...\" or --trust-repo-config if .shellmind-guard.toml defines one)"
+                );
+            }
+
+            let effective_port = resolve_sandbox_port(port, &cfg)?;
+            let probe_cfg = probe_config_from_cfg(&cfg);
+            let mut verified = Vec::new();
+            if let Some(ref boot) = effective_boot {
+                let (bwrap, v) = verify_findings_in_sandbox_with_config(
+                    &path,
+                    boot,
+                    effective_port,
+                    std::slice::from_ref(&finding),
+                    sync_race,
+                    unsafe_host_fallback,
+                    &probe_cfg,
+                )?;
+                println!(
+                    "ShellMind Guard Replay | {} ({}) | bwrap={}",
+                    finding.id,
+                    finding.entry_route,
+                    if bwrap { "isolated" } else { "local-loopback" }
+                );
+                for item in &v {
+                    let tag = match item.status {
+                        VerificationStatus::Proven => "PROVEN",
+                        VerificationStatus::Mitigated => "MITIGATED",
+                        VerificationStatus::SuspectUnverified => "SUSPECT",
+                    };
+                    println!("  [{}] {}", tag, item.evidence);
+                    println!("  Command: {}", item.replay_cmd);
+                }
+                verified = v;
+            } else {
+                println!(
+                    "ShellMind Guard Replay | {} ({}) | static-only apply-check",
+                    finding.id, finding.entry_route
+                );
+            }
+
+            let mut ai_patch_text: Option<String> = None;
+            let want_ai_or_prompt = patch || (apply_check && patch_file.is_none());
+            if want_ai_or_prompt {
+                if cfg.ai.is_enabled() {
+                    if !trust_repo_config {
+                        if apply_check && patch_file.is_none() {
+                            anyhow::bail!(
+                                "Repository config enables [ai] provider '{}'; pass --trust-repo-config (or --patch-file <FILE>) to authorize automated patch requests",
+                                cfg.ai.provider
+                            );
+                        }
+                        if patch {
+                            eprintln!(
+                                "[!] Ignoring [ai].provider='{}' in .shellmind-guard.toml without --trust-repo-config; showing offline minimal prompt.",
+                                cfg.ai.provider
+                            );
+                            let p = build_minimal_patch_prompt(&path, &finding, verified.first())?;
+                            println!("\n=== Minimal Patch Context ({} bytes) ===\n{}", p.len(), p);
+                        }
+                    } else {
+                        let provider = provider_from_config(&cfg.ai)?;
+                        if let Some(reply) =
+                            generate_patch_plan(&provider, &path, &finding, verified.first())?
+                        {
+                            if patch {
+                                println!("\n=== AI Generated Patch Plan ===\n{}", reply);
+                            }
+                            ai_patch_text = Some(reply);
+                        }
+                    }
+                } else if patch {
+                    let p = build_minimal_patch_prompt(&path, &finding, verified.first())?;
+                    println!("\n=== Minimal Patch Context ({} bytes) ===\n{}", p.len(), p);
+                }
+            }
+
+            if apply_check {
+                let raw_diff = if let Some(ref pf) = patch_file {
+                    fs::read_to_string(pf).with_context(|| {
+                        format!("Failed to read --patch-file '{}'", pf.display())
+                    })?
+                } else if let Some(diff_reply) = ai_patch_text {
+                    diff_reply
+                } else {
+                    anyhow::bail!(
+                        "--apply-check requires --patch-file <FILE> or an enabled [ai] provider in .shellmind-guard.toml (with --trust-repo-config)"
+                    );
+                };
+
+                let outcome = verify_patch_apply_check(&ApplyCheckParams {
+                    project_root: &path,
+                    cfg: &cfg,
+                    finding: &finding,
+                    raw_diff: &raw_diff,
+                    boot_cmd: effective_boot.as_deref(),
+                    port: effective_port,
+                    sync_race,
+                    unsafe_host_fallback,
+                    probe_cfg: &probe_cfg,
                 })?;
 
-            let (bwrap, verified) = verify_findings_in_sandbox(
-                &path,
-                &effective_boot,
-                port,
-                std::slice::from_ref(&finding),
-                sync_race,
-                unsafe_host_fallback,
-            )?;
-
-            println!(
-                "ShellMind Guard Replay | {} ({}) | bwrap={}",
-                finding.id,
-                finding.entry_route,
-                if bwrap { "isolated" } else { "local-loopback" }
-            );
-            for v in &verified {
-                let tag = match v.status {
-                    VerificationStatus::Proven => "PROVEN",
-                    VerificationStatus::Mitigated => "MITIGATED",
-                    VerificationStatus::SuspectUnverified => "SUSPECT",
-                };
-                println!("  [{}] {}", tag, v.evidence);
-                println!("  Command: {}", v.replay_cmd);
-            }
-            if patch {
-                let p = build_minimal_patch_prompt(&path, &finding, verified.first())?;
-                println!("\n=== Minimal Patch Context ({} bytes) ===\n{}", p.len(), p);
+                println!(
+                    "\n=== Isolated Patch Verification (modified: {:?}, hunks: {}) ===",
+                    outcome.modified_files, outcome.hunks_applied
+                );
+                if outcome.mitigated {
+                    println!("  [MITIGATED] {}", outcome.summary);
+                } else {
+                    eprintln!("  [UNMITIGATED] {}", outcome.summary);
+                    return Ok(ExitCode::from(2));
+                }
             }
         }
         Commands::Ui {
@@ -727,15 +904,18 @@ fn main() -> Result<ExitCode> {
                     .then(|| cfg.sandbox.boot_cmd.clone())
                     .flatten()
             });
+            let effective_port = resolve_sandbox_port(port, &cfg)?;
+            let probe_cfg = probe_config_from_cfg(&cfg);
             let verified_list = if let Some(ref cmd) = effective_boot {
                 if !graph_res.findings.is_empty() {
-                    verify_findings_in_sandbox(
+                    verify_findings_in_sandbox_with_config(
                         &path,
                         cmd,
-                        port,
+                        effective_port,
                         &graph_res.findings,
                         sync_race,
                         unsafe_host_fallback,
+                        &probe_cfg,
                     )?
                     .1
                 } else {
@@ -804,7 +984,11 @@ fn main() -> Result<ExitCode> {
         Commands::ProbeNetns { port, sync_race } => {
             let finding_json = std::env::var("VF_FINDING_JSON")?;
             let finding: LatticeFinding = serde_json::from_str(&finding_json)?;
-            let res = verify_finding_blocking(port, &finding, sync_race)?;
+            let probe_cfg: SandboxProbeConfig = std::env::var("VF_PROBE_CONFIG_JSON")
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+            let res = verify_finding_blocking_with_config(port, &finding, sync_race, &probe_cfg)?;
             println!("{}", serde_json::to_string(&res)?);
         }
     }
@@ -926,6 +1110,7 @@ fn handle_claude_pre_commit() -> Result<ExitCode> {
     let outcome = execute_scan_pipeline(ScanRunOptions {
         path: &scan_path,
         layers: &layers,
+        min_confidence: None,
         boot_cmd: None,
         port: 39911,
         sync_race: 12,
@@ -1146,8 +1331,12 @@ fn render_scan_output(
                 );
                 for f in &outcome.graph.findings {
                     println!(
-                        "\n  [{}] {} ({}) -> {}",
-                        f.severity, f.id, f.rule_id, f.title
+                        "\n  [{}] [{}] {} ({}) -> {}",
+                        f.severity,
+                        f.confidence.as_str(),
+                        f.id,
+                        f.rule_id,
+                        f.title
                     );
                     println!("      Entry: {}", f.entry_route);
                     for (i, hop) in f.witness_path.iter().enumerate() {
@@ -1232,6 +1421,164 @@ fn run_doctor(path: &Path) {
     );
 }
 
+static APPLY_CHECK_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+struct TempDirCleanup(PathBuf);
+
+impl Drop for TempDirCleanup {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+struct ApplyCheckParams<'a> {
+    project_root: &'a Path,
+    cfg: &'a ShellMindGuardConfig,
+    finding: &'a LatticeFinding,
+    raw_diff: &'a str,
+    boot_cmd: Option<&'a str>,
+    port: u16,
+    sync_race: usize,
+    unsafe_host_fallback: bool,
+    probe_cfg: &'a SandboxProbeConfig,
+}
+
+#[derive(Debug)]
+struct ApplyCheckOutcome {
+    mitigated: bool,
+    summary: String,
+    modified_files: Vec<PathBuf>,
+    hunks_applied: usize,
+}
+
+fn copy_workspace_for_apply_check(src_root: &Path, dst_root: &Path) -> Result<()> {
+    let canon_src = fs::canonicalize(src_root)?;
+    let canon_dst = fs::canonicalize(dst_root)?;
+    copy_dir_recursive(&canon_src, &canon_dst, &canon_dst)
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path, canonical_dst_root: &Path) -> Result<()> {
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if matches!(
+            name_str.as_ref(),
+            ".git" | "target" | ".shellmind-guard" | ".veriforge"
+        ) {
+            continue;
+        }
+        let meta = entry.metadata()?;
+        if entry.file_type()?.is_symlink() {
+            continue;
+        }
+        let src_path = entry.path();
+        if src_path == canonical_dst_root {
+            continue;
+        }
+        let dst_path = dst.join(&name);
+        if meta.is_dir() {
+            fs::create_dir_all(&dst_path)?;
+            copy_dir_recursive(&src_path, &dst_path, canonical_dst_root)?;
+        } else if meta.is_file() {
+            fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn finding_still_present<'a>(
+    post_findings: &'a [LatticeFinding],
+    target: &LatticeFinding,
+) -> Option<&'a LatticeFinding> {
+    post_findings.iter().find(|f| {
+        f.rule_id == target.rule_id
+            && f.sink_kind == target.sink_kind
+            && f.file == target.file
+            && (f.entry_route == target.entry_route
+                || (target.entry_route.contains(':') && f.title == target.title))
+    })
+}
+
+fn verify_patch_apply_check(params: &ApplyCheckParams<'_>) -> Result<ApplyCheckOutcome> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let seq = APPLY_CHECK_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let temp_root = std::env::temp_dir().join(format!(
+        "smg_apply_check_{}_{}_{}",
+        std::process::id(),
+        nanos,
+        seq
+    ));
+    fs::create_dir_all(&temp_root)?;
+    let _cleanup = TempDirCleanup(temp_root.clone());
+
+    copy_workspace_for_apply_check(params.project_root, &temp_root)?;
+    let report = apply_unified_diff_safely(&temp_root, params.raw_diff)?;
+
+    let post_summary = scan_repository(&temp_root, params.cfg)?;
+    let post_graph = analyze_codebase(&post_summary.files, params.cfg)?;
+
+    let Some(remaining) = finding_still_present(&post_graph.findings, params.finding) else {
+        return Ok(ApplyCheckOutcome {
+            mitigated: true,
+            summary: format!(
+                "Patch eliminated {} ({}) statically in isolated verification workspace",
+                params.finding.id, params.finding.rule_id
+            ),
+            modified_files: report.modified_files,
+            hunks_applied: report.hunks_applied,
+        });
+    };
+
+    if matches!(
+        remaining.missing_guard,
+        GuardKind::Auth | GuardKind::TxLock | GuardKind::OwnershipCheck
+    ) && let Some(boot) = params.boot_cmd
+    {
+        let (_, post_verified) = verify_findings_in_sandbox_with_config(
+            &temp_root,
+            boot,
+            params.port,
+            std::slice::from_ref(remaining),
+            params.sync_race,
+            params.unsafe_host_fallback,
+            params.probe_cfg,
+        )?;
+        if let Some(first) = post_verified.first() {
+            if first.status == VerificationStatus::Mitigated {
+                return Ok(ApplyCheckOutcome {
+                    mitigated: true,
+                    summary: format!("Runtime sandbox proved mitigation: {}", first.evidence),
+                    modified_files: report.modified_files,
+                    hunks_applied: report.hunks_applied,
+                });
+            }
+            return Ok(ApplyCheckOutcome {
+                mitigated: false,
+                summary: format!(
+                    "Patch did not mitigate {} dynamically ({})",
+                    remaining.id, first.evidence
+                ),
+                modified_files: report.modified_files,
+                hunks_applied: report.hunks_applied,
+            });
+        }
+    }
+
+    Ok(ApplyCheckOutcome {
+        mitigated: false,
+        summary: format!(
+            "Patch did not eliminate {} ({}) at {}:{}",
+            remaining.id, remaining.rule_id, remaining.file, remaining.line
+        ),
+        modified_files: report.modified_files,
+        hunks_applied: report.hunks_applied,
+    })
+}
+
 #[cfg(test)]
 mod main_tests {
     use super::*;
@@ -1298,6 +1645,7 @@ mod main_tests {
             severity: "MEDIUM".into(),
             title: "Empty catch".into(),
             status: "SUSPECT_UNGUARDED".into(),
+            confidence: Confidence::Heuristic,
             entry_route: "app.ts:1".into(),
             file: "app.ts".into(),
             line: 1,
@@ -1313,5 +1661,80 @@ mod main_tests {
             Some(FailSeverity::Medium)
         ));
         assert!(!should_fail_gate(&[med], false, Some(FailSeverity::High)));
+    }
+
+    #[test]
+    fn test_apply_check_eliminates_sqli_without_mutating_source_and_detects_ineffective_patch() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let repo = std::env::temp_dir().join(format!("smg_apply_unit_{}", nanos));
+        let _cleanup = TempDirCleanup(repo.clone());
+        fs::create_dir_all(repo.join("src")).unwrap();
+        let route_src = "import express from 'express';\nconst app = express();\napp.get('/api/items', async (req, res) => {\n  const rows = await db.query(`SELECT * FROM items WHERE name = '${req.query.q}'`);\n  res.json(rows);\n});\n";
+        fs::write(repo.join("src/app.ts"), route_src).unwrap();
+
+        let cfg = ShellMindGuardConfig::default();
+        let summary = scan_repository(&repo, &cfg).unwrap();
+        let graph = analyze_codebase(&summary.files, &cfg).unwrap();
+        let sqli = graph
+            .findings
+            .iter()
+            .find(|f| f.rule_id == "VF-SQLI-001")
+            .expect("expected initial VF-SQLI-001 finding");
+
+        let probe_cfg = probe_config_from_cfg(&cfg);
+        let good_diff = "--- a/src/app.ts\n+++ b/src/app.ts\n@@ -1,6 +1,6 @@\n import express from 'express';\n const app = express();\n app.get('/api/items', async (req, res) => {\n-  const rows = await db.query(`SELECT * FROM items WHERE name = '${req.query.q}'`);\n+  const rows = await db.query('SELECT * FROM items WHERE name = $1', [String(req.query.q)]);\n   res.json(rows);\n });\n";
+        let ok = verify_patch_apply_check(&ApplyCheckParams {
+            project_root: &repo,
+            cfg: &cfg,
+            finding: sqli,
+            raw_diff: good_diff,
+            boot_cmd: None,
+            port: 39911,
+            sync_race: 12,
+            unsafe_host_fallback: false,
+            probe_cfg: &probe_cfg,
+        })
+        .unwrap();
+        assert!(ok.mitigated, "good diff failed: {}", ok.summary);
+        assert_eq!(ok.modified_files, vec![PathBuf::from("src/app.ts")]);
+        // Original repo file must remain untouched!
+        assert_eq!(
+            fs::read_to_string(repo.join("src/app.ts")).unwrap(),
+            route_src
+        );
+
+        let ineffective_diff = "--- a/src/app.ts\n+++ b/src/app.ts\n@@ -1,6 +1,6 @@\n import express from 'express';\n const app = express();\n app.get('/api/items', async (req, res) => {\n+  // harmless comment\n   const rows = await db.query(`SELECT * FROM items WHERE name = '${req.query.q}'`);\n   res.json(rows);\n });\n";
+        let bad = verify_patch_apply_check(&ApplyCheckParams {
+            project_root: &repo,
+            cfg: &cfg,
+            finding: sqli,
+            raw_diff: ineffective_diff,
+            boot_cmd: None,
+            port: 39911,
+            sync_race: 12,
+            unsafe_host_fallback: false,
+            probe_cfg: &probe_cfg,
+        })
+        .unwrap();
+        assert!(!bad.mitigated, "ineffective diff should fail apply-check");
+
+        let traversal_diff = "--- a/../escape.ts\n+++ b/../escape.ts\n@@ -1,1 +1,1 @@\n-a\n+b\n";
+        assert!(
+            verify_patch_apply_check(&ApplyCheckParams {
+                project_root: &repo,
+                cfg: &cfg,
+                finding: sqli,
+                raw_diff: traversal_diff,
+                boot_cmd: None,
+                port: 39911,
+                sync_race: 12,
+                unsafe_host_fallback: false,
+                probe_cfg: &probe_cfg,
+            })
+            .is_err()
+        );
     }
 }

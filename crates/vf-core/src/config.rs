@@ -11,6 +11,50 @@ pub struct ShellMindGuardConfig {
     pub scan: ScanConfig,
     #[serde(default)]
     pub sandbox: SandboxConfig,
+    #[serde(default)]
+    pub ai: AiConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiConfig {
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default = "default_ai_endpoint")]
+    pub endpoint: String,
+    #[serde(default = "default_ai_model")]
+    pub model: String,
+    #[serde(default = "default_ai_key_env")]
+    pub api_key_env: String,
+}
+
+fn default_ai_endpoint() -> String {
+    "http://127.0.0.1:11434".to_string()
+}
+
+fn default_ai_model() -> String {
+    "qwen2.5-coder:7b".to_string()
+}
+
+fn default_ai_key_env() -> String {
+    "OPENAI_API_KEY".to_string()
+}
+
+impl Default for AiConfig {
+    fn default() -> Self {
+        Self {
+            provider: String::new(),
+            endpoint: default_ai_endpoint(),
+            model: default_ai_model(),
+            api_key_env: default_ai_key_env(),
+        }
+    }
+}
+
+impl AiConfig {
+    pub fn is_enabled(&self) -> bool {
+        let p = self.provider.trim().to_ascii_lowercase();
+        !p.is_empty() && p != "disabled" && p != "none"
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,6 +83,57 @@ pub struct ScanConfig {
 pub struct SandboxConfig {
     pub boot_cmd: Option<String>,
     pub base_url: Option<String>,
+    #[serde(default)]
+    pub user_a_header: Option<String>,
+    #[serde(default)]
+    pub user_b_header: Option<String>,
+    #[serde(default)]
+    pub probe_body: Option<String>,
+}
+
+impl SandboxConfig {
+    /// Parses `[sandbox].base_url` strictly enforcing loopback-only hosts (`127.0.0.1`, `localhost`, `[::1]`).
+    pub fn loopback_port(&self) -> Result<Option<u16>> {
+        let Some(raw) = self
+            .base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return Ok(None);
+        };
+        let rest = raw.strip_prefix("http://").ok_or_else(|| {
+            anyhow::anyhow!(
+                "sandbox.base_url must use http:// on loopback, got: {}",
+                raw
+            )
+        })?;
+        let authority = rest.split('/').next().unwrap_or("");
+        let (host, port_str) = if let Some(after_bracket) = authority.strip_prefix("[::1]") {
+            ("::1", after_bracket.strip_prefix(':').unwrap_or(""))
+        } else if let Some((h, p)) = authority.rsplit_once(':') {
+            (h, p)
+        } else {
+            (authority, "")
+        };
+        if !matches!(
+            host.to_ascii_lowercase().as_str(),
+            "127.0.0.1" | "localhost" | "::1"
+        ) {
+            anyhow::bail!(
+                "Refusing non-loopback sandbox.base_url `{}` (only 127.0.0.1, localhost, or [::1] allowed)",
+                raw
+            );
+        }
+        if port_str.is_empty() {
+            Ok(Some(80))
+        } else {
+            let p: u16 = port_str
+                .parse()
+                .with_context(|| format!("Invalid port in sandbox.base_url `{}`", raw))?;
+            Ok(Some(p))
+        }
+    }
 }
 
 fn default_auth_guards() -> Vec<String> {

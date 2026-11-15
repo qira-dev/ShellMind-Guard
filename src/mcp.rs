@@ -141,7 +141,12 @@ fn tool_definitions() -> Value {
                     "layers": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Optional layer filters: auth, race, taint, sqli, cmdi, path, ssrf, idor, secrets, config, deps, frontend"
+                        "description": "Optional layer filters: auth, race, taint, sqli, cmdi, path, ssrf, xss, csrf, idor, secrets, config, deps, frontend"
+                    },
+                    "min_confidence": {
+                        "type": "string",
+                        "enum": ["proven", "confirmed", "heuristic"],
+                        "description": "Optional minimum finding confidence tier (default: include all)"
                     }
                 }
             }
@@ -267,9 +272,15 @@ fn handle_tool_call(params: &Value) -> Result<Value> {
                 })
                 .unwrap_or_default();
 
+            let min_confidence = args
+                .get("min_confidence")
+                .and_then(|v| v.as_str())
+                .and_then(vf_graph::Confidence::parse);
+
             let outcome = execute_scan_pipeline(ScanRunOptions {
                 path: &root,
                 layers: &layers,
+                min_confidence,
                 boot_cmd: None,
                 port: 39911,
                 sync_race: 12,

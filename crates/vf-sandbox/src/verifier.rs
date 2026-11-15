@@ -31,6 +31,56 @@ pub struct VerifiedFinding {
     pub replay_cmd: String,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SandboxProbeConfig {
+    #[serde(default)]
+    pub user_a_header: Option<String>,
+    #[serde(default)]
+    pub user_b_header: Option<String>,
+    #[serde(default)]
+    pub probe_body: Option<String>,
+}
+
+fn format_optional_header(raw: Option<&str>) -> Option<String> {
+    let raw = raw?.trim();
+    let (name, value) = raw.split_once(':')?;
+    let clean_name: String = name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    let clean_val: String = value.chars().filter(|c| *c != '\r' && *c != '\n').collect();
+    let clean_val = clean_val.trim();
+    if clean_name.is_empty() || clean_val.is_empty() {
+        return None;
+    }
+    Some(format!("{}: {}\r\n", clean_name, clean_val))
+}
+
+async fn send_http_probe(
+    port: u16,
+    method: &str,
+    path: &str,
+    extra_header: Option<&str>,
+    body: Option<&str>,
+) -> Result<(u16, String, bool)> {
+    let hdr_line = format_optional_header(extra_header).unwrap_or_default();
+    let req = if let Some(b) = body {
+        format!(
+            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{hdr_line}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}",
+            b.len()
+        )
+    } else {
+        format!(
+            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{hdr_line}Connection: close\r\n\r\n"
+        )
+    };
+    let mut stream = timeout(IO_TIMEOUT, TcpStream::connect(("127.0.0.1", port))).await??;
+    timeout(IO_TIMEOUT, stream.write_all(req.as_bytes())).await??;
+    Ok(read_http_bounded(&mut stream)
+        .await
+        .unwrap_or((0, String::new(), false)))
+}
+
 fn parse_route(entry: &str) -> (&str, &str) {
     let mut parts = entry.split_whitespace();
     let method = parts.next().unwrap_or("POST");
@@ -247,20 +297,20 @@ fn shell_quote_single(s: &str) -> String {
 /// Checks whether an unauthenticated request to the flagged route is blocked (401/403)
 /// or actually executes a non-error payload inside the isolated loopback sandbox.
 pub async fn verify_auth_invariant(port: u16, finding: &LatticeFinding) -> Result<VerifiedFinding> {
+    verify_auth_invariant_with_config(port, finding, &SandboxProbeConfig::default()).await
+}
+
+pub async fn verify_auth_invariant_with_config(
+    port: u16,
+    finding: &LatticeFinding,
+    cfg: &SandboxProbeConfig,
+) -> Result<VerifiedFinding> {
     let (method, raw_path) = parse_route(&finding.entry_route);
     let path = substitute_route_params(raw_path);
-    let body = r#"{"userId":"test-user-1","amount":10}"#;
-    let req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-
-    let mut stream = timeout(IO_TIMEOUT, TcpStream::connect(("127.0.0.1", port))).await??;
-    timeout(IO_TIMEOUT, stream.write_all(req.as_bytes())).await??;
+    let default_body = r#"{"userId":"test-user-1","amount":10}"#;
+    let body = cfg.probe_body.as_deref().unwrap_or(default_body);
     let (status_code, resp_body, is_html) =
-        read_http_bounded(&mut stream)
-            .await
-            .unwrap_or((0, String::new(), false));
+        send_http_probe(port, method, &path, None, Some(body)).await?;
 
     let (status, evidence) = if status_code == 401 || status_code == 403 {
         (
@@ -319,6 +369,21 @@ pub async fn verify_concurrency_invariant(
     finding: &LatticeFinding,
     concurrency: usize,
 ) -> Result<VerifiedFinding> {
+    verify_concurrency_invariant_with_config(
+        port,
+        finding,
+        concurrency,
+        &SandboxProbeConfig::default(),
+    )
+    .await
+}
+
+pub async fn verify_concurrency_invariant_with_config(
+    port: u16,
+    finding: &LatticeFinding,
+    concurrency: usize,
+    cfg: &SandboxProbeConfig,
+) -> Result<VerifiedFinding> {
     if concurrency == 0 {
         return Ok(VerifiedFinding {
             finding_id: finding.id.clone(),
@@ -332,9 +397,13 @@ pub async fn verify_concurrency_invariant(
 
     let (method, raw_path) = parse_route(&finding.entry_route);
     let path = substitute_route_params(raw_path);
-    let body = r#"{"userId":"test-user-1","amount":80}"#;
+    let body = cfg
+        .probe_body
+        .as_deref()
+        .unwrap_or(r#"{"userId":"test-user-1","amount":80}"#);
+    let auth_hdr = format_optional_header(cfg.user_a_header.as_deref()).unwrap_or_default();
     let raw_req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{auth_hdr}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     let bytes = raw_req.into_bytes();
@@ -476,21 +545,138 @@ pub async fn verify_concurrency_invariant(
     })
 }
 
+/// Cross-tenant IDOR probe: replays User A's resource route as User B and fails-closed
+/// if `[sandbox]` credentials are omitted or baseline User A fails.
+pub async fn verify_idor_invariant_with_config(
+    port: u16,
+    finding: &LatticeFinding,
+    cfg: &SandboxProbeConfig,
+) -> Result<VerifiedFinding> {
+    let (method, raw_path) = parse_route(&finding.entry_route);
+    let path = substitute_route_params(raw_path);
+    let url = format!("http://127.0.0.1:{}{}", port, path);
+
+    let (Some(hdr_a), Some(hdr_b)) = (
+        cfg.user_a_header
+            .as_deref()
+            .filter(|s| format_optional_header(Some(s)).is_some()),
+        cfg.user_b_header
+            .as_deref()
+            .filter(|s| format_optional_header(Some(s)).is_some()),
+    ) else {
+        return Ok(VerifiedFinding {
+            finding_id: finding.id.clone(),
+            rule_id: finding.rule_id.clone(),
+            entry_route: finding.entry_route.clone(),
+            status: VerificationStatus::SuspectUnverified,
+            evidence: "IDOR live probe skipped: configure [sandbox] user_a_header and user_b_header in .shellmind-guard.toml".into(),
+            replay_cmd: format!("shellmind-guard replay {}", finding.id),
+        });
+    };
+
+    let req_body = if matches!(method, "GET" | "HEAD" | "DELETE") {
+        cfg.probe_body.as_deref()
+    } else {
+        Some(
+            cfg.probe_body
+                .as_deref()
+                .unwrap_or(r#"{"status":"updated"}"#),
+        )
+    };
+
+    let (code_a, body_a, html_a) =
+        send_http_probe(port, method, &path, Some(hdr_a), req_body).await?;
+    if !(200..300).contains(&code_a) || html_a || is_failure_envelope(code_a, &body_a) {
+        return Ok(VerifiedFinding {
+            finding_id: finding.id.clone(),
+            rule_id: finding.rule_id.clone(),
+            entry_route: finding.entry_route.clone(),
+            status: VerificationStatus::SuspectUnverified,
+            evidence: format!(
+                "IDOR baseline User A returned HTTP {} ({}); cannot confirm cross-tenant bypass",
+                code_a,
+                body_a.chars().take(80).collect::<String>()
+            ),
+            replay_cmd: format!(
+                "curl -i -X {} {} -H {}",
+                shell_quote_single(method),
+                shell_quote_single(&url),
+                shell_quote_single(hdr_b.trim())
+            ),
+        });
+    }
+
+    let (code_b, body_b, html_b) =
+        send_http_probe(port, method, &path, Some(hdr_b), req_body).await?;
+    let (status, evidence) = if matches!(code_b, 401 | 403 | 404)
+        || is_failure_envelope(code_b, &body_b)
+    {
+        (
+            VerificationStatus::Mitigated,
+            format!(
+                "IDOR Mitigated: User A succeeded (HTTP {}) while cross-tenant User B was blocked (HTTP {})",
+                code_a, code_b
+            ),
+        )
+    } else if (200..300).contains(&code_b) && !html_b {
+        (
+            VerificationStatus::Proven,
+            format!(
+                "Cross-tenant IDOR confirmed: User B read/mutated User A resource at {} with HTTP {} (payload: {})",
+                path,
+                code_b,
+                body_b.chars().take(120).collect::<String>()
+            ),
+        )
+    } else {
+        (
+            VerificationStatus::SuspectUnverified,
+            format!("IDOR User B returned HTTP {} (inconclusive)", code_b),
+        )
+    };
+
+    Ok(VerifiedFinding {
+        finding_id: finding.id.clone(),
+        rule_id: finding.rule_id.clone(),
+        entry_route: finding.entry_route.clone(),
+        status,
+        evidence,
+        replay_cmd: format!(
+            "curl -i -X {} {} -H {}",
+            shell_quote_single(method),
+            shell_quote_single(&url),
+            shell_quote_single(hdr_b.trim())
+        ),
+    })
+}
+
 pub async fn verify_finding(
     port: u16,
     finding: &LatticeFinding,
     concurrency: usize,
 ) -> Result<VerifiedFinding> {
+    verify_finding_with_config(port, finding, concurrency, &SandboxProbeConfig::default()).await
+}
+
+pub async fn verify_finding_with_config(
+    port: u16,
+    finding: &LatticeFinding,
+    concurrency: usize,
+    cfg: &SandboxProbeConfig,
+) -> Result<VerifiedFinding> {
     match finding.missing_guard {
-        GuardKind::Auth => verify_auth_invariant(port, finding).await,
-        GuardKind::TxLock => verify_concurrency_invariant(port, finding, concurrency).await,
+        GuardKind::Auth => verify_auth_invariant_with_config(port, finding, cfg).await,
+        GuardKind::TxLock => {
+            verify_concurrency_invariant_with_config(port, finding, concurrency, cfg).await
+        }
+        GuardKind::OwnershipCheck => verify_idor_invariant_with_config(port, finding, cfg).await,
         other => Ok(VerifiedFinding {
             finding_id: finding.id.clone(),
             rule_id: finding.rule_id.clone(),
             entry_route: finding.entry_route.clone(),
             status: VerificationStatus::SuspectUnverified,
             evidence: format!(
-                "Static/AST finding ({:?}); live exploit probe applies to Auth and Race findings",
+                "Static/AST finding ({:?}); live exploit probe applies to Auth, IDOR, and Race findings",
                 other
             ),
             replay_cmd: format!("shellmind-guard replay {}", finding.id),
@@ -605,6 +791,7 @@ mod tests {
             file: "server.mjs".into(),
             line: 14,
             status: "SUSPECT".into(),
+            confidence: vf_graph::Confidence::Confirmed,
             entry_route: "POST /api/pay".into(),
             sink_kind: vf_graph::SinkKind::BalanceUpdate,
             missing_guard: GuardKind::TxLock,
@@ -669,6 +856,7 @@ mod tests {
             file: "server.mjs".into(),
             line: 14,
             status: "SUSPECT".into(),
+            confidence: vf_graph::Confidence::Confirmed,
             entry_route: "POST /api/pay".into(),
             sink_kind: vf_graph::SinkKind::BalanceUpdate,
             missing_guard: GuardKind::TxLock,
@@ -679,5 +867,91 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(vf.status, VerificationStatus::Mitigated);
+    }
+
+    #[tokio::test]
+    async fn test_idor_probe_proven_mitigated_and_missing_headers() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                if let Ok((mut sock, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 4096];
+                        let n = sock.read(&mut buf).await.unwrap_or(0);
+                        let req = String::from_utf8_lossy(&buf[..n]);
+                        let (status_line, body) = if req.contains("Bearer tok-a") {
+                            ("200 OK", r#"{"id":1,"owner":"user-a","secret":"ok"}"#)
+                        } else if req.contains("Bearer tok-b-vuln") {
+                            ("200 OK", r#"{"id":1,"owner":"user-a","leaked":true}"#)
+                        } else if req.contains("Bearer tok-b-safe") {
+                            ("403 Forbidden", r#"{"error":"forbidden"}"#)
+                        } else {
+                            ("401 Unauthorized", r#"{"error":"unauthorized"}"#)
+                        };
+                        let resp = format!(
+                            "HTTP/1.1 {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            status_line,
+                            body.len(),
+                            body
+                        );
+                        let _ = sock.write_all(resp.as_bytes()).await;
+                    });
+                }
+            }
+        });
+
+        let finding = LatticeFinding {
+            id: "VF-IDOR-001".into(),
+            rule_id: "VF-IDOR-001".into(),
+            severity: "HIGH".into(),
+            title: "Potential IDOR".into(),
+            file: "routes.ts".into(),
+            line: 10,
+            status: "SUSPECT".into(),
+            confidence: vf_graph::Confidence::Confirmed,
+            entry_route: "GET /orders/:id".into(),
+            sink_kind: vf_graph::SinkKind::IdorDbAccess,
+            missing_guard: GuardKind::OwnershipCheck,
+            witness_path: Vec::new(),
+            remediation: String::new(),
+        };
+
+        // 1. Missing headers fails closed as SuspectUnverified
+        let missing = verify_finding_with_config(port, &finding, 4, &SandboxProbeConfig::default())
+            .await
+            .unwrap();
+        assert_eq!(missing.status, VerificationStatus::SuspectUnverified);
+
+        // 2. User B receives 200 OK -> Proven!
+        let proven = verify_finding_with_config(
+            port,
+            &finding,
+            4,
+            &SandboxProbeConfig {
+                user_a_header: Some("Authorization: Bearer tok-a".into()),
+                user_b_header: Some("Authorization: Bearer tok-b-vuln".into()),
+                probe_body: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(proven.status, VerificationStatus::Proven);
+        assert!(proven.evidence.contains("/orders/1"));
+
+        // 3. User B receives 403 Forbidden -> Mitigated!
+        let mitigated = verify_finding_with_config(
+            port,
+            &finding,
+            4,
+            &SandboxProbeConfig {
+                user_a_header: Some("Authorization: Bearer tok-a".into()),
+                user_b_header: Some("Authorization: Bearer tok-b-safe".into()),
+                probe_body: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(mitigated.status, VerificationStatus::Mitigated);
     }
 }

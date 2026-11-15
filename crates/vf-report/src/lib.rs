@@ -1,6 +1,6 @@
 use serde_json::json;
 use std::collections::HashMap;
-use vf_graph::{GraphAnalysisResult, LatticeFinding};
+use vf_graph::{Confidence, GraphAnalysisResult, LatticeFinding};
 use vf_sandbox::{VerificationStatus, VerifiedFinding};
 
 fn security_severity_score(sev: &str) -> &'static str {
@@ -99,16 +99,24 @@ pub fn to_sarif_json(findings: &[LatticeFinding], verified: &[VerifiedFinding]) 
                 })
                 .collect();
 
+            let conf_tag = if status_tag == "PROVEN" || f.confidence == Confidence::Proven {
+                Confidence::Proven.as_str()
+            } else {
+                f.confidence.as_str()
+            };
             let msg = match v_opt {
                 Some(v) if !f.remediation.is_empty() => format!(
-                    "[{}] {} — {} | Fix: {}",
-                    status_tag, f.title, v.evidence, f.remediation
+                    "[{}/{}] {} — {} | Fix: {}",
+                    status_tag, conf_tag, f.title, v.evidence, f.remediation
                 ),
-                Some(v) => format!("[{}] {} — {}", status_tag, f.title, v.evidence),
+                Some(v) => format!("[{}/{}] {} — {}", status_tag, conf_tag, f.title, v.evidence),
                 None if !f.remediation.is_empty() => {
-                    format!("[{}] {} | Fix: {}", status_tag, f.title, f.remediation)
+                    format!(
+                        "[{}/{}] {} | Fix: {}",
+                        status_tag, conf_tag, f.title, f.remediation
+                    )
                 }
-                None => format!("[{}] {}", status_tag, f.title),
+                None => format!("[{}/{}] {}", status_tag, conf_tag, f.title),
             };
 
             let fingerprint = fnv1a_hex(&format!(
@@ -121,6 +129,11 @@ pub fn to_sarif_json(findings: &[LatticeFinding], verified: &[VerifiedFinding]) 
                 "ruleIndex": seen_rules.get(&f.rule_id).copied().unwrap_or(0),
                 "level": level,
                 "message": { "text": msg },
+                "properties": {
+                    "confidence": conf_tag,
+                    "verificationStatus": status_tag,
+                    "missingGuard": format!("{:?}", f.missing_guard),
+                },
                 "partialFingerprints": {
                     "primaryLocationLineHash": fingerprint
                 },
@@ -227,6 +240,7 @@ pub fn to_html_graph(
             "<div class=\"card\">\
               <div class=\"card-head\">\
                 <span class=\"badge {badge_cls}\">{badge}</span>\
+                <span class=\"conf {conf_cls}\">{conf}</span>\
                 <span class=\"sev\">{sev}</span>\
                 <strong>{id}</strong> — {title}\
               </div>\
@@ -241,6 +255,18 @@ pub fn to_html_graph(
             </div>",
             badge_cls = badge_cls,
             badge = badge,
+            conf_cls = if badge == "PROVEN" || f.confidence == Confidence::Proven {
+                "conf-proven"
+            } else if f.confidence == Confidence::Confirmed {
+                "conf-confirmed"
+            } else {
+                "conf-heuristic"
+            },
+            conf = if badge == "PROVEN" || f.confidence == Confidence::Proven {
+                Confidence::Proven.as_str()
+            } else {
+                f.confidence.as_str()
+            },
             sev = escape_html(&f.severity),
             id = escape_html(&f.id),
             title = escape_html(&f.title),
@@ -269,6 +295,10 @@ pub fn to_html_graph(
   .badge-proven {{ background:#da3633; color:#fff; }}
   .badge-mitigated {{ background:#238636; color:#fff; }}
   .badge-suspect {{ background:#9e6a03; color:#fff; }}
+  .conf {{ font-size:11px; font-weight:600; padding:1px 7px; border-radius:4px; border:1px solid #30363d; }}
+  .conf-proven {{ color:#ff7b72; border-color:#da3633; }}
+  .conf-confirmed {{ color:#58a6ff; border-color:#1f6feb; }}
+  .conf-heuristic {{ color:#d29922; border-color:#9e6a03; }}
   .sev {{ font-size:11px; color:#8b949e; border:1px solid #30363d; padding:1px 6px; border-radius:4px; }}
   .route {{ font-size:13px; color:#8b949e; margin-bottom:10px; }}
   .svg-wrap {{ overflow-x:auto; background:#0d1117; border:1px solid #21262d; border-radius:8px; padding:6px; }}

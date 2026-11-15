@@ -1,63 +1,58 @@
-# ShellMind Guard — Execution Planning & Module Specification (v2 Audited)
+# ShellMind Guard — Execution Planning & Change-Safety Contract (v3 Next-Gen)
+
+> **Purpose:** Actionable engineering plan anchored strictly to what currently exists in `d21223c`, protecting working components from unnecessary rewrites while executing Phase 6–10 upgrades cleanly.
 
 ---
 
-## 1. Cargo Workspace & Directory Structure
+## 1. Change-Safety Contract: Protected Core vs Extension Seams
 
-```text
-ShellMind Guard/
-├── BLUEPRINT.md               # Master ASCII architecture, lattice math & OS/UX design
-├── ROADMAP.md                 # Phase 0–5 milestones & verification gates
-├── PLANNING.md                # Sprint tasks, crate layout & risk matrix
-├── Cargo.toml                 # Workspace root (resolver = "2")
-├── crates/
-│   ├── vf-core/               # .shellmind-guard.toml, BLAKE3 walker (ignore), SQLite WAL+FTS5 store
-│   ├── vf-graph/              # Rayon + Tree-sitter AST (TS/JS/Go/Python/Rust), 6-layer taint & O(V+E) Lattice
-│   ├── vf-sandbox/            # Bubblewrap + process-group reaper, 12-way Barrier + JoinSet race & auth prover
-│   ├── vf-tui/                # Panic-safe ratatui 3-pane workspace + [L] log ring-buffer
-│   ├── vf-report/             # JSON, SARIF 2.1.0, CI exit-codes & self-contained HTML graph
-│   └── vf-ai/                 # Optional BYOK / Ollama minimal-context (<4 KB) patch prompt builder
-├── src/
-│   ├── main.rs                # Unified CLI/TUI entrypoint (`init`, `index`, `scan`, `replay`, `ui`, `mcp`)
-│   └── mcp.rs                 # Stdio JSON-RPC 2.0 Model Context Protocol server (`shellmind-guard mcp`)
-└── fixtures/                  # Intentionally vulnerable multi-file test apps (Node/TS, Rust)
-    ├── vuln-payment-node/     # Double-spend race condition + negative-amount checkout bug
-    └── vuln-auth-rust/        # Cross-tenant IDOR + missing middleware guard
-```
+**Rule:** Do **not** break or refactor stable code unless a specific milestone requires extending it.
 
----
-
-## 2. Sprint 1 Actionable Plan (Phase 0 + Phase 1 Start)
-
-| Task ID | Component | Concrete Engineering Task | Acceptance Criteria |
+| Crate / File | Current Role (Verified at `d21223c`) | Status | Planned Modification Scope |
 | :--- | :--- | :--- | :--- |
-| `S1-01` | Workspace | Initialize Cargo workspace + `vf-core` + `vf-graph` crates | `cargo check` passes cleanly |
-| `S1-02` | `vf-core` | Implement `ignore::WalkParallel`, `.shellmind-guard.toml` & `BLAKE3` scanner | Ignores `node_modules`/`.git`/`target`, hashes 13k files < 250ms |
-| `S1-03` | `vf-core` | Implement `.shellmind-guard/state.db` (`SQLite` WAL + FTS5 symbol cache) | Warm delta skips 100% of unchanged files; cross-file link stays fresh |
-| `S1-04` | `vf-graph` | Integrate `tree-sitter-typescript` & `tree-sitter-rust` | Extracts routes, middleware, functions, imports, DB/payment sinks |
-| `S1-05` | `vf-graph` | Build `petgraph` linker + $O(V + E)$ Guard-Set Lattice solver | Traces `route -> service -> sink` across 3+ files; no $O(V!)$ blowup |
-| `S1-06` | `fixtures` | Create `vuln-payment-node` & `vuln-auth-rust` multi-file fixtures | Scanner flags missing lock/auth witness path in < 500ms |
+| `crates/vf-core/src/config.rs` | `.shellmind-guard.toml` parsing, `2..=6` thread clamp, `[sandbox]` stub | **LOCKED / EXTEND ONLY** | Append optional `[sandbox]` test identity/probe fields (`user_a_header`, `user_b_header`, `probe_body`), `[advisories]` & `[ai]` keys with `#[serde(default)]` |
+| `crates/vf-core/src/scanner.rs` | `ignore` parallel walk, bounded `rayon` pool, `BLAKE3`, `256 KiB` cap | **LOCKED / EXTEND ONLY** | Add new file extensions to `Language::from_path` only when that grammar ships in Phase 8 |
+| `crates/vf-core/src/store.rs` | XDG cache SQLite WAL + FTS5 + `ast_cache` (+ unused `symbols`/`edges` tables) | **LOCKED / EXTEND ONLY** | Migrate `findings` to include confidence level (Phase 6), clean unused `symbols`/`edges` schema, add read-only `advisories.db` handle (Phase 7) |
+| `crates/vf-graph/src/lattice.rs` | $O(V+E)$ Guard-Set Lattice + BFS witness builder | **PROTECTED** | Preserve exact fixed-point intersection logic; add new `GuardKind`/`SinkKind` variants & confidence tag cleanly |
+| `crates/vf-graph/src/ast.rs` | `2,439` lines handling 5 working languages (`TS/JS, Rust, Py, Go`) | **PROTECTED / SEAM-EXTEND** | Keep working 5-language extractors intact (no risky rewrite); add Phase 8 languages cleanly via parallel `crates/vf-graph/src/langs/` submodules feeding `FileAstSummary` |
+| `crates/vf-graph/src/taint.rs` | SQLi/CMDi/Path/SSRF/FE-ERR rules | **EXTEND** | Add `XSS`/`CSRF`/Confidence tracking (Phase 6), then inter-procedural field flow (Phase 10) |
+| `crates/vf-graph/src/deps.rs` | 4-ecosystem parser + 26 hardcoded `OFFLINE_ADVISORIES` | **UPGRADE (Phase 7)** | Keep offline fallback list; layer SQLite advisory DB lookup (`advisories.db`) + lockfile precision |
+| `crates/vf-sandbox/src/{lib.rs,bwrap.rs,verifier.rs}` | Linux `bwrap` (`--unshare-all --unshare-net`), PGID reaper, HTTP/1.1 `Auth` & `TxLock` tests | **EXTEND (Phase 6 & 10)** | Keep existing `Auth` + Last-Byte Sync intact; wire `[sandbox]` profiles + `IDOR` two-user swapper (Phase 6), then TLS/cross-OS/mock shims & `RLIMIT_AS` (Phase 10) |
+| `crates/vf-ai/src/lib.rs` | `2048`-byte witness prompt builder + disabled provider stub (no HTTP crate yet) | **COMPLETE IN PHASE 6** | Add minimal HTTP client (e.g., `ureq` + `rustls`) to `vf-ai/Cargo.toml` & closed-loop `tmpfs` diff verification |
+| `crates/vf-tui`, `vf-report`, `src/{main.rs,mcp.rs}` | Panic-safe TUI, SARIF/HTML, CLI, hooks, MCP server | **PROTECTED / WIRE FLAGS** | Keep 12 existing `--layers` tokens intact; add confidence badges, `xss`/`csrf` layer filters, `has_dynamic_targets` IDOR trigger (`main.rs:304`), MCP schema sync, and `deps sync` subcommand |
 
 ---
 
-## 3. Core Rust Crate Stack (Locked Choices)
+## 2. Immediate Next Sprint (`Sprint 2` — Phase 6 Execution Plan)
 
-- **CLI & Async Runtime:** `clap` (derive), `tokio` (multi-thread), `anyhow`, `tracing`
-- **13k-File Walker & Hashing:** `ignore`, `rayon`, `blake3`, `toml`
-- **AST & Lattice Graph Engine:** `tree-sitter`, `tree-sitter-typescript`, `tree-sitter-javascript`, `tree-sitter-go`, `tree-sitter-rust`, `tree-sitter-python`, `petgraph`
-- **Database:** `rusqlite` (`features = ["bundled", "fts5"]`)
-- **TUI & Web Report:** `ratatui`, `crossterm`, `axum` (ephemeral report server), `serde_json`
-- **Sandbox & Last-Byte Sync PoC:** `/usr/bin/bwrap`, raw `tokio::net::TcpStream` (for `<50us` Last-Byte Sync), `reqwest` (rustls)
+Do not start Phase 8 languages before locking Web/API accuracy and verification quality in Sprint 2:
+
+| Task ID | Crate / File Target | Concrete Task | Acceptance Criteria |
+| :--- | :--- | :--- | :--- |
+| `S2-01` | `vf-core/store.rs`, `vf-graph`, `vf-report`, `vf-tui`, `main.rs`, `mcp.rs` | Add explicit finding confidence/verification tier (`PROVEN`, `CONFIRMED`, `HEURISTIC`) consistently across SQLite store, graph output, SARIF/HTML, TUI badges, CLI `--fail-on`, and MCP JSON | CI gates and MCP callers distinguish verified findings cleanly; 0 breaking schema regressions |
+| `S2-02` | `vf-graph/src/{ast.rs,taint.rs,lattice.rs}`, `main.rs`, `mcp.rs` | Implement sanitizer-aware AST taint rules for `VF-XSS-001` and `VF-CSRF-001`, add corresponding `GuardKind` variants, and wire `--layers xss,csrf` in CLI + MCP schemas | Precision unit tests pass on vulnerable vs sanitized TS/JS/Python/Go handlers (0 false positives on escaped/CSRF-protected routes) |
+| `S2-03` | `vf-graph/src/secrets_config.rs` + `ast.rs` | Add `VF-CFG-JWT-LOGIC` detecting `alg: "none"` and disabled signature checks (`jwt.decode(..., verify=False)` / unverified claims decode) | Flags unsafe JWT verification across JS/TS/Python/Go while ignoring properly verified calls |
+| `S2-04` | `vf-core/config.rs`, `main.rs`, `vf-sandbox/src/{lib.rs,verifier.rs}` | Extend `[sandbox]` config (`user_a_header`, `user_b_header`, `probe_body`, wire `base_url`), update `main.rs:301-304` `has_dynamic_targets` to include `OwnershipCheck`, and add live `IDOR` prober inside `bwrap` | Broken-ownership fixture yields `PROVEN`; properly scoped fixture yields `MITIGATED`; missing tokens cleanly yield `SuspectUnverified` |
+| `S2-05` | `vf-ai/{Cargo.toml,src/lib.rs}` + `vf-sandbox` | Add zero-bloat HTTP client (`ureq` + `rustls`), implement opt-in `--patch --apply-check` applying unified diff in Linux `bwrap --tmpfs` copy, and re-run `verify_finding` | Requires explicit provider config (still `Disabled` by default, 0 cost); rejects invalid paths and verifies patch transitions finding to `MITIGATED` |
+| `S2-06` | `README.md`, `store.rs`, `skills/` | Sync stale doc claims (`VF-SEC-JWT`, `pyproject.toml`, XDG cache path) and safely clean/retire unused `symbols`/`edges` dead SQLite schema | Docs and DB schema match actual runtime code 100% |
+| `S2-07` | Full workspace verification | Run `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --locked`, and self-scan (`cargo run -- scan src --ci` & `crates --ci`) | Zero warnings, all workspace + Sprint 2 tests pass on Linux/macOS/Windows CI matrix, zero self-scan false positives |
 
 ---
 
-## 4. Engineering Risk & Mitigation Matrix
+## 3. Speed & Accuracy Guardrails (Mandatory Engineering Rules)
 
-| Risk | Impact | Mitigation Strategy |
+1. **No Accuracy-Destroying Shortcuts:** Never replace AST/taint checks with global raw-text regexes just to shave parse time. Optimize via `BLAKE3` file-level skipping and `ast_cache`, not weaker analysis.
+2. **Tier Separation:** Keep default `shellmind-guard scan .` strictly offline, static, bounded to `max_threads` (`2..=6`), and memory-capped (`256 KiB` cached file cap) so developer desktops never lag. Dynamic fuzzing, sandbox loops, and advisory syncing run only when requested (`--boot-cmd`, `--deep`, `deps sync`).
+3. **Incremental Modularity (Preserve Working Code):** Keep the existing 5-language parser in `crates/vf-graph/src/ast.rs` intact and add Phase 8 languages via clean `crates/vf-graph/src/langs/` submodules implementing a shared extractor feeding `FileAstSummary`, so existing suites never regress.
+
+---
+
+## 4. Risk & Anti-Bloat Matrix
+
+| Risk | Consequence | Concrete Mitigation |
 | :--- | :--- | :--- |
-| **Path explosion ($O(V!)$) on 3,000+ file cyclic graphs** | Scanner hangs or OOMs | Use $O(V+E)$ Guard-Set Lattice fixed-point solver instead of enumerating all paths |
-| **Cross-file cache staleness on partial edits** | Missed bugs when `auth.ts` changes | Cache per-file AST symbols by `BLAKE3`, always re-link global graph in RAM (<80ms) |
-| **TCP/TLS jitter hiding real DB race conditions** | False `MITIGATED` on race bugs | Use Last-Byte Sync (`tokio::sync::Barrier` + final-byte flush in `<50us`) |
-| **Orphan sandbox processes or terminal corruption** | Zombie processes / broken TTY | Wrap `bwrap` in cgroup v2 subtree (`cgroup.kill=1`) + global `ratatui` panic hook |
-| **Target app crashes without external DB/Stripe** | Unverifiable flows | Spin up in-sandbox mock shims on `127.0.0.1` or explicitly label `UNBOOTABLE` |
-| **CPU saturation on 4-core PC during 13k scan** | Desktop UI lag | Cap Rayon pool to `num_cpus - 1` (max 3 threads) and run sandbox at `nice -n 15` |
+| Adding 7+ new languages inside `ast.rs` at once | Unmaintainable 8,000+ line file, slow compile, regressions in TS/JS/Rust/Py/Go | Route new Phase 8 grammars through isolated `langs/` modules with parity tests while preserving existing `ast.rs` |
+| False positives from new Core-Engine / Mobile rules | Erodes user trust ("noisy alerts = useless tool") | Require AST structural evidence (missing unlock / missing sanitize / exported without permission) + label unconfirmed patterns `HEURISTIC` |
+| Heavy external CVE DB or sandbox spawning stalls low-end PC | Violates core "zero PC hang" workflow | Store compressed SQLite `advisories.db` indexed by `(ecosystem, pkg)` outside repo; sync only on explicit `deps sync`; keep `bwrap` under strict `IO_TIMEOUT` + PGID kill |
+| Sandbox probes breaking on apps needing custom seed users/DBs | `IDOR` tests misclassified as `MITIGATED` | Reuse `.shellmind-guard.toml` `[sandbox]` seed/header hooks and report inconclusive runs strictly as `SuspectUnverified`, never `Mitigated` |
+| Refactoring `lattice.rs` or `scanner.rs` unnecessarily | Breaks battle-tested $O(V+E)$ convergence and BLAKE3 delta speed | Treat `scanner.rs`, `store.rs`, and `lattice.rs` core loop as **Protected Core**; cover with snapshot regression tests |

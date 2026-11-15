@@ -9,8 +9,8 @@ use rayon::prelude::*;
 use vf_core::{IndexedFile, ShellMindGuardConfig, StateStore};
 
 pub use ast::{
-    FileAstSummary, FrontendApiCall, GuardKind, LocalStaticFinding, SinkKind, parse_file_ast,
-    parse_file_ast_with_hash,
+    Confidence, FileAstSummary, FrontendApiCall, GuardKind, LocalStaticFinding, SinkKind,
+    parse_file_ast, parse_file_ast_with_hash,
 };
 pub use lattice::{
     GraphAnalysisResult, LatticeFinding, TraceHop, solve_guard_lattice,
@@ -48,7 +48,11 @@ pub fn analyze_codebase_cached(
     store: &mut StateStore,
 ) -> Result<GraphAnalysisResult> {
     let cfg_json = serde_json::to_string(&cfg.guards).unwrap_or_default();
-    let versioned_cfg = format!("v4-6layer-{}|{}", env!("CARGO_PKG_VERSION"), cfg_json);
+    let versioned_cfg = format!(
+        "v6-sprint2-bitmask-csrf-ast-{}|{}",
+        env!("CARGO_PKG_VERSION"),
+        cfg_json
+    );
     let cfg_hash = blake3::hash(versioned_cfg.as_bytes()).to_hex().to_string();
 
     let cached_map = store.load_ast_cache(&cfg_hash)?;

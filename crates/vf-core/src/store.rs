@@ -21,6 +21,7 @@ pub struct StoredFinding {
     pub scan_id: i64,
     pub rule_id: String,
     pub severity: String,
+    pub confidence: String,
     pub status: String,
     pub trace_json: String,
     pub poc_cmd: String,
@@ -80,29 +81,15 @@ impl StateStore {
                 ast_json TEXT NOT NULL
             );
 
-            CREATE TABLE IF NOT EXISTS symbols (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
-                kind TEXT NOT NULL,
-                name TEXT NOT NULL,
-                line_start INTEGER NOT NULL,
-                line_end INTEGER NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS edges (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                src_symbol_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
-                dst_symbol_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
-                edge_type TEXT NOT NULL,
-                guard_tag TEXT,
-                taint_var TEXT
-            );
+            DROP TABLE IF EXISTS edges;
+            DROP TABLE IF EXISTS symbols;
 
             CREATE TABLE IF NOT EXISTS findings (
                 id TEXT PRIMARY KEY,
                 scan_id INTEGER NOT NULL,
                 rule_id TEXT NOT NULL,
                 severity TEXT NOT NULL,
+                confidence TEXT NOT NULL DEFAULT 'CONFIRMED',
                 status TEXT NOT NULL,
                 trace_json TEXT NOT NULL,
                 poc_cmd TEXT NOT NULL
@@ -116,6 +103,24 @@ impl StateStore {
             );
             ",
         )?;
+
+        let mut has_confidence = false;
+        {
+            let mut stmt = conn.prepare("PRAGMA table_info(findings)")?;
+            let cols = stmt.query_map([], |r| r.get::<_, String>(1))?;
+            for col in cols.flatten() {
+                if col == "confidence" {
+                    has_confidence = true;
+                    break;
+                }
+            }
+        }
+        if !has_confidence {
+            conn.execute(
+                "ALTER TABLE findings ADD COLUMN confidence TEXT NOT NULL DEFAULT 'CONFIRMED'",
+                [],
+            )?;
+        }
 
         Ok(Self { conn })
     }
@@ -261,22 +266,22 @@ impl StateStore {
     pub fn save_findings(
         &mut self,
         scan_id: i64,
-        rows: &[(&str, &str, &str, &str, &str, &str)],
+        rows: &[(&str, &str, &str, &str, &str, &str, &str)],
     ) -> Result<()> {
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM findings", [])?;
         tx.execute("DELETE FROM findings_fts", [])?;
         {
             let mut ins = tx.prepare(
-                "INSERT OR REPLACE INTO findings (id, scan_id, rule_id, severity, status, trace_json, poc_cmd)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT OR REPLACE INTO findings (id, scan_id, rule_id, severity, confidence, status, trace_json, poc_cmd)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             )?;
             let mut fts = tx.prepare(
                 "INSERT INTO findings_fts (id, rule_id, trace_json, poc_cmd) VALUES (?1, ?2, ?3, ?4)",
             )?;
-            for (id, rule_id, severity, status, trace_json, poc_cmd) in rows {
+            for (id, rule_id, severity, confidence, status, trace_json, poc_cmd) in rows {
                 ins.execute(params![
-                    id, scan_id, rule_id, severity, status, trace_json, poc_cmd
+                    id, scan_id, rule_id, severity, confidence, status, trace_json, poc_cmd
                 ])?;
                 fts.execute(params![id, rule_id, trace_json, poc_cmd])?;
             }
@@ -287,7 +292,7 @@ impl StateStore {
 
     pub fn get_finding(&self, finding_id: &str) -> Result<Option<StoredFinding>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, scan_id, rule_id, severity, status, trace_json, poc_cmd
+            "SELECT id, scan_id, rule_id, severity, confidence, status, trace_json, poc_cmd
              FROM findings WHERE id = ?1",
         )?;
         let res = stmt
@@ -297,9 +302,10 @@ impl StateStore {
                     scan_id: r.get(1)?,
                     rule_id: r.get(2)?,
                     severity: r.get(3)?,
-                    status: r.get(4)?,
-                    trace_json: r.get(5)?,
-                    poc_cmd: r.get(6)?,
+                    confidence: r.get(4)?,
+                    status: r.get(5)?,
+                    trace_json: r.get(6)?,
+                    poc_cmd: r.get(7)?,
                 })
             })
             .optional()?;
@@ -350,6 +356,23 @@ mod tests {
         assert_eq!(d2.added_or_modified, 0);
         assert_eq!(d2.unchanged_cached, 1);
         assert!(c2.is_empty());
+
+        store
+            .save_findings(
+                d2.scan_id,
+                &[(
+                    "VF-SQLI-001",
+                    "VF-SQLI-001",
+                    "CRITICAL",
+                    "CONFIRMED",
+                    "SUSPECT_UNGUARDED",
+                    "{}",
+                    "shellmind-guard replay VF-SQLI-001",
+                )],
+            )
+            .unwrap();
+        let stored = store.get_finding("VF-SQLI-001").unwrap().unwrap();
+        assert_eq!(stored.confidence, "CONFIRMED");
 
         let _ = fs::remove_dir_all(&tmp);
     }

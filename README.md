@@ -51,27 +51,27 @@ flowchart TD
     subgraph S1["Stage 1: Two-Phase Incremental Ingestion (vf-core)"]
         B1["ignore::WalkParallel\n(.gitignore + fast path filter)"]
         B2["BLAKE3 Content Fingerprinting\n+ mtime_ns Fast-Skip"]
-        B3["SQLite WAL + FTS5 Store\n(.shellmind-guard/state.db)"]
+        B3["SQLite WAL + FTS5 Store\n($XDG_CACHE_HOME/shellmind-guard/<hash>/state.db)"]
         B1 --> B2 --> B3
     end
 
     subgraph S2["Stage 2: Polyglot AST & O(V+E) Guard-Set Lattice (vf-graph)"]
         C1["Rayon Parallel Tree-sitter AST\nTS/TSX · JS/JSX · Go · Python · Rust"]
         C2["Cross-File Module Linker\ntsconfig paths · barrels · Go pkgs · Rust mod · Python rel"]
-        C3["6-Layer Guard-Set Lattice & Taint Solver\nG(v) = ⋂ (G(p) ∪ EdgeGuards(p → v))"]
+        C3["6-Layer Guard-Set Lattice & Sink-Typed Bitmask Taint\nG(v) = ⋂ (G(p) ∪ EdgeGuards(p → v))"]
         C1 --> C2 --> C3
     end
 
     subgraph S3["Stage 3: OS-Isolated Runtime Prover (vf-sandbox)"]
-        D1["Linux Bubblewrap (/usr/bin/bwrap)\n--unshare-all · --ro-bind · --tmpfs · RLIMIT_AS"]
-        D2["12-Way Barrier-Synchronized Prober\nAuth Bypass & Last-Byte Sync Race Engine"]
+        D1["Linux Bubblewrap (/usr/bin/bwrap)\n--unshare-all · --ro-bind · --tmpfs · PGID Reaper"]
+        D2["12-Way Barrier-Synchronized Prober\nAuth Bypass, Cross-Tenant IDOR & Last-Byte Sync Race"]
         D1 --> D2
     end
 
     subgraph S4["Stage 4: Actionable Outputs (vf-report / vf-ai)"]
-        E1["SARIF 2.1.0\nGitHub Code Scanning"]
+        E1["SARIF 2.1.0 + Confidence\nGitHub Code Scanning"]
         E2["Interactive HTML/SVG\nMulti-File Witness Graph"]
-        E3["Minimal Patch Prompt (<4 KB)\nExact Witness Hops + Remediation"]
+        E3["Minimal Patch Prompt (<= 2 KB) & --apply-check\nExact Witness Hops + Opt-In AI Patch Verifier"]
     end
 
     CLI --> S1 --> S2
@@ -82,7 +82,7 @@ flowchart TD
 
 ### Mathematical Formulation: The $O(V + E)$ Guard-Set Lattice
 
-Instead of enumerating all simple paths between routes and sinks (which degrades to $O(V!)$ on cyclic call graphs), ShellMind Guard formulates security invariant verification as a forward data-flow monotone lattice over the finite universe of security guards $\mathcal{U} = \{\text{Auth}, \text{TxLock}, \text{OwnershipCheck}, \text{SqlSanitizer}, \text{CmdSanitizer}, \text{PathSanitizer}, \text{SsrfSanitizer}\}$:
+Instead of enumerating all simple paths between routes and sinks (which degrades to $O(V!)$ on cyclic call graphs), ShellMind Guard formulates security invariant verification as a forward data-flow monotone lattice over the finite universe of security guards $\mathcal{U} = \{\text{Auth}, \text{TxLock}, \text{OwnershipCheck}, \text{SqlSanitizer}, \text{CmdSanitizer}, \text{PathSanitizer}, \text{SsrfSanitizer}, \text{XssSanitizer}, \text{CsrfProtection}\}$ paired with a sink-typed bitmask taint semilattice (preventing cross-sink sanitizer confusion) and explicit finding confidence grading (`PROVEN`, `CONFIRMED`, `HEURISTIC`):
 
 $$\mathcal{G}_{\text{in}}(v) = \begin{cases} \emptyset & \text{if } v \in \text{EntryRoutes} \\ \displaystyle\bigcap_{p \in \text{Pred}(v)} \mathcal{G}_{\text{out}}(p) & \text{otherwise} \end{cases}, \qquad \mathcal{G}_{\text{out}}(v) = \mathcal{G}_{\text{in}}(v) \cup \text{LocalGuards}(v)$$
 
@@ -98,16 +98,18 @@ ShellMind Guard executes all 6 verification layers in a single unified pass:
 
 | Layer | Rule ID | Severity | Category & Invariant Checked | Required Guard / Sanitizer Disproof |
 | :---: | :--- | :---: | :--- | :--- |
-| **1** | `VF-SEC-AWS`<br>`VF-SEC-STRIPE`<br>`VF-SEC-GITHUB`<br>`VF-SEC-OPENAI`<br>`VF-SEC-ANTHROPIC`<br>`VF-SEC-GOOGLE`<br>`VF-SEC-SLACK`<br>`VF-SEC-PRIVKEY`<br>`VF-SEC-DBURL`<br>`VF-SEC-ENTROPY` | `CRITICAL`<br>`HIGH` | **Secrets & Credential Exposure:** Provider-prefixed tokens, PEM private keys, inline credentials in `postgres://`/`mysql://`/`mongodb://`/`redis://` URLs, and Shannon entropy ($H > 4.3$) secret literals. | Excluded on lockfiles, test fixtures, example placeholders (`EXAMPLE`, `YOUR_API_KEY`, `changeme`), URLs/SQL, and non-assignment strings. |
+| **1** | `VF-SEC-AWS`<br>`VF-SEC-STRIPE`<br>`VF-SEC-GITHUB`<br>`VF-SEC-OPENAI`<br>`VF-SEC-ANTHROPIC`<br>`VF-SEC-GOOGLE`<br>`VF-SEC-SLACK`<br>`VF-SEC-JWT`<br>`VF-SEC-PRIVKEY`<br>`VF-SEC-DBURL`<br>`VF-SEC-ENTROPY` | `CRITICAL`<br>`HIGH` | **Secrets & Credential Exposure:** Provider-prefixed tokens, hardcoded JWT secrets (`VF-SEC-JWT`), PEM private keys, inline credentials in `postgres://`/`mysql://`/`mongodb://`/`redis://` URLs, and Shannon entropy ($H > 4.3$) secret literals. | Excluded on lockfiles, test fixtures, example placeholders (`EXAMPLE`, `YOUR_API_KEY`, `changeme`), URLs/SQL, and non-assignment strings. |
 | **1** | `VF-SEC-ENV` | `HIGH` | **Unignored `.env` File:** `.env` or `.env.production` containing live secrets is not covered by `.gitignore`. | Add `.env` / `.env.*` to `.gitignore`. |
-| **1** | `VF-CFG-CORS`<br>`VF-CFG-JWT`<br>`VF-CFG-TLS`<br>`VF-CFG-DEBUG`<br>`VF-CFG-COOKIE`<br>`VF-CFG-DOCKER` | `CRITICAL`<br>`HIGH`<br>`MEDIUM` | **Security Misconfigurations:** Wildcard CORS (`origin: "*"`) with `credentials: true`, hardcoded JWT secrets or `alg: "none"`, `NODE_TLS_REJECT_UNAUTHORIZED=0` / `InsecureSkipVerify: true` / `verify=False`, production `DEBUG=True`, insecure session cookies, and `Dockerfile` missing non-root `USER`. | Restrict CORS origins, load secrets from env, keep TLS verification enabled, enforce `httpOnly: true, secure: true`, add `USER <non-root>`. |
-| **2** | `VF-DEP-001` | `HIGH`<br>`MEDIUM` | **Offline-First Dependency & Lockfile Audit:** Parses `package.json`, `package-lock.json`, `Cargo.toml`, `Cargo.lock`, `go.mod`, and `requirements.txt` for unpinned `*`/`latest` versions, `http://` tarball registries, and embedded high-risk advisories. | Pin deterministic semver ranges and upgrade affected packages (zero external network calls). |
-| **3** | `VF-SQLI-001` | `CRITICAL` | **Cross-File SQL Injection:** Untrusted HTTP input (`req.query`, `req.params`, `req.body`, `c.Query`, `r.URL.Query`, FastAPI/NestJS route params) flows into dynamic SQL (`${...}`, `fmt.Sprintf`, `f"SELECT..."`, `%`, `+`, `.concat()`). | Parameterized queries (`$1`, `?`), safe tagged templates (`prisma.$queryRaw\`...\``), or integer/UUID/Zod parsers (`strconv.Atoi`, `parseInt`, `z.object`). |
+| **1** | `VF-CFG-CORS`<br>`VF-CFG-JWT-LOGIC`<br>`VF-CFG-TLS`<br>`VF-CFG-DEBUG`<br>`VF-CFG-COOKIE`<br>`VF-CFG-DOCKER` | `CRITICAL`<br>`HIGH`<br>`MEDIUM` | **Security Misconfigurations:** Wildcard CORS (`origin: "*"`) with `credentials: true`, JWT verification bypasses (`alg: "none"`, `verify_signature: False`, unverified `jwt.decode`), `NODE_TLS_REJECT_UNAUTHORIZED=0` / `InsecureSkipVerify: true` / `verify=False`, production `DEBUG=True`, insecure session cookies, and `Dockerfile` missing non-root `USER`. | Restrict CORS origins, enforce strong verified JWT algorithms, keep TLS verification enabled, enforce `httpOnly: true, secure: true`, add `USER <non-root>`. |
+| **2** | `VF-DEP-001` | `HIGH`<br>`MEDIUM` | **Offline-First Dependency & Lockfile Audit:** Parses `package.json`, `package-lock.json`, `Cargo.toml`, `Cargo.lock`, `go.mod`, `requirements.txt`, and `pyproject.toml` for unpinned `*`/`latest` versions, `http://` tarball registries, and embedded high-risk advisories. | Pin deterministic semver ranges and upgrade affected packages (zero external network calls). |
+| **3** | `VF-SQLI-001` | `CRITICAL` | **Cross-File SQL Injection:** Untrusted HTTP input (`req.query`, `req.params`, `req.body`, `c.Query`, `r.URL.Query`/`FormValue`, FastAPI/NestJS route params) flows into dynamic SQL (`${...}`, `fmt.Sprintf`, `f"SELECT..."`, `%`, `+`, `.concat()`). | Parameterized queries (`$1`, `?`), safe tagged templates (`prisma.$queryRaw\`...\``), or integer/UUID/Zod parsers (`strconv.Atoi`, `parseInt`, `z.object`). |
+| **3** | `VF-XSS-001` | `HIGH` | **Cross-Site Scripting (XSS):** Untrusted HTTP input flows into `dangerouslySetInnerHTML`, `innerHTML`, `res.send`/`html` responses, `template.HTML(...)`, Python `Markup(...)`/`render_template_string`, or unsafe raw HTML without an XSS sanitizer bit in the taint lattice. | HTML escaping/sanitization (`DOMPurify.sanitize`, `bluemonday`, `bleach.clean`, `ammonia::clean`, `html.escape`) matching the XSS sink bit. |
 | **3** | `VF-CMDI-001` | `CRITICAL` | **Command Injection:** Tainted input reaches `exec`, `execSync`, `spawn(..., { shell: true })`, `os.system`, `subprocess.run(..., shell=True)`, `exec.Command("sh", "-c", ...)`, or `Command::new("sh")`. | Argument array execution without shell, `shlex.quote`, `shellEscape`, or strict allowlist/numeric parser. |
 | **3** | `VF-PATH-001` | `HIGH` | **Path Traversal:** Tainted input reaches `fs.readFile`, `fs.writeFile`, `res.sendFile`, `os.Open`, `os.ReadFile`, `http.ServeFile`, `open()`, or `std::fs::read`. | `path.basename`, `filepath.Base`, `filepath.Clean` + `.startsWith(baseDir)` prefix check. |
 | **3** | `VF-SSRF-001` | `HIGH` | **Server-Side Request Forgery (SSRF):** Tainted URL reaches `fetch`, `axios`, `http.Get`, `requests.get`, `httpx.get`, or `reqwest::get`. | Explicit hostname allowlist (`allowedHosts`, `validateUrl`) and private/link-local CIDR block. |
 | **4** | `VF-AUTH-001` | `HIGH` | **Missing Authentication Guard:** Reachable path from an HTTP route to a privileged state-mutating sink (`PaymentMutation`, `BalanceUpdate`, `SqlWrite`, `AuthMutation`, `ResourceDestroy`) without an active `Auth` guard. | Route/router middleware (`requireAuth`, `UseGuards`, `protectedProcedure`, `login_required`, `AuthMiddleware`) or `.shellmind-guard.toml` `public_routes`. |
-| **4** | `VF-IDOR-001` | `HIGH` | **Insecure Direct Object Reference (IDOR):** Authenticated route accepts a resource ID (`:id`, `{id}`, `[id]`) and executes a DB read/update/delete (`prisma.*.delete`, `db.*.findUnique`, `SELECT/UPDATE/DELETE WHERE id = ...`) without scoping by caller identity. | Include caller ownership predicate (`user_id = req.user.id`, `owner_id`, `tenant_id`, `org_id`, `current_user`). |
+| **4** | `VF-CSRF-001` | `HIGH` | **Cross-Site Request Forgery (CSRF):** Cookie/session-authenticated state-changing endpoints or explicit `@csrf_exempt` overrides without CSRF token middleware or `SameSite` cookie protection (excludes pure Bearer/JWT APIs, webhooks, and health probes). | `csurf` / `csrfProtect` / `SameSite=Strict` or `SameSite=Lax` cookies, or token-based `Authorization: Bearer` auth. |
+| **4** | `VF-IDOR-001` | `HIGH` | **Insecure Direct Object Reference (IDOR):** Authenticated route accepts a resource ID (`:id`, `{id}`, `[id]`) and executes a DB read/update/delete without scoping by caller identity—provable dynamically via User A vs User B sandbox probing. | Include caller ownership predicate (`user_id = req.user.id`, `owner_id`, `tenant_id`, `org_id`, `current_user`) and verify HTTP `401/403/404` across tenants. |
 | **5** | `VF-RACE-001` | `CRITICAL` | **Concurrency / Double-Spend Race:** Payment or balance/wallet mutation reachable without an enclosing ACID transaction lock or idempotency guard—proven at runtime via 12 concurrent barrier-synchronized requests. | `withTransaction`, `SELECT ... FOR UPDATE`, `db.Transaction`, `BeginTx`, `$transaction`, or atomic `idempotencyKey`. |
 | **6** | `VF-FE-404`<br>`VF-FE-ERR` | `MEDIUM`<br>`LOW` | **Frontend ↔ Backend Contract & UI Integrity:** Frontend `fetch('/api/...')` / `axios.<method>('/api/...')` calling a path that matches no backend route (`VF-FE-404`), dead `onClick={() => {}}` handlers, or unhandled async `fetch`/`axios` calls without `try/catch` or `.catch()`. | Align frontend API paths with backend routes (including mounted prefixes) and handle async rejection states. |
 
@@ -158,7 +160,7 @@ claude --plugin-dir /path/to/ShellMind-Guard
 
 ```bash
 git clone https://github.com/qira-dev/ShellMind-Guard.git
-cd ShellMind Guard
+cd ShellMind-Guard
 
 # Install the optimized release binary to ~/.cargo/bin/shellmind-guard
 cargo install --path .
@@ -183,8 +185,8 @@ shellmind-guard scan /path/to/your/repo
 shellmind-guard scan /path/to/your/repo --format json
 shellmind-guard scan /path/to/your/repo --format sarif
 
-# Filter specific layers or rule families
-shellmind-guard scan /path/to/your/repo --layers secrets,sqli,idor,race
+# Filter specific layers or enforce a minimum confidence threshold (proven | confirmed | heuristic)
+shellmind-guard scan /path/to/your/repo --layers secrets,sqli,xss,csrf,idor,race --min-confidence confirmed
 ```
 
 ### 4. Prove Exploits in the Isolated Bubblewrap Sandbox
@@ -221,12 +223,18 @@ ShellMind Guard Sandbox Proof (bwrap=isolated):
   [PROVEN] VF-RACE-002 (VF-RACE-001) -> 12/12 concurrent requests returned HTTP 200 (Last-Byte Sync, 1 distinct bodies)
 ```
 
-### 5. Replay a Single Finding & Generate a Minimal (<4 KB) Patch Prompt
+### 5. Replay a Finding, Generate Minimal Patch Context (<= 2 KB) & Verify Diffs (`--apply-check`)
 
 ```bash
+# Replay live exploit proof and print minimal <= 2048 B witness context
 shellmind-guard replay VF-RACE-002 fixtures/vuln-payment-node \
   --boot-cmd "node server.mjs" \
   --patch
+
+# Apply a unified diff inside an isolated temporary workspace and verify mitigation
+shellmind-guard replay VF-SQLI-001 /path/to/your/repo \
+  --patch-file fix.diff \
+  --apply-check
 ```
 
 ### 6. Launch the Panic-Safe 60fps Terminal UI (`ratatui`)
@@ -237,7 +245,8 @@ shellmind-guard ui fixtures/vuln-payment-node --boot-cmd "node server.mjs"
 
 - **`[j]` / `[k]` or `↑` / `↓`:** Navigate findings across all 6 layers
 - **`[Enter]`:** Re-run live Bubblewrap sandbox PoC for the selected finding
-- **`[p]`:** Generate minimal (<4 KB) multi-file witness patch prompt
+- **`[p]`:** Generate minimal (<= 2 KB) multi-file witness patch prompt
+- **`[f]`:** Cycle filter mode (`ALL` -> `UNMITIGATED` -> `PROVEN` -> `CONFIRMED+` -> `CRITICAL`)
 - **`[g]` / `[s]`:** Export interactive Carbon-Slate HTML/SVG graph and SARIF 2.1.0 report
 - **`[L]`:** Toggle internal sandbox & diagnostics ring-buffer drawer (zero stdout corruption)
 
@@ -266,8 +275,8 @@ Add the following to your `.mcp.json`, `~/.claude.json`, or `.cursor/mcp.json`:
 
 | Tool Name | Input Schema | Description |
 | :--- | :--- | :--- |
-| `shellmind_guard_scan` | `{ "path"?: string, "layers"?: string[], "boot_cmd"?: string }` | Runs the full 6-layer AST + Guard-Set Lattice scan (and optional `bwrap` sandbox proof) and returns structured JSON findings with witness hops and remediation. |
-| `shellmind_guard_explain_finding` | `{ "path"?: string, "finding_id": string }` | Resolves a finding by `id` (e.g. `VF-RACE-002`) or `rule_id` (e.g. `VF-SQLI-001`) and returns exact source lines around every hop in `witness_path`, a<4 KB patch prompt, and concrete remediation guidance. |
+| `shellmind_guard_scan` | `{ "path"?: string, "layers"?: string[], "min_confidence"?: "proven"\|"confirmed"\|"heuristic", "boot_cmd"?: string }` | Runs the full 6-layer AST + Guard-Set Lattice scan (and optional `bwrap` sandbox proof) and returns structured JSON findings with confidence, witness hops, and remediation. |
+| `shellmind_guard_explain_finding` | `{ "path"?: string, "finding_id": string }` | Resolves a finding by `id` (e.g. `VF-RACE-002`) or `rule_id` (e.g. `VF-SQLI-001`) and returns exact source lines around every hop in `witness_path`, a <= 2 KB patch prompt, and concrete remediation guidance. |
 | `shellmind_guard_init` | `{ "path"?: string, "ci"?: boolean }` | Detects the repository language stack, writes `.shellmind-guard.toml`, and optionally scaffolds `.github/workflows/shellmind-guard.yml`. |
 
 ---
@@ -306,8 +315,19 @@ max_threads = 4
 max_file_bytes = 2097152
 
 [sandbox]
-# Default boot command for `shellmind-guard scan`, `shellmind-guard replay`, and `shellmind-guard ui`
+# Default boot command, loopback base_url, and IDOR/body overrides (require --trust-repo-config)
 # boot_cmd = "node server.mjs"
+# base_url = "http://127.0.0.1:3000"
+# user_a_header = "Authorization: Bearer token-user-a"
+# user_b_header = "Authorization: Bearer token-user-b"
+# probe_body = '{"amount": 100}'
+
+[ai]
+# Opt-in only (disabled by default = zero network calls; requires --trust-repo-config)
+# provider = "disabled"          # "disabled" | "ollama" | "openai_compatible"
+# endpoint = "http://127.0.0.1:11434"
+# model = "qwen2.5-coder:7b"
+# api_key_env = "OPENAI_API_KEY"
 ```
 
 ---
@@ -317,21 +337,21 @@ max_file_bytes = 2097152
 ShellMind Guard is organized as a modular, 100% pure-Rust Cargo workspace:
 
 ```text
-ShellMind Guard/
+ShellMind-Guard/
 ├── Cargo.toml                     # Workspace root (Rust 2024 Edition)
 ├── src/
 │   ├── main.rs                    # Unified CLI (`init`, `index`, `scan`, `replay`, `ui`, `mcp`)
 │   └── mcp.rs                     # Stdio JSON-RPC 2.0 Model Context Protocol server
 ├── crates/
 │   ├── vf-core/                   # .shellmind-guard.toml config, ignore::WalkParallel + BLAKE3 scanner,
-│   │                              # SQLite WAL + FTS5 Two-Phase AST & findings store
+│   │                              # XDG SQLite WAL + FTS5 Two-Phase AST & findings store
 │   ├── vf-graph/                  # Parallel Tree-sitter AST (TS/JS/Go/Python/Rust), cross-file
-│   │                              # module resolver, 6-layer taint engine & O(V+E) Guard-Set Lattice
+│   │                              # module resolver, 6-layer bitmask taint & O(V+E) Guard-Set Lattice
 │   ├── vf-sandbox/                # Linux Bubblewrap (--unshare-all) runner, inner namespace probe,
-│   │                              # 12-way Barrier + JoinSet concurrent race & auth verifier
+│   │                              # Auth/IDOR probers & 12-way Barrier + JoinSet concurrent race verifier
 │   ├── vf-report/                 # SARIF 2.1.0 & self-contained Carbon-Slate HTML/SVG graph exporter
 │   ├── vf-tui/                    # Panic-safe 60fps ratatui 3-pane workspace + ring-buffer log drawer
-│   └── vf-ai/                     # Opt-in minimal-context (<4 KB) witness patch prompt builder
+│   └── vf-ai/                     # Opt-in minimal-context (<= 2 KB) HTTP/TLS patcher & safe diff applier
 └── fixtures/
     ├── vuln-payment-node/         # Runnable multi-file Node/TS double-spend race, SQLi & auth fixture
     └── vuln-auth-rust/            # Multi-file Rust Axum unauthenticated role-mutation fixture

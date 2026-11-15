@@ -1,9 +1,16 @@
-use crate::ast::{FrontendApiCall, GuardKind, LocalStaticFinding, SinkKind};
+use crate::ast::{Confidence, FrontendApiCall, GuardKind, LocalStaticFinding, SinkKind};
 use regex::Regex;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 use tree_sitter::Node;
 use vf_core::Language;
+
+pub const TAINT_SQL: u8 = 1 << 0;
+pub const TAINT_CMD: u8 = 1 << 1;
+pub const TAINT_PATH: u8 = 1 << 2;
+pub const TAINT_SSRF: u8 = 1 << 3;
+pub const TAINT_XSS: u8 = 1 << 4;
+pub const TAINT_ALL: u8 = TAINT_SQL | TAINT_CMD | TAINT_PATH | TAINT_SSRF | TAINT_XSS;
 
 #[derive(Debug, Default)]
 pub struct FunctionTaintSummary {
@@ -13,9 +20,61 @@ pub struct FunctionTaintSummary {
     pub has_db_crud_sink: bool,
     pub db_crud_line: Option<usize>,
     pub tainted_calls: Vec<String>,
+    pub tainted_call_masks: HashMap<String, u8>,
     pub param_forwarding_calls: Vec<String>,
     pub local_taint_hits: Vec<LocalStaticFinding>,
     pub param_sinks: Vec<LocalStaticFinding>,
+    pub has_cookie_session_auth: bool,
+    pub has_bearer_header_auth: bool,
+    pub csrf_exempt: bool,
+}
+
+#[derive(Clone, Default)]
+struct TaintEnv {
+    direct: HashMap<String, u8>,
+    params: HashMap<String, u8>,
+    sql_vars: HashSet<String>,
+    html_vars: HashSet<String>,
+}
+
+impl TaintEnv {
+    fn join(&mut self, other: &Self) {
+        for (k, v) in &other.direct {
+            *self.direct.entry(k.clone()).or_insert(0) |= *v;
+        }
+        for (k, v) in &other.params {
+            *self.params.entry(k.clone()).or_insert(0) |= *v;
+        }
+        for k in &other.sql_vars {
+            self.sql_vars.insert(k.clone());
+        }
+        for k in &other.html_vars {
+            self.html_vars.insert(k.clone());
+        }
+    }
+
+    fn join_pair(a: &Self, b: &Self) -> Self {
+        let mut out = a.clone();
+        out.join(b);
+        out
+    }
+
+    fn clear_bits_for_vars(&mut self, vars: &HashSet<String>, clear_mask: u8) {
+        for v in vars {
+            if let Some(m) = self.direct.get_mut(v) {
+                *m &= !clear_mask;
+                if *m == 0 {
+                    self.direct.remove(v);
+                }
+            }
+            if let Some(m) = self.params.get_mut(v) {
+                *m &= !clear_mask;
+                if *m == 0 {
+                    self.params.remove(v);
+                }
+            }
+        }
+    }
 }
 
 fn node_text<'a>(node: Node, src: &'a [u8]) -> &'a str {
@@ -31,7 +90,7 @@ fn params_mask_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r#"(?:req(?:uest)?\.(?:params|query|body|args|json|form|values|data)(?:\.[A-Za-z0-9_]+|\[[^\]]*\])?|c\.(?:Param|Query|DefaultQuery|PostForm)\s*\([^)]*\)|r\.(?:PathValue|FormValue|PostFormValue)\s*\([^)]*\)|r\.URL\.Query\s*\(\s*\)\.Get\s*\([^)]*\)|chi\.URLParam\s*\([^)]*\)|mux\.Vars\s*\([^)]*\)\s*\[[^\]]*\])"#,
+            r#"(?:req(?:uest)?\.(?:params|query|body|args|json|form|values|data)(?:\.[A-Za-z0-9_]+|\[[^\]]*\])?|c\.(?:Param|Query|DefaultQuery|PostForm)\s*\([^)]*\)|(?:r|req|request)\.(?:PathValue|FormValue|PostFormValue)\s*\([^)]*\)|(?:r|req|request)\.URL\.Query\s*\(\s*\)\.Get\s*\([^)]*\)|chi\.URLParam\s*\([^)]*\)|mux\.Vars\s*\([^)]*\)\s*\[[^\]]*\])"#,
         )
         .expect("valid params mask regex")
     })
@@ -124,6 +183,114 @@ pub(crate) fn strip_comments_simple(src: &str) -> String {
     String::from_utf8(out).unwrap_or_else(|_| src.to_string())
 }
 
+/// Extracts non-literal active code spans for taint-source detection:
+/// strips plain `"..."` / `'...'` string literals so log/error messages like
+/// `throw new Error("missing req.body")` never fabricate taint, while keeping
+/// template `${...}` and Python f-string `{...}` interpolations verbatim.
+fn extract_active_code_for_taint_sources(src: &str) -> String {
+    let bytes = src.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    let mut interp_depth: Vec<u8> = Vec::new(); // b'`' or b'f'
+    let mut brace_depth = 0usize;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if matches!(b, b'"' | b'\'') {
+            let is_fstring = i > 0
+                && matches!(bytes[i - 1], b'f' | b'F')
+                && (i < 2 || !bytes[i - 2].is_ascii_alphanumeric());
+            let quote = b;
+            i += 1;
+            out.push(b' ');
+            while i < bytes.len() {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    i += 2;
+                    continue;
+                }
+                if is_fstring && bytes[i] == b'{' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    let mut bd = 1usize;
+                    while i < bytes.len() && bd > 0 {
+                        if bytes[i] == b'{' {
+                            bd += 1;
+                        } else if bytes[i] == b'}' {
+                            bd -= 1;
+                            if bd == 0 {
+                                i += 1;
+                                break;
+                            }
+                        }
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
+                    out.push(b' ');
+                    continue;
+                }
+                if bytes[i] == quote {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'`' {
+            if interp_depth.last().copied() == Some(b'`') && brace_depth == 0 {
+                interp_depth.pop();
+                i += 1;
+                out.push(b' ');
+                continue;
+            }
+            i += 1;
+            out.push(b' ');
+            while i < bytes.len() {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+                    i += 2;
+                    let mut bd = 1usize;
+                    while i < bytes.len() && bd > 0 {
+                        if bytes[i] == b'{' {
+                            bd += 1;
+                        } else if bytes[i] == b'}' {
+                            bd -= 1;
+                            if bd == 0 {
+                                i += 1;
+                                break;
+                            }
+                        }
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
+                    out.push(b' ');
+                    continue;
+                }
+                if bytes[i] == b'`' {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'{' && !interp_depth.is_empty() {
+            brace_depth += 1;
+        } else if b == b'}' && brace_depth > 0 {
+            brace_depth -= 1;
+        }
+        out.push(b);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| src.to_string())
+}
+
 pub fn has_taint_source_expr(text: &str) -> bool {
     const SOURCES: &[&str] = &[
         "req.body",
@@ -157,10 +324,15 @@ pub fn has_taint_source_expr(text: &str) -> bool {
         "c.BodyParser(",
         "c.QueryParser(",
         "r.URL.Query(",
+        "req.URL.Query(",
         "r.FormValue(",
+        "req.FormValue(",
         "r.PostFormValue(",
+        "req.PostFormValue(",
         "r.PathValue(",
+        "req.PathValue(",
         "r.Header.Get(",
+        "req.Header.Get(",
         "chi.URLParam(",
         "mux.Vars(",
         "ctx.query",
@@ -178,7 +350,212 @@ pub fn has_taint_source_expr(text: &str) -> bool {
         "axum::extract::Query",
         "axum::extract::Json",
     ];
-    SOURCES.iter().any(|s| text.contains(s))
+    let active = extract_active_code_for_taint_sources(text);
+    SOURCES.iter().any(|s| active.contains(s))
+}
+
+pub fn has_cookie_session_expr(text: &str) -> bool {
+    const INDICATORS: &[&str] = &[
+        "req.cookies",
+        "req.session",
+        "request.cookies",
+        "request.COOKIES",
+        "request.session",
+        "flask.session",
+        "express-session",
+        "cookie-session",
+        "cookieParser",
+        "cookie_parser",
+        "c.Cookie(",
+        "r.Cookie(",
+        "http.Cookie",
+        "http.SetCookie",
+        "django.contrib.sessions",
+    ];
+    INDICATORS.iter().any(|p| text.contains(p))
+}
+
+pub fn has_bearer_header_expr(text: &str) -> bool {
+    let low = text.to_ascii_lowercase();
+    low.contains("headers.authorization")
+        || low.contains("headers['authorization']")
+        || low.contains("headers[\"authorization\"]")
+        || low.contains("header('authorization')")
+        || low.contains("header(\"authorization\")")
+        || low.contains("header.get(\"authorization\")")
+        || low.contains("getheader(\"authorization\")")
+        || low.contains("x-api-key")
+        || low.contains("httpbearer")
+        || low.contains("authorization: bearer")
+        || low.contains("\"bearer \"")
+        || low.contains("'bearer '")
+}
+
+pub fn has_csrf_guard_expr(text: &str) -> bool {
+    let low = text.to_ascii_lowercase();
+    low.contains("csurf")
+        || low.contains("csrfprotect")
+        || low.contains("csrf_protect")
+        || low.contains("lusca.csrf")
+        || low.contains("csrfviewmiddleware")
+        || low.contains("django.middleware.csrf")
+        || low.contains("gin-csrf")
+        || low.contains("gorilla/csrf")
+        || low.contains("tower_csrf")
+        || low.contains("antiforgery")
+        || low.contains("verifycsrf")
+        || low.contains("validatecsrf")
+        || low.contains("csrfmiddleware")
+        || (low.contains("samesite") && (low.contains("strict") || low.contains("lax")))
+}
+
+pub fn has_global_csrf_middleware(text: &str) -> bool {
+    let low = text.to_ascii_lowercase();
+    low.contains("csurf(")
+        || low.contains("csrfprotect(")
+        || low.contains("csrf_protect(")
+        || low.contains("lusca.csrf")
+        || low.contains("csrfviewmiddleware")
+        || low.contains("django.middleware.csrf")
+        || low.contains("gorilla/csrf")
+        || low.contains("gin-csrf")
+        || low.contains("tower_csrf")
+}
+
+fn strip_comments_and_quoted_strings(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let prev_is_ident = i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+        if !prev_is_ident && bytes[i] == b'r' {
+            let mut hashes = 0usize;
+            while i + 1 + hashes < bytes.len() && bytes[i + 1 + hashes] == b'#' {
+                hashes += 1;
+            }
+            if i + 1 + hashes < bytes.len() && bytes[i + 1 + hashes] == b'"' {
+                out.push_str("  ");
+                i += 2 + hashes;
+                while i < bytes.len() {
+                    if bytes[i] == b'"' {
+                        let mut close_hashes = 0usize;
+                        while close_hashes < hashes
+                            && i + 1 + close_hashes < bytes.len()
+                            && bytes[i + 1 + close_hashes] == b'#'
+                        {
+                            close_hashes += 1;
+                        }
+                        if close_hashes == hashes {
+                            i += 1 + hashes;
+                            break;
+                        }
+                    }
+                    out.push(if bytes[i] == b'\n' { '\n' } else { ' ' });
+                    i += 1;
+                }
+                continue;
+            }
+        }
+        if bytes[i..].starts_with(b"//")
+            || (bytes[i] == b'#' && !matches!(bytes.get(i + 1), Some(b'[' | b'!')))
+        {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                out.push(' ');
+                i += 1;
+            }
+            continue;
+        }
+        if bytes[i..].starts_with(b"/*") {
+            out.push_str("  ");
+            i += 2;
+            while i < bytes.len() {
+                if bytes[i..].starts_with(b"*/") {
+                    out.push_str("  ");
+                    i += 2;
+                    break;
+                }
+                out.push(if bytes[i] == b'\n' { '\n' } else { ' ' });
+                i += 1;
+            }
+            continue;
+        }
+        if bytes[i..].starts_with(b"\"\"\"") || bytes[i..].starts_with(b"'''") {
+            let delim = if bytes[i] == b'"' { b"\"\"\"" } else { b"'''" };
+            out.push_str("   ");
+            i += 3;
+            while i < bytes.len() {
+                if bytes[i..].starts_with(delim) {
+                    out.push_str("   ");
+                    i += 3;
+                    break;
+                }
+                out.push(if bytes[i] == b'\n' { '\n' } else { ' ' });
+                i += 1;
+            }
+            continue;
+        }
+        if matches!(bytes[i], b'"' | b'`') {
+            let quote = bytes[i];
+            out.push(' ');
+            i += 1;
+            let mut escaped = false;
+            while i < bytes.len() {
+                let b = bytes[i];
+                out.push(if b == b'\n' { '\n' } else { ' ' });
+                i += 1;
+                if escaped {
+                    escaped = false;
+                } else if b == b'\\' {
+                    escaped = true;
+                } else if b == quote {
+                    break;
+                }
+            }
+            continue;
+        }
+        if bytes[i] == b'\'' {
+            let mut scan = i + 1;
+            let mut escaped = false;
+            let mut closed_at = None;
+            while scan < bytes.len() && bytes[scan] != b'\n' {
+                if escaped {
+                    escaped = false;
+                } else if bytes[scan] == b'\\' {
+                    escaped = true;
+                } else if bytes[scan] == b'\'' {
+                    closed_at = Some(scan + 1);
+                    break;
+                }
+                scan += 1;
+            }
+            if let Some(end_idx) = closed_at {
+                while i < end_idx {
+                    out.push(' ');
+                    i += 1;
+                }
+                continue;
+            }
+        }
+        let ch = text[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn csrf_exempt_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)(?:@csrf_exempt\b|(?:^|[^.\w])csrf_exempt\s*\(|\bcsrf(?:protection)?\s*:\s*false\b)",
+        )
+        .unwrap()
+    })
+}
+
+pub fn has_csrf_exempt_expr(text: &str) -> bool {
+    let cleaned = strip_comments_and_quoted_strings(text);
+    csrf_exempt_re().is_match(&cleaned)
 }
 
 pub fn has_resource_id_expr(text: &str, route_path: Option<&str>) -> bool {
@@ -324,6 +701,44 @@ fn expr_has_cmd_sanitizer(expr: &str) -> bool {
         || is_universal_sanitizer(expr)
 }
 
+fn expr_has_xss_sanitizer(expr: &str) -> bool {
+    const XSS_SAN: &[&str] = &[
+        "DOMPurify.sanitize(",
+        "sanitizeHtml(",
+        "sanitize_html(",
+        "escapeHtml(",
+        "escape_html(",
+        "html.escape(",
+        "markupsafe.escape(",
+        "bleach.clean(",
+        "html.EscapeString(",
+        "he.encode(",
+        "ammonia::clean(",
+        "validator.escape(",
+    ];
+    XSS_SAN.iter().any(|s| expr.contains(s)) || is_universal_sanitizer(expr)
+}
+
+fn sanitizer_clear_mask(expr: &str) -> u8 {
+    if is_universal_sanitizer(expr) {
+        return TAINT_ALL;
+    }
+    let mut clear = 0u8;
+    if expr_has_cmd_sanitizer(expr) {
+        clear |= TAINT_CMD;
+    }
+    if expr_has_path_sanitizer(expr) {
+        clear |= TAINT_PATH;
+    }
+    if expr_has_ssrf_sanitizer(expr) {
+        clear |= TAINT_SSRF;
+    }
+    if expr_has_xss_sanitizer(expr) {
+        clear |= TAINT_XSS;
+    }
+    clear
+}
+
 fn extract_param_names(fn_node: Node, src: &[u8]) -> HashSet<String> {
     let mut out = HashSet::new();
     let Some(params) = fn_node.child_by_field_name("parameters") else {
@@ -425,7 +840,20 @@ fn expr_references_any(expr: &str, vars: &HashSet<String>) -> bool {
     false
 }
 
-fn extract_assigned_targets(stmt: Node, src: &[u8]) -> Option<(Vec<String>, String, bool)> {
+fn extract_assigned_targets<'a>(
+    stmt: Node<'a>,
+    src: &[u8],
+) -> Option<(Vec<String>, Vec<String>, Node<'a>, bool)> {
+    let collect_lhs = |n: Node| -> Vec<String> {
+        let mut names = Vec::new();
+        for cap in ident_re().captures_iter(node_text(n, src)) {
+            let id = &cap[1];
+            if id != "_" && id != "err" && id != "mut" {
+                names.push(id.to_string());
+            }
+        }
+        names
+    };
     let k = stmt.kind();
     match k {
         "lexical_declaration" | "variable_declaration" => {
@@ -437,11 +865,12 @@ fn extract_assigned_targets(stmt: Node, src: &[u8]) -> Option<(Vec<String>, Stri
                         ch.child_by_field_name("value"),
                     )
                 {
-                    let mut names = Vec::new();
-                    for cap in ident_re().captures_iter(node_text(n, src)) {
-                        names.push(cap[1].to_string());
-                    }
-                    return Some((names, node_text(v, src).to_string(), false));
+                    return Some((
+                        collect_lhs(n),
+                        vec![node_text(n, src).trim().to_string()],
+                        v,
+                        false,
+                    ));
                 }
             }
             None
@@ -459,11 +888,12 @@ fn extract_assigned_targets(stmt: Node, src: &[u8]) -> Option<(Vec<String>, Stri
                         ch.child_by_field_name("right"),
                     )
                 {
-                    let mut names = Vec::new();
-                    for cap in ident_re().captures_iter(node_text(l, src)) {
-                        names.push(cap[1].to_string());
-                    }
-                    return Some((names, node_text(r, src).to_string(), is_aug));
+                    return Some((
+                        collect_lhs(l),
+                        vec![node_text(l, src).trim().to_string()],
+                        r,
+                        is_aug,
+                    ));
                 }
             }
             None
@@ -475,25 +905,22 @@ fn extract_assigned_targets(stmt: Node, src: &[u8]) -> Option<(Vec<String>, Stri
             let is_aug = k == "augmented_assignment" || node_text(stmt, src).contains("+=");
             let left = stmt.child_by_field_name("left")?;
             let right = stmt.child_by_field_name("right")?;
-            let mut names = Vec::new();
-            for cap in ident_re().captures_iter(node_text(left, src)) {
-                let id = &cap[1];
-                if id != "_" && id != "err" {
-                    names.push(id.to_string());
-                }
-            }
-            Some((names, node_text(right, src).to_string(), is_aug))
+            Some((
+                collect_lhs(left),
+                vec![node_text(left, src).trim().to_string()],
+                right,
+                is_aug,
+            ))
         }
         "let_declaration" => {
             let pat = stmt.child_by_field_name("pattern")?;
             let val = stmt.child_by_field_name("value")?;
-            let mut names = Vec::new();
-            for cap in ident_re().captures_iter(node_text(pat, src)) {
-                if &cap[1] != "mut" {
-                    names.push(cap[1].to_string());
-                }
-            }
-            Some((names, node_text(val, src).to_string(), false))
+            Some((
+                collect_lhs(pat),
+                vec![node_text(pat, src).trim().to_string()],
+                val,
+                false,
+            ))
         }
         "var_declaration" => {
             let mut c = stmt.walk();
@@ -504,11 +931,12 @@ fn extract_assigned_targets(stmt: Node, src: &[u8]) -> Option<(Vec<String>, Stri
                         ch.child_by_field_name("value"),
                     )
                 {
-                    let mut names = Vec::new();
-                    for cap in ident_re().captures_iter(node_text(n, src)) {
-                        names.push(cap[1].to_string());
-                    }
-                    return Some((names, node_text(v, src).to_string(), false));
+                    return Some((
+                        collect_lhs(n),
+                        vec![node_text(n, src).trim().to_string()],
+                        v,
+                        false,
+                    ));
                 }
             }
             None
@@ -566,18 +994,256 @@ enum TaintSourceKind {
     Param,
 }
 
-fn stmt_taint_status(
-    text: &str,
-    tainted_vars: &HashSet<String>,
-    param_vars: &HashSet<String>,
-) -> Option<TaintSourceKind> {
-    if has_taint_source_expr(text) || expr_references_any(text, tainted_vars) {
-        Some(TaintSourceKind::Direct)
-    } else if expr_references_any(text, param_vars) {
-        Some(TaintSourceKind::Param)
+fn html_markup_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)<(?:!doctype|html|head|body|div|span|p|a|h[1-6]|script|iframe|img|svg|ul|ol|li|table|tr|td|form|input|button|b|i|em|strong|pre|code|style|template)(?:\b|[\s>])",
+        )
+        .expect("valid html markup regex")
+    })
+}
+
+fn has_html_markup_lit(text: &str) -> bool {
+    html_markup_re().is_match(text)
+}
+
+fn is_call_sanitizer_for(ftxt: &str, full_txt: &str, sink_mask: u8) -> bool {
+    if is_universal_sanitizer(full_txt) {
+        return true;
+    }
+    let short = ftxt.rsplit('.').next().unwrap_or(ftxt);
+    let short = short.rsplit("::").next().unwrap_or(short);
+    if (sink_mask & TAINT_CMD != 0)
+        && (ftxt == "shlex.quote"
+            || short == "shellEscape"
+            || ftxt.to_ascii_lowercase().contains("allowlist"))
+    {
+        return true;
+    }
+    if (sink_mask & TAINT_PATH != 0)
+        && matches!(ftxt, "filepath.Base" | "path.basename" | "os.path.basename")
+        || ((sink_mask & TAINT_PATH != 0) && short == "file_name")
+    {
+        return true;
+    }
+    if (sink_mask & TAINT_SSRF != 0) && expr_has_ssrf_sanitizer(ftxt) {
+        return true;
+    }
+    if (sink_mask & TAINT_XSS != 0)
+        && (expr_has_xss_sanitizer(&format!("{}(", ftxt)) || short == "escapeHtml")
+    {
+        return true;
+    }
+    false
+}
+
+/// Evaluates `(direct_mask, param_mask)` over an expression AST node with
+/// sink-specific sanitizer pruning and partial-concatenation preservation.
+fn ast_eval_masks(node: Node, src: &[u8], env: &TaintEnv) -> (u8, u8) {
+    let k = node.kind();
+    let txt = node_text(node, src);
+
+    if matches!(
+        k,
+        "number"
+            | "integer_literal"
+            | "float_literal"
+            | "true"
+            | "false"
+            | "null"
+            | "none"
+            | "nil"
+            | "undefined"
+            | "boolean_literal"
+    ) {
+        return (0, 0);
+    }
+
+    if matches!(
+        k,
+        "string"
+            | "string_literal"
+            | "interpreted_string_literal"
+            | "raw_string_literal"
+            | "string_fragment"
+    ) {
+        let mut has_interp = false;
+        let mut d = 0u8;
+        let mut p = 0u8;
+        let mut c = node.walk();
+        for ch in node.children(&mut c) {
+            if matches!(
+                ch.kind(),
+                "interpolation" | "format_expression" | "template_substitution"
+            ) {
+                has_interp = true;
+                let (cd, cp) = ast_eval_masks(ch, src, env);
+                d |= cd;
+                p |= cp;
+            }
+        }
+        if has_interp {
+            return (d, p);
+        }
+        // Fallback for non-interpolated template or f-string text nodes without child spans
+        if (txt.starts_with('`') && txt.contains("${"))
+            || ((txt.starts_with("f\"") || txt.starts_with("f'")) && txt.contains('{'))
+        {
+            if has_taint_source_expr(txt) {
+                return (TAINT_ALL, 0);
+            }
+            for cap in ident_re().captures_iter(&extract_active_code_for_taint_sources(txt)) {
+                let id = &cap[1];
+                d |= env.direct.get(id).copied().unwrap_or(0);
+                p |= env.params.get(id).copied().unwrap_or(0);
+            }
+            return (d, p);
+        }
+        return (0, 0);
+    }
+
+    if k == "identifier" {
+        let ident = txt.trim();
+        let d = env.direct.get(ident).copied().unwrap_or(0);
+        let p = env.params.get(ident).copied().unwrap_or(0);
+        return (d, p);
+    }
+
+    if matches!(
+        k,
+        "member_expression"
+            | "attribute"
+            | "subscript_expression"
+            | "field_expression"
+            | "selector_expression"
+    ) {
+        if has_taint_source_expr(txt) {
+            return (TAINT_ALL, 0);
+        }
+        let mut d = 0u8;
+        let mut p = 0u8;
+        if let Some(obj) = node
+            .child_by_field_name("object")
+            .or_else(|| node.child_by_field_name("value"))
+            .or_else(|| node.child_by_field_name("operand"))
+        {
+            let (od, op) = ast_eval_masks(obj, src, env);
+            d |= od;
+            p |= op;
+        }
+        if let Some(sub) = node
+            .child_by_field_name("subscript")
+            .or_else(|| node.child_by_field_name("index"))
+        {
+            let (sd, sp) = ast_eval_masks(sub, src, env);
+            d |= sd;
+            p |= sp;
+        }
+        return (d, p);
+    }
+
+    if k == "call_expression" || k == "call" {
+        let ftxt = node
+            .child_by_field_name("function")
+            .map(|f| node_text(f, src).trim())
+            .unwrap_or("");
+        let mut d = 0u8;
+        let mut p = 0u8;
+        if has_taint_source_expr(ftxt)
+            || has_taint_source_expr(txt)
+                && txt.starts_with(ftxt)
+                && (ftxt.contains("req.")
+                    || ftxt.contains("request.")
+                    || ftxt.contains("c.")
+                    || ftxt.contains("r."))
+        {
+            d |= TAINT_ALL;
+        }
+        let mut c = node.walk();
+        for ch in node.children(&mut c) {
+            if matches!(ch.kind(), "(" | ")" | ",") {
+                continue;
+            }
+            // For call_expression, skip bare identifier/property function name so helper fn name doesn't match a variable,
+            // EXCEPT if `function` contains a chained call like `r.URL.Query().Get`.
+            if node
+                .child_by_field_name("function")
+                .is_some_and(|fn_n| fn_n.id() == ch.id())
+            {
+                let mut fc = ch.walk();
+                for fch in ch.children(&mut fc) {
+                    if matches!(fch.kind(), "call_expression" | "call")
+                        || node_text(fch, src).contains('(')
+                    {
+                        let (fd, fp) = ast_eval_masks(fch, src, env);
+                        d |= fd;
+                        p |= fp;
+                    }
+                }
+                continue;
+            }
+            let (cd, cp) = ast_eval_masks(ch, src, env);
+            d |= cd;
+            p |= cp;
+        }
+        let mut clear = 0u8;
+        for bit in [TAINT_SQL, TAINT_CMD, TAINT_PATH, TAINT_SSRF, TAINT_XSS] {
+            if is_call_sanitizer_for(ftxt, txt, bit) {
+                clear |= bit;
+            }
+        }
+        return (d & !clear, p & !clear);
+    }
+
+    let mut d = 0u8;
+    let mut p = 0u8;
+    let mut c = node.walk();
+    for ch in node.children(&mut c) {
+        let (cd, cp) = ast_eval_masks(ch, src, env);
+        d |= cd;
+        p |= cp;
+    }
+    if d == 0 && has_taint_source_expr(txt) {
+        d |= TAINT_ALL;
+    }
+    (d, p)
+}
+
+fn ast_sink_status(
+    node: Node,
+    src: &[u8],
+    sink_mask: u8,
+    env: &TaintEnv,
+) -> Option<(TaintSourceKind, u8)> {
+    let (d, p) = ast_eval_masks(node, src, env);
+    if (d & sink_mask) != 0 {
+        Some((TaintSourceKind::Direct, d))
+    } else if (p & sink_mask) != 0 {
+        Some((TaintSourceKind::Param, p))
     } else {
         None
     }
+}
+
+fn stmt_taint_status(text: &str, sink_mask: u8, env: &TaintEnv) -> Option<TaintSourceKind> {
+    let clear = sanitizer_clear_mask(text);
+    if (clear & sink_mask) == sink_mask {
+        return None;
+    }
+    if has_taint_source_expr(text) {
+        return Some(TaintSourceKind::Direct);
+    }
+    for cap in ident_re().captures_iter(&extract_active_code_for_taint_sources(text)) {
+        let id = &cap[1];
+        if (env.direct.get(id).copied().unwrap_or(0) & sink_mask) != 0 {
+            return Some(TaintSourceKind::Direct);
+        }
+        if (env.params.get(id).copied().unwrap_or(0) & sink_mask) != 0 {
+            return Some(TaintSourceKind::Param);
+        }
+    }
+    None
 }
 
 fn push_unique_hit(list: &mut Vec<LocalStaticFinding>, hit: LocalStaticFinding) {
@@ -707,12 +1373,64 @@ fn check_call_taint_sinks(
     rel_path: &str,
     lang: Language,
     symbol_name: &str,
-    tainted_vars: &HashSet<String>,
-    param_vars: &HashSet<String>,
+    env: &TaintEnv,
     fn_guards: &HashSet<GuardKind>,
     summary: &mut FunctionTaintSummary,
 ) {
     let k = node.kind();
+
+    // React JSX `dangerouslySetInnerHTML={{ __html: untrusted }}` (VF-XSS-001)
+    if k == "jsx_attribute"
+        && !fn_guards.contains(&GuardKind::XssSanitizer)
+        && node_text(node, src)
+            .trim_start()
+            .starts_with("dangerouslySetInnerHTML")
+        && let Some((tkind, _)) = ast_sink_status(node, src, TAINT_XSS, env)
+    {
+        let hit = LocalStaticFinding {
+            rule_id: "VF-XSS-001".into(),
+            severity: "HIGH".into(),
+            title: format!("Cross-Site Scripting (XSS) via `dangerouslySetInnerHTML` in `{}`", symbol_name),
+            rel_path: rel_path.to_string(),
+            line: node.start_position().row + 1,
+            symbol: symbol_name.to_string(),
+            sink_kind: SinkKind::Xss,
+            missing_guard: GuardKind::XssSanitizer,
+            confidence: Confidence::Confirmed,
+            remediation: "Sanitize untrusted HTML with `DOMPurify.sanitize(...)` before passing to `dangerouslySetInnerHTML` or render plain text safely.".into(),
+        };
+        match tkind {
+            TaintSourceKind::Direct => push_unique_hit(&mut summary.local_taint_hits, hit),
+            TaintSourceKind::Param => push_unique_hit(&mut summary.param_sinks, hit),
+        }
+    }
+
+    // Go `template.HTML(untrusted)` when parsed as `type_conversion_expression`
+    if k == "type_conversion_expression"
+        && !fn_guards.contains(&GuardKind::XssSanitizer)
+        && node
+            .child_by_field_name("type")
+            .is_some_and(|t| node_text(t, src).trim() == "template.HTML")
+        && let Some(op) = node.child_by_field_name("operand")
+        && let Some((tkind, _)) = ast_sink_status(op, src, TAINT_XSS, env)
+    {
+        let hit = LocalStaticFinding {
+            rule_id: "VF-XSS-001".into(),
+            severity: "HIGH".into(),
+            title: format!("Cross-Site Scripting (XSS) via `template.HTML` in `{}`", symbol_name),
+            rel_path: rel_path.to_string(),
+            line: node.start_position().row + 1,
+            symbol: symbol_name.to_string(),
+            sink_kind: SinkKind::Xss,
+            missing_guard: GuardKind::XssSanitizer,
+            confidence: Confidence::Confirmed,
+            remediation: "HTML-escape or sanitize untrusted input (`html.EscapeString`, Go `html/template` auto-escaping) instead of converting raw strings to `template.HTML`.".into(),
+        };
+        match tkind {
+            TaintSourceKind::Direct => push_unique_hit(&mut summary.local_taint_hits, hit),
+            TaintSourceKind::Param => push_unique_hit(&mut summary.param_sinks, hit),
+        }
+    }
 
     if (k == "call_expression" || k == "call")
         && let Some(func) = node.child_by_field_name("function")
@@ -724,16 +1442,27 @@ fn check_call_taint_sinks(
         let args_txt = args_node.map(|a| node_text(a, src)).unwrap_or("");
         let line = node.start_position().row + 1;
 
-        // Track tainted call-arg forwarding to other functions (only if arguments are not sanitized at call site!)
-        if !short.is_empty() && !is_universal_sanitizer(args_txt) {
-            if has_taint_source_expr(args_txt) || expr_references_any(args_txt, tainted_vars) {
+        // Track sink-typed call-arg forwarding (`(callee, bitmask)`) for inter-procedural propagation
+        if !short.is_empty()
+            && let Some(an) = args_node
+        {
+            let (d_mask, p_mask) = ast_eval_masks(an, src, env);
+            if d_mask != 0 {
                 if !summary.tainted_calls.iter().any(|c| c == short) {
                     summary.tainted_calls.push(short.to_string());
                 }
-            } else if expr_references_any(args_txt, param_vars)
-                && !summary.param_forwarding_calls.iter().any(|c| c == short)
-            {
-                summary.param_forwarding_calls.push(short.to_string());
+                *summary
+                    .tainted_call_masks
+                    .entry(short.to_string())
+                    .or_insert(0) |= d_mask;
+            } else if p_mask != 0 {
+                if !summary.param_forwarding_calls.iter().any(|c| c == short) {
+                    summary.param_forwarding_calls.push(short.to_string());
+                }
+                *summary
+                    .tainted_call_masks
+                    .entry(short.to_string())
+                    .or_insert(0) |= p_mask;
             }
         }
 
@@ -772,8 +1501,7 @@ fn check_call_taint_sinks(
                 ) && !arg0_txt.starts_with("f\"")
                     && !arg0_txt.starts_with("f'");
                 if !is_plain_string_lit
-                    && !is_universal_sanitizer(arg0_txt)
-                    && let Some(tkind) = stmt_taint_status(arg0_txt, tainted_vars, param_vars)
+                    && let Some((tkind, _)) = ast_sink_status(arg0, src, TAINT_SQL, env)
                 {
                     let hit = LocalStaticFinding {
                         rule_id: "VF-SQLI-001".into(),
@@ -787,6 +1515,7 @@ fn check_call_taint_sinks(
                         symbol: symbol_name.to_string(),
                         sink_kind: SinkKind::SqlInjection,
                         missing_guard: GuardKind::SqlSanitizer,
+                        confidence: Confidence::Confirmed,
                         remediation: "Use parameterized queries (`$1`, `?`, or ORM query builders) instead of passing dynamically constructed or untrusted SQL strings.".into(),
                     };
                     match tkind {
@@ -823,8 +1552,8 @@ fn check_call_taint_sinks(
 
         if is_shell_exec
             && !fn_guards.contains(&GuardKind::CmdSanitizer)
-            && !expr_has_cmd_sanitizer(args_txt)
-            && let Some(tkind) = stmt_taint_status(args_txt, tainted_vars, param_vars)
+            && let Some(an) = args_node
+            && let Some((tkind, _)) = ast_sink_status(an, src, TAINT_CMD, env)
         {
             let hit = LocalStaticFinding {
                     rule_id: "VF-CMDI-001".into(),
@@ -835,6 +1564,7 @@ fn check_call_taint_sinks(
                     symbol: symbol_name.to_string(),
                     sink_kind: SinkKind::CommandInjection,
                     missing_guard: GuardKind::CmdSanitizer,
+                    confidence: Confidence::Confirmed,
                     remediation: "Avoid invoking a shell; use `execFile`/`spawn` with an argument array (`shell: false`) or strict input allowlisting.".into(),
                 };
             match tkind {
@@ -871,8 +1601,8 @@ fn check_call_taint_sinks(
 
         if is_fs_sink
             && !fn_guards.contains(&GuardKind::PathSanitizer)
-            && !expr_has_path_sanitizer(args_txt)
-            && let Some(tkind) = stmt_taint_status(args_txt, tainted_vars, param_vars)
+            && let Some(an) = args_node
+            && let Some((tkind, _)) = ast_sink_status(an, src, TAINT_PATH, env)
         {
             let hit = LocalStaticFinding {
                     rule_id: "VF-PATH-001".into(),
@@ -883,6 +1613,7 @@ fn check_call_taint_sinks(
                     symbol: symbol_name.to_string(),
                     sink_kind: SinkKind::PathTraversal,
                     missing_guard: GuardKind::PathSanitizer,
+                    confidence: Confidence::Confirmed,
                     remediation: "Normalize the path with `path.basename` / `filepath.Base` and verify `resolvedPath.startsWith(baseDir)` before accessing the filesystem.".into(),
                 };
             match tkind {
@@ -920,8 +1651,8 @@ fn check_call_taint_sinks(
         if is_http_sink
             && !is_relative_api_url
             && !fn_guards.contains(&GuardKind::SsrfSanitizer)
-            && !expr_has_ssrf_sanitizer(args_txt)
-            && let Some(tkind) = stmt_taint_status(args_txt, tainted_vars, param_vars)
+            && let Some(an) = args_node
+            && let Some((tkind, _)) = ast_sink_status(an, src, TAINT_SSRF, env)
         {
             let hit = LocalStaticFinding {
                     rule_id: "VF-SSRF-001".into(),
@@ -932,7 +1663,55 @@ fn check_call_taint_sinks(
                     symbol: symbol_name.to_string(),
                     sink_kind: SinkKind::Ssrf,
                     missing_guard: GuardKind::SsrfSanitizer,
+                    confidence: Confidence::Confirmed,
                     remediation: "Parse the URL and enforce an explicit hostname allowlist while blocking loopback/private/link-local IP ranges (169.254.0.0/16, 10.0.0.0/8, 127.0.0.1).".into(),
+                };
+            match tkind {
+                TaintSourceKind::Direct => push_unique_hit(&mut summary.local_taint_hits, hit),
+                TaintSourceKind::Param => push_unique_hit(&mut summary.param_sinks, hit),
+            }
+        }
+
+        // 4. Cross-Site Scripting / XSS (VF-XSS-001)
+        let is_always_xss_sink = matches!(
+            ftxt,
+            "document.write"
+                | "document.writeln"
+                | "render_template_string"
+                | "flask.render_template_string"
+                | "mark_safe"
+                | "django.utils.safestring.mark_safe"
+                | "Markup"
+                | "markupsafe.Markup"
+                | "HTMLResponse"
+                | "fastapi.responses.HTMLResponse"
+                | "template.HTML"
+                | "c.html"
+                | "res.html"
+                | "reply.html"
+        ) || ftxt.ends_with(".insertAdjacentHTML");
+        let is_html_conditional_sink = matches!(
+            ftxt,
+            "res.send" | "reply.send" | "w.Write" | "fmt.Fprintf" | "io.WriteString"
+        ) && (has_html_markup_lit(args_txt)
+            || expr_references_any(args_txt, &env.html_vars));
+
+        if (is_always_xss_sink || is_html_conditional_sink)
+            && !fn_guards.contains(&GuardKind::XssSanitizer)
+            && let Some(an) = args_node
+            && let Some((tkind, _)) = ast_sink_status(an, src, TAINT_XSS, env)
+        {
+            let hit = LocalStaticFinding {
+                    rule_id: "VF-XSS-001".into(),
+                    severity: "HIGH".into(),
+                    title: format!("Cross-Site Scripting (XSS) via `{}` in `{}`", ftxt, symbol_name),
+                    rel_path: rel_path.to_string(),
+                    line,
+                    symbol: symbol_name.to_string(),
+                    sink_kind: SinkKind::Xss,
+                    missing_guard: GuardKind::XssSanitizer,
+                    confidence: Confidence::Confirmed,
+                    remediation: "HTML-escape or sanitize untrusted input (`DOMPurify.sanitize`, `escapeHtml`, `html.escape`, `html.EscapeString`) before HTML rendering.".into(),
                 };
             match tkind {
                 TaintSourceKind::Direct => push_unique_hit(&mut summary.local_taint_hits, hit),
@@ -952,12 +1731,36 @@ fn check_call_taint_sinks(
             rel_path,
             lang,
             symbol_name,
-            tainted_vars,
-            param_vars,
+            env,
             fn_guards,
             summary,
         );
     }
+}
+
+fn stmt_unconditionally_exits(stmt: Node) -> bool {
+    let k = stmt.kind();
+    if matches!(
+        k,
+        "return_statement" | "throw_statement" | "raise_statement" | "return_expression"
+    ) {
+        return true;
+    }
+    if matches!(k, "statement_block" | "block") {
+        let mut c = stmt.walk();
+        return stmt
+            .children(&mut c)
+            .any(|ch| stmt_unconditionally_exits(ch));
+    }
+    false
+}
+
+fn collect_cond_idents(cond_txt: &str) -> HashSet<String> {
+    let mut vars = HashSet::new();
+    for cap in ident_re().captures_iter(cond_txt) {
+        vars.insert(cap[1].to_string());
+    }
+    vars
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -967,9 +1770,7 @@ fn analyze_statement_block(
     rel_path: &str,
     lang: Language,
     symbol_name: &str,
-    tainted_vars: &mut HashSet<String>,
-    param_vars: &mut HashSet<String>,
-    sql_vars: &mut HashSet<String>,
+    env: &mut TaintEnv,
     summary: &mut FunctionTaintSummary,
 ) {
     let mut cursor = block.walk();
@@ -981,6 +1782,7 @@ fn analyze_statement_block(
         let is_compound = matches!(
             sk,
             "if_statement"
+                | "if_expression"
                 | "else_clause"
                 | "try_statement"
                 | "catch_clause"
@@ -998,6 +1800,19 @@ fn analyze_statement_block(
 
         let stmt_txt = node_text(stmt, src);
         let stmt_code = strip_comments_simple(stmt_txt);
+
+        if has_cookie_session_expr(&stmt_code) {
+            summary.has_cookie_session_auth = true;
+        }
+        if has_bearer_header_expr(&stmt_code) {
+            summary.has_bearer_header_auth = true;
+        }
+        if has_csrf_exempt_expr(&stmt_code) {
+            summary.csrf_exempt = true;
+        }
+        if has_csrf_guard_expr(&stmt_code) {
+            summary.guards.insert(GuardKind::CsrfProtection);
+        }
 
         if !is_compound {
             if has_taint_source_expr(&stmt_code) {
@@ -1031,14 +1846,96 @@ fn analyze_statement_block(
         if !is_non_sql_log_or_ui_stmt(&stmt_code)
             && has_dynamic_sql_interpolation(stmt, src)
             && !is_universal_sanitizer(&stmt_code)
+            && let Some(tkind) = stmt_taint_status(&stmt_code, TAINT_SQL, env)
         {
             let line = stmt.start_position().row + 1;
-            if let Some(tkind) = stmt_taint_status(&stmt_code, tainted_vars, param_vars) {
+            let hit = LocalStaticFinding {
+                rule_id: "VF-SQLI-001".into(),
+                severity: "CRITICAL".into(),
+                title: format!(
+                    "SQL Injection via unsanitized string interpolation in `{}`",
+                    symbol_name
+                ),
+                rel_path: rel_path.to_string(),
+                line,
+                symbol: symbol_name.to_string(),
+                sink_kind: SinkKind::SqlInjection,
+                missing_guard: GuardKind::SqlSanitizer,
+                confidence: Confidence::Confirmed,
+                remediation: "Use parameterized queries (`$1`, `?`, or ORM query builders) instead of interpolating untrusted input into SQL strings.".into(),
+            };
+            match tkind {
+                TaintSourceKind::Direct => push_unique_hit(&mut summary.local_taint_hits, hit),
+                TaintSourceKind::Param => push_unique_hit(&mut summary.param_sinks, hit),
+            }
+        }
+
+        // Check CMDi, Path Traversal, SSRF, XSS, SQL exec sinks, and tainted callee forwarding
+        check_call_taint_sinks(
+            stmt,
+            src,
+            rel_path,
+            lang,
+            symbol_name,
+            env,
+            &summary.guards.clone(),
+            summary,
+        );
+
+        // Update local sink-typed variable taint state, `.innerHTML` assignment sink, and HTML/SQL builder vars
+        if let Some((lhs_names, lhs_raws, rhs_node, is_aug)) = extract_assigned_targets(stmt, src) {
+            let rhs_txt = node_text(rhs_node, src);
+            let rhs_has_sql = sql_verb_re().is_match(rhs_txt);
+            if rhs_has_sql {
+                for n in &lhs_names {
+                    env.sql_vars.insert(n.clone());
+                }
+            }
+            if has_html_markup_lit(rhs_txt) {
+                for n in &lhs_names {
+                    env.html_vars.insert(n.clone());
+                }
+            }
+
+            // DOM `.innerHTML = rhs` / `.outerHTML = rhs` sink
+            if lhs_raws
+                .iter()
+                .any(|raw| raw.ends_with(".innerHTML") || raw.ends_with(".outerHTML"))
+                && !summary.guards.contains(&GuardKind::XssSanitizer)
+                && let Some((tkind, _)) = ast_sink_status(rhs_node, src, TAINT_XSS, env)
+            {
+                let hit = LocalStaticFinding {
+                    rule_id: "VF-XSS-001".into(),
+                    severity: "HIGH".into(),
+                    title: format!("DOM Cross-Site Scripting (XSS) via `innerHTML` assignment in `{}`", symbol_name),
+                    rel_path: rel_path.to_string(),
+                    line: stmt.start_position().row + 1,
+                    symbol: symbol_name.to_string(),
+                    sink_kind: SinkKind::Xss,
+                    missing_guard: GuardKind::XssSanitizer,
+                    confidence: Confidence::Confirmed,
+                    remediation: "Use `textContent` for text or sanitize HTML with `DOMPurify.sanitize(...)` before assigning `innerHTML`.".into(),
+                };
+                match tkind {
+                    TaintSourceKind::Direct => push_unique_hit(&mut summary.local_taint_hits, hit),
+                    TaintSourceKind::Param => push_unique_hit(&mut summary.param_sinks, hit),
+                }
+            }
+
+            let (rhs_direct_mask, rhs_param_mask) = ast_eval_masks(rhs_node, src, env);
+            let touches_sql_var = lhs_names.iter().any(|n| env.sql_vars.contains(n))
+                || expr_references_any(rhs_txt, &env.sql_vars);
+
+            if ((rhs_direct_mask & TAINT_SQL != 0) || (rhs_param_mask & TAINT_SQL != 0))
+                && touches_sql_var
+                && (is_aug || rhs_txt.contains('+') || rhs_txt.contains("${"))
+            {
+                let line = stmt.start_position().row + 1;
                 let hit = LocalStaticFinding {
                     rule_id: "VF-SQLI-001".into(),
                     severity: "CRITICAL".into(),
                     title: format!(
-                        "SQL Injection via unsanitized string interpolation in `{}`",
+                        "SQL Injection via multi-statement query concatenation in `{}`",
                         symbol_name
                     ),
                     rel_path: rel_path.to_string(),
@@ -1046,89 +1943,104 @@ fn analyze_statement_block(
                     symbol: symbol_name.to_string(),
                     sink_kind: SinkKind::SqlInjection,
                     missing_guard: GuardKind::SqlSanitizer,
-                    remediation: "Use parameterized queries (`$1`, `?`, or ORM query builders) instead of interpolating untrusted input into SQL strings.".into(),
+                    confidence: Confidence::Confirmed,
+                    remediation: "Use parameterized queries (`$1`, `?`, or ORM query builders) instead of concatenating untrusted input into SQL strings.".into(),
                 };
-                match tkind {
-                    TaintSourceKind::Direct => push_unique_hit(&mut summary.local_taint_hits, hit),
-                    TaintSourceKind::Param => push_unique_hit(&mut summary.param_sinks, hit),
+                if rhs_direct_mask & TAINT_SQL != 0 {
+                    push_unique_hit(&mut summary.local_taint_hits, hit);
+                } else {
+                    push_unique_hit(&mut summary.param_sinks, hit);
                 }
             }
-        }
 
-        // Check CMDi, Path Traversal, SSRF, SQL exec sinks, and tainted callee forwarding
-        check_call_taint_sinks(
-            stmt,
-            src,
-            rel_path,
-            lang,
-            symbol_name,
-            tainted_vars,
-            param_vars,
-            &summary.guards.clone(),
-            summary,
-        );
-
-        // Update local variable taint state and multi-statement SQL builder state after evaluating RHS
-        if let Some((lhs_names, rhs_txt, is_aug)) = extract_assigned_targets(stmt, src) {
-            let rhs_has_sql = sql_verb_re().is_match(&rhs_txt);
-            if rhs_has_sql {
-                for n in &lhs_names {
-                    sql_vars.insert(n.clone());
-                }
-            }
-            let touches_sql_var = lhs_names.iter().any(|n| sql_vars.contains(n))
-                || expr_references_any(&rhs_txt, sql_vars);
-
-            if is_universal_sanitizer(&rhs_txt)
-                || expr_has_path_sanitizer(&rhs_txt)
-                || expr_has_cmd_sanitizer(&rhs_txt)
-                || expr_has_ssrf_sanitizer(&rhs_txt)
-            {
-                if !is_aug {
-                    for n in &lhs_names {
-                        tainted_vars.remove(n);
-                        param_vars.remove(n);
+            for n in lhs_names {
+                if is_aug {
+                    if rhs_direct_mask != 0 {
+                        *env.direct.entry(n.clone()).or_insert(0) |= rhs_direct_mask;
                     }
-                }
-            } else if let Some(tkind) = stmt_taint_status(&rhs_txt, tainted_vars, param_vars) {
-                if touches_sql_var && (is_aug || rhs_txt.contains('+') || rhs_txt.contains("${")) {
-                    let line = stmt.start_position().row + 1;
-                    let hit = LocalStaticFinding {
-                        rule_id: "VF-SQLI-001".into(),
-                        severity: "CRITICAL".into(),
-                        title: format!(
-                            "SQL Injection via multi-statement query concatenation in `{}`",
-                            symbol_name
-                        ),
-                        rel_path: rel_path.to_string(),
-                        line,
-                        symbol: symbol_name.to_string(),
-                        sink_kind: SinkKind::SqlInjection,
-                        missing_guard: GuardKind::SqlSanitizer,
-                        remediation: "Use parameterized queries (`$1`, `?`, or ORM query builders) instead of concatenating untrusted input into SQL strings.".into(),
-                    };
-                    match tkind {
-                        TaintSourceKind::Direct => {
-                            push_unique_hit(&mut summary.local_taint_hits, hit)
-                        }
-                        TaintSourceKind::Param => push_unique_hit(&mut summary.param_sinks, hit),
+                    if rhs_param_mask != 0 {
+                        *env.params.entry(n).or_insert(0) |= rhs_param_mask;
                     }
-                }
-                for n in lhs_names {
-                    match tkind {
-                        TaintSourceKind::Direct => {
-                            tainted_vars.insert(n);
-                        }
-                        TaintSourceKind::Param => {
-                            param_vars.insert(n);
-                        }
+                } else {
+                    if rhs_direct_mask != 0 {
+                        env.direct.insert(n.clone(), rhs_direct_mask);
+                    } else {
+                        env.direct.remove(&n);
+                    }
+                    if rhs_param_mask != 0 {
+                        env.params.insert(n, rhs_param_mask);
+                    } else {
+                        env.params.remove(&n);
                     }
                 }
             }
         }
 
-        // Recurse into control-flow sub-blocks (`if`, `else`, `try`, `for`, etc.)
-        if is_compound {
+        // Structured Control-Flow Lattice Join & Early-Return Pruning
+        if sk == "if_statement" || sk == "if_expression" {
+            let cond_node = stmt.child_by_field_name("condition");
+            let cons_node = stmt.child_by_field_name("consequence");
+            let alt_node = stmt.child_by_field_name("alternative");
+            let mut env_then = env.clone();
+            if let Some(cons) = cons_node {
+                analyze_statement_block(
+                    cons,
+                    src,
+                    rel_path,
+                    lang,
+                    symbol_name,
+                    &mut env_then,
+                    summary,
+                );
+            }
+            let then_exits = cons_node.is_some_and(stmt_unconditionally_exits);
+
+            if let Some(alt) = alt_node {
+                let mut env_else = env.clone();
+                analyze_statement_block(
+                    alt,
+                    src,
+                    rel_path,
+                    lang,
+                    symbol_name,
+                    &mut env_else,
+                    summary,
+                );
+                let else_exits = stmt_unconditionally_exits(alt);
+                match (then_exits, else_exits) {
+                    (false, false) => *env = TaintEnv::join_pair(&env_then, &env_else),
+                    (false, true) => *env = env_then,
+                    (true, false) => *env = env_else,
+                    (true, true) => {}
+                }
+            } else if then_exits {
+                // Early-return validation narrowing on fall-through path!
+                if let Some(cn) = cond_node {
+                    let cond_txt = strip_comments_simple(node_text(cn, src));
+                    let c_vars = collect_cond_idents(&cond_txt);
+                    let mut narrow_mask = 0u8;
+                    if stmt_is_path_prefix_guard(&cond_txt)
+                        || cond_txt.to_ascii_lowercase().contains("isallowedpath")
+                    {
+                        narrow_mask |= TAINT_PATH;
+                    }
+                    if expr_has_ssrf_sanitizer(&cond_txt) && !is_universal_sanitizer(&cond_txt) {
+                        narrow_mask |= TAINT_SSRF;
+                    }
+                    if expr_has_cmd_sanitizer(&cond_txt) && !is_universal_sanitizer(&cond_txt) {
+                        narrow_mask |= TAINT_CMD;
+                    }
+                    if expr_has_xss_sanitizer(&cond_txt) && !is_universal_sanitizer(&cond_txt) {
+                        narrow_mask |= TAINT_XSS;
+                    }
+                    if narrow_mask != 0 {
+                        env.clear_bits_for_vars(&c_vars, narrow_mask);
+                    }
+                }
+            } else {
+                env.join(&env_then);
+            }
+        } else if is_compound {
             let mut sub = stmt.walk();
             for ch in stmt.children(&mut sub) {
                 if matches!(
@@ -1136,6 +2048,7 @@ fn analyze_statement_block(
                     "statement_block"
                         | "block"
                         | "if_statement"
+                        | "if_expression"
                         | "else_clause"
                         | "try_statement"
                         | "catch_clause"
@@ -1147,24 +2060,14 @@ fn analyze_statement_block(
                         | "match_block"
                         | "match_arm"
                 ) {
-                    analyze_statement_block(
-                        ch,
-                        src,
-                        rel_path,
-                        lang,
-                        symbol_name,
-                        tainted_vars,
-                        param_vars,
-                        sql_vars,
-                        summary,
-                    );
+                    analyze_statement_block(ch, src, rel_path, lang, symbol_name, env, summary);
                 }
             }
         }
     }
 }
 
-/// Runs intra-procedural taint, sanitizer, ownership, and DB CRUD extraction on a function or inline handler AST node.
+/// Runs intra-procedural sink-typed taint lattice, sanitizer, ownership, and DB CRUD extraction on a function or inline handler AST node.
 pub fn analyze_function_taint(
     fn_node: Node,
     src: &[u8],
@@ -1182,6 +2085,18 @@ pub fn analyze_function_taint(
     if has_resource_id_expr(&fn_code, route_path) {
         summary.has_resource_id = true;
     }
+    if has_cookie_session_expr(&fn_code) {
+        summary.has_cookie_session_auth = true;
+    }
+    if has_bearer_header_expr(&fn_code) {
+        summary.has_bearer_header_auth = true;
+    }
+    if has_csrf_exempt_expr(&fn_code) {
+        summary.csrf_exempt = true;
+    }
+    if has_csrf_guard_expr(&fn_code) {
+        summary.guards.insert(GuardKind::CsrfProtection);
+    }
     let body_code = fn_node
         .child_by_field_name("body")
         .map(|b| strip_comments_simple(node_text(b, src)))
@@ -1190,9 +2105,10 @@ pub fn analyze_function_taint(
         summary.guards.insert(GuardKind::OwnershipCheck);
     }
 
-    let mut tainted_vars = HashSet::new();
-    let mut param_vars = extract_param_names(fn_node, src);
-    let mut sql_vars = HashSet::new();
+    let mut env = TaintEnv::default();
+    for p in extract_param_names(fn_node, src) {
+        env.params.insert(p, TAINT_ALL);
+    }
 
     if let Some(body) = fn_node.child_by_field_name("body") {
         if matches!(body.kind(), "statement_block" | "block") {
@@ -1202,9 +2118,7 @@ pub fn analyze_function_taint(
                 rel_path,
                 lang,
                 symbol_name,
-                &mut tainted_vars,
-                &mut param_vars,
-                &mut sql_vars,
+                &mut env,
                 &mut summary,
             );
         } else {
@@ -1215,9 +2129,7 @@ pub fn analyze_function_taint(
                 rel_path,
                 lang,
                 symbol_name,
-                &mut tainted_vars,
-                &mut param_vars,
-                &mut sql_vars,
+                &mut env,
                 &mut summary,
             );
         }
@@ -1363,6 +2275,7 @@ pub fn extract_frontend_calls_and_bugs(
                             symbol: attr_txt.split('=').next().unwrap_or("onClick").trim().to_string(),
                             sink_kind: SinkKind::FrontendContract,
                             missing_guard: GuardKind::FrontendContract,
+                            confidence: Confidence::Heuristic,
                             remediation: "Wire the event handler to an actual state update, callback, or remove the dead interactive trigger.".into(),
                         });
                     }
@@ -1467,6 +2380,7 @@ pub fn extract_frontend_calls_and_bugs(
                 symbol: "await mutation".into(),
                 sink_kind: SinkKind::FrontendContract,
                 missing_guard: GuardKind::FrontendContract,
+                confidence: Confidence::Heuristic,
                 remediation: "Wrap the `await` mutation in a `try { ... } catch (err) { ... }` block and surface an explicit error state to the UI.".into(),
             });
         }
@@ -1497,6 +2411,7 @@ pub fn extract_frontend_calls_and_bugs(
                 symbol: "catch".into(),
                 sink_kind: SinkKind::FrontendContract,
                 missing_guard: GuardKind::FrontendContract,
+                confidence: Confidence::Heuristic,
                 remediation: "Handle caught errors explicitly (surface UI error feedback, report telemetry, or rethrow).".into(),
             });
         } else if stmts.len() == 1 {
@@ -1511,6 +2426,7 @@ pub fn extract_frontend_calls_and_bugs(
                     symbol: "catch (console-only)".into(),
                     sink_kind: SinkKind::FrontendContract,
                     missing_guard: GuardKind::FrontendContract,
+                    confidence: Confidence::Heuristic,
                     remediation: "Update error UI state, return an error result, or rethrow instead of only logging to console.".into(),
                 });
             }

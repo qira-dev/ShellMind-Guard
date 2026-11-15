@@ -1,6 +1,6 @@
 #[cfg(unix)]
 mod imp {
-    use crate::verifier::VerifiedFinding;
+    use crate::verifier::{SandboxProbeConfig, VerifiedFinding};
     use anyhow::{Context, Result};
     use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
@@ -159,12 +159,31 @@ mod imp {
         finding: &LatticeFinding,
         concurrency: usize,
     ) -> Result<VerifiedFinding> {
+        run_finding_in_isolated_netns_with_config(
+            project_root,
+            boot_cmd,
+            port,
+            finding,
+            concurrency,
+            &SandboxProbeConfig::default(),
+        )
+    }
+
+    pub fn run_finding_in_isolated_netns_with_config(
+        project_root: &Path,
+        boot_cmd: &str,
+        port: u16,
+        finding: &LatticeFinding,
+        concurrency: usize,
+        probe_cfg: &SandboxProbeConfig,
+    ) -> Result<VerifiedFinding> {
         let bwrap_bin =
             find_bwrap_path().ok_or_else(|| anyhow::anyhow!("bwrap binary not found on system"))?;
         let abs_root = std::fs::canonicalize(project_root)?;
         let self_exe =
             std::env::current_exe().context("Cannot locate current shellmind-guard executable")?;
         let finding_json = serde_json::to_string(finding)?;
+        let probe_cfg_json = serde_json::to_string(probe_cfg)?;
 
         let mut cmd = build_base_bwrap_cmd(&bwrap_bin, &abs_root, port);
         cmd.args([
@@ -174,6 +193,9 @@ mod imp {
             "--setenv",
             "VF_FINDING_JSON",
             &finding_json,
+            "--setenv",
+            "VF_PROBE_CONFIG_JSON",
+            &probe_cfg_json,
             "--",
             "/bin/sh",
             "-c",
@@ -337,7 +359,7 @@ mod imp {
 
 #[cfg(not(unix))]
 mod imp {
-    use crate::verifier::VerifiedFinding;
+    use crate::verifier::{SandboxProbeConfig, VerifiedFinding};
     use anyhow::Result;
     use std::path::Path;
     use vf_graph::LatticeFinding;
@@ -359,6 +381,17 @@ mod imp {
         _port: u16,
         _finding: &LatticeFinding,
         _concurrency: usize,
+    ) -> Result<VerifiedFinding> {
+        anyhow::bail!("Isolated Bubblewrap sandbox verification requires Linux")
+    }
+
+    pub fn run_finding_in_isolated_netns_with_config(
+        _project_root: &Path,
+        _boot_cmd: &str,
+        _port: u16,
+        _finding: &LatticeFinding,
+        _concurrency: usize,
+        _probe_cfg: &SandboxProbeConfig,
     ) -> Result<VerifiedFinding> {
         anyhow::bail!("Isolated Bubblewrap sandbox verification requires Linux")
     }

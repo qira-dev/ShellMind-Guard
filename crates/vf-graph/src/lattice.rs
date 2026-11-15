@@ -1,7 +1,8 @@
 use crate::ast::{
-    FileAstSummary, GuardKind, LocalStaticFinding, SinkKind, SymbolInfo, SymbolKind,
+    Confidence, FileAstSummary, GuardKind, LocalStaticFinding, SinkKind, SymbolInfo, SymbolKind,
     resolve_import_target,
 };
+use crate::taint::{TAINT_ALL, TAINT_CMD, TAINT_PATH, TAINT_SQL, TAINT_SSRF, TAINT_XSS};
 use petgraph::Direction;
 use petgraph::graph::{DiGraph, NodeIndex};
 use serde::{Deserialize, Serialize};
@@ -25,6 +26,8 @@ pub struct LatticeFinding {
     #[serde(default)]
     pub line: usize,
     pub status: String,
+    #[serde(default)]
+    pub confidence: Confidence,
     pub entry_route: String,
     pub sink_kind: SinkKind,
     pub missing_guard: GuardKind,
@@ -141,6 +144,12 @@ fn remediation_for_guard(g: GuardKind) -> &'static str {
         GuardKind::SsrfSanitizer => {
             "Enforce an explicit domain/host allowlist and block private/loopback/metadata IP ranges (127.0.0.0/8, 169.254.0.0/16)."
         }
+        GuardKind::XssSanitizer => {
+            "Encode or sanitize untrusted HTML with `DOMPurify.sanitize` or strict context-aware template auto-escaping instead of raw HTML sinks."
+        }
+        GuardKind::CsrfProtection => {
+            "Enforce anti-CSRF token validation (`csurf`, Django `CsrfViewMiddleware`, SameSite=Strict/Lax cookies) or switch to stateless `Authorization: Bearer` headers."
+        }
         GuardKind::OwnershipCheck => {
             "Enforce object-level authorization by filtering the DB query with the authenticated actor (`WHERE id = $1 AND user_id = req.user.id`)."
         }
@@ -177,11 +186,51 @@ fn prefix_for_guard(g: GuardKind) -> &'static str {
         GuardKind::CmdSanitizer => "VF-CMDI",
         GuardKind::PathSanitizer => "VF-PATH",
         GuardKind::SsrfSanitizer => "VF-SSRF",
+        GuardKind::XssSanitizer => "VF-XSS",
+        GuardKind::CsrfProtection => "VF-CSRF",
         GuardKind::OwnershipCheck => "VF-IDOR",
         GuardKind::SecretPolicy => "VF-SEC",
         GuardKind::ConfigPolicy => "VF-CFG",
         GuardKind::DependencyPolicy => "VF-DEP",
         GuardKind::FrontendContract => "VF-FE",
+    }
+}
+
+fn sink_bit_for_guard(g: GuardKind) -> u8 {
+    match g {
+        GuardKind::SqlSanitizer => TAINT_SQL,
+        GuardKind::CmdSanitizer => TAINT_CMD,
+        GuardKind::PathSanitizer => TAINT_PATH,
+        GuardKind::SsrfSanitizer => TAINT_SSRF,
+        GuardKind::XssSanitizer => TAINT_XSS,
+        _ => TAINT_ALL,
+    }
+}
+
+fn push_taint_edges(
+    resolved_callee_map: &HashMap<(usize, String), Vec<NodeIndex>>,
+    src_node: NodeIndex,
+    callee: &str,
+    out_mask: u8,
+    taint_parents: &mut [Option<NodeIndex>],
+    taint_mask: &mut [u8],
+    taint_q: &mut VecDeque<NodeIndex>,
+) {
+    if out_mask == 0 {
+        return;
+    }
+    if let Some(vs) = resolved_callee_map.get(&(src_node.index(), callee.to_string())) {
+        for &v in vs {
+            let vi = v.index();
+            if taint_parents[vi].is_none() {
+                taint_parents[vi] = Some(src_node);
+            }
+            let next = taint_mask[vi] | out_mask;
+            if next != taint_mask[vi] {
+                taint_mask[vi] = next;
+                taint_q.push_back(v);
+            }
+        }
     }
 }
 
@@ -395,14 +444,13 @@ pub fn solve_guard_lattice_with_public(
     let lock_parents = build_unguarded_bfs_tree(&graph, GuardKind::TxLock);
     let route_parents = build_any_route_bfs_tree(&graph);
 
-    // O(V + E) Taint Propagation across function boundaries (`Route` handlers + `tainted_calls` -> `param_forwarding_calls`)
+    // O(V + E) Sink-Typed Bitmask Join-Semilattice Taint Propagation (`tainted_call_masks` + `param_forwarding_calls`)
     let mut taint_parents: Vec<Option<NodeIndex>> = vec![None; node_count];
+    let mut taint_mask: Vec<u8> = vec![0; node_count];
     let mut taint_q = VecDeque::new();
+
     for u in graph.node_indices() {
         let is_route_entry = graph[u].kind == SymbolKind::Route;
-        // Only fall back to seeding `calls` on a Route node if it is a delegating route registration
-        // without an inline body (`tainted_calls` & `param_forwarding_calls` empty, `!has_taint_source`,
-        // and `has_resource_id` present in URL).
         let seed_delegated_route_calls = is_route_entry
             && graph[u].tainted_calls.is_empty()
             && graph[u].param_forwarding_calls.is_empty()
@@ -422,30 +470,55 @@ pub fn solve_guard_lattice_with_public(
                 &[]
             });
         for callee in seed_iter {
-            if let Some(vs) = resolved_callee_map.get(&(u.index(), callee.clone())) {
-                for &v in vs {
-                    if taint_parents[v.index()].is_none() {
-                        taint_parents[v.index()] = Some(u);
-                        taint_q.push_back(v);
-                    }
-                }
-            }
+            let edge_mask = graph[u]
+                .tainted_call_masks
+                .get(callee)
+                .copied()
+                .unwrap_or(TAINT_ALL);
+            push_taint_edges(
+                &resolved_callee_map,
+                u,
+                callee,
+                edge_mask,
+                &mut taint_parents,
+                &mut taint_mask,
+                &mut taint_q,
+            );
         }
     }
     while let Some(w) = taint_q.pop_front() {
-        for callee in graph[w]
-            .tainted_calls
-            .iter()
-            .chain(graph[w].param_forwarding_calls.iter())
-        {
-            if let Some(vs) = resolved_callee_map.get(&(w.index(), callee.clone())) {
-                for &next_v in vs {
-                    if taint_parents[next_v.index()].is_none() {
-                        taint_parents[next_v.index()] = Some(w);
-                        taint_q.push_back(next_v);
-                    }
-                }
-            }
+        let w_mask = taint_mask[w.index()];
+        for callee in &graph[w].tainted_calls {
+            let edge_mask = graph[w]
+                .tainted_call_masks
+                .get(callee)
+                .copied()
+                .unwrap_or(TAINT_ALL);
+            push_taint_edges(
+                &resolved_callee_map,
+                w,
+                callee,
+                edge_mask,
+                &mut taint_parents,
+                &mut taint_mask,
+                &mut taint_q,
+            );
+        }
+        for callee in &graph[w].param_forwarding_calls {
+            let edge_mask = graph[w]
+                .tainted_call_masks
+                .get(callee)
+                .copied()
+                .unwrap_or(TAINT_ALL);
+            push_taint_edges(
+                &resolved_callee_map,
+                w,
+                callee,
+                w_mask & edge_mask,
+                &mut taint_parents,
+                &mut taint_mask,
+                &mut taint_q,
+            );
         }
     }
 
@@ -467,6 +540,16 @@ pub fn solve_guard_lattice_with_public(
             }
         }
     }
+
+    let mut repo_has_cookie_session = false;
+    let mut repo_has_bearer_auth = false;
+    let mut repo_has_global_csrf = false;
+    for f in summaries {
+        repo_has_cookie_session |= f.has_cookie_session_setup;
+        repo_has_bearer_auth |= f.has_bearer_auth_setup;
+        repo_has_global_csrf |= f.has_global_csrf_guard;
+    }
+    let repo_bearer_only = repo_has_bearer_auth && !repo_has_cookie_session;
 
     // Deduplicate on the fly by (entry_route, rule_id)
     let mut best_by_key: HashMap<(String, String), LatticeFinding> = HashMap::new();
@@ -495,6 +578,7 @@ pub fn solve_guard_lattice_with_public(
                         file: String::new(),
                         line: 0,
                         status: "SUSPECT_UNGUARDED".into(),
+                        confidence: Confidence::Confirmed,
                         entry_route: entry_name,
                         sink_kind,
                         missing_guard: GuardKind::Auth,
@@ -524,6 +608,7 @@ pub fn solve_guard_lattice_with_public(
                         file: String::new(),
                         line: 0,
                         status: "SUSPECT_UNGUARDED".into(),
+                        confidence: Confidence::Confirmed,
                         entry_route: entry_name,
                         sink_kind,
                         missing_guard: GuardKind::TxLock,
@@ -534,7 +619,7 @@ pub fn solve_guard_lattice_with_public(
             }
         }
 
-        // Layer 2a: Intra-procedural Injection / Path / SSRF hits (`Source -> Sink` inside node)
+        // Layer 2a: Intra-procedural Injection / Path / SSRF / XSS hits (`Source -> Sink` inside node)
         for hit in &sym.local_taint_hits {
             if reachable[vi] && active_guards.contains(&hit.missing_guard) {
                 continue;
@@ -565,6 +650,7 @@ pub fn solve_guard_lattice_with_public(
                     file: hit.rel_path.clone(),
                     line: hit.line,
                     status: "SUSPECT_UNGUARDED".into(),
+                    confidence: hit.confidence,
                     entry_route,
                     sink_kind: hit.sink_kind,
                     missing_guard: hit.missing_guard,
@@ -575,8 +661,11 @@ pub fn solve_guard_lattice_with_public(
         }
 
         // Layer 2b: Cross-file / Inter-procedural Taint (`Source -> param_forwarding -> ParamSink`)
-        if taint_parents[vi].is_some() {
+        if taint_parents[vi].is_some() && taint_mask[vi] != 0 {
             for hit in &sym.param_sinks {
+                if (taint_mask[vi] & sink_bit_for_guard(hit.missing_guard)) == 0 {
+                    continue;
+                }
                 if reachable[vi] && active_guards.contains(&hit.missing_guard) {
                     continue;
                 }
@@ -596,6 +685,7 @@ pub fn solve_guard_lattice_with_public(
                             file: hit.rel_path.clone(),
                             line: hit.line,
                             status: "SUSPECT_UNGUARDED".into(),
+                            confidence: hit.confidence,
                             entry_route,
                             sink_kind: hit.sink_kind,
                             missing_guard: hit.missing_guard,
@@ -637,6 +727,7 @@ pub fn solve_guard_lattice_with_public(
                     file: String::new(),
                     line: 0,
                     status: "SUSPECT_UNGUARDED".into(),
+                    confidence: Confidence::Confirmed,
                     entry_route: entry_name,
                     sink_kind: SinkKind::IdorDbAccess,
                     missing_guard: GuardKind::OwnershipCheck,
@@ -644,6 +735,90 @@ pub fn solve_guard_lattice_with_public(
                     remediation: remediation_for_guard(GuardKind::OwnershipCheck).into(),
                 },
             );
+        }
+
+        // Layer 2e: CSRF (`VF-CSRF-001`) on `@csrf_exempt` views or unguarded state-changing cookie/session routes
+        let lower_sym_name = sym.name.to_ascii_lowercase();
+        let is_webhook_or_health = lower_sym_name.contains("webhook")
+            || lower_sym_name.contains("/health")
+            || lower_sym_name.contains("/metrics");
+        if sym.csrf_exempt && !is_webhook_or_health && !sym.has_bearer_header_auth {
+            let (entry_name, witness) =
+                if let Some((er, w)) = reconstruct_witness(&graph, &route_parents, idx) {
+                    (er, w)
+                } else {
+                    (
+                        sym.name.clone(),
+                        vec![TraceHop {
+                            file: sym.rel_path.clone(),
+                            symbol: sym.name.clone(),
+                            line: sym.line_start,
+                        }],
+                    )
+                };
+            insert_shorter(
+                &mut best_by_key,
+                LatticeFinding {
+                    id: String::new(),
+                    rule_id: "VF-CSRF-001".into(),
+                    severity: "HIGH".into(),
+                    title: format!(
+                        "CSRF protection explicitly disabled (`@csrf_exempt`) on `{}`",
+                        sym.name
+                    ),
+                    file: sym.rel_path.clone(),
+                    line: sym.line_start,
+                    status: "SUSPECT_UNGUARDED".into(),
+                    confidence: Confidence::Confirmed,
+                    entry_route: entry_name,
+                    sink_kind: SinkKind::Csrf,
+                    missing_guard: GuardKind::CsrfProtection,
+                    witness_path: witness,
+                    remediation: remediation_for_guard(GuardKind::CsrfProtection).into(),
+                },
+            );
+        } else if sym.kind == SymbolKind::Route
+            && !is_webhook_or_health
+            && !active_guards.contains(&GuardKind::CsrfProtection)
+            && !repo_has_global_csrf
+            && !sym.has_bearer_header_auth
+        {
+            let method = sym.name.split_whitespace().next().unwrap_or("");
+            let is_state_changing = matches!(method, "POST" | "PUT" | "PATCH" | "DELETE");
+            let cookie_session_route = sym.has_cookie_session_auth
+                || (active_guards.contains(&GuardKind::Auth)
+                    && repo_has_cookie_session
+                    && !repo_bearer_only);
+            if is_state_changing
+                && cookie_session_route
+                && !is_public_route(&sym.name, public_routes)
+            {
+                insert_shorter(
+                    &mut best_by_key,
+                    LatticeFinding {
+                        id: String::new(),
+                        rule_id: "VF-CSRF-001".into(),
+                        severity: "HIGH".into(),
+                        title: format!(
+                            "State-changing cookie/session endpoint `{}` lacks CSRF protection",
+                            sym.name
+                        ),
+                        file: sym.rel_path.clone(),
+                        line: sym.line_start,
+                        status: "SUSPECT_UNGUARDED".into(),
+                        confidence: Confidence::Confirmed,
+                        entry_route: sym.name.clone(),
+                        sink_kind: SinkKind::Csrf,
+                        missing_guard: GuardKind::CsrfProtection,
+                        witness_path: vec![TraceHop {
+                            file: sym.rel_path.clone(),
+                            symbol: sym.name.clone(),
+                            line: sym.line_start,
+                        }],
+                        remediation: remediation_for_guard(GuardKind::CsrfProtection).into(),
+                    },
+                );
+            }
         }
     }
 
@@ -737,6 +912,7 @@ pub fn solve_guard_lattice_with_public(
                         file: call.rel_path.clone(),
                         line: call.line,
                         status: "SUSPECT_UNGUARDED".into(),
+                        confidence: Confidence::Heuristic,
                         entry_route: format!("{} {}", call.method, call.raw_path),
                         sink_kind: SinkKind::FrontendContract,
                         missing_guard: GuardKind::FrontendContract,
@@ -857,6 +1033,7 @@ fn insert_static_finding(
         file: sf.rel_path.clone(),
         line: sf.line,
         status: "SUSPECT_UNGUARDED".into(),
+        confidence: sf.confidence,
         entry_route,
         sink_kind: sf.sink_kind,
         missing_guard: sf.missing_guard,
@@ -1334,6 +1511,300 @@ export async function executeUnsafeSql(targetId: string) {
                 .any(|f| f.rule_id == "VF-IDOR-001" && f.entry_route == "GET /admin/orders/:id"),
             "Admin route GET /admin/orders/:id must not trigger VF-IDOR-001: {:?}",
             res.findings
+        );
+    }
+
+    fn make_indexed(rel: &str, lang: Language, code: &str) -> IndexedFile {
+        IndexedFile {
+            abs_path: rel.into(),
+            rel_path: rel.into(),
+            language: lang,
+            size_bytes: code.len() as u64,
+            mtime_ns: 0,
+            blake3_hash: String::new(),
+            cached_bytes: Some(code.as_bytes().to_vec()),
+        }
+    }
+
+    #[test]
+    fn test_sprint2_bitmask_taint_precision_and_early_return_narrowing() {
+        let cfg = ShellMindGuardConfig::default();
+        let route_src = r#"
+import { writeNote, queryUser } from './helpers';
+
+app.get('/report', async (req, res) => {
+    if (!req.query.id) {
+        return res.status(400).send("missing req.query.id parameter");
+    }
+    const safeName = path.basename(req.query.name);
+    await writeNote(safeName);
+    await queryUser(safeName);
+
+    const targetUrl = req.query.url;
+    if (!isAllowedHost(targetUrl)) {
+        return res.status(400).send("blocked");
+    }
+    await fetch(targetUrl);
+    return res.json({ ok: true });
+});
+"#;
+        let helpers_src = r#"
+import * as fs from 'fs';
+export async function writeNote(fileName: string) {
+    return fs.readFileSync('/var/notes/' + fileName, 'utf8');
+}
+export async function queryUser(userKey: string) {
+    return await db.query(`SELECT * FROM notes WHERE key = '${userKey}'`);
+}
+"#;
+        let s1 = parse_file_ast(
+            &make_indexed("src/route.ts", Language::TypeScript, route_src),
+            &cfg,
+        )
+        .unwrap();
+        let s2 = parse_file_ast(
+            &make_indexed("src/helpers.ts", Language::TypeScript, helpers_src),
+            &cfg,
+        )
+        .unwrap();
+        let res = solve_guard_lattice(&[s1, s2]);
+
+        assert!(
+            !res.findings.iter().any(|f| f.rule_id == "VF-PATH-001"),
+            "path.basename clears TAINT_PATH across call boundaries: {:?}",
+            res.findings
+        );
+        assert!(
+            !res.findings.iter().any(|f| f.rule_id == "VF-SSRF-001"),
+            "Early-return !isAllowedHost guard must narrow SSRF taint: {:?}",
+            res.findings
+        );
+        assert!(
+            !res.findings.iter().any(|f| f.rule_id == "VF-XSS-001"),
+            "Static string literal error messages and JSON responses must not trigger VF-XSS-001: {:?}",
+            res.findings
+        );
+        let sqli = res.findings.iter().find(|f| f.rule_id == "VF-SQLI-001");
+        assert!(
+            sqli.is_some(),
+            "path.basename must NOT clear TAINT_SQL on SQL sink: {:?}",
+            res.findings
+        );
+        assert_eq!(sqli.unwrap().confidence, Confidence::Confirmed);
+    }
+
+    #[test]
+    fn test_sprint2_xss_partial_sanitization_and_multilang() {
+        let cfg = ShellMindGuardConfig::default();
+        let ts_src = r#"
+app.get('/profile', (req, res) => {
+    const clean = DOMPurify.sanitize(req.query.clean);
+    el1.innerHTML = clean;
+    const partial = DOMPurify.sanitize(req.query.a) + req.query.raw;
+    el2.innerHTML = partial;
+});
+app.get('/banner', (req, res) => {
+    res.send(`<div>${req.query.msg}</div>`);
+});
+"#;
+        let py_src = r#"
+from flask import Flask, request, render_template_string
+app = Flask(__name__)
+
+@app.get("/hello")
+def hello():
+    name = request.args.get("name")
+    return render_template_string("<h1>" + name + "</h1>")
+"#;
+        let go_src = r#"
+package main
+import ("html/template"; "net/http")
+
+func Register(r *http.ServeMux) {
+    r.HandleFunc("/card", func(w http.ResponseWriter, req *http.Request) {
+        bio := req.URL.Query().Get("bio")
+        _ = template.HTML(bio)
+    })
+}
+"#;
+        let s1 = parse_file_ast(
+            &make_indexed("web/xss.tsx", Language::TypeScript, ts_src),
+            &cfg,
+        )
+        .unwrap();
+        let s2 =
+            parse_file_ast(&make_indexed("api/app.py", Language::Python, py_src), &cfg).unwrap();
+        let s3 = parse_file_ast(&make_indexed("srv/card.go", Language::Go, go_src), &cfg).unwrap();
+        let res = solve_guard_lattice(&[s1, s2, s3]);
+
+        let xss_hits: Vec<_> = res
+            .findings
+            .iter()
+            .filter(|f| f.rule_id == "VF-XSS-001")
+            .collect();
+        assert!(
+            xss_hits
+                .iter()
+                .any(|f| f.file == "web/xss.tsx" && f.line == 6),
+            "Partial sanitization DOMPurify + raw must still trigger VF-XSS-001 on line 6: {:?}",
+            xss_hits
+        );
+        assert!(
+            !xss_hits
+                .iter()
+                .any(|f| f.file == "web/xss.tsx" && f.line == 4),
+            "Full DOMPurify.sanitize must NOT trigger VF-XSS-001 on line 4: {:?}",
+            xss_hits
+        );
+        assert!(
+            xss_hits
+                .iter()
+                .any(|f| f.file == "web/xss.tsx" && f.line == 9),
+            "HTML template response res.send(`<div>${{...}}</div>`) must trigger VF-XSS-001: {:?}",
+            xss_hits
+        );
+        assert!(
+            xss_hits.iter().any(|f| f.file == "api/app.py"),
+            "Flask render_template_string with request.args must trigger VF-XSS-001: {:?}",
+            xss_hits
+        );
+        assert!(
+            xss_hits.iter().any(|f| f.file == "srv/card.go"),
+            "Go template.HTML with tainted query input must trigger VF-XSS-001: {:?}",
+            xss_hits
+        );
+    }
+
+    #[test]
+    fn test_sprint2_csrf_precision_cookie_vs_bearer_and_exempt() {
+        let cfg = ShellMindGuardConfig::default();
+        let cookie_app = r#"
+app.use(session({ secret: process.env.SESSION_SECRET }));
+app.get('/me', requireAuth, (req, res) => res.json({ user: req.session.uid }));
+app.post('/transfer', requireAuth, (req, res) => {
+    const u = req.session.uid;
+    return res.json({ transferred: u });
+});
+app.post('/webhooks/stripe', (req, res) => res.sendStatus(200));
+"#;
+        let bearer_api = r#"
+function bearerAuth(req: any, res: any, next: any) {
+    const hdr = req.headers.authorization;
+    if (!hdr) return res.status(401).end();
+    next();
+}
+app.post('/api/v1/orders', bearerAuth, (req, res) => res.json({ ok: true }));
+"#;
+        let dj_views = r#"
+@csrf_exempt
+def update_email(request):
+    return HttpResponse("ok")
+"#;
+        let rust_detector_helper = r##"
+fn inspect_helper(sym: &mut Sym) {
+    let s = "csrf_exempt";
+    let doc = r#"@csrf_exempt"#;
+    sym.csrf_exempt = false;
+}
+"##;
+        let s_cookie = parse_file_ast(
+            &make_indexed("cookie_app.ts", Language::TypeScript, cookie_app),
+            &cfg,
+        )
+        .unwrap();
+        let s_dj =
+            parse_file_ast(&make_indexed("views.py", Language::Python, dj_views), &cfg).unwrap();
+        let s_rust = parse_file_ast(
+            &make_indexed("detector.rs", Language::Rust, rust_detector_helper),
+            &cfg,
+        )
+        .unwrap();
+        let res_vuln = solve_guard_lattice(&[s_cookie, s_dj, s_rust]);
+        assert!(
+            !res_vuln
+                .findings
+                .iter()
+                .any(|f| f.file == "detector.rs" && f.rule_id == "VF-CSRF-001"),
+            "Rust helper referencing sym.csrf_exempt or quoted literals must NOT trigger VF-CSRF-001: {:?}",
+            res_vuln.findings
+        );
+        let csrf_routes: Vec<&str> = res_vuln
+            .findings
+            .iter()
+            .filter(|f| f.rule_id == "VF-CSRF-001")
+            .map(|f| f.entry_route.as_str())
+            .collect();
+        assert!(
+            csrf_routes.contains(&"POST /transfer"),
+            "State-changing cookie/session POST /transfer must trigger VF-CSRF-001: {:?}",
+            csrf_routes
+        );
+        assert!(
+            csrf_routes.contains(&"update_email"),
+            "Django @csrf_exempt view must trigger VF-CSRF-001: {:?}",
+            csrf_routes
+        );
+        assert!(
+            !csrf_routes.contains(&"GET /me") && !csrf_routes.contains(&"POST /webhooks/stripe"),
+            "GET and webhook endpoints must NOT trigger VF-CSRF-001: {:?}",
+            csrf_routes
+        );
+
+        let s_bearer = parse_file_ast(
+            &make_indexed("bearer_api.ts", Language::TypeScript, bearer_api),
+            &cfg,
+        )
+        .unwrap();
+        let res_bearer = solve_guard_lattice(&[s_bearer]);
+        assert!(
+            !res_bearer
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "VF-CSRF-001"),
+            "Stateless Authorization: Bearer API must NOT trigger VF-CSRF-001: {:?}",
+            res_bearer.findings
+        );
+    }
+
+    #[test]
+    fn test_sprint2_jwt_logic_flaws() {
+        let cfg = ShellMindGuardConfig::default();
+        let bad_ts = r#"
+export function decodeUnsafe(token: string, key: string) {
+    return jwt.verify(token, key, { algorithms: ['HS256', 'none'] });
+}
+export function safeVerify(token: string, pubKey: string) {
+    return jwt.verify(token, pubKey, { algorithms: ['RS256'] });
+}
+"#;
+        let bad_py = r#"
+import jwt
+def parse_tok(tok: str):
+    return jwt.decode(tok, options={"verify_signature": False})
+"#;
+        let s1 = parse_file_ast(
+            &make_indexed("auth_jwt.ts", Language::TypeScript, bad_ts),
+            &cfg,
+        )
+        .unwrap();
+        let s2 =
+            parse_file_ast(&make_indexed("auth_jwt.py", Language::Python, bad_py), &cfg).unwrap();
+        let res = solve_guard_lattice(&[s1, s2]);
+        let jwt_hits: Vec<_> = res
+            .findings
+            .iter()
+            .filter(|f| f.rule_id == "VF-CFG-JWT-LOGIC")
+            .collect();
+        assert_eq!(
+            jwt_hits.len(),
+            2,
+            "Both alg:none and verify_signature=False must trigger VF-CFG-JWT-LOGIC while safe RS256 does not: {:?}",
+            jwt_hits
+        );
+        assert!(
+            jwt_hits
+                .iter()
+                .all(|f| f.confidence == Confidence::Confirmed)
         );
     }
 }

@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 use vf_ai::build_minimal_patch_prompt;
-use vf_graph::{GraphAnalysisResult, GuardKind, LatticeFinding, SinkKind};
+use vf_graph::{Confidence, GraphAnalysisResult, GuardKind, LatticeFinding, SinkKind};
 use vf_report::{to_html_graph, to_sarif_json};
 use vf_sandbox::{VerificationStatus, VerifiedFinding, verify_findings_in_sandbox};
 
@@ -55,6 +55,7 @@ const SYN_STRING_BLUE: Color = Color::Rgb(165, 214, 255);
 enum FilterMode {
     All,
     ProvenOnly,
+    ConfirmedOrProven,
     CriticalOnly,
 }
 
@@ -62,7 +63,8 @@ impl FilterMode {
     fn next(self) -> Self {
         match self {
             FilterMode::All => FilterMode::ProvenOnly,
-            FilterMode::ProvenOnly => FilterMode::CriticalOnly,
+            FilterMode::ProvenOnly => FilterMode::ConfirmedOrProven,
+            FilterMode::ConfirmedOrProven => FilterMode::CriticalOnly,
             FilterMode::CriticalOnly => FilterMode::All,
         }
     }
@@ -71,6 +73,7 @@ impl FilterMode {
         match self {
             FilterMode::All => "ALL",
             FilterMode::ProvenOnly => "PROVEN ONLY",
+            FilterMode::ConfirmedOrProven => "CONFIRMED+",
             FilterMode::CriticalOnly => "CRITICAL ONLY",
         }
     }
@@ -201,6 +204,12 @@ impl TuiState {
                     self.verified_map.get(&f.id).map(|v| &v.status),
                     Some(VerificationStatus::Proven)
                 ),
+                FilterMode::ConfirmedOrProven => {
+                    matches!(
+                        self.verified_map.get(&f.id).map(|v| &v.status),
+                        Some(VerificationStatus::Proven)
+                    ) || f.confidence >= Confidence::Confirmed
+                }
                 FilterMode::CriticalOnly => f.severity == "CRITICAL",
             })
             .collect()
@@ -521,6 +530,16 @@ fn render_findings_queue(f: &mut Frame, area: Rect, state: &TuiState) {
                         SEM_AUTH_CORAL,
                         "Missing: URL Host Allowlist",
                     ),
+                    GuardKind::XssSanitizer => (
+                        "[HIGH · XSS]",
+                        SEM_AUTH_CORAL,
+                        "Missing: HTML Sanitizer / Escaping",
+                    ),
+                    GuardKind::CsrfProtection => (
+                        "[HIGH · CSRF]",
+                        SEM_AUTH_CORAL,
+                        "Missing: Anti-CSRF Protection",
+                    ),
                     GuardKind::OwnershipCheck => (
                         "[HIGH · IDOR]",
                         SEM_AUTH_CORAL,
@@ -588,6 +607,27 @@ fn render_findings_queue(f: &mut Frame, area: Rect, state: &TuiState) {
                                 .fg(cat_color)
                                 .bg(row_bg)
                                 .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            format!(
+                                " [{}]",
+                                if verdict_label == "PROVEN"
+                                    || item.confidence == Confidence::Proven
+                                {
+                                    Confidence::Proven.as_str()
+                                } else {
+                                    item.confidence.as_str()
+                                }
+                            ),
+                            Style::default()
+                                .fg(if verdict_label == "PROVEN" {
+                                    SEM_PROVEN_RED
+                                } else if item.confidence == Confidence::Confirmed {
+                                    SEM_BRAND_CYAN
+                                } else {
+                                    SEM_SUSPECT_AMBER
+                                })
+                                .bg(row_bg),
                         ),
                     ])
                     .style(Style::default().bg(row_bg)),
@@ -699,6 +739,14 @@ fn render_pipeline_card(f: &mut Frame, area: Rect, state: &TuiState) {
                 ("Path Canonicalization + BaseDir Check", format!("{:?}", sk))
             }
             (GuardKind::SsrfSanitizer, sk) => ("Outbound URL Host Allowlist", format!("{:?}", sk)),
+            (GuardKind::XssSanitizer, sk) => (
+                "DOMPurify / Context-Aware HTML Escaping",
+                format!("{:?}", sk),
+            ),
+            (GuardKind::CsrfProtection, sk) => (
+                "Anti-CSRF Token / SameSite Cookie / Bearer",
+                format!("{:?}", sk),
+            ),
             (GuardKind::OwnershipCheck, sk) => {
                 ("Actor / Tenant Ownership Filter", format!("{:?}", sk))
             }
@@ -1020,7 +1068,10 @@ fn render_proof_and_remediation(f: &mut Frame, area: Rect, state: &TuiState) {
                 Line::from(vec![
                     Span::styled("  Proof   : ", Style::default().fg(FG_SECONDARY)),
                     Span::styled(
-                        "◆ STATIC LATTICE WITNESS (Press [Enter] with --boot-cmd to run isolated bwrap exploit)",
+                        format!(
+                            "◆ {} STATIC LATTICE WITNESS (Press [Enter] with --boot-cmd to run isolated bwrap exploit)",
+                            cur.confidence.as_str()
+                        ),
                         Style::default().fg(SEM_SUSPECT_AMBER),
                     ),
                 ]),
@@ -1509,6 +1560,7 @@ mod tests {
                 file: "src/db/queries.ts".into(),
                 line: 1,
                 status: "PROVEN".into(),
+                confidence: Confidence::Proven,
                 entry_route: "POST /api/v1/checkout/withdraw".into(),
                 sink_kind: SinkKind::BalanceUpdate,
                 missing_guard: GuardKind::TxLock,

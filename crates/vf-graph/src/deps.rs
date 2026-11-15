@@ -1,4 +1,4 @@
-use crate::ast::{GuardKind, LocalStaticFinding, SinkKind};
+use crate::ast::{Confidence, GuardKind, LocalStaticFinding, SinkKind};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -292,6 +292,7 @@ fn make_dep_finding(
         symbol: format!("{}:{}", rel_path, line.max(1)),
         sink_kind: SinkKind::DependencyRisk,
         missing_guard: GuardKind::DependencyPolicy,
+        confidence: Confidence::Heuristic,
         remediation,
     }
 }
@@ -352,7 +353,7 @@ fn check_advisory(
                     pkg_name
                 ),
             };
-            out.push(make_dep_finding(
+            let mut hit = make_dep_finding(
                 adv.severity,
                 format!(
                     "High-risk dependency `{}@{}`: {}",
@@ -361,7 +362,9 @@ fn check_advisory(
                 rel_path,
                 line,
                 fix_hint,
-            ));
+            );
+            hit.confidence = Confidence::Confirmed;
+            out.push(hit);
         }
     }
 }

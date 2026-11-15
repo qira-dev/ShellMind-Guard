@@ -1,52 +1,76 @@
-# ShellMind Guard — Engineering Roadmap (v2 Audited)
+# ShellMind Guard — Engineering Roadmap (v3 Next-Gen)
 
-> **Goal:** Build ShellMind Guard from zero to a compiler-grade, zero-false-positive multi-file security & business-logic verifier in 5 structured phases. Every phase has strict mathematical/performance SLAs and a binary verification gate.
+> **Guiding Principle:** Preserve 100% of the working `v0.1.0` deterministic core (`d21223c`), close Web/API verification gaps first without sacrificing accuracy or speed, then expand systematically into **Desktop Core Engines** and **Mobile Application Codebases**.
 
 ---
 
-## Phase 0: Workspace, Config & Two-Phase Cache (`vf-core`)
-- **Deliverables:**
-  - Cargo workspace (`vf-core`, `vf-graph`, `vf-sandbox`, `vf-tui`, `vf-report`, `vf-ai`).
-  - `.shellmind-guard.toml` parser (custom `auth_guards`, `ignore_paths`, `sandbox_boot_cmd`).
-  - `ignore`-based parallel directory walker + `BLAKE3` file fingerprinter.
-  - `SQLite` (`rusqlite` with `bundled` + `WAL` + `FTS5`) two-phase symbol cache.
-- **Performance Target:** Walk 13,000 files and compute/check `BLAKE3` hashes in **< 250ms**.
-- **Verification Gate:** Run `shellmind-guard index <enterprise_13k_repo>` twice; verify cold pass < 500ms and warm delta pass < 50ms.
+## Baseline Completed (`v0.1.0` — Locked Foundation at `d21223c`)
 
-## Phase 1: Parallel AST, Middleware Resolution & Guard-Lattice Solver (`vf-graph`)
-- **Deliverables:**
-  - `tree-sitter` parsers for **TypeScript/JavaScript**, **Rust**, and **Python**.
-  - Cross-file symbol linker (`tsconfig.json` aliases, `index.ts` barrel re-exports, Rust `mod`/`use`, route-level middleware attachment).
-  - **$O(V + E)$ Guard-Set Lattice Solver** (fixed-point intersection across incoming paths—zero exponential $O(V!)$ path explosion) + BFS shortest unguarded witness extractor.
-- **Performance Target:** Parse 3,000 active source files across 3 Rayon threads in **< 2.0s**; re-link global graph + solve lattice in **< 120ms**.
-- **Verification Gate:** Automated test suite proving: (1) cross-file edit to `auth.ts` immediately flags unmodified `routes.ts`, and (2) cyclic call graphs terminate in linear time.
+The initial 5-phase v0.1 build is **done, verified, and must not be broken**:
+- **Core & Delta Cache (`vf-core`):** `.shellmind-guard.toml` config, `ignore` + bounded `rayon` (`2..=6` threads) + `BLAKE3` walker, XDG SQLite WAL + FTS5 store (`ast_cache`).
+- **6-Layer Graph Engine (`vf-graph`):** `tree-sitter` across **TS/JS, Rust, Python, Go**; $O(V+E)$ Guard-Set Lattice (`Auth`, `TxLock`, `IDOR`, taint sinks `SQLI/CMDI/PATH/SSRF`, secrets, misconfigs, offline manifest advisories, frontend API mismatch/error contract).
+- **Isolated Runtime Prover (`vf-sandbox`):** Linux `/usr/bin/bwrap` `--unshare-all --unshare-net` execution, PGID reaper, cancel-safe Last-Byte Sync (`TxLock`) and `Auth` bypass invariant probers.
+- **Surfaces (`src/`, `vf-tui`, `vf-report`, `vf-ai`):** CLI, CI workflow generator, `--watch`, `--sarif`, `--html`, panic-safe `ratatui` TUI, Git & Claude `pre-commit` hooks, stdio MCP server (`scan`, `explain_finding`, `init`), and 2 KB root-confined patch prompt builder.
 
-## Phase 2: Bubblewrap Sandbox, Mock Shims & Last-Byte Sync PoC Engine (`vf-sandbox`)
-- **Deliverables:**
-  - Unprivileged `/usr/bin/bwrap` launcher with `--ro-bind` code, `--tmpfs` writable overlays, isolated loopback, `RLIMIT_AS` (1 GiB), and `cgroup v2` / process-group reaper on drop/Ctrl+C.
-  - In-sandbox deterministic HTTP/Webhook mock responder (`127.0.0.1`) + explicit `UNBOOTABLE` status when external dependencies cannot be mocked.
-  - **Last-Byte Sync (Single-Packet Attack) Race Runner:** `tokio::sync::Barrier`-synchronized raw TCP/HTTP frames flushing final byte in `< 50 µs` to prove double-spend / over-credit bugs.
-  - **Auth/IDOR Swapper & Negative-Qty/Price-Tamper Runner** + `PROVEN` vs `MITIGATED` classifier + 1-command `shellmind-guard replay <id>` & `curl` PoC.
-- **Verification Gate:** Run against `fixtures/vuln-payment-node` and `fixtures/vuln-auth-rust`; confirm 100% detection of double-spend & IDOR with **0 false positives** on patched builds and **0 orphan processes** on `SIGINT`.
+---
 
-## Phase 3: Panic-Safe `ratatui` TUI, SARIF & Interactive HTML Graph (`vf-tui`, `vf-report`)
-- **Deliverables:**
-  - Panic-safe 3-pane `ratatui` TUI (Proven Flows, Multi-File Trace & Sandbox Proof, Action Bar) + toggleable `[L] Logs` ring-buffer drawer (zero stdout corruption).
-  - `g` hotkey to open self-contained interactive HTML/SVG taint-flow graph.
-  - `--json`, `--sarif` (SARIF 2.1.0), and `--ci --fail-on proven` exit-code flags.
-- **Verification Gate:** End-to-end interactive test on a 13,000-file codebase + live Last-Byte Sync replay inside TUI + `Ctrl+C` terminal cleanliness check.
+## Phase 6: Web/API Priority Closure, Accuracy Hardening & Closed-Loop AI
+**Goal:** Make Web & API scanning deeply reliable with lower false positives and real runtime proof expansion.
 
-## Phase 4: Optional Hybrid AI Patcher (`vf-ai`)
 - **Deliverables:**
-  - Opt-in BYOK / Local Ollama adapter (strictly disabled by default; 0 API cost in core mode).
-  - Context minimizer: sends ONLY the proven 3–5 hop witness trace (< 2 KB) to generate a minimal unified `.patch` diff.
-  - Closed-loop verification: applies patch in `tmpfs` sandbox and re-runs the exact Last-Byte Sync / IDOR PoC to confirm `[MITIGATED]`.
-- **Verification Gate:** Patch `vuln-payment-node` double-spend via AI adapter and automatically verify the fix passes the Last-Byte Sync race PoC.
+  1. **End-to-End Confidence & Verification Grading:** Propagate `PROVEN`, `CONFIRMED_STATIC`, and `HEURISTIC` levels consistently across `vf-graph`, `vf-core` (`store.rs` `findings`), `vf-report` (SARIF/HTML), `vf-tui`, `src/main.rs` (`--fail-on`), and `src/mcp.rs` so CI gates never block on noisy guesses.
+  2. **AST-Level Web Security Rules:** Add sanitizer-aware `VF-XSS-001` (unsanitized DOM/HTML sinks), `VF-CSRF-001` (cookie-authenticated state mutations missing CSRF/SameSite guards), and `VF-CFG-JWT-LOGIC` (`alg: "none"`, skipped signature checks), cleanly wired into `--layers` (`xss,csrf`) and MCP tool schemas.
+  3. **Configurable Sandbox Profiles + Live `IDOR` Prover (`vf-core` + `vf-sandbox`):** Extend `.shellmind-guard.toml` `[sandbox]` (`base_url` wiring, custom `probe_body`, seeded `user_a_header` / `user_b_header`) and extend `verifier.rs` / `vf-sandbox/src/lib.rs` to prove cross-tenant `GuardKind::OwnershipCheck` (`VF-IDOR-001`) over loopback HTTP inside `bwrap`.
+  4. **Real Closed-Loop `vf-ai` Patcher (Opt-in Only):** Add a minimal HTTP client (`ureq` + `rustls` or equivalent zero-bloat crate) in `vf-ai` behind explicit opt-in config (`Disabled` by default), generate minimal unified diff patches, apply in `--tmpfs` inside Linux `bwrap`, and re-run `verify_finding` to confirm `[MITIGATED]`.
+  5. **Docs & Repo Hygiene Sync:** Align `README.md` (`VF-SEC-JWT`, `pyproject.toml`, XDG cache path) and remove unused `symbols`/`edges` dead SQLite schema or `.veriforge` fixture cache remnants safely.
+- **Verification Gate:** `cargo test --workspace` + fixture regression proving live `IDOR` detection (`PROVEN` when vulnerable, `MITIGATED` when ownership-scoped) with zero impact on existing `Auth`/`TxLock` tests.
 
-## Phase 5: Universal 6-Layer Engine, MCP Server & Open-Source Release
+---
+
+## Phase 7: High-Speed Offline-First CVE & Advisory Cache (`VF-DEP` Upgrade)
+**Goal:** Replace the 26-entry hardcoded `OFFLINE_ADVISORIES` limit without adding network latency or memory bloat to `scan`.
+
 - **Deliverables:**
-  - Universal 6-layer verification engine: Secrets & Misconfigurations (`VF-SEC-*`, `VF-CFG-*`), Offline Dependency & Lockfile Audit (`VF-DEP-001`), Sanitizer-Aware Cross-File Taint (`VF-SQLI-001`, `VF-CMDI-001`, `VF-PATH-001`, `VF-SSRF-001`), Auth & IDOR Ownership Lattice (`VF-AUTH-001`, `VF-IDOR-001`), 12-Way Barrier Race Prover (`VF-RACE-001`), and Frontend ↔ Backend API Contract Verification (`VF-FE-404`, `VF-FE-ERR`).
-  - Polyglot `Tree-sitter` support across TypeScript/TSX, JavaScript/JSX, Go (`net/http`, Gin, Echo, Chi), Python (FastAPI, Flask, Django), and Rust (Axum, Actix-Web).
-  - Stdio JSON-RPC 2.0 Model Context Protocol server (`shellmind-guard mcp`) for AI coding agents (`shellmind_guard_scan`, `shellmind_guard_explain_finding`, `shellmind_guard_init`).
-  - GitHub Actions CI workflow (`shellmind-guard init --ci`), release binary stripping, benchmark suite, and complete documentation.
-- **Verification Gate:** Clean release binary (< 15 MB), full 27-test suite green, 0 clippy warnings, 0 self-scan false positives.
+  1. **Local SQLite Advisory Index (`~/.cache/shellmind-guard/advisories.db`):** Compact indexed lookup by `(ecosystem, package, version_range)` built with Zstd/OSV feeds.
+  2. **Explicit Opt-In Sync (`shellmind-guard deps sync`):** Fetches/updates OSV advisory bundles separately on demand. Regular `shellmind-guard scan` stays **100% offline** and fast.
+  3. **Strict Semver/Lockfile Matching:** Parse exact resolved versions from `package-lock.json`, `Cargo.lock`, `go.mod`, and pinned `requirements.txt` / poetry / uv lockfiles to minimize false dependency alerts.
+- **Verification Gate:** Cold `scan` makes zero network calls; offline advisory lookups complete in `< 20 ms` across real lockfiles with deterministic regression fixtures.
+
+---
+
+## Phase 8: Language & Ecosystem Expansion (Modular AST Plugin Split)
+**Goal:** Expand reach to **Mobile Apps, Enterprise Backends, and Native Core Software** while preserving fast compile times and maintainable `vf-graph` modules.
+
+- **Deliverables:**
+  1. **Preserve Working 5-Language Core + Modular Trait for New Languages:** Keep the existing 5-language `ast.rs` parser (`TS/JS, Rust, Python, Go`) intact and covered by regression tests, while introducing a clean per-language extractor module (`crates/vf-graph/src/langs/`) feeding the shared `FileAstSummary` and `solve_guard_lattice`.
+  2. **Web & Enterprise Expansion:** Add `tree-sitter` extractors for **PHP** (Laravel/Symfony), **Java** (Spring Boot), and **C#** (.NET minimal APIs/controllers).
+  3. **Mobile & Native Core Languages:** Add `tree-sitter` extractors for **Kotlin** (Android/Ktor), **Swift** (iOS/Vapor), **Dart** (Flutter), and **C / C++** (native engines, desktop cores, shared libraries).
+- **Verification Gate:** Each new language adds parity fixture tests (`routes/functions/imports/sinks/guards`) and keeps incremental delta scans bounded via `max_threads`.
+
+---
+
+## Phase 9: Complex Core-Engine, Desktop Software & Mobile Logic Rules
+**Goal:** Move beyond web/payment routes so complex software cores (e.g., cross-OS desktop engines, native libraries, mobile apps) catch reliability, concurrency, and memory hazards accurately.
+
+- **Deliverables:**
+  1. **Domain-Aware Analyzer Routing:** Automatically activate Web/API checks for web backends, System/Engine checks for native software cores, and Mobile checks for Android/iOS trees—never running irrelevant rules blindly.
+  2. **Core Engine Concurrency & Resource Invariants:**
+     - `VF-ENG-DEADLOCK`: Cross-function inconsistent lock acquisition ordering / lock held across blocking or async `.await` calls.
+     - `VF-ENG-LEAK`: Unclosed file/socket/DB handles on error-return paths (missing `defer`/`Drop`/RAII/`finally`).
+  3. **Native Memory & Boundary Safety (C/C++/Unsafe Rust):**
+     - `VF-MEM-BOUNDS`: Unbounded string/buffer copies (`strcpy`, `sprintf`, `memcpy` with untrusted/unchecked length) and unchecked `unsafe` pointer/slice offsets.
+     - `VF-ENG-INT`: Untrusted arithmetic leading to allocation size or buffer-index integer overflow.
+  4. **Mobile App Security Rules (`Kotlin`/`Swift`/`Dart`):**
+     - `VF-MOB-STORAGE` (unencrypted sensitive storage in `SharedPreferences` / plain `UserDefaults`), `VF-MOB-IPC` (exported Android components without permissions), `VF-MOB-TLS` (custom trust-all cert verifiers).
+- **Verification Gate:** Dedicated fixture test suites for C++ core-engine concurrency/memory bugs and Kotlin/Swift mobile issues with strict low-false-positive validation.
+
+---
+
+## Phase 10: Deep Inter-Procedural Taint, Targeted Fuzzing & Sandbox Hardening
+**Goal:** Raise detection accuracy on multi-hop real-world codebases and complex runtime paths (CI / `--deep` mode).
+
+- **Deliverables:**
+  1. **Inter-Procedural Dataflow Propagation:** Track tainted struct/object fields and callback closures across files (`a.foo -> helper(a) -> sink`), reducing both missed multi-hop bugs and false alerts when sanitizers wrap objects.
+  2. **Cross-OS Sandbox & Loopback TLS Hardening (`bwrap.rs`, `verifier.rs`):** Add optional `RLIMIT_AS` / `cgroups v2` (Linux), macOS (`sandbox-exec`) / Windows (Job Objects / restricted container) parity beyond Linux-only `bwrap`, optional local `rustls` HTTPS loopback probing, deterministic mock shims, and explicit `UNBOOTABLE` status reporting when external DBs cannot start.
+  3. **Targeted Route Spec & Payload Fuzzing (`--deep`):** Extract parameter schemas from AST/OpenAPI specs to test malformed boundaries, price/quantity tampering, and malformed UTF-8/null-byte edge cases in isolated CI runs.
+- **Verification Gate:** End-to-end `--deep` verification passes on all fixture apps with zero orphan processes on `SIGINT` and sub-minute CI budgets.
