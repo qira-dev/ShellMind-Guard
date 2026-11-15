@@ -72,12 +72,22 @@ impl Language {
         ) {
             return Some(Language::Manifest);
         }
+        let low_fname = fname.to_ascii_lowercase();
         if fname == ".gitignore"
             || fname == "Dockerfile"
             || fname.starts_with("Dockerfile.")
             || matches!(
                 fname,
                 "AndroidManifest.xml" | "network_security_config.xml" | "Info.plist" | "Podfile"
+            )
+            || matches!(
+                low_fname.as_str(),
+                "openapi.json"
+                    | "openapi.yaml"
+                    | "openapi.yml"
+                    | "swagger.json"
+                    | "swagger.yaml"
+                    | "swagger.yml"
             )
             || (fname == ".env"
                 || (fname.starts_with(".env.")

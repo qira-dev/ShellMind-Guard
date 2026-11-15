@@ -66,16 +66,16 @@ The current repository (`d21223c`) already delivers a complete, tested determini
 |   - GuardKind::Auth   (verify_auth_invariant) |   |  - Opt-in HTTP/TLS client (`reqwest` |
 |   - GuardKind::OwnershipCheck (IDOR A/B probe)|   |    + `rustls` ring, loopback/HTTPS)  |
 |   - GuardKind::TxLock (Last-Byte Sync Barrier)|   |  - Safe pure-Rust diff applier +     |
-| Statuses: Proven | Mitigated | SuspectUnverif |   |    `--apply-check` temp re-verifier  |
-+===============================================+   +--------------------------------------+
-```
+|   - GuardKind::InputValidation (--deep fuzz)  |   |    `--apply-check` temp re-verifier  |
+| Status: Proven | Mitigated | Suspect | Unboot |   +--------------------------------------+
++===============================================+
 
-### Explicit Gap Correction (Implemented Reality vs Previous v2 Claims)
+### Implemented Reality vs Spec Alignment
 
-Future planning strictly anchors to what actually exists in code today rather than stale v2 documentation:
+Current codebase architecture aligned with Phases 1–10:
 1. **Cache location:** `state.db` lives outside repositories under `$XDG_CACHE_HOME/shellmind-guard/<repo_hash_16>/state.db`, so scans never dirty `git status`.
-2. **Sandbox isolation & OS parity:** On Linux, `bwrap.rs` enforces `--unshare-all --unshare-net --new-session --cap-drop ALL --die-with-parent` + process-group `kill -9 -<pgid>` on Drop/Ctrl+C. On **Windows (`#[cfg(not(unix))]`) and macOS (without `bwrap`)**, isolated runtime sandboxing currently fails closed unless `--unsafe-host-fallback` (Unix) is used; `cgroups v2`, `RLIMIT_AS`, macOS `sandbox-exec`, and Windows Job-Object isolation remain future hardening items.
-3. **Dynamic protocol & payload support:** `vf-sandbox` dynamically executes `GuardKind::Auth`, `GuardKind::OwnershipCheck` (`IDOR` User A vs User B probes via `SandboxConfig` headers), and `GuardKind::TxLock` over plaintext loopback HTTP/1.1 (`tokio::net::TcpStream` + `SandboxConfig::loopback_port()`) using configurable `probe_body` or default JSON payloads. Webhook signature/Stripe mocks and an explicit `UNBOOTABLE` status remain future expansion.
+2. **Sandbox isolation & OS parity:** On Linux, `bwrap.rs` enforces `--unshare-all --unshare-net --new-session --cap-drop ALL --die-with-parent`, process-group `kill -9 -<pgid>` on Drop/Ctrl+C, optional `--sandbox-mem-mb` (`RLIMIT_AS`), and optional `--cgroup-v2` (`systemd-run --user --scope`). Cross-platform detection (`detect_sandbox_backend()`) and helpers exist for macOS Seatbelt (`build_macos_seatbelt_profile`) and Windows Job Objects (`build_windows_job_wrapper_script`), failing closed on hosts without `bwrap` unless `--unsafe-host-fallback` is explicitly passed.
+3. **Dynamic protocol, TLS, mocks & `--deep` fuzzing:** `vf-sandbox` dynamically executes `GuardKind::Auth`, `GuardKind::OwnershipCheck` (`IDOR` User A vs User B probes), `GuardKind::TxLock` (Last-Byte Sync), and `--deep` route schema fuzzing (`VF-FUZZ-TAMPER`, `VF-FUZZ-CRASH`, `VF-FUZZ-ENCODING`) over both HTTP/1.1 and local `rustls` HTTPS (`--sandbox-tls` / `https://` `base_url`), with opt-in loopback mock shims (`--mock-shims` for `/v1/charges`, `/oauth/token`, `/webhooks`) and fast `VerificationStatus::Unbootable` diagnostics when external DBs or deps prevent startup.
 4. **AI integration:** `vf-ai` stays `Disabled` by default (`0` network calls), builds bounded `<= 2048`-byte root-confined prompts, supports opt-in Ollama (loopback-restricted) & OpenAI-compatible HTTP/TLS endpoints (`--trust-repo-config`), and verifies unified diffs via `--apply-check` inside an isolated temporary workspace copy without mutating the repository.
 5. **Schema & rule-ID hygiene:** Unused `symbols`/`edges` SQLite tables are dropped (`findings` tracks `confidence TEXT NOT NULL DEFAULT 'CONFIRMED'` with safe `ALTER TABLE` migration). Hardcoded JWT secret detection emits `VF-SEC-JWT`, JWT verification logic bypasses emit `VF-CFG-JWT-LOGIC`, web taint/CSRF rules emit `VF-XSS-001` & `VF-CSRF-001`, and `--layers` includes `xss,csrf` alongside the original 12 filter tokens (`auth,race,taint,sqli,cmdi,path,ssrf,idor,secrets,config,deps,frontend`).
 

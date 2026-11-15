@@ -61,6 +61,7 @@ pub fn to_sarif_json(findings: &[LatticeFinding], verified: &[VerifiedFinding]) 
             let status_tag = match v_opt.map(|v| &v.status) {
                 Some(VerificationStatus::Proven) => "PROVEN",
                 Some(VerificationStatus::Mitigated) => "MITIGATED",
+                Some(VerificationStatus::Unbootable) => "UNBOOTABLE",
                 _ => "SUSPECT",
             };
             let level = if status_tag == "MITIGATED" {
@@ -205,6 +206,14 @@ pub fn to_html_graph(
                 "badge-mitigated",
                 format!(
                     "<div class=\"proof\"><strong>Mitigated:</strong> {}</div>",
+                    escape_html(&v.evidence)
+                ),
+            ),
+            Some(v) if v.status == VerificationStatus::Unbootable => (
+                "UNBOOTABLE",
+                "badge-suspect",
+                format!(
+                    "<div class=\"proof\"><strong>Unbootable in Sandbox:</strong> {}</div>",
                     escape_html(&v.evidence)
                 ),
             ),

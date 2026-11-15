@@ -46,6 +46,8 @@ pub struct GraphAnalysisResult {
     #[serde(default)]
     pub active_domains: Vec<String>,
     pub findings: Vec<LatticeFinding>,
+    #[serde(default)]
+    pub route_schemas: Vec<crate::phase10::RouteSchema>,
 }
 
 pub fn solve_guard_lattice(summaries: &[FileAstSummary]) -> GraphAnalysisResult {
@@ -180,6 +182,9 @@ fn remediation_for_guard(g: GuardKind) -> &'static str {
         GuardKind::MobilePolicy => {
             "Harden mobile storage (Android Keystore/EncryptedSharedPreferences, iOS Keychain, FlutterSecureStorage), restrict exported IPC components, and enforce TLS certificate pinning."
         }
+        GuardKind::InputValidation => {
+            "Validate financial/numeric and boundary inputs (reject NaN, Infinity, <= 0 amounts/quantities, oversized arrays, null bytes, and malformed UTF-8) before mutating state."
+        }
     }
 }
 
@@ -212,6 +217,7 @@ fn prefix_for_guard(g: GuardKind) -> &'static str {
         GuardKind::ResourceCleanup => "VF-ENG",
         GuardKind::MemoryBounds => "VF-MEM",
         GuardKind::MobilePolicy => "VF-MOB",
+        GuardKind::InputValidation => "VF-FUZZ",
     }
 }
 
@@ -372,12 +378,7 @@ pub fn solve_guard_lattice_with_public(
             let Some(&src_idx) = id_to_idx.get(&sym.id) else {
                 continue;
             };
-            for callee in sym
-                .calls
-                .iter()
-                .chain(sym.tainted_calls.iter())
-                .chain(sym.param_forwarding_calls.iter())
-            {
+            let mut resolve_one = |callee: &String, add_edge: bool| {
                 let mut dst_indices: Vec<NodeIndex> = Vec::new();
                 if let Some(same_file_idxs) =
                     file_symbols_map.get(&(f.rel_path.clone(), callee.clone()))
@@ -442,12 +443,48 @@ pub fn solve_guard_lattice_with_public(
                         if !entry.contains(&dst_idx) {
                             entry.push(dst_idx);
                         }
-                        if seen_edges.insert((src_idx.index(), dst_idx.index())) {
+                        if add_edge && seen_edges.insert((src_idx.index(), dst_idx.index())) {
                             graph.add_edge(src_idx, dst_idx, ());
                         }
                     }
                 }
+            };
+
+            for callee in sym
+                .calls
+                .iter()
+                .chain(sym.tainted_calls.iter())
+                .chain(sym.param_forwarding_calls.iter())
+            {
+                resolve_one(callee, true);
             }
+            for (_, cb_name, _) in &sym.callback_forwards {
+                resolve_one(cb_name, false);
+            }
+        }
+    }
+
+    // Phase 10: materialize callback edges (`runner -> cb`) when `runner` invokes its callback param
+    let mut cb_graph_edges: Vec<(NodeIndex, NodeIndex)> = Vec::new();
+    for u in graph.node_indices() {
+        for (runner, cb_name, _) in &graph[u].callback_forwards {
+            if let (Some(runners), Some(cbs)) = (
+                resolved_callee_map.get(&(u.index(), runner.clone())),
+                resolved_callee_map.get(&(u.index(), cb_name.clone())),
+            ) {
+                for &rn in runners {
+                    if graph[rn].invokes_callback_mask != 0 {
+                        for &cn in cbs {
+                            cb_graph_edges.push((rn, cn));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for (rn, cn) in cb_graph_edges {
+        if rn != cn && seen_edges.insert((rn.index(), cn.index())) {
+            graph.add_edge(rn, cn, ());
         }
     }
 
@@ -511,83 +548,276 @@ pub fn solve_guard_lattice_with_public(
     let lock_parents = build_unguarded_bfs_tree(&graph, GuardKind::TxLock);
     let route_parents = build_any_route_bfs_tree(&graph);
 
-    // O(V + E) Sink-Typed Bitmask Join-Semilattice Taint Propagation (`tainted_call_masks` + `param_forwarding_calls`)
+    // Phase 10 helper: resolve cross-file sanitizer wrapper clear bitmask for `(caller, wrapper_fn, field_opt)`
+    let resolved_wrapper_clear_mask =
+        |caller_idx: NodeIndex, wrapper_fn: &str, field_opt: Option<&str>| -> u8 {
+            let Some(targets) =
+                resolved_callee_map.get(&(caller_idx.index(), wrapper_fn.to_string()))
+            else {
+                return 0;
+            };
+            if targets.is_empty() {
+                return 0;
+            }
+            let mut combined = u8::MAX;
+            for &t in targets {
+                let ts = &graph[t];
+                let clear = match field_opt {
+                    Some(fld) => {
+                        ts.clears_field_masks.get(fld).copied().unwrap_or(0) | ts.clears_taint_mask
+                    }
+                    None => ts.clears_taint_mask,
+                };
+                combined &= clear;
+            }
+            if combined == u8::MAX { 0 } else { combined }
+        };
+
+    // O(V + E) Sink-Typed Bitmask Join-Semilattice Taint Propagation (`tainted_call_masks`, field maps, & callbacks)
     let mut taint_parents: Vec<Option<NodeIndex>> = vec![None; node_count];
     let mut taint_mask: Vec<u8> = vec![0; node_count];
+    let mut taint_field_masks: Vec<HashMap<String, u8>> = vec![HashMap::new(); node_count];
+    let mut has_field_restriction: Vec<bool> = vec![false; node_count];
     let mut taint_q = VecDeque::new();
 
-    for u in graph.node_indices() {
-        let is_route_entry = graph[u].kind == SymbolKind::Route;
-        let seed_delegated_route_calls = is_route_entry
-            && graph[u].tainted_calls.is_empty()
-            && graph[u].param_forwarding_calls.is_empty()
-            && !graph[u].has_taint_source
-            && graph[u].has_resource_id;
-        let seed_iter = graph[u]
-            .tainted_calls
-            .iter()
-            .chain(if is_route_entry {
-                graph[u].param_forwarding_calls.as_slice()
-            } else {
-                &[]
-            })
-            .chain(if seed_delegated_route_calls {
-                graph[u].calls.as_slice()
-            } else {
-                &[]
-            });
-        for callee in seed_iter {
-            let edge_mask = graph[u]
-                .tainted_call_masks
-                .get(callee)
-                .copied()
-                .unwrap_or(TAINT_ALL);
-            push_taint_edges(
-                &resolved_callee_map,
-                u,
-                callee,
-                edge_mask,
-                &mut taint_parents,
-                &mut taint_mask,
-                &mut taint_q,
-            );
+    let push_field_taint_edges =
+        |resolved_callee_map: &HashMap<(usize, String), Vec<NodeIndex>>,
+         src_node: NodeIndex,
+         callee: &str,
+         out_mask: u8,
+         src_fields: Option<&[(String, u8)]>,
+         taint_parents: &mut [Option<NodeIndex>],
+         taint_mask: &mut [u8],
+         taint_field_masks: &mut [HashMap<String, u8>],
+         has_field_restriction: &mut [bool],
+         taint_q: &mut VecDeque<NodeIndex>| {
+            if out_mask == 0 {
+                return;
+            }
+            if let Some(vs) = resolved_callee_map.get(&(src_node.index(), callee.to_string())) {
+                for &v in vs {
+                    let vi = v.index();
+                    if taint_parents[vi].is_none() {
+                        taint_parents[vi] = Some(src_node);
+                    }
+                    let mut changed = false;
+                    let next = taint_mask[vi] | out_mask;
+                    if next != taint_mask[vi] {
+                        taint_mask[vi] = next;
+                        changed = true;
+                    }
+                    if let Some(fields) = src_fields {
+                        has_field_restriction[vi] = true;
+                        for (fld, fm) in fields {
+                            let effective_fm = *fm & out_mask;
+                            if effective_fm != 0 {
+                                let entry = taint_field_masks[vi].entry(fld.clone()).or_insert(0);
+                                let nfm = *entry | effective_fm;
+                                if nfm != *entry {
+                                    *entry = nfm;
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                    if changed {
+                        taint_q.push_back(v);
+                    }
+                }
+            }
+        };
+
+    for routes_first in [true, false] {
+        for u in graph.node_indices() {
+            let is_route_entry = graph[u].kind == SymbolKind::Route;
+            if is_route_entry != routes_first {
+                continue;
+            }
+            let seed_delegated_route_calls = is_route_entry
+                && graph[u].tainted_calls.is_empty()
+                && graph[u].param_forwarding_calls.is_empty()
+                && !graph[u].has_taint_source
+                && graph[u].has_resource_id;
+            let seed_iter = graph[u]
+                .tainted_calls
+                .iter()
+                .chain(if is_route_entry {
+                    graph[u].param_forwarding_calls.as_slice()
+                } else {
+                    &[]
+                })
+                .chain(if seed_delegated_route_calls {
+                    graph[u].calls.as_slice()
+                } else {
+                    &[]
+                });
+            for callee in seed_iter {
+                let mut edge_mask = graph[u]
+                    .tainted_call_masks
+                    .get(callee)
+                    .copied()
+                    .unwrap_or(TAINT_ALL);
+                for (wc, wfn, wfld, wmask) in &graph[u].tainted_call_wrappers {
+                    if wc == callee {
+                        let cleared = resolved_wrapper_clear_mask(u, wfn, wfld.as_deref()) & *wmask;
+                        edge_mask &= !cleared;
+                    }
+                }
+                let src_fields = graph[u]
+                    .tainted_field_calls
+                    .get(callee)
+                    .map(|v| v.as_slice());
+                push_field_taint_edges(
+                    &resolved_callee_map,
+                    u,
+                    callee,
+                    edge_mask,
+                    src_fields,
+                    &mut taint_parents,
+                    &mut taint_mask,
+                    &mut taint_field_masks,
+                    &mut has_field_restriction,
+                    &mut taint_q,
+                );
+            }
+            // Phase 10: cross-file callback dispatch (`dispatchTask(req.body.cmd, workerCb)`)
+            for (runner, cb_name, cb_mask) in &graph[u].callback_forwards {
+                let Some(runner_targets) = resolved_callee_map.get(&(u.index(), runner.clone()))
+                else {
+                    continue;
+                };
+                let Some(cb_targets) = resolved_callee_map.get(&(u.index(), cb_name.clone()))
+                else {
+                    continue;
+                };
+                if let Some(&runner_node) = runner_targets
+                    .iter()
+                    .find(|&&rn| graph[rn].invokes_callback_mask != 0)
+                {
+                    let ri = runner_node.index();
+                    if taint_parents[ri].is_none() {
+                        taint_parents[ri] = Some(u);
+                    }
+                    let eff_mask = *cb_mask & graph[runner_node].invokes_callback_mask;
+                    if eff_mask != 0 {
+                        for &cb_node in cb_targets {
+                            let ci = cb_node.index();
+                            if taint_parents[ci].is_none() {
+                                taint_parents[ci] = Some(runner_node);
+                            }
+                            let next = taint_mask[ci] | eff_mask;
+                            if next != taint_mask[ci] {
+                                taint_mask[ci] = next;
+                                taint_q.push_back(cb_node);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
     while let Some(w) = taint_q.pop_front() {
         let w_mask = taint_mask[w.index()];
+        let w_fields: Vec<(String, u8)> = taint_field_masks[w.index()]
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        let w_restricted = has_field_restriction[w.index()];
         for callee in &graph[w].tainted_calls {
-            let edge_mask = graph[w]
+            let mut edge_mask = graph[w]
                 .tainted_call_masks
                 .get(callee)
                 .copied()
                 .unwrap_or(TAINT_ALL);
-            push_taint_edges(
+            for (wc, wfn, wfld, wmask) in &graph[w].tainted_call_wrappers {
+                if wc == callee {
+                    let cleared = resolved_wrapper_clear_mask(w, wfn, wfld.as_deref()) & *wmask;
+                    edge_mask &= !cleared;
+                }
+            }
+            let src_fields = graph[w]
+                .tainted_field_calls
+                .get(callee)
+                .map(|v| v.as_slice());
+            push_field_taint_edges(
                 &resolved_callee_map,
                 w,
                 callee,
                 edge_mask,
+                src_fields,
                 &mut taint_parents,
                 &mut taint_mask,
+                &mut taint_field_masks,
+                &mut has_field_restriction,
                 &mut taint_q,
             );
         }
         for callee in &graph[w].param_forwarding_calls {
-            let edge_mask = graph[w]
+            let mut edge_mask = graph[w]
                 .tainted_call_masks
                 .get(callee)
                 .copied()
                 .unwrap_or(TAINT_ALL);
-            push_taint_edges(
+            for (wc, wfn, wfld, wmask) in &graph[w].tainted_call_wrappers {
+                if wc == callee {
+                    let cleared = resolved_wrapper_clear_mask(w, wfn, wfld.as_deref()) & *wmask;
+                    edge_mask &= !cleared;
+                }
+            }
+            let forwarded_fields = if let Some(explicit) = graph[w].tainted_field_calls.get(callee)
+            {
+                Some(explicit.as_slice())
+            } else if w_restricted {
+                Some(w_fields.as_slice())
+            } else {
+                None
+            };
+            push_field_taint_edges(
                 &resolved_callee_map,
                 w,
                 callee,
                 w_mask & edge_mask,
+                forwarded_fields,
                 &mut taint_parents,
                 &mut taint_mask,
+                &mut taint_field_masks,
+                &mut has_field_restriction,
                 &mut taint_q,
             );
         }
+        for (runner, cb_name, cb_mask) in &graph[w].callback_forwards {
+            let Some(runner_targets) = resolved_callee_map.get(&(w.index(), runner.clone())) else {
+                continue;
+            };
+            let Some(cb_targets) = resolved_callee_map.get(&(w.index(), cb_name.clone())) else {
+                continue;
+            };
+            if let Some(&runner_node) = runner_targets
+                .iter()
+                .find(|&&rn| graph[rn].invokes_callback_mask != 0)
+            {
+                let ri = runner_node.index();
+                if taint_parents[ri].is_none() {
+                    taint_parents[ri] = Some(w);
+                }
+                let eff_mask = w_mask & *cb_mask & graph[runner_node].invokes_callback_mask;
+                if eff_mask != 0 {
+                    for &cb_node in cb_targets {
+                        let ci = cb_node.index();
+                        if taint_parents[ci].is_none() {
+                            taint_parents[ci] = Some(runner_node);
+                        }
+                        let next = taint_mask[ci] | eff_mask;
+                        if next != taint_mask[ci] {
+                            taint_mask[ci] = next;
+                            taint_q.push_back(cb_node);
+                        }
+                    }
+                }
+            }
+        }
     }
+    let _ = push_taint_edges;
 
     // O(V + E) IDOR Resource-ID Reachability BFS (from any Route/node holding a resource ID parameter)
     let mut res_id_reaches = vec![false; node_count];
@@ -691,6 +921,16 @@ pub fn solve_guard_lattice_with_public(
             if reachable[vi] && active_guards.contains(&hit.missing_guard) {
                 continue;
             }
+            let req_bit = sink_bit_for_guard(hit.missing_guard);
+            let sanitized_via_cross_file_wrapper =
+                sym.local_hit_wrappers.iter().any(|(rid, ln, wfn, wf)| {
+                    rid == &hit.rule_id
+                        && *ln == hit.line
+                        && (resolved_wrapper_clear_mask(idx, wfn, wf.as_deref()) & req_bit) != 0
+                });
+            if sanitized_via_cross_file_wrapper {
+                continue;
+            }
             let (entry_route, mut witness) =
                 if let Some((er, w)) = reconstruct_witness(&graph, &route_parents, idx) {
                     (er, w)
@@ -730,8 +970,20 @@ pub fn solve_guard_lattice_with_public(
         // Layer 2b: Cross-file / Inter-procedural Taint (`Source -> param_forwarding -> ParamSink`)
         if taint_parents[vi].is_some() && taint_mask[vi] != 0 {
             for hit in &sym.param_sinks {
-                if (taint_mask[vi] & sink_bit_for_guard(hit.missing_guard)) == 0 {
+                let req_bit = sink_bit_for_guard(hit.missing_guard);
+                if (taint_mask[vi] & req_bit) == 0 {
                     continue;
+                }
+                if has_field_restriction[vi]
+                    && let Some((_, Some(fld))) = sym
+                        .param_sink_fields
+                        .iter()
+                        .find(|(h, _)| h.rule_id == hit.rule_id && h.line == hit.line)
+                {
+                    let fm = taint_field_masks[vi].get(fld).copied().unwrap_or(0);
+                    if (fm & req_bit) == 0 {
+                        continue;
+                    }
                 }
                 if reachable[vi] && active_guards.contains(&hit.missing_guard) {
                     continue;
@@ -1084,6 +1336,7 @@ pub fn solve_guard_lattice_with_public(
         route_entries,
         active_domains,
         findings: deduped,
+        route_schemas: crate::phase10::merge_repo_route_schemas(summaries),
     }
 }
 

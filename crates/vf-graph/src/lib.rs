@@ -3,6 +3,7 @@ pub mod deep_stack;
 pub mod deps;
 pub mod langs;
 pub mod lattice;
+pub mod phase10;
 pub mod phase9;
 pub mod secrets_config;
 pub mod taint;
@@ -19,6 +20,7 @@ pub use lattice::{
     GraphAnalysisResult, LatticeFinding, TraceHop, solve_guard_lattice,
     solve_guard_lattice_with_public,
 };
+pub use phase10::{ParamTypeHint, RouteParamSpec, RouteSchema, collect_deep_schema_findings};
 
 pub fn analyze_codebase(
     files: &[IndexedFile],
@@ -26,6 +28,7 @@ pub fn analyze_codebase(
 ) -> Result<GraphAnalysisResult> {
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(cfg.scan.max_threads)
+        .stack_size(8 * 1024 * 1024)
         .build()?;
 
     let summaries: Vec<FileAstSummary> = pool.install(|| {
@@ -53,7 +56,7 @@ pub fn analyze_codebase_cached(
     let cfg_json = serde_json::to_string(&cfg.guards).unwrap_or_default();
     let adv_stamp = vf_core::advisories_db_stamp();
     let versioned_cfg = format!(
-        "v10-phase9-engine-mem-mobile-{}|{}|{}",
+        "v12-phase10-deep-dataflow-{}|{}|{}",
         env!("CARGO_PKG_VERSION"),
         adv_stamp,
         cfg_json
@@ -78,6 +81,7 @@ pub fn analyze_codebase_cached(
     if !to_parse.is_empty() {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(cfg.scan.max_threads)
+            .stack_size(8 * 1024 * 1024)
             .build()?;
 
         let newly_parsed: Vec<(String, String, FileAstSummary)> = pool.install(|| {

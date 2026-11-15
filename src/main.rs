@@ -17,12 +17,13 @@ use vf_ai::{
 use vf_core::{DeltaStats, ShellMindGuardConfig, StateStore, scan_repository};
 use vf_graph::{
     Confidence, GraphAnalysisResult, GuardKind, LatticeFinding, analyze_codebase,
-    analyze_codebase_cached,
+    analyze_codebase_cached, collect_deep_schema_findings,
 };
 use vf_report::{to_html_graph, to_sarif_json};
 use vf_sandbox::{
-    SandboxProbeConfig, VerificationStatus, VerifiedFinding, verify_finding_blocking_with_config,
-    verify_findings_in_sandbox_with_config,
+    SandboxProbeConfig, VerificationStatus, VerifiedFinding, detect_sandbox_backend,
+    verify_deep_fuzz_blocking_with_config, verify_deep_fuzz_in_sandbox,
+    verify_finding_blocking_with_config, verify_findings_in_sandbox_with_config,
 };
 use vf_tui::{TuiLaunchConfig, run_tui};
 
@@ -32,6 +33,13 @@ enum OutputFormat {
     Text,
     Json,
     Sarif,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum ProbeMode {
+    #[default]
+    Verify,
+    Fuzz,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -112,6 +120,11 @@ pub(crate) struct ScanRunOptions<'a> {
     pub sync_race: usize,
     pub unsafe_host_fallback: bool,
     pub trust_repo_config: bool,
+    pub deep: bool,
+    pub sandbox_mem_mb: Option<u64>,
+    pub sandbox_tls: bool,
+    pub mock_shims: bool,
+    pub cgroup_v2: bool,
 }
 
 pub(crate) struct ScanOutcome {
@@ -161,7 +174,7 @@ enum Commands {
         #[arg(
             long,
             value_delimiter = ',',
-            help = "Filter active layers (auth,race,taint,sqli,cmdi,path,ssrf,xss,csrf,idor,secrets,config,deps,frontend,engine,memory,mobile)"
+            help = "Filter active layers (auth,race,taint,sqli,cmdi,path,ssrf,xss,csrf,idor,secrets,config,deps,frontend,engine,memory,mobile,deep)"
         )]
         layers: Vec<String>,
         #[arg(
@@ -170,12 +183,38 @@ enum Commands {
             help = "Hide findings below this confidence tier (proven, confirmed, heuristic)"
         )]
         min_confidence: Option<MinConfidenceArg>,
+        #[arg(
+            long,
+            help = "Enable Phase 10 deep schema validation (VF-FUZZ-SCHEMA) & targeted route payload fuzzing"
+        )]
+        deep: bool,
         #[arg(long)]
         boot_cmd: Option<String>,
         #[arg(long, default_value_t = 39911)]
         port: u16,
         #[arg(long, default_value_t = 12)]
         sync_race: usize,
+        #[arg(
+            long,
+            value_name = "MB",
+            help = "Optional RLIMIT_AS / cgroups v2 memory limit (MiB) inside sandbox"
+        )]
+        sandbox_mem_mb: Option<u64>,
+        #[arg(
+            long,
+            help = "Probe sandbox target over local loopback TLS using rustls"
+        )]
+        sandbox_tls: bool,
+        #[arg(
+            long,
+            help = "Start deterministic loopback mock shims (/v1/charges, /oauth/token, /webhooks) inside sandbox"
+        )]
+        mock_shims: bool,
+        #[arg(
+            long,
+            help = "Enforce systemd-run user cgroups v2 memory/task limits when available"
+        )]
+        cgroup_v2: bool,
         #[arg(long)]
         sarif: Option<PathBuf>,
         #[arg(long)]
@@ -270,6 +309,8 @@ enum Commands {
         port: u16,
         #[arg(long, default_value_t = 12)]
         sync_race: usize,
+        #[arg(long, value_enum, default_value_t = ProbeMode::Verify)]
+        mode: ProbeMode,
     },
 }
 
@@ -322,7 +363,11 @@ fn finding_matches_layer(f: &LatticeFinding, layer: &str) -> bool {
                 | GuardKind::CsrfProtection
                 | GuardKind::OwnershipCheck
                 | GuardKind::FrontendContract
+                | GuardKind::InputValidation
         ),
+        "deep" | "fuzz" | "schema" => {
+            f.missing_guard == GuardKind::InputValidation || f.rule_id.starts_with("VF-FUZZ-")
+        }
         "3" | "layer3" | "deps" | "dep" | "dependencies" => {
             f.missing_guard == GuardKind::DependencyPolicy
         }
@@ -371,6 +416,52 @@ fn probe_config_from_cfg(cfg: &ShellMindGuardConfig) -> SandboxProbeConfig {
         user_a_header: cfg.sandbox.user_a_header.clone(),
         user_b_header: cfg.sandbox.user_b_header.clone(),
         probe_body: cfg.sandbox.probe_body.clone(),
+        memory_limit_mb: cfg.sandbox.memory_limit_mb,
+        use_cgroup_v2: cfg.sandbox.use_cgroup_v2,
+        use_tls: cfg.sandbox.is_tls(),
+        mock_shims: cfg.sandbox.mock_shims,
+        fuzz_routes: Vec::new(),
+    }
+}
+
+fn probe_config_from_opts(
+    cfg: &ShellMindGuardConfig,
+    opts: &ScanRunOptions<'_>,
+    fuzz_routes: Vec<vf_graph::RouteSchema>,
+) -> SandboxProbeConfig {
+    let mut probe_cfg = probe_config_from_cfg(cfg);
+    if let Some(mb) = opts.sandbox_mem_mb {
+        probe_cfg.memory_limit_mb = Some(mb);
+    }
+    if opts.cgroup_v2 {
+        probe_cfg.use_cgroup_v2 = true;
+    }
+    if opts.sandbox_tls {
+        probe_cfg.use_tls = true;
+    }
+    if opts.mock_shims {
+        probe_cfg.mock_shims = true;
+    }
+    probe_cfg.fuzz_routes = fuzz_routes;
+    probe_cfg
+}
+
+fn apply_verification_statuses(
+    findings: &mut [LatticeFinding],
+    ver_map: &HashMap<&str, &VerificationStatus>,
+) {
+    for f in findings {
+        if let Some(st) = ver_map.get(f.id.as_str()) {
+            match st {
+                VerificationStatus::Proven => {
+                    f.status = "PROVEN".into();
+                    f.confidence = Confidence::Proven;
+                }
+                VerificationStatus::Mitigated => f.status = "MITIGATED".into(),
+                VerificationStatus::Unbootable => f.status = "UNBOOTABLE".into(),
+                VerificationStatus::SuspectUnverified => {}
+            }
+        }
     }
 }
 
@@ -389,6 +480,12 @@ pub(crate) fn execute_scan_pipeline(opts: ScanRunOptions<'_>) -> Result<ScanOutc
     let mut store = StateStore::open(opts.path)?;
     let (delta, _) = store.sync_files(&summary.files)?;
     let mut graph_res = analyze_codebase_cached(&summary.files, &cfg, &mut store)?;
+
+    if opts.deep {
+        graph_res
+            .findings
+            .extend(collect_deep_schema_findings(&graph_res));
+    }
     let mut all_findings = graph_res.findings.clone();
 
     if !opts.layers.is_empty() {
@@ -397,20 +494,36 @@ pub(crate) fn execute_scan_pipeline(opts: ScanRunOptions<'_>) -> Result<ScanOutc
             .retain(|f| opts.layers.iter().any(|l| finding_matches_layer(f, l)));
     }
 
-    let effective_boot = opts.boot_cmd.or_else(|| {
+    let effective_boot = opts.boot_cmd.clone().or_else(|| {
         opts.trust_repo_config
             .then(|| cfg.sandbox.boot_cmd.clone())
             .flatten()
     });
     let effective_port = resolve_sandbox_port(opts.port, &cfg)?;
-    let probe_cfg = probe_config_from_cfg(&cfg);
+    let wants_deep_fuzz = opts.deep
+        && !graph_res.route_schemas.is_empty()
+        && (opts.layers.is_empty()
+            || opts.layers.iter().any(|l| {
+                matches!(
+                    l.trim().to_ascii_lowercase().as_str(),
+                    "all" | "*" | "deep" | "fuzz" | "schema" | "2" | "layer2"
+                )
+            }));
+    let fuzz_routes = if wants_deep_fuzz {
+        graph_res.route_schemas.clone()
+    } else {
+        Vec::new()
+    };
+    let probe_cfg = probe_config_from_opts(&cfg, &opts, fuzz_routes);
     let has_dynamic_targets = graph_res.findings.iter().any(|f| {
         matches!(
             f.missing_guard,
             GuardKind::Auth | GuardKind::TxLock | GuardKind::OwnershipCheck
         )
     });
-    let sandbox_res = if let Some(cmd) = effective_boot {
+
+    let mut sandbox_res: Option<(bool, Vec<VerifiedFinding>)> = None;
+    if let Some(cmd) = effective_boot {
         if has_dynamic_targets {
             match verify_findings_in_sandbox_with_config(
                 opts.path,
@@ -421,18 +534,67 @@ pub(crate) fn execute_scan_pipeline(opts: ScanRunOptions<'_>) -> Result<ScanOutc
                 opts.unsafe_host_fallback,
                 &probe_cfg,
             ) {
-                Ok(res) => Some(res),
-                Err(e) => {
-                    eprintln!("[ShellMind Guard] Sandbox verification failed: {}", e);
-                    None
-                }
+                Ok(res) => sandbox_res = Some(res),
+                Err(e) => eprintln!("[ShellMind Guard] Sandbox verification failed: {}", e),
             }
-        } else {
-            None
         }
-    } else {
-        None
-    };
+        if wants_deep_fuzz {
+            match verify_deep_fuzz_in_sandbox(
+                opts.path,
+                &cmd,
+                effective_port,
+                opts.unsafe_host_fallback,
+                &probe_cfg,
+            ) {
+                Ok((bwrap_iso, hits, unbootable_opt)) => {
+                    let entry = sandbox_res.get_or_insert_with(|| (bwrap_iso, Vec::new()));
+                    entry.0 = entry.0 || bwrap_iso;
+                    let live_offset = all_findings
+                        .iter()
+                        .filter(|f| f.id.starts_with("VF-FUZZ-"))
+                        .count()
+                        + 1;
+                    for (idx, mut hit) in hits.into_iter().enumerate() {
+                        let live_id = format!("VF-FUZZ-LIVE-{:03}", live_offset + idx);
+                        hit.finding.id = live_id.clone();
+                        hit.finding.status = "PROVEN".into();
+                        hit.finding.confidence = Confidence::Proven;
+                        hit.verified.finding_id = live_id.clone();
+                        hit.verified.replay_cmd = format!("shellmind-guard replay {}", live_id);
+
+                        let layer_ok = opts.layers.is_empty()
+                            || opts
+                                .layers
+                                .iter()
+                                .any(|l| finding_matches_layer(&hit.finding, l));
+                        if layer_ok {
+                            graph_res.findings.push(hit.finding.clone());
+                        }
+                        all_findings.push(hit.finding);
+                        entry.1.push(hit.verified);
+                    }
+                    if let Some(reason) = unbootable_opt {
+                        eprintln!("[ShellMind Guard] Deep fuzz sandbox status: {}", reason);
+                        if entry.1.is_empty() {
+                            entry.1.push(VerifiedFinding {
+                                finding_id: "VF-SANDBOX-BOOT".into(),
+                                rule_id: "VF-SANDBOX-UNBOOTABLE".into(),
+                                entry_route: cmd.clone(),
+                                status: VerificationStatus::Unbootable,
+                                evidence: reason,
+                                replay_cmd: format!(
+                                    "shellmind-guard scan {} --deep --boot-cmd {:?}",
+                                    opts.path.display(),
+                                    cmd
+                                ),
+                            });
+                        }
+                    }
+                }
+                Err(e) => eprintln!("[ShellMind Guard] Deep fuzz sandbox failed: {}", e),
+            }
+        }
+    }
 
     let verified_list: Vec<VerifiedFinding> = sandbox_res
         .as_ref()
@@ -444,30 +606,8 @@ pub(crate) fn execute_scan_pipeline(opts: ScanRunOptions<'_>) -> Result<ScanOutc
             .iter()
             .map(|v| (v.finding_id.as_str(), &v.status))
             .collect();
-        for f in &mut graph_res.findings {
-            if let Some(st) = ver_map.get(f.id.as_str()) {
-                match st {
-                    VerificationStatus::Proven => {
-                        f.status = "PROVEN".into();
-                        f.confidence = Confidence::Proven;
-                    }
-                    VerificationStatus::Mitigated => f.status = "MITIGATED".into(),
-                    VerificationStatus::SuspectUnverified => {}
-                }
-            }
-        }
-        for f in &mut all_findings {
-            if let Some(st) = ver_map.get(f.id.as_str()) {
-                match st {
-                    VerificationStatus::Proven => {
-                        f.status = "PROVEN".into();
-                        f.confidence = Confidence::Proven;
-                    }
-                    VerificationStatus::Mitigated => f.status = "MITIGATED".into(),
-                    VerificationStatus::SuspectUnverified => {}
-                }
-            }
-        }
+        apply_verification_statuses(&mut graph_res.findings, &ver_map);
+        apply_verification_statuses(&mut all_findings, &ver_map);
     }
 
     if let Some(min_conf) = opts.min_confidence {
@@ -502,6 +642,7 @@ fn persist_scan_findings(
         let status_str = match v_opt.map(|v| &v.status) {
             Some(VerificationStatus::Proven) => "PROVEN",
             Some(VerificationStatus::Mitigated) => "MITIGATED",
+            Some(VerificationStatus::Unbootable) => "UNBOOTABLE",
             _ => f.status.as_str(),
         };
         let conf_str = if status_str == "PROVEN" || f.confidence == Confidence::Proven {
@@ -646,9 +787,14 @@ fn main() -> Result<ExitCode> {
             format,
             layers,
             min_confidence,
+            deep,
             boot_cmd,
             port,
             sync_race,
+            sandbox_mem_mb,
+            sandbox_tls,
+            mock_shims,
+            cgroup_v2,
             sarif,
             html,
             patch,
@@ -669,6 +815,11 @@ fn main() -> Result<ExitCode> {
                 sync_race,
                 unsafe_host_fallback,
                 trust_repo_config,
+                deep,
+                sandbox_mem_mb,
+                sandbox_tls,
+                mock_shims,
+                cgroup_v2,
             })?;
             let verified_list: Vec<VerifiedFinding> = outcome
                 .sandbox
@@ -745,6 +896,11 @@ fn main() -> Result<ExitCode> {
                             sync_race,
                             unsafe_host_fallback,
                             trust_repo_config,
+                            deep,
+                            sandbox_mem_mb,
+                            sandbox_tls,
+                            mock_shims,
+                            cgroup_v2,
                         })?;
                         let next_verified: Vec<VerifiedFinding> = next_outcome
                             .sandbox
@@ -835,11 +991,7 @@ fn main() -> Result<ExitCode> {
                     if bwrap { "isolated" } else { "local-loopback" }
                 );
                 for item in &v {
-                    let tag = match item.status {
-                        VerificationStatus::Proven => "PROVEN",
-                        VerificationStatus::Mitigated => "MITIGATED",
-                        VerificationStatus::SuspectUnverified => "SUSPECT",
-                    };
+                    let tag = verification_status_tag(&item.status);
                     println!("  [{}] {}", tag, item.evidence);
                     println!("  Command: {}", item.replay_cmd);
                 }
@@ -1082,15 +1234,28 @@ fn main() -> Result<ExitCode> {
         Commands::Doctor { path } => {
             run_doctor(&path);
         }
-        Commands::ProbeNetns { port, sync_race } => {
-            let finding_json = std::env::var("VF_FINDING_JSON")?;
-            let finding: LatticeFinding = serde_json::from_str(&finding_json)?;
+        Commands::ProbeNetns {
+            port,
+            sync_race,
+            mode,
+        } => {
             let probe_cfg: SandboxProbeConfig = std::env::var("VF_PROBE_CONFIG_JSON")
                 .ok()
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or_default();
-            let res = verify_finding_blocking_with_config(port, &finding, sync_race, &probe_cfg)?;
-            println!("{}", serde_json::to_string(&res)?);
+            match mode {
+                ProbeMode::Verify => {
+                    let finding_json = std::env::var("VF_FINDING_JSON")?;
+                    let finding: LatticeFinding = serde_json::from_str(&finding_json)?;
+                    let res =
+                        verify_finding_blocking_with_config(port, &finding, sync_race, &probe_cfg)?;
+                    println!("{}", serde_json::to_string(&res)?);
+                }
+                ProbeMode::Fuzz => {
+                    let hits = verify_deep_fuzz_blocking_with_config(port, &probe_cfg)?;
+                    println!("{}", serde_json::to_string(&hits)?);
+                }
+            }
         }
     }
 
@@ -1217,6 +1382,11 @@ fn handle_claude_pre_commit() -> Result<ExitCode> {
         sync_race: 12,
         unsafe_host_fallback: false,
         trust_repo_config: false,
+        deep: false,
+        sandbox_mem_mb: None,
+        sandbox_tls: false,
+        mock_shims: false,
+        cgroup_v2: false,
     })?;
 
     if should_fail_gate(&outcome.graph.findings, true, None) {
@@ -1360,6 +1530,15 @@ fn severity_rank(sev: &str) -> u8 {
     }
 }
 
+fn verification_status_tag(st: &VerificationStatus) -> &'static str {
+    match st {
+        VerificationStatus::Proven => "PROVEN",
+        VerificationStatus::Mitigated => "MITIGATED",
+        VerificationStatus::SuspectUnverified => "SUSPECT",
+        VerificationStatus::Unbootable => "UNBOOTABLE",
+    }
+}
+
 fn should_fail_gate(findings: &[LatticeFinding], ci: bool, fail_on: Option<FailSeverity>) -> bool {
     if let Some(threshold) = fail_on {
         let min_rank = match threshold {
@@ -1461,11 +1640,7 @@ fn render_scan_output(
                     if *bwrap { "isolated" } else { "local-loopback" }
                 );
                 for v in verified {
-                    let tag = match v.status {
-                        VerificationStatus::Proven => "PROVEN",
-                        VerificationStatus::Mitigated => "MITIGATED",
-                        VerificationStatus::SuspectUnverified => "SUSPECT",
-                    };
+                    let tag = verification_status_tag(&v.status);
                     println!(
                         "  [{}] {} ({}) -> {}",
                         tag, v.finding_id, v.rule_id, v.evidence
@@ -1494,13 +1669,15 @@ fn run_doctor(path: &Path) {
         std::env::consts::OS,
         std::env::consts::ARCH
     );
+    let backend = detect_sandbox_backend();
     let bwrap_ok = vf_sandbox::has_bwrap();
+    println!("  Sandbox Backend : {}", backend.label());
     println!(
         "  Sandbox (bwrap) : {}",
         if bwrap_ok {
-            "OK (bwrap available)"
+            "OK (bwrap available; --unshare-all netns isolation active)"
         } else {
-            "UNAVAILABLE (static 6-layer scan, TUI, SARIF & MCP work; live sandbox requires Linux bwrap)"
+            "UNAVAILABLE (static scan, TUI, SARIF & MCP work; fallback sandbox uses host loopback if authorized)"
         }
     );
     let cfg_exists = path.join(".shellmind-guard.toml").exists();
@@ -1836,6 +2013,139 @@ mod main_tests {
                 probe_cfg: &probe_cfg,
             })
             .is_err()
+        );
+    }
+
+    fn copy_dir_recursive(src: &Path, dst: &Path) {
+        fs::create_dir_all(dst).unwrap();
+        for entry in fs::read_dir(src).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let name = entry.file_name();
+            if name == ".shellmind-guard" {
+                continue;
+            }
+            let target = dst.join(name);
+            if path.is_dir() {
+                copy_dir_recursive(&path, &target);
+            } else {
+                fs::copy(&path, &target).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn test_phase10_deep_scan_and_layers_filter_on_fixtures() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let tmp = std::env::temp_dir().join(format!("smg_p10_main_{}", nanos));
+        let _cleanup = TempDirCleanup(tmp.clone());
+
+        let pay_dir = tmp.join("vuln-payment-node");
+        copy_dir_recursive(Path::new("fixtures/vuln-payment-node"), &pay_dir);
+
+        let base_scan = execute_scan_pipeline(ScanRunOptions {
+            path: &pay_dir,
+            layers: &[],
+            min_confidence: None,
+            boot_cmd: None,
+            port: 39911,
+            sync_race: 12,
+            unsafe_host_fallback: false,
+            trust_repo_config: false,
+            deep: false,
+            sandbox_mem_mb: None,
+            sandbox_tls: false,
+            mock_shims: false,
+            cgroup_v2: false,
+        })
+        .unwrap();
+        assert!(
+            !base_scan
+                .graph
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "VF-FUZZ-SCHEMA"),
+            "deep=false must not emit VF-FUZZ-SCHEMA"
+        );
+
+        let deep_scan = execute_scan_pipeline(ScanRunOptions {
+            path: &pay_dir,
+            layers: &[],
+            min_confidence: None,
+            boot_cmd: None,
+            port: 39911,
+            sync_race: 12,
+            unsafe_host_fallback: false,
+            trust_repo_config: false,
+            deep: true,
+            sandbox_mem_mb: None,
+            sandbox_tls: false,
+            mock_shims: false,
+            cgroup_v2: false,
+        })
+        .unwrap();
+        assert!(
+            deep_scan
+                .graph
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "VF-FUZZ-SCHEMA"),
+            "deep=true must emit VF-FUZZ-SCHEMA on unvalidated payment route amount"
+        );
+
+        let deep_layer_only = execute_scan_pipeline(ScanRunOptions {
+            path: &pay_dir,
+            layers: &["deep".to_string()],
+            min_confidence: None,
+            boot_cmd: None,
+            port: 39911,
+            sync_race: 12,
+            unsafe_host_fallback: false,
+            trust_repo_config: false,
+            deep: true,
+            sandbox_mem_mb: None,
+            sandbox_tls: false,
+            mock_shims: false,
+            cgroup_v2: false,
+        })
+        .unwrap();
+        assert!(!deep_layer_only.graph.findings.is_empty());
+        assert!(
+            deep_layer_only
+                .graph
+                .findings
+                .iter()
+                .all(|f| f.missing_guard == GuardKind::InputValidation)
+        );
+
+        let auth_dir = tmp.join("vuln-auth-rust");
+        copy_dir_recursive(Path::new("fixtures/vuln-auth-rust"), &auth_dir);
+        let auth_deep = execute_scan_pipeline(ScanRunOptions {
+            path: &auth_dir,
+            layers: &[],
+            min_confidence: None,
+            boot_cmd: None,
+            port: 39911,
+            sync_race: 12,
+            unsafe_host_fallback: false,
+            trust_repo_config: false,
+            deep: true,
+            sandbox_mem_mb: None,
+            sandbox_tls: false,
+            mock_shims: false,
+            cgroup_v2: false,
+        })
+        .unwrap();
+        assert!(
+            auth_deep
+                .graph
+                .findings
+                .iter()
+                .any(|f| f.missing_guard == GuardKind::Auth),
+            "auth fixture must preserve Auth finding under --deep"
         );
     }
 }

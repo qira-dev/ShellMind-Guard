@@ -33,7 +33,7 @@ Conventional security tools fail on these bugs in two predictable ways:
 - **Two-Phase Incremental Ingestion (`BLAKE3` + `SQLite WAL`):** Fingerprints 13,000+ files at >1 GB/s, caching per-file `Tree-sitter` AST summaries in SQLite while **always re-linking the global cross-file call graph in RAM (<80 ms)** so edits to a shared middleware (`auth.ts`) immediately invalidate downstream routes (`routes.ts`).
 - **$O(V + E)$ Guard-Set Lattice Solver:** Computes fixed-point security guard intersections across all incoming call paths without exponential $O(V!)$ path enumeration—terminating in linear time even on cyclic enterprise call graphs.
 - **Universal 6-Layer Static & Taint Engine:** Covers hardcoded secrets, CORS/JWT/TLS/Dockerfile misconfigurations, offline lockfile advisories, cross-file SQL/Command/Path/SSRF taint with sanitizer disproof, missing auth/transaction locks, IDOR missing ownership filters, and frontend-to-backend API contract drift (`404` dead routes).
-- **OS-Isolated Bubblewrap (`bwrap`) Exploit Prover:** Boots your service inside an unprivileged Linux namespace (`--unshare-all`, read-only rootfs, ephemeral `tmpfs`, 1 GiB `RLIMIT_AS` memory cap, process-group reaper) and fires barrier-synchronized **12-way Last-Byte Sync** concurrent HTTP bursts (`tokio::sync::Barrier` + `tokio::task::JoinSet`) to upgrade static `SUSPECT` findings to **`PROVEN`** or **`MITIGATED`**.
+- **OS-Isolated Bubblewrap (`bwrap`) Exploit Prover:** Boots your service inside an unprivileged Linux namespace (`--unshare-all`, read-only rootfs, ephemeral `tmpfs`, optional `--sandbox-mem-mb` `RLIMIT_AS` / `--cgroup-v2` resource caps, `--sandbox-tls` loopback `rustls`, `--mock-shims` offline service endpoints, fast `UNBOOTABLE` diagnostics, and process-group reaper) and fires barrier-synchronized **12-way Last-Byte Sync** concurrent HTTP/HTTPS bursts (`tokio::sync::Barrier` + `tokio::task::JoinSet`) to upgrade static `SUSPECT` findings to **`PROVEN`** or **`MITIGATED`**.
 - **Native Model Context Protocol (`shellmind-guard mcp`) Server:** Exposes deterministic, zero-token-overhead security verification over `stdio` JSON-RPC 2.0 for **Claude Code, Cursor, AntiGravity, Windsurf, OpenCode, and Z-Code**.
 
 ---
@@ -113,6 +113,7 @@ ShellMind Guard executes all 6 verification layers in a single unified pass:
 | **5** | `VF-RACE-001`<br>`VF-ENG-DEADLOCK`<br>`VF-ENG-LEAK`<br>`VF-MEM-BOUNDS`<br>`VF-ENG-INT` | `CRITICAL`<br>`HIGH` | **Concurrency, Resource Leaks & Native Memory Safety:** Payment/balance double-spend races (`VF-RACE-001`), cross-function `A->B / B->A` lock-order inversions & sync locks held across `.await` (`VF-ENG-DEADLOCK`), unclosed file/socket/DB handles on early error returns (`VF-ENG-LEAK`), unbounded C/C++ copies (`strcpy`, `sprintf`, unchecked `memcpy`) & unguarded Rust `unsafe` slice/ptr access (`VF-MEM-BOUNDS`), and allocation integer overflow (`VF-ENG-INT`). | Enforce `withTransaction`/`SELECT ... FOR UPDATE`, canonical lock ordering (`std::scoped_lock`), drop mutexes before `.await`, use RAII/`defer`/`try-finally`, and validate bounds + checked arithmetic. |
 | **6** | `VF-FE-404`<br>`VF-FE-ERR`<br>`VF-FE-STORAGE`<br>`VF-FE-MSG`<br>`VF-FE-TABNAB` | `HIGH`<br>`MEDIUM`<br>`LOW` | **Frontend ↔ Backend Contract & Browser Security:** Frontend `fetch`/`axios`/`$fetch`/`useFetch`/`this.http.*` calling missing backend routes (`VF-FE-404`), dead `onClick` or unhandled async fetches (`VF-FE-ERR`), auth tokens/secrets persisted in `localStorage`/`sessionStorage` (`VF-FE-STORAGE`), unverified `postMessage` (`*` target origin or `.data` without `.origin` check, `VF-FE-MSG`), and `target="_blank"` missing `noopener` (`VF-FE-TABNAB`). | Align API contracts, handle rejections, store tokens in `httpOnly` cookies, enforce strict `event.origin` checks, and add `rel="noopener noreferrer"`. |
 | **Domain** | `VF-MOB-STORAGE`<br>`VF-MOB-IPC`<br>`VF-MOB-TLS` | `CRITICAL`<br>`HIGH`<br>`MEDIUM` | **Domain-Routed Mobile Security (`Android`/`iOS`/`Flutter`):** Activated automatically when mobile code/manifests (`AndroidManifest.xml`, `Info.plist`, `pubspec.yaml`) exist: plaintext `SharedPreferences` / `UserDefaults` credential storage (`VF-MOB-STORAGE`), exported permissionless Android components / dynamic receivers / WebView bridges (`VF-MOB-IPC`), and trust-all TLS verifiers / ATS bypasses (`VF-MOB-TLS`). | Use `EncryptedSharedPreferences`/Keychain/`FlutterSecureStorage`, enforce `android:exported="false"` or signature permissions, and enable strict TLS pinning. |
+| **Deep (`--deep`)** | `VF-FUZZ-SCHEMA`<br>`VF-FUZZ-TAMPER`<br>`VF-FUZZ-CRASH`<br>`VF-FUZZ-ENCODING` | `CRITICAL`<br>`HIGH` | **Schema Bounds & Targeted Route Fuzzing (`--deep`):** Extracts route schemas from AST handlers and OpenAPI/Swagger specs to flag unvalidated financial/quantity parameters (`VF-FUZZ-SCHEMA`) and probe live sandboxed routes for negative/zero tampering (`VF-FUZZ-TAMPER`), server 5xx/panic crashes (`VF-FUZZ-CRASH`), and null-byte / invalid UTF-8 (`\xff\xfe`) failures (`VF-FUZZ-ENCODING`). | Enforce finite positive schema validation (`amount > 0`, Zod `.finite().positive()`, Pydantic `gt=0`) and reject malformed/non-UTF-8 payloads with `400/422`. |
 
 ### Supported Languages & Frameworks
 
@@ -207,10 +208,11 @@ shellmind-guard deps status
 
 ### 4. Prove Exploits in the Isolated Bubblewrap Sandbox
 
-Run ShellMind Guard against the included vulnerable Node/TypeScript payment fixture (`fixtures/vuln-payment-node`) to see static `SUSPECT` findings upgraded to **`PROVEN`** via live sandbox execution and 12-way barrier-synchronized race probing:
+Run ShellMind Guard against the included vulnerable Node/TypeScript payment fixture (`fixtures/vuln-payment-node`) to see static `SUSPECT` findings upgraded to **`PROVEN`** via live sandbox execution and 12-way barrier-synchronized race probing (add `--deep` for Phase 10 schema & payload fuzzing, or `--sandbox-tls` / `--mock-shims` / `--sandbox-mem-mb 512` for hardened probing):
 
 ```bash
 shellmind-guard scan fixtures/vuln-payment-node \
+  --deep \
   --boot-cmd "node server.mjs" \
   --sarif .shellmind-guard/report.sarif \
   --html .shellmind-guard/report.html
@@ -291,7 +293,7 @@ Add the following to your `.mcp.json`, `~/.claude.json`, or `.cursor/mcp.json`:
 
 | Tool Name | Input Schema | Description |
 | :--- | :--- | :--- |
-| `shellmind_guard_scan` | `{ "path"?: string, "layers"?: string[], "min_confidence"?: "proven"\|"confirmed"\|"heuristic", "boot_cmd"?: string }` | Runs the full 6-layer AST + Guard-Set Lattice scan (and optional `bwrap` sandbox proof) and returns structured JSON findings with confidence, witness hops, and remediation. |
+| `shellmind_guard_scan` | `{ "path"?: string, "layers"?: string[], "min_confidence"?: "proven"\|"confirmed"\|"heuristic", "deep"?: boolean }` | Runs the multi-layer AST + Guard-Set Lattice scan (plus optional Phase 10 `deep` schema checks) and returns structured JSON findings with confidence, witness hops, and remediation. |
 | `shellmind_guard_explain_finding` | `{ "path"?: string, "finding_id": string }` | Resolves a finding by `id` (e.g. `VF-RACE-002`) or `rule_id` (e.g. `VF-SQLI-001`) and returns exact source lines around every hop in `witness_path`, a <= 2 KB patch prompt, and concrete remediation guidance. |
 | `shellmind_guard_init` | `{ "path"?: string, "ci"?: boolean }` | Detects the repository language stack, writes `.shellmind-guard.toml`, and optionally scaffolds `.github/workflows/shellmind-guard.yml`. |
 
@@ -331,12 +333,15 @@ max_threads = 4
 max_file_bytes = 2097152
 
 [sandbox]
-# Default boot command, loopback base_url, and IDOR/body overrides (require --trust-repo-config)
+# Default boot command, loopback base_url (http:// or https://), IDOR/body overrides, and resource/mock hardening
 # boot_cmd = "node server.mjs"
 # base_url = "http://127.0.0.1:3000"
 # user_a_header = "Authorization: Bearer token-user-a"
 # user_b_header = "Authorization: Bearer token-user-b"
 # probe_body = '{"amount": 100}'
+# memory_limit_mb = 512
+# use_cgroup_v2 = false
+# mock_shims = false
 
 [ai]
 # Opt-in only (disabled by default = zero network calls; requires --trust-repo-config)
@@ -365,9 +370,9 @@ ShellMind-Guard/
 │   ├── vf-graph/                  # Parallel Tree-sitter AST across 16 languages (TS/JS/Go/Python/Rust
 │   │                              # + modular langs/ for PHP/Java/C#/Kotlin/Swift/Dart/C/C++/Ruby/Bash/HCL),
 │   │                              # domain routing (`web`/`system_engine`/`mobile`), deep SQL/DOM/SSTI rules,
-│   │                              # concurrency/leak/memory (`phase9`) & O(V+E) Guard-Set Lattice
-│   ├── vf-sandbox/                # Linux Bubblewrap (--unshare-all) runner, inner namespace probe,
-│   │                              # Auth/IDOR probers & 12-way Barrier + JoinSet concurrent race verifier
+│   │                              # Phase 9/10 cross-file field/closure taint, OpenAPI schemas & O(V+E) Lattice
+│   ├── vf-sandbox/                # Linux Bubblewrap (--unshare-all) + macOS/Windows sandbox helpers,
+│   │                              # RLIMIT_AS/cgroups v2, rustls TLS loopback, mock shims & `--deep` fuzz prover
 │   ├── vf-report/                 # SARIF 2.1.0 & self-contained Carbon-Slate HTML/SVG graph exporter
 │   ├── vf-tui/                    # Panic-safe 60fps ratatui 3-pane workspace + ring-buffer log drawer
 │   └── vf-ai/                     # Opt-in minimal-context (<= 2 KB) HTTP/TLS patcher & safe diff applier

@@ -27,6 +27,14 @@ pub struct FunctionTaintSummary {
     pub has_cookie_session_auth: bool,
     pub has_bearer_header_auth: bool,
     pub csrf_exempt: bool,
+    pub tainted_field_calls: HashMap<String, Vec<(String, u8)>>,
+    pub param_sink_fields: Vec<(LocalStaticFinding, Option<String>)>,
+    pub clears_taint_mask: u8,
+    pub clears_field_masks: HashMap<String, u8>,
+    pub invokes_callback_mask: u8,
+    pub callback_forwards: Vec<(String, String, u8)>,
+    pub local_hit_wrappers: Vec<(String, usize, String, Option<String>)>,
+    pub tainted_call_wrappers: Vec<(String, String, Option<String>, u8)>,
 }
 
 #[derive(Clone, Default)]
@@ -35,6 +43,18 @@ struct TaintEnv {
     params: HashMap<String, u8>,
     sql_vars: HashSet<String>,
     html_vars: HashSet<String>,
+    /// Phase 10: field-sensitive taint bitmasks `(base_var, field_name) -> mask`.
+    field_direct: HashMap<(String, String), u8>,
+    field_params: HashMap<(String, String), u8>,
+    sanitized_fields: HashSet<(String, String)>,
+    object_vars: HashSet<String>,
+    destructured_param_fields: HashMap<String, String>,
+    /// Phase 10: `(wrapper_fn_name, optional_field_accessed)` for cross-file wrapper provenance.
+    var_wrappers: HashMap<String, (String, Option<String>)>,
+    /// Phase 10: `var_name -> bitmask cleared by sanitizers while deriving var_name`.
+    var_cleared_masks: HashMap<String, u8>,
+    /// Phase 10: `(obj_var, field_name) -> sanitizer bits cleared when creating object literal`.
+    object_cleared_fields: HashMap<(String, String), u8>,
 }
 
 impl TaintEnv {
@@ -50,6 +70,46 @@ impl TaintEnv {
         }
         for k in &other.html_vars {
             self.html_vars.insert(k.clone());
+        }
+        for (k, v) in &other.field_direct {
+            *self.field_direct.entry(k.clone()).or_insert(0) |= *v;
+            self.sanitized_fields.remove(k);
+        }
+        for (k, v) in &other.field_params {
+            *self.field_params.entry(k.clone()).or_insert(0) |= *v;
+            self.sanitized_fields.remove(k);
+        }
+        for k in &other.sanitized_fields {
+            if !self.field_direct.contains_key(k) && !self.field_params.contains_key(k) {
+                self.sanitized_fields.insert(k.clone());
+            }
+        }
+        for k in &other.object_vars {
+            self.object_vars.insert(k.clone());
+        }
+        for (k, v) in &other.destructured_param_fields {
+            self.destructured_param_fields
+                .entry(k.clone())
+                .or_insert_with(|| v.clone());
+        }
+        for (k, v) in &other.var_wrappers {
+            self.var_wrappers
+                .entry(k.clone())
+                .or_insert_with(|| v.clone());
+        }
+        for (k, v) in &other.var_cleared_masks {
+            if let Some(prev) = self.var_cleared_masks.get_mut(k) {
+                *prev &= *v;
+            } else {
+                self.var_cleared_masks.insert(k.clone(), *v);
+            }
+        }
+        for (k, v) in &other.object_cleared_fields {
+            if let Some(prev) = self.object_cleared_fields.get_mut(k) {
+                *prev &= *v;
+            } else {
+                self.object_cleared_fields.insert(k.clone(), *v);
+            }
         }
     }
 
@@ -73,6 +133,28 @@ impl TaintEnv {
                     self.params.remove(v);
                 }
             }
+            let keys: Vec<(String, String)> = self
+                .field_direct
+                .keys()
+                .chain(self.field_params.keys())
+                .filter(|(obj, fld)| obj == v || fld == v)
+                .cloned()
+                .collect();
+            for k in keys {
+                if let Some(m) = self.field_direct.get_mut(&k) {
+                    *m &= !clear_mask;
+                    if *m == 0 {
+                        self.field_direct.remove(&k);
+                    }
+                }
+                if let Some(m) = self.field_params.get_mut(&k) {
+                    *m &= !clear_mask;
+                    if *m == 0 {
+                        self.field_params.remove(&k);
+                    }
+                }
+            }
+            *self.var_cleared_masks.entry(v.clone()).or_insert(0) |= clear_mask;
         }
     }
 }
@@ -1045,8 +1127,157 @@ fn is_call_sanitizer_for(ftxt: &str, full_txt: &str, sink_mask: u8) -> bool {
     false
 }
 
-/// Evaluates `(direct_mask, param_mask)` over an expression AST node with
-/// sink-specific sanitizer pruning and partial-concatenation preservation.
+fn is_plain_ident(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+fn split_simple_member(raw: &str) -> Option<(String, String)> {
+    let trimmed = raw.trim();
+    let (base, field) = trimmed.split_once('.')?;
+    let base = base.trim();
+    let field = field.trim();
+    if is_plain_ident(base) && is_plain_ident(field) {
+        Some((base.to_string(), field.to_string()))
+    } else {
+        None
+    }
+}
+
+fn extract_member_base_field(node: Node, src: &[u8]) -> Option<(String, String)> {
+    let k = node.kind();
+    if !matches!(
+        k,
+        "member_expression"
+            | "attribute"
+            | "subscript_expression"
+            | "field_expression"
+            | "selector_expression"
+    ) {
+        return None;
+    }
+    let obj = node
+        .child_by_field_name("object")
+        .or_else(|| node.child_by_field_name("value"))
+        .or_else(|| node.child_by_field_name("operand"))?;
+    let base = node_text(obj, src).trim();
+    if !is_plain_ident(base) {
+        return None;
+    }
+    let prop_node = node
+        .child_by_field_name("property")
+        .or_else(|| node.child_by_field_name("attribute"))
+        .or_else(|| node.child_by_field_name("field"))
+        .or_else(|| node.child_by_field_name("subscript"))
+        .or_else(|| node.child_by_field_name("index"))?;
+    let field = node_text(prop_node, src)
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'' || c == '`');
+    if is_plain_ident(field) {
+        Some((base.to_string(), field.to_string()))
+    } else {
+        None
+    }
+}
+
+fn extract_expr_param_field(node: Node, src: &[u8], env: &TaintEnv) -> Option<String> {
+    if let Some((base, field)) = extract_member_base_field(node, src)
+        && (env.params.contains_key(&base) || env.field_params.keys().any(|(b, _)| b == &base))
+    {
+        return Some(field);
+    }
+    if node.kind() == "identifier" {
+        let id = node_text(node, src).trim();
+        if let Some(fld) = env.destructured_param_fields.get(id) {
+            return Some(fld.clone());
+        }
+    }
+    let mut c = node.walk();
+    for ch in node.children(&mut c) {
+        if let Some(fld) = extract_expr_param_field(ch, src, env) {
+            return Some(fld);
+        }
+    }
+    None
+}
+
+fn extract_expr_wrapper(
+    node: Node,
+    src: &[u8],
+    env: &TaintEnv,
+) -> Option<(String, Option<String>)> {
+    let txt = node_text(node, src);
+    if has_taint_source_expr(txt) || env.var_wrappers.is_empty() {
+        return None;
+    }
+    if let Some((base, field)) = extract_member_base_field(node, src)
+        && let Some((wfn, prev_f)) = env.var_wrappers.get(&base)
+    {
+        return Some((wfn.clone(), prev_f.clone().or(Some(field))));
+    }
+    // Unwrap container nodes (`arguments`, `parenthesized_expression`) to preserve `member_expression` field names
+    if matches!(
+        node.kind(),
+        "arguments" | "argument_list" | "parenthesized_expression"
+    ) {
+        let mut c = node.walk();
+        let expr_children: Vec<Node> = node
+            .children(&mut c)
+            .filter(|ch| !matches!(ch.kind(), "(" | ")" | "," | "comment"))
+            .collect();
+        if expr_children.len() == 1
+            && let Some(res) = extract_expr_wrapper(expr_children[0], src, env)
+        {
+            return Some(res);
+        }
+    }
+    let mut wrapped: Option<(String, Option<String>)> = None;
+    for cap in ident_re().captures_iter(txt) {
+        let id = &cap[1];
+        if let Some(w) = env.var_wrappers.get(id) {
+            match &wrapped {
+                None => wrapped = Some(w.clone()),
+                Some(prev) if prev != w => return None,
+                Some(_) => {}
+            }
+        } else if env.direct.contains_key(id) || env.params.contains_key(id) {
+            // Also mixed with an unwrapped tainted variable -> do not suppress!
+            return None;
+        }
+    }
+    wrapped
+}
+
+fn expr_call_sanitized_bits(node: Node, src: &[u8], env: &TaintEnv) -> u8 {
+    let k = node.kind();
+    let txt = node_text(node, src);
+    let mut bits = sanitizer_clear_mask(txt);
+    if k == "identifier"
+        && let Some(&cleared) = env.var_cleared_masks.get(txt.trim())
+    {
+        bits |= cleared;
+    }
+    if k == "call_expression" || k == "call" {
+        let ftxt = node
+            .child_by_field_name("function")
+            .map(|f| node_text(f, src).trim())
+            .unwrap_or("");
+        for bit in [TAINT_SQL, TAINT_CMD, TAINT_PATH, TAINT_SSRF, TAINT_XSS] {
+            if is_call_sanitizer_for(ftxt, txt, bit) {
+                bits |= bit;
+            }
+        }
+    }
+    let mut c = node.walk();
+    for ch in node.children(&mut c) {
+        bits |= expr_call_sanitized_bits(ch, src, env);
+    }
+    bits
+}
+
 fn ast_eval_masks(node: Node, src: &[u8], env: &TaintEnv) -> (u8, u8) {
     let k = node.kind();
     let txt = node_text(node, src);
@@ -1127,6 +1358,28 @@ fn ast_eval_masks(node: Node, src: &[u8], env: &TaintEnv) -> (u8, u8) {
     ) {
         if has_taint_source_expr(txt) {
             return (TAINT_ALL, 0);
+        }
+        if let Some((base, field)) = extract_member_base_field(node, src) {
+            let f_direct = env
+                .field_direct
+                .get(&(base.clone(), field.clone()))
+                .copied();
+            let f_param = env
+                .field_params
+                .get(&(base.clone(), field.clone()))
+                .copied();
+            if f_direct.is_some() || f_param.is_some() {
+                return (f_direct.unwrap_or(0), f_param.unwrap_or(0));
+            }
+            if env
+                .sanitized_fields
+                .contains(&(base.clone(), field.clone()))
+            {
+                return (0, 0);
+            }
+            if env.object_vars.contains(&base) {
+                return (0, 0);
+            }
         }
         let mut d = 0u8;
         let mut p = 0u8;
@@ -1449,10 +1702,63 @@ fn check_call_taint_sinks(
         let args_txt = args_node.map(|a| node_text(a, src)).unwrap_or("");
         let line = node.start_position().row + 1;
 
-        // Track sink-typed call-arg forwarding (`(callee, bitmask)`) for inter-procedural propagation
+        // Phase 10: record cross-file callback handoffs & inline closure taint propagation!
+        if !short.is_empty() && env.params.contains_key(short) {
+            let (cd, cp) = args_node
+                .map(|an| ast_eval_masks(an, src, env))
+                .unwrap_or((TAINT_ALL, TAINT_ALL));
+            summary.invokes_callback_mask |= cd | cp | TAINT_ALL;
+        }
+
+        // Track sink-typed call-arg forwarding (`(callee, bitmask)`), object field masks, wrappers & callbacks
         if !short.is_empty()
             && let Some(an) = args_node
         {
+            let mut non_cb_d = 0u8;
+            let mut non_cb_p = 0u8;
+            let mut inline_cbs: Vec<Node> = Vec::new();
+            let mut named_cbs: Vec<String> = Vec::new();
+            let mut single_tainted_arg: Option<Node> = None;
+            let mut tainted_arg_count = 0usize;
+
+            // Check receiver object for array iteration helpers like `items.forEach(cb)`
+            let mut recv_mask = (0u8, 0u8);
+            if let Some(obj_n) = func.child_by_field_name("object") {
+                recv_mask = ast_eval_masks(obj_n, src, env);
+            }
+
+            let mut ac = an.walk();
+            for arg in an.children(&mut ac) {
+                let ak = arg.kind();
+                if matches!(ak, "(" | ")" | "," | "comment") {
+                    continue;
+                }
+                if matches!(
+                    ak,
+                    "arrow_function" | "function_expression" | "closure_expression" | "lambda"
+                ) {
+                    inline_cbs.push(arg);
+                    continue;
+                }
+                let (ad, ap) = ast_eval_masks(arg, src, env);
+                non_cb_d |= ad;
+                non_cb_p |= ap;
+                if ad != 0 || ap != 0 {
+                    tainted_arg_count += 1;
+                    single_tainted_arg = Some(arg);
+                } else if ak == "identifier" {
+                    let cname = node_text(arg, src).trim();
+                    if is_plain_ident(cname)
+                        && !matches!(
+                            cname,
+                            "true" | "false" | "null" | "undefined" | "None" | "nil"
+                        )
+                    {
+                        named_cbs.push(cname.to_string());
+                    }
+                }
+            }
+
             let (d_mask, p_mask) = ast_eval_masks(an, src, env);
             if d_mask != 0 {
                 if !summary.tainted_calls.iter().any(|c| c == short) {
@@ -1470,6 +1776,131 @@ fn check_call_taint_sinks(
                     .tainted_call_masks
                     .entry(short.to_string())
                     .or_insert(0) |= p_mask;
+            }
+
+            // Field-level argument metadata when passing an object variable `helper(payload)`
+            let mut ac2 = an.walk();
+            for arg in an.children(&mut ac2) {
+                if arg.kind() == "identifier" {
+                    let aname = node_text(arg, src).trim();
+                    if env.object_vars.contains(aname) {
+                        let mut field_pairs: Vec<(String, u8)> = Vec::new();
+                        for ((obj, fld), m) in &env.field_direct {
+                            if obj == aname && *m != 0 {
+                                field_pairs.push((fld.clone(), *m));
+                            }
+                        }
+                        for ((obj, fld), m) in &env.field_params {
+                            if obj == aname && *m != 0 {
+                                if let Some(ex) = field_pairs.iter_mut().find(|(f, _)| f == fld) {
+                                    ex.1 |= *m;
+                                } else {
+                                    field_pairs.push((fld.clone(), *m));
+                                }
+                            }
+                        }
+                        if !field_pairs.is_empty() {
+                            summary
+                                .tainted_field_calls
+                                .entry(short.to_string())
+                                .or_default()
+                                .extend(field_pairs);
+                        }
+                    }
+                }
+            }
+
+            // Track wrapper provenance when calling `callee(cleanOrWrappedVar)`
+            if d_mask != 0
+                && tainted_arg_count == 1
+                && let Some(sa) = single_tainted_arg
+                && let Some((wfn, wf)) = extract_expr_wrapper(sa, src, env)
+            {
+                summary
+                    .tainted_call_wrappers
+                    .push((short.to_string(), wfn, wf, d_mask));
+            }
+
+            // Record cross-file callback forwards `runTask(req.body.cmd, workerCb)`
+            let cb_data_mask = non_cb_d | non_cb_p | recv_mask.0 | recv_mask.1;
+            if cb_data_mask != 0 {
+                for cb_name in named_cbs {
+                    let tup = (short.to_string(), cb_name, cb_data_mask);
+                    if !summary.callback_forwards.contains(&tup) {
+                        summary.callback_forwards.push(tup);
+                    }
+                }
+            }
+
+            // Evaluate inline closure bodies `(val) => { execSync(val); worker(val); }`
+            for cb_node in inline_cbs {
+                let mut cb_env = env.clone();
+                let seed_d = non_cb_d | recv_mask.0;
+                let seed_p = non_cb_p | recv_mask.1;
+                let cb_params = extract_param_names(cb_node, src);
+                for cp in &cb_params {
+                    if seed_d != 0 {
+                        *cb_env.direct.entry(cp.clone()).or_insert(0) |= seed_d;
+                    }
+                    if seed_p != 0 {
+                        *cb_env.params.entry(cp.clone()).or_insert(0) |= seed_p;
+                    }
+                    // Preserve object fields when passing an object_var to a closure
+                    if tainted_arg_count == 1
+                        && let Some(sa) = single_tainted_arg
+                        && sa.kind() == "identifier"
+                    {
+                        let sa_name = node_text(sa, src).trim();
+                        if env.object_vars.contains(sa_name) {
+                            cb_env.object_vars.insert(cp.clone());
+                            let fd: Vec<_> = env
+                                .field_direct
+                                .iter()
+                                .filter(|((o, _), _)| o == sa_name)
+                                .map(|((_, f), m)| ((cp.clone(), f.clone()), *m))
+                                .collect();
+                            cb_env.field_direct.extend(fd);
+                            let fp: Vec<_> = env
+                                .field_params
+                                .iter()
+                                .filter(|((o, _), _)| o == sa_name)
+                                .map(|((_, f), m)| ((cp.clone(), f.clone()), *m))
+                                .collect();
+                            cb_env.field_params.extend(fp);
+                            let sf: Vec<_> = env
+                                .sanitized_fields
+                                .iter()
+                                .filter(|(o, _)| o == sa_name)
+                                .map(|(_, f)| (cp.clone(), f.clone()))
+                                .collect();
+                            cb_env.sanitized_fields.extend(sf);
+                        }
+                    }
+                }
+                if let Some(cb_body) = cb_node.child_by_field_name("body") {
+                    if matches!(cb_body.kind(), "statement_block" | "block") {
+                        analyze_statement_block(
+                            cb_body,
+                            src,
+                            rel_path,
+                            lang,
+                            symbol_name,
+                            &mut cb_env,
+                            summary,
+                        );
+                    } else {
+                        check_call_taint_sinks(
+                            cb_body,
+                            src,
+                            rel_path,
+                            lang,
+                            symbol_name,
+                            &cb_env,
+                            fn_guards,
+                            summary,
+                        );
+                    }
+                }
             }
         }
 
@@ -1536,9 +1967,21 @@ fn check_call_taint_sinks(
                     };
                     match tkind {
                         TaintSourceKind::Direct => {
-                            push_unique_hit(&mut summary.local_taint_hits, hit)
+                            if let Some((wfn, wf)) = extract_expr_wrapper(arg0, src, env) {
+                                summary.local_hit_wrappers.push((
+                                    hit.rule_id.clone(),
+                                    line,
+                                    wfn,
+                                    wf,
+                                ));
+                            }
+                            push_unique_hit(&mut summary.local_taint_hits, hit);
                         }
-                        TaintSourceKind::Param => push_unique_hit(&mut summary.param_sinks, hit),
+                        TaintSourceKind::Param => {
+                            let pf = extract_expr_param_field(arg0, src, env);
+                            summary.param_sink_fields.push((hit.clone(), pf));
+                            push_unique_hit(&mut summary.param_sinks, hit);
+                        }
                     }
                 }
             }
@@ -1584,8 +2027,19 @@ fn check_call_taint_sinks(
                     remediation: "Avoid invoking a shell; use `execFile`/`spawn` with an argument array (`shell: false`) or strict input allowlisting.".into(),
                 };
             match tkind {
-                TaintSourceKind::Direct => push_unique_hit(&mut summary.local_taint_hits, hit),
-                TaintSourceKind::Param => push_unique_hit(&mut summary.param_sinks, hit),
+                TaintSourceKind::Direct => {
+                    if let Some((wfn, wf)) = extract_expr_wrapper(an, src, env) {
+                        summary
+                            .local_hit_wrappers
+                            .push((hit.rule_id.clone(), line, wfn, wf));
+                    }
+                    push_unique_hit(&mut summary.local_taint_hits, hit);
+                }
+                TaintSourceKind::Param => {
+                    let pf = extract_expr_param_field(an, src, env);
+                    summary.param_sink_fields.push((hit.clone(), pf));
+                    push_unique_hit(&mut summary.param_sinks, hit);
+                }
             }
         }
 
@@ -1633,8 +2087,19 @@ fn check_call_taint_sinks(
                     remediation: "Normalize the path with `path.basename` / `filepath.Base` and verify `resolvedPath.startsWith(baseDir)` before accessing the filesystem.".into(),
                 };
             match tkind {
-                TaintSourceKind::Direct => push_unique_hit(&mut summary.local_taint_hits, hit),
-                TaintSourceKind::Param => push_unique_hit(&mut summary.param_sinks, hit),
+                TaintSourceKind::Direct => {
+                    if let Some((wfn, wf)) = extract_expr_wrapper(an, src, env) {
+                        summary
+                            .local_hit_wrappers
+                            .push((hit.rule_id.clone(), line, wfn, wf));
+                    }
+                    push_unique_hit(&mut summary.local_taint_hits, hit);
+                }
+                TaintSourceKind::Param => {
+                    let pf = extract_expr_param_field(an, src, env);
+                    summary.param_sink_fields.push((hit.clone(), pf));
+                    push_unique_hit(&mut summary.param_sinks, hit);
+                }
             }
         }
 
@@ -1683,8 +2148,19 @@ fn check_call_taint_sinks(
                     remediation: "Parse the URL and enforce an explicit hostname allowlist while blocking loopback/private/link-local IP ranges (169.254.0.0/16, 10.0.0.0/8, 127.0.0.1).".into(),
                 };
             match tkind {
-                TaintSourceKind::Direct => push_unique_hit(&mut summary.local_taint_hits, hit),
-                TaintSourceKind::Param => push_unique_hit(&mut summary.param_sinks, hit),
+                TaintSourceKind::Direct => {
+                    if let Some((wfn, wf)) = extract_expr_wrapper(an, src, env) {
+                        summary
+                            .local_hit_wrappers
+                            .push((hit.rule_id.clone(), line, wfn, wf));
+                    }
+                    push_unique_hit(&mut summary.local_taint_hits, hit);
+                }
+                TaintSourceKind::Param => {
+                    let pf = extract_expr_param_field(an, src, env);
+                    summary.param_sink_fields.push((hit.clone(), pf));
+                    push_unique_hit(&mut summary.param_sinks, hit);
+                }
             }
         }
 
@@ -1730,8 +2206,19 @@ fn check_call_taint_sinks(
                     remediation: "HTML-escape or sanitize untrusted input (`DOMPurify.sanitize`, `escapeHtml`, `html.escape`, `html.EscapeString`) before HTML rendering.".into(),
                 };
             match tkind {
-                TaintSourceKind::Direct => push_unique_hit(&mut summary.local_taint_hits, hit),
-                TaintSourceKind::Param => push_unique_hit(&mut summary.param_sinks, hit),
+                TaintSourceKind::Direct => {
+                    if let Some((wfn, wf)) = extract_expr_wrapper(an, src, env) {
+                        summary
+                            .local_hit_wrappers
+                            .push((hit.rule_id.clone(), line, wfn, wf));
+                    }
+                    push_unique_hit(&mut summary.local_taint_hits, hit);
+                }
+                TaintSourceKind::Param => {
+                    let pf = extract_expr_param_field(an, src, env);
+                    summary.param_sink_fields.push((hit.clone(), pf));
+                    push_unique_hit(&mut summary.param_sinks, hit);
+                }
             }
         }
     }
@@ -1751,6 +2238,156 @@ fn check_call_taint_sinks(
             fn_guards,
             summary,
         );
+    }
+}
+
+fn extract_object_pairs<'a>(rhs: Node<'a>, src: &[u8]) -> Vec<(Option<String>, Node<'a>)> {
+    let mut pairs = Vec::new();
+    let k = rhs.kind();
+    if !matches!(
+        k,
+        "object" | "dictionary" | "struct_expression" | "composite_literal"
+    ) {
+        return pairs;
+    }
+    let mut c = rhs.walk();
+    for ch in rhs.children(&mut c) {
+        match ch.kind() {
+            "pair" => {
+                if let (Some(kn), Some(vn)) = (
+                    ch.child_by_field_name("key"),
+                    ch.child_by_field_name("value"),
+                ) {
+                    let key = node_text(kn, src)
+                        .trim()
+                        .trim_matches(|q| q == '"' || q == '\'' || q == '`')
+                        .to_string();
+                    if is_plain_ident(&key) {
+                        pairs.push((Some(key), vn));
+                    }
+                }
+            }
+            "shorthand_property_identifier" => {
+                let key = node_text(ch, src).trim().to_string();
+                if is_plain_ident(&key) {
+                    pairs.push((Some(key), ch));
+                }
+            }
+            "spread_element" => {
+                let mut sc = ch.walk();
+                for sch in ch.children(&mut sc) {
+                    if sch.kind() == "identifier" {
+                        pairs.push((None, sch));
+                    }
+                }
+            }
+            "field_initializer" => {
+                if let (Some(fn_n), Some(vn)) = (
+                    ch.child_by_field_name("name"),
+                    ch.child_by_field_name("value"),
+                ) {
+                    let key = node_text(fn_n, src).trim().to_string();
+                    if is_plain_ident(&key) {
+                        pairs.push((Some(key), vn));
+                    }
+                } else {
+                    let txt = node_text(ch, src).trim();
+                    if is_plain_ident(txt) {
+                        pairs.push((Some(txt.to_string()), ch));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    pairs
+}
+
+fn extract_object_pattern_keys(stmt: Node, src: &[u8]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut cursor = stmt.walk();
+    for ch in stmt.children(&mut cursor) {
+        if ch.kind() == "shorthand_property_identifier_pattern" {
+            let k = node_text(ch, src).trim();
+            if is_plain_ident(k) {
+                out.push((k.to_string(), k.to_string()));
+            }
+        } else if ch.kind() == "pair_pattern"
+            && let (Some(kn), Some(vn)) = (
+                ch.child_by_field_name("key"),
+                ch.child_by_field_name("value"),
+            )
+        {
+            let k = node_text(kn, src).trim();
+            let v = node_text(vn, src).trim();
+            if is_plain_ident(k) && is_plain_ident(v) {
+                out.push((k.to_string(), v.to_string()));
+            }
+        } else {
+            out.extend(extract_object_pattern_keys(ch, src));
+        }
+    }
+    out
+}
+
+fn collect_return_sanitizer_clears(
+    node: Node,
+    src: &[u8],
+    env: &TaintEnv,
+    summary: &mut FunctionTaintSummary,
+) {
+    let k = node.kind();
+    if matches!(
+        k,
+        "arrow_function" | "function_expression" | "function_declaration" | "closure_expression"
+    ) {
+        return;
+    }
+    if matches!(k, "return_statement" | "return_expression") {
+        let mut c = node.walk();
+        for ch in node.children(&mut c) {
+            if matches!(ch.kind(), "return" | ";") {
+                continue;
+            }
+            let ck = ch.kind();
+            if matches!(ck, "object" | "dictionary" | "struct_expression") {
+                for (key_opt, vn) in extract_object_pairs(ch, src) {
+                    if let Some(fld) = key_opt {
+                        let (vd, vp) = ast_eval_masks(vn, src, env);
+                        let cleared = expr_call_sanitized_bits(vn, src, env) & !(vd | vp);
+                        if cleared != 0 {
+                            *summary.clears_field_masks.entry(fld).or_insert(0) |= cleared;
+                        }
+                    } else if vn.kind() == "identifier" {
+                        let spread_id = node_text(vn, src).trim();
+                        for ((obj, fld), m) in &env.object_cleared_fields {
+                            if obj == spread_id {
+                                *summary.clears_field_masks.entry(fld.clone()).or_insert(0) |= *m;
+                            }
+                        }
+                    }
+                }
+            } else if ck == "identifier" {
+                let id = node_text(ch, src).trim();
+                let (rd, rp) = ast_eval_masks(ch, src, env);
+                let cleared = expr_call_sanitized_bits(ch, src, env) & !(rd | rp);
+                summary.clears_taint_mask |= cleared;
+                for ((obj, fld), m) in &env.object_cleared_fields {
+                    if obj == id {
+                        *summary.clears_field_masks.entry(fld.clone()).or_insert(0) |= *m;
+                    }
+                }
+            } else {
+                let (rd, rp) = ast_eval_masks(ch, src, env);
+                let cleared = expr_call_sanitized_bits(ch, src, env) & !(rd | rp);
+                summary.clears_taint_mask |= cleared;
+            }
+        }
+        return;
+    }
+    let mut c = node.walk();
+    for ch in node.children(&mut c) {
+        collect_return_sanitizer_clears(ch, src, env, summary);
     }
 }
 
@@ -1920,12 +2557,13 @@ fn analyze_statement_block(
                 && !summary.guards.contains(&GuardKind::XssSanitizer)
                 && let Some((tkind, _)) = ast_sink_status(rhs_node, src, TAINT_XSS, env)
             {
+                let line = stmt.start_position().row + 1;
                 let hit = LocalStaticFinding {
                     rule_id: "VF-XSS-001".into(),
                     severity: "HIGH".into(),
                     title: format!("DOM Cross-Site Scripting (XSS) via `innerHTML` assignment in `{}`", symbol_name),
                     rel_path: rel_path.to_string(),
-                    line: stmt.start_position().row + 1,
+                    line,
                     symbol: symbol_name.to_string(),
                     sink_kind: SinkKind::Xss,
                     missing_guard: GuardKind::XssSanitizer,
@@ -1933,12 +2571,24 @@ fn analyze_statement_block(
                     remediation: "Use `textContent` for text or sanitize HTML with `DOMPurify.sanitize(...)` before assigning `innerHTML`.".into(),
                 };
                 match tkind {
-                    TaintSourceKind::Direct => push_unique_hit(&mut summary.local_taint_hits, hit),
-                    TaintSourceKind::Param => push_unique_hit(&mut summary.param_sinks, hit),
+                    TaintSourceKind::Direct => {
+                        if let Some((wfn, wf)) = extract_expr_wrapper(rhs_node, src, env) {
+                            summary
+                                .local_hit_wrappers
+                                .push((hit.rule_id.clone(), line, wfn, wf));
+                        }
+                        push_unique_hit(&mut summary.local_taint_hits, hit);
+                    }
+                    TaintSourceKind::Param => {
+                        let pf = extract_expr_param_field(rhs_node, src, env);
+                        summary.param_sink_fields.push((hit.clone(), pf));
+                        push_unique_hit(&mut summary.param_sinks, hit);
+                    }
                 }
             }
 
             let (rhs_direct_mask, rhs_param_mask) = ast_eval_masks(rhs_node, src, env);
+            let rhs_cleared = expr_call_sanitized_bits(rhs_node, src, env);
             let touches_sql_var = lhs_names.iter().any(|n| env.sql_vars.contains(n))
                 || expr_references_any(rhs_txt, &env.sql_vars);
 
@@ -1963,30 +2613,200 @@ fn analyze_statement_block(
                     remediation: "Use parameterized queries (`$1`, `?`, or ORM query builders) instead of concatenating untrusted input into SQL strings.".into(),
                 };
                 if rhs_direct_mask & TAINT_SQL != 0 {
+                    if let Some((wfn, wf)) = extract_expr_wrapper(rhs_node, src, env) {
+                        summary
+                            .local_hit_wrappers
+                            .push((hit.rule_id.clone(), line, wfn, wf));
+                    }
                     push_unique_hit(&mut summary.local_taint_hits, hit);
                 } else {
+                    let pf = extract_expr_param_field(rhs_node, src, env);
+                    summary.param_sink_fields.push((hit.clone(), pf));
                     push_unique_hit(&mut summary.param_sinks, hit);
                 }
             }
 
-            for n in lhs_names {
-                if is_aug {
-                    if rhs_direct_mask != 0 {
-                        *env.direct.entry(n.clone()).or_insert(0) |= rhs_direct_mask;
-                    }
-                    if rhs_param_mask != 0 {
-                        *env.params.entry(n).or_insert(0) |= rhs_param_mask;
+            // Member field write `a.foo = ...` / `a.safe = "ok"` without clobbering sibling fields!
+            if !is_aug
+                && lhs_raws.len() == 1
+                && let Some((base, field)) = split_simple_member(&lhs_raws[0])
+            {
+                env.object_vars.insert(base.clone());
+                if rhs_direct_mask != 0 {
+                    env.field_direct
+                        .insert((base.clone(), field.clone()), rhs_direct_mask);
+                    env.sanitized_fields.remove(&(base.clone(), field.clone()));
+                    *env.direct.entry(base.clone()).or_insert(0) |= rhs_direct_mask;
+                } else {
+                    env.field_direct.remove(&(base.clone(), field.clone()));
+                }
+                if rhs_param_mask != 0 {
+                    env.field_params
+                        .insert((base.clone(), field.clone()), rhs_param_mask);
+                    env.sanitized_fields.remove(&(base.clone(), field.clone()));
+                    *env.params.entry(base.clone()).or_insert(0) |= rhs_param_mask;
+                } else {
+                    env.field_params.remove(&(base.clone(), field.clone()));
+                }
+                if rhs_direct_mask == 0 && rhs_param_mask == 0 {
+                    env.sanitized_fields.insert((base.clone(), field.clone()));
+                }
+                if rhs_cleared != 0 {
+                    env.object_cleared_fields.insert(
+                        (base, field),
+                        rhs_cleared & !(rhs_direct_mask | rhs_param_mask),
+                    );
+                }
+            } else {
+                // Track cross-file wrapper call assignment `const clean = sanitizeFn(arg)`
+                let rhs_wrapper: Option<(String, Option<String>)> =
+                    if rhs_node.kind() == "call_expression" || rhs_node.kind() == "call" {
+                        let ftxt = rhs_node
+                            .child_by_field_name("function")
+                            .map(|f| node_text(f, src).trim())
+                            .unwrap_or("");
+                        let short_fn = ftxt
+                            .rsplit('.')
+                            .next()
+                            .unwrap_or(ftxt)
+                            .rsplit("::")
+                            .next()
+                            .unwrap_or(ftxt);
+                        if !short_fn.is_empty()
+                            && !is_universal_sanitizer(ftxt)
+                            && (rhs_direct_mask != 0 || rhs_param_mask != 0)
+                        {
+                            Some((short_fn.to_string(), None))
+                        } else {
+                            None
+                        }
+                    } else {
+                        extract_expr_wrapper(rhs_node, src, env)
+                    };
+
+                // Object literal construction `const payload = { foo: req.body.cmd, safe: "ok" }`
+                let obj_pairs = extract_object_pairs(rhs_node, src);
+                // Object destructuring `const { foo, safe } = payload`
+                let destructured_keys = extract_object_pattern_keys(stmt, src);
+
+                if !destructured_keys.is_empty() && rhs_node.kind() == "identifier" {
+                    let rhs_id = rhs_txt.trim();
+                    for (orig_k, local_var) in destructured_keys {
+                        if let Some((wfn, _)) = env.var_wrappers.get(rhs_id).cloned() {
+                            env.var_wrappers
+                                .insert(local_var.clone(), (wfn, Some(orig_k.clone())));
+                        }
+                        if env.params.contains_key(rhs_id) {
+                            env.destructured_param_fields
+                                .insert(local_var.clone(), orig_k.clone());
+                        }
+                        if env.object_vars.contains(rhs_id) {
+                            let fd = env
+                                .field_direct
+                                .get(&(rhs_id.to_string(), orig_k.clone()))
+                                .copied()
+                                .unwrap_or(0);
+                            let fp = env
+                                .field_params
+                                .get(&(rhs_id.to_string(), orig_k.clone()))
+                                .copied()
+                                .unwrap_or(0);
+                            if fd != 0 {
+                                env.direct.insert(local_var.clone(), fd);
+                            } else {
+                                env.direct.remove(&local_var);
+                            }
+                            if fp != 0 {
+                                env.params.insert(local_var.clone(), fp);
+                            } else {
+                                env.params.remove(&local_var);
+                            }
+                        } else {
+                            if rhs_direct_mask != 0 {
+                                env.direct.insert(local_var.clone(), rhs_direct_mask);
+                            } else {
+                                env.direct.remove(&local_var);
+                            }
+                            if rhs_param_mask != 0 {
+                                env.params.insert(local_var.clone(), rhs_param_mask);
+                            } else {
+                                env.params.remove(&local_var);
+                            }
+                        }
                     }
                 } else {
-                    if rhs_direct_mask != 0 {
-                        env.direct.insert(n.clone(), rhs_direct_mask);
-                    } else {
-                        env.direct.remove(&n);
-                    }
-                    if rhs_param_mask != 0 {
-                        env.params.insert(n, rhs_param_mask);
-                    } else {
-                        env.params.remove(&n);
+                    for n in lhs_names {
+                        if is_aug {
+                            if rhs_direct_mask != 0 {
+                                *env.direct.entry(n.clone()).or_insert(0) |= rhs_direct_mask;
+                            }
+                            if rhs_param_mask != 0 {
+                                *env.params.entry(n.clone()).or_insert(0) |= rhs_param_mask;
+                            }
+                        } else {
+                            if rhs_direct_mask != 0 {
+                                env.direct.insert(n.clone(), rhs_direct_mask);
+                            } else {
+                                env.direct.remove(&n);
+                            }
+                            if rhs_param_mask != 0 {
+                                env.params.insert(n.clone(), rhs_param_mask);
+                            } else {
+                                env.params.remove(&n);
+                            }
+                            if rhs_cleared != 0 {
+                                env.var_cleared_masks.insert(
+                                    n.clone(),
+                                    rhs_cleared & !(rhs_direct_mask | rhs_param_mask),
+                                );
+                            }
+                            if let Some(ref w) = rhs_wrapper {
+                                env.var_wrappers.insert(n.clone(), w.clone());
+                            } else {
+                                env.var_wrappers.remove(&n);
+                            }
+                            if !obj_pairs.is_empty() {
+                                env.object_vars.insert(n.clone());
+                                for (k_opt, vn) in &obj_pairs {
+                                    if let Some(fld) = k_opt {
+                                        let (fd, fp) = ast_eval_masks(*vn, src, env);
+                                        let fclr =
+                                            expr_call_sanitized_bits(*vn, src, env) & !(fd | fp);
+                                        if fclr != 0 {
+                                            env.object_cleared_fields
+                                                .insert((n.clone(), fld.clone()), fclr);
+                                        }
+                                        if fd != 0 {
+                                            env.field_direct.insert((n.clone(), fld.clone()), fd);
+                                            env.sanitized_fields.remove(&(n.clone(), fld.clone()));
+                                        }
+                                        if fp != 0 {
+                                            env.field_params.insert((n.clone(), fld.clone()), fp);
+                                            env.sanitized_fields.remove(&(n.clone(), fld.clone()));
+                                        }
+                                        if fd == 0 && fp == 0 {
+                                            env.sanitized_fields.insert((n.clone(), fld.clone()));
+                                        }
+                                    } else if vn.kind() == "identifier" {
+                                        let sp = node_text(*vn, src).trim();
+                                        let sp_fd: Vec<_> = env
+                                            .field_direct
+                                            .iter()
+                                            .filter(|((o, _), _)| o == sp)
+                                            .map(|((_, f), m)| ((n.clone(), f.clone()), *m))
+                                            .collect();
+                                        env.field_direct.extend(sp_fd);
+                                        let sp_fp: Vec<_> = env
+                                            .field_params
+                                            .iter()
+                                            .filter(|((o, _), _)| o == sp)
+                                            .map(|((_, f), m)| ((n.clone(), f.clone()), *m))
+                                            .collect();
+                                        env.field_params.extend(sp_fp);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -2137,8 +2957,9 @@ pub fn analyze_function_taint(
                 &mut env,
                 &mut summary,
             );
+            collect_return_sanitizer_clears(body, src, &env, &mut summary);
         } else {
-            // Expression-bodied arrow function `(req, res) => execSync(...)`
+            // Expression-bodied arrow function `(req, res) => execSync(...)` or `(x) => shellEscape(x)`
             analyze_statement_block(
                 fn_node,
                 src,
@@ -2148,6 +2969,21 @@ pub fn analyze_function_taint(
                 &mut env,
                 &mut summary,
             );
+            if matches!(body.kind(), "object" | "dictionary" | "struct_expression") {
+                for (key_opt, vn) in extract_object_pairs(body, src) {
+                    if let Some(fld) = key_opt {
+                        let (vd, vp) = ast_eval_masks(vn, src, &env);
+                        let cleared = expr_call_sanitized_bits(vn, src, &env) & !(vd | vp);
+                        if cleared != 0 {
+                            *summary.clears_field_masks.entry(fld).or_insert(0) |= cleared;
+                        }
+                    }
+                }
+            } else {
+                let (rd, rp) = ast_eval_masks(body, src, &env);
+                let cleared = expr_call_sanitized_bits(body, src, &env) & !(rd | rp);
+                summary.clears_taint_mask |= cleared;
+            }
         }
     }
 

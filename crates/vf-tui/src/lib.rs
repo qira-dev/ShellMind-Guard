@@ -498,6 +498,9 @@ fn render_findings_queue(f: &mut Frame, area: Rect, state: &TuiState) {
                     match state.verified_map.get(&item.id).map(|v| &v.status) {
                         Some(VerificationStatus::Proven) => ("●", "PROVEN", SEM_PROVEN_RED),
                         Some(VerificationStatus::Mitigated) => ("✓", "MITIGATED", SEM_SAFE_GREEN),
+                        Some(VerificationStatus::Unbootable) => {
+                            ("✖", "UNBOOTABLE", SEM_SUSPECT_AMBER)
+                        }
                         _ => ("◆", "SUSPECT", SEM_SUSPECT_AMBER),
                     };
 
@@ -584,6 +587,11 @@ fn render_findings_queue(f: &mut Frame, area: Rect, state: &TuiState) {
                         "[HIGH · MOBILE]",
                         SEM_AUTH_CORAL,
                         "Mobile Storage / IPC / TLS",
+                    ),
+                    GuardKind::InputValidation => (
+                        "[HIGH · FUZZ]",
+                        SEM_SUSPECT_AMBER,
+                        "Missing Input / Schema Bound",
                     ),
                 };
 
@@ -795,6 +803,10 @@ fn render_pipeline_card(f: &mut Frame, area: Rect, state: &TuiState) {
             ),
             (GuardKind::MobilePolicy, sk) => (
                 "Keystore/Keychain, Export Permission & TLS Pinning",
+                format!("{:?}", sk),
+            ),
+            (GuardKind::InputValidation, sk) => (
+                "Strict Schema & Positive/UTF-8 Input Validation",
                 format!("{:?}", sk),
             ),
         };
@@ -1067,6 +1079,9 @@ fn render_proof_and_remediation(f: &mut Frame, area: Rect, state: &TuiState) {
                 (GuardKind::TxLock, SinkKind::BalanceUpdate | SinkKind::PaymentMutation) => {
                     "Wrap balance/payment mutation in an atomic DB transaction (`withTransaction` / `SELECT ... FOR UPDATE`) or enforce an idempotency key.".to_string()
                 }
+                (GuardKind::InputValidation, _) => {
+                    "Enforce strict schema types, positive numeric bounds, and valid UTF-8 / length limits on request parameters.".to_string()
+                }
                 _ => "Apply the recommended security control before deploying.".to_string(),
             }
         };
@@ -1078,6 +1093,7 @@ fn render_proof_and_remediation(f: &mut Frame, area: Rect, state: &TuiState) {
                 VerificationStatus::SuspectUnverified => {
                     ("◆ SUSPECT / UNVERIFIED", SEM_SUSPECT_AMBER)
                 }
+                VerificationStatus::Unbootable => ("✖ SANDBOX UNBOOTABLE", SEM_SUSPECT_AMBER),
             };
             vec![
                 Line::from(vec![
@@ -1589,6 +1605,7 @@ mod tests {
             edge_count: 6,
             route_entries: 2,
             active_domains: vec!["web".to_string()],
+            route_schemas: Vec::new(),
             findings: vec![LatticeFinding {
                 id: "VF-RACE-002".into(),
                 rule_id: "VF-RACE-001".into(),

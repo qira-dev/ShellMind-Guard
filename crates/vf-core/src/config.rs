@@ -89,9 +89,22 @@ pub struct SandboxConfig {
     pub user_b_header: Option<String>,
     #[serde(default)]
     pub probe_body: Option<String>,
+    #[serde(default)]
+    pub memory_limit_mb: Option<u64>,
+    #[serde(default)]
+    pub use_cgroup_v2: bool,
+    #[serde(default)]
+    pub mock_shims: bool,
 }
 
 impl SandboxConfig {
+    pub fn is_tls(&self) -> bool {
+        self.base_url
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|s| s.to_ascii_lowercase().starts_with("https://"))
+    }
+
     /// Parses `[sandbox].base_url` strictly enforcing loopback-only hosts (`127.0.0.1`, `localhost`, `[::1]`).
     pub fn loopback_port(&self) -> Result<Option<u16>> {
         let Some(raw) = self
@@ -102,12 +115,17 @@ impl SandboxConfig {
         else {
             return Ok(None);
         };
-        let rest = raw.strip_prefix("http://").ok_or_else(|| {
-            anyhow::anyhow!(
-                "sandbox.base_url must use http:// on loopback, got: {}",
+        let lower = raw.to_ascii_lowercase();
+        let (rest, default_port) = if lower.starts_with("https://") {
+            (&raw["https://".len()..], 443u16)
+        } else if lower.starts_with("http://") {
+            (&raw["http://".len()..], 80u16)
+        } else {
+            anyhow::bail!(
+                "sandbox.base_url must use http:// or https:// on loopback, got: {}",
                 raw
-            )
-        })?;
+            );
+        };
         let authority = rest.split('/').next().unwrap_or("");
         let (host, port_str) = if let Some(after_bracket) = authority.strip_prefix("[::1]") {
             ("::1", after_bracket.strip_prefix(':').unwrap_or(""))
@@ -126,7 +144,7 @@ impl SandboxConfig {
             );
         }
         if port_str.is_empty() {
-            Ok(Some(80))
+            Ok(Some(default_port))
         } else {
             let p: u16 = port_str
                 .parse()

@@ -147,6 +147,10 @@ fn tool_definitions() -> Value {
                         "type": "string",
                         "enum": ["proven", "confirmed", "heuristic"],
                         "description": "Optional minimum finding confidence tier (default: include all)"
+                    },
+                    "deep": {
+                        "type": "boolean",
+                        "description": "Enable Phase 10 deep AST/OpenAPI schema validation (VF-FUZZ-SCHEMA)"
                     }
                 }
             }
@@ -277,6 +281,8 @@ fn handle_tool_call(params: &Value) -> Result<Value> {
                 .and_then(|v| v.as_str())
                 .and_then(vf_graph::Confidence::parse);
 
+            let deep = args.get("deep").and_then(|v| v.as_bool()).unwrap_or(false);
+
             let outcome = execute_scan_pipeline(ScanRunOptions {
                 path: &root,
                 layers: &layers,
@@ -286,6 +292,11 @@ fn handle_tool_call(params: &Value) -> Result<Value> {
                 sync_race: 12,
                 unsafe_host_fallback: false,
                 trust_repo_config: false,
+                deep,
+                sandbox_mem_mb: None,
+                sandbox_tls: false,
+                mock_shims: false,
+                cgroup_v2: false,
             })?;
 
             const MAX_MCP_FINDINGS: usize = 50;

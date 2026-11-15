@@ -65,6 +65,7 @@ pub enum SinkKind {
     MemorySafety,
     IntegerOverflow,
     MobileSecurity,
+    SchemaTampering,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -86,6 +87,7 @@ pub enum GuardKind {
     ResourceCleanup,
     MemoryBounds,
     MobilePolicy,
+    InputValidation,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -185,6 +187,30 @@ pub struct SymbolInfo {
     pub locks_held_calls: Vec<LockHeldCall>,
     #[serde(default)]
     pub locks_acquired: Vec<(String, usize)>,
+    /// Phase 10: per-callee struct/object field taint masks `callee -> [(field_name, bitmask)]`.
+    #[serde(default)]
+    pub tainted_field_calls: std::collections::HashMap<String, Vec<(String, u8)>>,
+    /// Phase 10: field names read from parameters by each `param_sinks` hit (`None` = whole param).
+    #[serde(default)]
+    pub param_sink_fields: Vec<(LocalStaticFinding, Option<String>)>,
+    /// Phase 10: sanitizer bits cleared on this function's returned value (cross-file sanitizer wrapper).
+    #[serde(default)]
+    pub clears_taint_mask: u8,
+    /// Phase 10: per-field sanitizer bits cleared on returned object literal (`field -> clear_mask`).
+    #[serde(default)]
+    pub clears_field_masks: std::collections::HashMap<String, u8>,
+    /// Phase 10: taint mask when this function invokes a callback parameter (`cb(data)`).
+    #[serde(default)]
+    pub invokes_callback_mask: u8,
+    /// Phase 10: `(dispatcher_callee, callback_symbol, taint_mask)` for cross-file callback handoffs.
+    #[serde(default)]
+    pub callback_forwards: Vec<(String, String, u8)>,
+    /// Phase 10: `(rule_id, line, wrapper_fn, field)` for local sink args sourced purely via cross-file wrappers.
+    #[serde(default)]
+    pub local_hit_wrappers: Vec<(String, usize, String, Option<String>)>,
+    /// Phase 10: `(callee, wrapper_fn, field, mask)` for inter-procedural wrapper suppression.
+    #[serde(default)]
+    pub tainted_call_wrappers: Vec<(String, String, Option<String>, u8)>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -210,6 +236,8 @@ pub struct FileAstSummary {
     pub has_global_csrf_guard: bool,
     #[serde(default)]
     pub domain_hints: DomainHints,
+    #[serde(default)]
+    pub route_schemas: Vec<crate::phase10::RouteSchema>,
 }
 
 impl SymbolInfo {
@@ -252,6 +280,14 @@ impl SymbolInfo {
             lock_pairs: Vec::new(),
             locks_held_calls: Vec::new(),
             locks_acquired: Vec::new(),
+            tainted_field_calls: std::collections::HashMap::new(),
+            param_sink_fields: Vec::new(),
+            clears_taint_mask: 0,
+            clears_field_masks: std::collections::HashMap::new(),
+            invokes_callback_mask: 0,
+            callback_forwards: Vec::new(),
+            local_hit_wrappers: Vec::new(),
+            tainted_call_wrappers: Vec::new(),
         }
     }
 
@@ -279,6 +315,29 @@ impl SymbolInfo {
                 self.param_forwarding_calls.push(c);
             }
         }
+        for (callee, pairs) in t.tainted_field_calls {
+            let entry = self.tainted_field_calls.entry(callee).or_default();
+            for (fld, m) in pairs {
+                if let Some(ex) = entry.iter_mut().find(|(f, _)| f == &fld) {
+                    ex.1 |= m;
+                } else {
+                    entry.push((fld, m));
+                }
+            }
+        }
+        self.param_sink_fields.extend(t.param_sink_fields);
+        self.clears_taint_mask |= t.clears_taint_mask;
+        for (fld, m) in t.clears_field_masks {
+            *self.clears_field_masks.entry(fld).or_insert(0) |= m;
+        }
+        self.invokes_callback_mask |= t.invokes_callback_mask;
+        for cb in t.callback_forwards {
+            if !self.callback_forwards.contains(&cb) {
+                self.callback_forwards.push(cb);
+            }
+        }
+        self.local_hit_wrappers.extend(t.local_hit_wrappers);
+        self.tainted_call_wrappers.extend(t.tainted_call_wrappers);
         self.local_taint_hits.extend(t.local_taint_hits);
         self.param_sinks.extend(t.param_sinks);
     }
@@ -346,6 +405,11 @@ pub fn parse_file_ast_with_hash(
     ) {
         let domain_hints =
             crate::phase9::detect_domain_hints(file.language, &file.rel_path, source, &[]);
+        let route_schemas = if matches!(file.language, Language::Config) {
+            crate::phase10::parse_openapi_route_schemas(&file.rel_path, source)
+        } else {
+            Vec::new()
+        };
         return Some((
             actual_hash,
             FileAstSummary {
@@ -354,6 +418,7 @@ pub fn parse_file_ast_with_hash(
                 gitignore_lines,
                 is_sensitive_env_or_pem: is_sensitive,
                 domain_hints,
+                route_schemas,
                 ..Default::default()
             },
         ));
@@ -475,6 +540,13 @@ pub fn parse_file_ast_with_hash(
     let has_bearer_auth_setup = crate::taint::has_bearer_header_expr(&code_only);
     let has_global_csrf_guard = file_middleware_guards.contains(&GuardKind::CsrfProtection)
         || crate::taint::has_global_csrf_middleware(&code_only);
+    let route_schemas = crate::phase10::extract_ast_route_schemas(
+        root,
+        src_bytes,
+        &file.rel_path,
+        file.language,
+        &symbols,
+    );
 
     Some((
         actual_hash,
@@ -491,6 +563,7 @@ pub fn parse_file_ast_with_hash(
             has_bearer_auth_setup,
             has_global_csrf_guard,
             domain_hints,
+            route_schemas,
         },
     ))
 }
@@ -781,7 +854,7 @@ fn find_inline_fn_node(arg: Node) -> Option<Node> {
     None
 }
 
-fn is_rust_test_item(node: Node, src: &[u8]) -> bool {
+pub(crate) fn is_rust_test_item(node: Node, src: &[u8]) -> bool {
     let mut prev = node.prev_sibling();
     while let Some(p) = prev {
         if p.kind() == "attribute_item" {
@@ -800,8 +873,8 @@ fn is_rust_test_item(node: Node, src: &[u8]) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn extract_node(
-    node: Node,
+fn extract_node<'a>(
+    root: Node<'a>,
     src: &[u8],
     rel_path: &str,
     lang: Language,
@@ -811,12 +884,50 @@ fn extract_node(
     symbols: &mut Vec<SymbolInfo>,
     route_prefixes: &mut Vec<String>,
 ) {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if !extract_single_node(
+            node,
+            src,
+            rel_path,
+            lang,
+            cfg,
+            file_middleware_guards,
+            imports,
+            symbols,
+            route_prefixes,
+            &mut stack,
+        ) {
+            continue;
+        }
+        let prev_len = stack.len();
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            stack.push(child);
+        }
+        stack[prev_len..].reverse();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn extract_single_node<'a>(
+    node: Node<'a>,
+    src: &[u8],
+    rel_path: &str,
+    lang: Language,
+    cfg: &ShellMindGuardConfig,
+    file_middleware_guards: &mut HashSet<GuardKind>,
+    imports: &mut Vec<ImportRef>,
+    symbols: &mut Vec<SymbolInfo>,
+    route_prefixes: &mut Vec<String>,
+    stack: &mut Vec<Node<'a>>,
+) -> bool {
     let kind = node.kind();
     if lang == Language::Rust
         && matches!(kind, "mod_item" | "function_item")
         && is_rust_test_item(node, src)
     {
-        return;
+        return false;
     }
 
     // 1a. Cross-file imports & re-exports (TS/JS: named, aliased `a as b`, default, namespace `* as`, barrel `export * from`)
@@ -1243,7 +1354,7 @@ fn extract_node(
                     route_sym.apply_taint(t);
                 }
                 symbols.push(route_sym);
-                return;
+                return false;
             }
         }
     }
@@ -1326,7 +1437,7 @@ fn extract_node(
                 route_sym.apply_taint(t);
             }
             symbols.push(route_sym);
-            return;
+            return false;
         }
     }
 
@@ -1475,18 +1586,8 @@ fn extract_node(
             route_sym.csrf_exempt = dec_csrf_exempt;
             symbols.push(route_sym);
             // Continue into `fnode` to emit the Function / Sink symbol itself
-            extract_node(
-                fnode,
-                src,
-                rel_path,
-                lang,
-                cfg,
-                file_middleware_guards,
-                imports,
-                symbols,
-                route_prefixes,
-            );
-            return;
+            stack.push(fnode);
+            return false;
         } else if let Some(fnode) = fn_node
             && (dec_csrf_exempt || !dec_guards.is_empty())
             && let Some(name_node) = fnode.child_by_field_name("name")
@@ -1522,7 +1623,7 @@ fn extract_node(
                 fnode, src, rel_path, lang, &name, None,
             ));
             symbols.push(sym);
-            return;
+            return false;
         }
     }
 
@@ -1639,7 +1740,7 @@ fn extract_node(
                 );
                 route_sym.has_resource_id = has_res_id;
                 symbols.push(route_sym);
-                return;
+                return false;
             }
         }
     }
@@ -1820,7 +1921,7 @@ fn extract_node(
                     route_sym.apply_taint(t);
                 }
                 symbols.push(route_sym);
-                return;
+                return false;
             }
         }
     }
@@ -1989,23 +2090,10 @@ fn extract_node(
             val_node, src, rel_path, lang, &name, None,
         ));
         symbols.push(sym);
-        return;
+        return false;
     }
 
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        extract_node(
-            child,
-            src,
-            rel_path,
-            lang,
-            cfg,
-            file_middleware_guards,
-            imports,
-            symbols,
-            route_prefixes,
-        );
-    }
+    true
 }
 
 pub fn resolve_import_target(

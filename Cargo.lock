@@ -2304,9 +2304,13 @@ name = "vf-sandbox"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libc",
+ "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "vf-core",
  "vf-graph",
