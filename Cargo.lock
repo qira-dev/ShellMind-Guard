@@ -1514,110 +1514,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sh-ai"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "reqwest",
- "rustls",
- "serde",
- "serde_json",
- "sh-core",
- "sh-graph",
- "sh-sandbox",
-]
-
-[[package]]
-name = "sh-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "blake3",
- "ignore",
- "rayon",
- "rusqlite",
- "serde",
- "serde_json",
- "toml",
- "tracing",
-]
-
-[[package]]
-name = "sh-graph"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "blake3",
- "petgraph",
- "rayon",
- "regex",
- "serde",
- "serde_json",
- "sh-core",
- "toml",
- "tree-sitter",
- "tree-sitter-bash",
- "tree-sitter-c",
- "tree-sitter-c-sharp",
- "tree-sitter-cpp",
- "tree-sitter-dart",
- "tree-sitter-go",
- "tree-sitter-hcl",
- "tree-sitter-java",
- "tree-sitter-javascript",
- "tree-sitter-kotlin-ng",
- "tree-sitter-php",
- "tree-sitter-python",
- "tree-sitter-ruby",
- "tree-sitter-rust",
- "tree-sitter-swift",
- "tree-sitter-typescript",
-]
-
-[[package]]
-name = "sh-report"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "serde",
- "serde_json",
- "sh-core",
- "sh-graph",
- "sh-sandbox",
-]
-
-[[package]]
-name = "sh-sandbox"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "libc",
- "rustls",
- "rustls-pki-types",
- "serde",
- "serde_json",
- "sh-core",
- "sh-graph",
- "tokio",
- "tokio-rustls",
- "tracing",
-]
-
-[[package]]
-name = "sh-tui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "crossterm",
- "ratatui",
- "sh-ai",
- "sh-core",
- "sh-graph",
- "sh-report",
- "sh-sandbox",
-]
-
-[[package]]
 name = "sharded-slab"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1636,12 +1532,12 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
- "sh-ai",
- "sh-core",
- "sh-graph",
- "sh-report",
- "sh-sandbox",
- "sh-tui",
+ "smg-ai",
+ "smg-core",
+ "smg-graph",
+ "smg-report",
+ "smg-sandbox",
+ "smg-tui",
  "tracing",
  "tracing-subscriber",
 ]
@@ -1710,6 +1606,110 @@ name = "smallvec"
 version = "1.16.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "149309498a5f7334b12ddae0cad8aba81ce785fe91755068867e017cf98fee46"
+
+[[package]]
+name = "smg-ai"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "smg-core",
+ "smg-graph",
+ "smg-sandbox",
+]
+
+[[package]]
+name = "smg-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "ignore",
+ "rayon",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "toml",
+ "tracing",
+]
+
+[[package]]
+name = "smg-graph"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "petgraph",
+ "rayon",
+ "regex",
+ "serde",
+ "serde_json",
+ "smg-core",
+ "toml",
+ "tree-sitter",
+ "tree-sitter-bash",
+ "tree-sitter-c",
+ "tree-sitter-c-sharp",
+ "tree-sitter-cpp",
+ "tree-sitter-dart",
+ "tree-sitter-go",
+ "tree-sitter-hcl",
+ "tree-sitter-java",
+ "tree-sitter-javascript",
+ "tree-sitter-kotlin-ng",
+ "tree-sitter-php",
+ "tree-sitter-python",
+ "tree-sitter-ruby",
+ "tree-sitter-rust",
+ "tree-sitter-swift",
+ "tree-sitter-typescript",
+]
+
+[[package]]
+name = "smg-report"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "smg-core",
+ "smg-graph",
+ "smg-sandbox",
+]
+
+[[package]]
+name = "smg-sandbox"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "smg-core",
+ "smg-graph",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+]
+
+[[package]]
+name = "smg-tui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crossterm",
+ "ratatui",
+ "smg-ai",
+ "smg-core",
+ "smg-graph",
+ "smg-report",
+ "smg-sandbox",
+]
 
 [[package]]
 name = "socket2"

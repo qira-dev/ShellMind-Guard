@@ -2,12 +2,12 @@
 resolver = "2"
 members = [
     ".",
-    "crates/sh-core",
-    "crates/sh-graph",
-    "crates/sh-sandbox",
-    "crates/sh-tui",
-    "crates/sh-report",
-    "crates/sh-ai",
+    "crates/smg-core",
+    "crates/smg-graph",
+    "crates/smg-sandbox",
+    "crates/smg-tui",
+    "crates/smg-report",
+    "crates/smg-ai",
 ]
 
 [workspace.package]
@@ -57,6 +57,17 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description.workspace = true
+default-run = "smg"
+
+[[bin]]
+name = "smg"
+path = "src/bin/smg.rs"
+test = false
+
+[[bin]]
+name = "shellmind-guard"
+path = "src/main.rs"
+test = false
 
 [dependencies]
 anyhow.workspace = true
@@ -67,12 +78,12 @@ serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-sh-core = { path = "crates/sh-core" }
-sh-graph = { path = "crates/sh-graph" }
-sh-sandbox = { path = "crates/sh-sandbox" }
-sh-tui = { path = "crates/sh-tui" }
-sh-report = { path = "crates/sh-report" }
-sh-ai = { path = "crates/sh-ai" }
+smg-core = { path = "crates/smg-core" }
+smg-graph = { path = "crates/smg-graph" }
+smg-sandbox = { path = "crates/smg-sandbox" }
+smg-tui = { path = "crates/smg-tui" }
+smg-report = { path = "crates/smg-report" }
+smg-ai = { path = "crates/smg-ai" }
 
 [profile.release]
 codegen-units = 16

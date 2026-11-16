@@ -56,6 +56,11 @@ install_from_source() {
     cargo install --git "https://github.com/${REPO}.git" --root "${cargo_root}" --locked
   fi
   install -m 0755 "${cargo_root}/bin/${BIN_NAME}" "${INSTALL_DIR}/${BIN_NAME}"
+  if [[ -f "${cargo_root}/bin/smg" ]]; then
+    install -m 0755 "${cargo_root}/bin/smg" "${INSTALL_DIR}/smg"
+  else
+    ln -sf "${INSTALL_DIR}/${BIN_NAME}" "${INSTALL_DIR}/smg"
+  fi
   rm -rf "${cargo_root}"
 }
 
@@ -86,6 +91,11 @@ if [[ "${FROM_SOURCE}" -eq 0 ]] && asset="$(detect_asset)"; then
     fi
     tar -xzf "${tmp_dir}/${asset}" -C "${tmp_dir}"
     install -m 0755 "${tmp_dir}/${BIN_NAME}" "${INSTALL_DIR}/${BIN_NAME}"
+    if [[ -f "${tmp_dir}/smg" ]]; then
+      install -m 0755 "${tmp_dir}/smg" "${INSTALL_DIR}/smg"
+    else
+      ln -sf "${INSTALL_DIR}/${BIN_NAME}" "${INSTALL_DIR}/smg"
+    fi
   else
     echo "[ShellMind Guard] Prebuilt release unavailable, falling back to source build..."
     install_from_source
@@ -98,9 +108,9 @@ if ! echo ":${PATH}:" | grep -q ":${INSTALL_DIR}:"; then
   echo "[ShellMind Guard] Add to PATH: export PATH=\"${INSTALL_DIR}:\$PATH\""
 fi
 
-if command -v "${BIN_NAME}" >/dev/null 2>&1; then
-  "${BIN_NAME}" --version
+if command -v smg >/dev/null 2>&1; then
+  smg --version
 else
-  "${INSTALL_DIR}/${BIN_NAME}" --version
+  "${INSTALL_DIR}/smg" --version
 fi
-echo "[ShellMind Guard] Installed. Run 'shellmind-guard scan .' or 'shellmind-guard mcp'."
+echo "[ShellMind Guard] Installed 'smg' (and '${BIN_NAME}' alias). Run 'smg' for TUI, 'smg scan .', or 'smg mcp'."

@@ -4,7 +4,7 @@
 
 ## Architectural Invariants Checklist
 
-- [ ] Preserves $O(V + E)$ linear time complexity in `sh-graph` (no path-enumeration blowup)
+- [ ] Preserves $O(V + E)$ linear time complexity in `smg-graph` (no path-enumeration blowup)
 - [ ] Pre-compiles any regular expressions via `std::sync::OnceLock<Regex>` (zero per-file regex compilation)
 - [ ] Preserves strict `stdout` hygiene in `shellmind-guard mcp` and `shellmind-guard ui`
 - [ ] `cargo fmt --all -- --check` passes

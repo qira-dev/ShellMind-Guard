@@ -14,11 +14,11 @@ ShellMind Guard is designed to analyze untrusted or AI-generated codebases safel
 
 ### 1. Zero Network & Zero Telemetry in Static Mode (`shellmind-guard index` / `shellmind-guard scan`)
 - Static indexing and 6-layer Guard-Set Lattice analysis operate **100% offline**.
-- Dependency and lockfile auditing (`crates/sh-graph/src/deps.rs`) uses an embedded deterministic advisory table and never makes outbound HTTP requests.
-- The optional AI patch prompt builder (`crates/sh-ai`) is **disabled by default** and never transmits source code over the network.
+- Dependency and lockfile auditing (`crates/smg-graph/src/deps.rs`) uses an embedded deterministic advisory table and never makes outbound HTTP requests.
+- The optional AI patch prompt builder (`crates/smg-ai`) is **disabled by default** and never transmits source code over the network.
 
 ### 2. OS-Isolated Bubblewrap Sandbox (`--boot-cmd`)
-When `--boot-cmd` is supplied to `shellmind-guard scan`, `shellmind-guard replay`, or `shellmind-guard ui`, ShellMind Guard executes the target server inside `/usr/bin/bwrap` (`crates/sh-sandbox/src/bwrap.rs`) with strict Linux namespace isolation:
+When `--boot-cmd` is supplied to `shellmind-guard scan`, `shellmind-guard replay`, or `shellmind-guard ui`, ShellMind Guard executes the target server inside `/usr/bin/bwrap` (`crates/smg-sandbox/src/bwrap.rs`) with strict Linux namespace isolation:
 - **Namespace Unsharing:** `--unshare-all` (unshares `user`, `ipc`, `pid`, `net`, `uts`, and `cgroup` namespaces).
 - **Read-Only Root & Project Mounts:** System libraries (`/usr`, `/lib`, `/lib64`, `/bin`, `/etc/alternatives`) and the target project directory are mounted `--ro-bind` (read-only). Host credentials (`~/.ssh`, `~/.aws`, `~/.config`, host `.env` files outside the target directory) are never mounted inside the namespace.
 - **Ephemeral Writable Overlays:** `/tmp` and runtime cache directories are backed by isolated in-memory `--tmpfs` mounts that vanish immediately on teardown.
@@ -29,7 +29,7 @@ When `--boot-cmd` is supplied to `shellmind-guard scan`, `shellmind-guard replay
 
 ## Reporting a Vulnerability
 
-If you discover a security issue in ShellMind Guard itself (for example, a sandbox escape in `sh-sandbox`, a parser memory-safety issue, or a command-injection vector in CLI/MCP argument handling):
+If you discover a security issue in ShellMind Guard itself (for example, a sandbox escape in `smg-sandbox`, a parser memory-safety issue, or a command-injection vector in CLI/MCP argument handling):
 
 1. **Do not open a public GitHub issue** for exploitable vulnerabilities.
 2. Report the vulnerability privately via [GitHub Security Advisories](https://github.com/qira-dev/ShellMind-Guard/security/advisories/new) on `qira-dev/ShellMind-Guard`.

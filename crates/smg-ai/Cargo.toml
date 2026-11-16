@@ -1,0 +1,15 @@
+[package]
+name = "smg-ai"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+smg-core = { path = "../smg-core" }
+smg-graph = { path = "../smg-graph" }
+smg-sandbox = { path = "../smg-sandbox" }

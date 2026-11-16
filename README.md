@@ -9,9 +9,9 @@
 [![CI](https://github.com/qira-dev/ShellMind-Guard/actions/workflows/ci.yml/badge.svg)](https://github.com/qira-dev/ShellMind-Guard/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Rust Edition](https://img.shields.io/badge/Rust-2024_Edition-orange.svg)](Cargo.toml)
-[![Sandbox](https://img.shields.io/badge/Sandbox-Bubblewrap_Namespaces-success.svg)](crates/sh-sandbox)
+[![Sandbox](https://img.shields.io/badge/Sandbox-Bubblewrap_Namespaces-success.svg)](crates/smg-sandbox)
 [![MCP Server](https://img.shields.io/badge/MCP-JSON--RPC_2.0_Stdio-purple.svg)](src/mcp.rs)
-[![SARIF](https://img.shields.io/badge/Output-SARIF_2.1.0_%7C_HTML_%7C_JSON-informational.svg)](crates/sh-report)
+[![SARIF](https://img.shields.io/badge/Output-SARIF_2.1.0_%7C_HTML_%7C_JSON-informational.svg)](crates/smg-report)
 
 [**Architecture**](#system-architecture) · [**6-Layer Engine**](#the-6-layer-universal-verification-engine) · [**Quickstart**](#quickstart) · [**AI Agent MCP**](#model-context-protocol-shellmind-guard-mcp) · [**Benchmarks**](#verified-performance-benchmarks) · [**Blueprint**](BLUEPRINT.md)
 
@@ -42,33 +42,33 @@ Conventional security tools fail on these bugs in two predictable ways:
 
 ```mermaid
 flowchart TD
-    subgraph CLI["Unified Rust Binary (shellmind-guard)"]
-        A1["CLI / CI Gate\nshellmind-guard scan --ci"]
-        A2["60fps Terminal UI\nshellmind-guard ui (ratatui)"]
-        A3["Stdio MCP Server\nshellmind-guard mcp (JSON-RPC 2.0)"]
+    subgraph CLI["Unified Rust Binaries (smg / shellmind-guard)"]
+        A1["CLI / CI Gate\nsmg scan --ci · smg rules · smg explain"]
+        A2["60fps Interactive TUI\nsmg (or smg ui) (ratatui)"]
+        A3["Stdio MCP Server\nsmg mcp (JSON-RPC 2.0)"]
     end
 
-    subgraph S1["Stage 1: Two-Phase Incremental Ingestion (sh-core)"]
+    subgraph S1["Stage 1: Two-Phase Incremental Ingestion (smg-core)"]
         B1["ignore::WalkParallel\n(.gitignore + fast path filter)"]
         B2["BLAKE3 Content Fingerprinting\n+ mtime_ns Fast-Skip"]
         B3["SQLite WAL + FTS5 Store\n($XDG_CACHE_HOME/shellmind-guard/<hash>/state.db)"]
         B1 --> B2 --> B3
     end
 
-    subgraph S2["Stage 2: Polyglot AST & O(V+E) Guard-Set Lattice (sh-graph)"]
+    subgraph S2["Stage 2: Polyglot AST & O(V+E) Guard-Set Lattice (smg-graph)"]
         C1["Rayon Parallel Tree-sitter AST (16 Languages)\nTS/JS · Go · Python · Rust · PHP · Java · C# · Kotlin · Swift · Dart · C/C++ · Ruby · Bash · HCL"]
         C2["Cross-File Module, Header & IaC Linker\ntsconfig paths · barrels · Go/Java/Kotlin/C#/PHP/Dart/Ruby/Bash/C++ headers · Terraform modules"]
         C3["6-Layer Guard-Set Lattice & Sink-Typed Bitmask Taint\nG(v) = ⋂ (G(p) ∪ EdgeGuards(p → v))"]
         C1 --> C2 --> C3
     end
 
-    subgraph S3["Stage 3: OS-Isolated Runtime Prover (sh-sandbox)"]
+    subgraph S3["Stage 3: OS-Isolated Runtime Prover (smg-sandbox)"]
         D1["Linux Bubblewrap (/usr/bin/bwrap)\n--unshare-all · --ro-bind · --tmpfs · PGID Reaper"]
         D2["12-Way Barrier-Synchronized Prober\nAuth Bypass, Cross-Tenant IDOR & Last-Byte Sync Race"]
         D1 --> D2
     end
 
-    subgraph S4["Stage 4: Actionable Outputs (sh-report / sh-ai)"]
+    subgraph S4["Stage 4: Actionable Outputs (smg-report / smg-ai)"]
         E1["SARIF 2.1.0 + Confidence\nGitHub Code Scanning"]
         E2["Interactive HTML/SVG\nMulti-File Witness Graph"]
         E3["Minimal Patch Prompt (<= 2 KB) & --apply-check\nExact Witness Hops + Opt-In AI Patch Verifier"]
@@ -98,22 +98,22 @@ ShellMind Guard executes all 6 verification layers in a single unified pass:
 
 | Layer | Rule ID | Severity | Category & Invariant Checked | Required Guard / Sanitizer Disproof |
 | :---: | :--- | :---: | :--- | :--- |
-| **1** | `VF-SEC-AWS`<br>`VF-SEC-STRIPE`<br>`VF-SEC-GITHUB`<br>`VF-SEC-OPENAI`<br>`VF-SEC-ANTHROPIC`<br>`VF-SEC-GOOGLE`<br>`VF-SEC-SLACK`<br>`VF-SEC-JWT`<br>`VF-SEC-PRIVKEY`<br>`VF-SEC-DBURL`<br>`VF-SEC-CLIENT-ENV`<br>`VF-SEC-ENTROPY` | `CRITICAL`<br>`HIGH` | **Secrets & Credential Exposure:** Provider-prefixed tokens, hardcoded JWT secrets (`VF-SEC-JWT`), PEM private keys, inline credentials in `postgres://`/`mysql://`/`mongodb://`/`redis://` URLs, private secrets exposed in public frontend bundles (`NEXT_PUBLIC_*`, `VITE_*`, `REACT_APP_*`, `NUXT_PUBLIC_*`), and Shannon entropy ($H > 4.3$) secret literals. | Excluded on lockfiles, test fixtures, example placeholders (`EXAMPLE`, `YOUR_API_KEY`, `changeme`), URLs/SQL, and non-assignment strings. |
-| **1** | `VF-SEC-ENV` | `HIGH` | **Unignored `.env` File:** `.env` or `.env.production` containing live secrets is not covered by `.gitignore`. | Add `.env` / `.env.*` to `.gitignore`. |
-| **1** | `VF-CFG-CORS`<br>`VF-CFG-JWT-LOGIC`<br>`VF-CFG-TLS`<br>`VF-CFG-DEBUG`<br>`VF-CFG-COOKIE`<br>`VF-CFG-DOCKER`<br>`VF-CFG-PROTO`<br>`VF-CFG-XXE`<br>`VF-CFG-SQL-EXEC`<br>`VF-CFG-SQL-SEARCHPATH`<br>`VF-CFG-SQL-RLS`<br>`VF-CFG-SQL-PRIV` | `CRITICAL`<br>`HIGH`<br>`MEDIUM` | **Security Misconfigurations & SQL Schema Policies:** Wildcard CORS (`origin: "*"`) with `credentials: true`, JWT bypasses (`alg: "none"`, `verify_signature: False`, unverified `jwt.decode`, weak hardcoded JWT secrets), TLS disabled, `DEBUG=True`, insecure cookies, non-root `USER`-less `Dockerfile`, JavaScript prototype pollution (`__proto__`/`constructor.prototype`), unsafe XML/XXE parsers, and `.sql` migration hazards (dynamic `EXECUTE format('%s')`, `SECURITY DEFINER` missing `SET search_path`, `DISABLE ROW LEVEL SECURITY`, `SUPERUSER`/over-privileged grants). | Restrict CORS, enforce strong verified JWT secrets/algorithms, keep TLS checks on, sanitize keys against `__proto__`, disable XML external entities/DTDs, and harden `.sql` procedures/grants. |
-| **2** | `VF-DEP-001` | `HIGH`<br>`MEDIUM` | **Offline-First Dependency & Lockfile Audit:** Parses `package.json`, `package-lock.json`, `Cargo.toml`, `Cargo.lock`, `go.mod`, `requirements.txt`, `pyproject.toml`, `poetry.lock`, and `uv.lock` for unpinned `*`/`latest` versions, `http://` tarball registries, embedded high-risk advisories, and local SQLite OSV advisory index (`$XDG_CACHE_HOME/shellmind-guard/advisories.db`) synced opt-in via `shellmind-guard deps sync`. | Pin deterministic semver ranges and upgrade affected packages (scans stay 100% offline with zero network calls). |
-| **3** | `VF-SQLI-001`<br>`VF-SQLI-NOSQL`<br>`VF-SQLI-MASS` | `CRITICAL`<br>`HIGH` | **Cross-File SQL, NoSQL & ORM Injection:** Untrusted HTTP input flows into dynamic SQL (`knex.raw`, `sequelize.query`, `queryRunner.query`, `sql.unsafe`, `db.prepare`, `Fmt`/`f""`/`${...}`), MongoDB queries (`find`/`aggregate`/`$where`/`$function`/`$regex`) or Redis Lua `eval`/`evalsha`, or unvalidated ORM mass assignment (`prisma.create({ data: req.body })`, `bulkCreate`). | Parameterized queries (`$1`, `?`), safe tagged templates (`prisma.$queryRaw\`...\``), `$eq` / strict Zod/integer/UUID allowlists, and explicit field picking. |
-| **3** | `VF-XSS-001` | `HIGH` | **Cross-Site Scripting (XSS):** Untrusted HTTP or DOM URL input (`window.location.search`, `window.location.hash`, `URLSearchParams`) flows into `dangerouslySetInnerHTML`, `innerHTML`, `res.send`/`html` responses, `template.HTML(...)`, or Python `Markup(...)`/`render_template_string` without an XSS sanitizer bit. | HTML escaping/sanitization (`DOMPurify.sanitize`, `bluemonday`, `bleach.clean`, `ammonia::clean`, `html.escape`) matching the XSS sink bit. |
-| **3** | `VF-CMDI-001`<br>`VF-CMDI-SSTI`<br>`VF-CMDI-DESER` | `CRITICAL` | **Command, SSTI & Deserialization Execution:** Tainted input reaches `exec`/`os.system`/`subprocess.run(..., shell=True)`/`exec.Command`, unsafe template rendering (SSTI), or unsafe deserialization (`pickle.loads`, `yaml.load`, `unserialize`, `ObjectInputStream`). | Argument array execution without shell, `shlex.quote`, `yaml.safe_load`/JSON schemas, or strict allowlist/numeric parser. |
-| **3** | `VF-PATH-001` | `HIGH` | **Path Traversal:** Tainted input reaches `fs.readFile`, `fs.writeFile`, `res.sendFile`, `os.Open`, `os.ReadFile`, `http.ServeFile`, `open()`, or `std::fs::read`. | `path.basename`, `filepath.Base`, `filepath.Clean` + `.startsWith(baseDir)` prefix check. |
-| **3** | `VF-SSRF-001`<br>`VF-SSRF-REDIRECT` | `HIGH` | **SSRF & Open Redirect:** Tainted URL reaches `fetch`, `axios`, `http.Get`, `requests.get`, `httpx.get`, `reqwest::get`, or unvalidated server/DOM redirects (`window.location.href`, `window.open`, `res.redirect`). | Explicit hostname allowlist (`allowedHosts`, `validateUrl`), scheme validation, and private/link-local CIDR block. |
-| **4** | `VF-AUTH-001` | `HIGH` | **Missing Authentication Guard:** Reachable path from an HTTP route to a privileged state-mutating sink (`PaymentMutation`, `BalanceUpdate`, `SqlWrite`, `AuthMutation`, `ResourceDestroy`) without an active `Auth` guard. | Route/router middleware (`requireAuth`, `UseGuards`, `protectedProcedure`, `login_required`, `AuthMiddleware`) or `.shellmind-guard.toml` `public_routes`. |
-| **4** | `VF-CSRF-001` | `HIGH` | **Cross-Site Request Forgery (CSRF):** Cookie/session-authenticated state-changing endpoints or explicit `@csrf_exempt` overrides without CSRF token middleware or `SameSite` cookie protection (excludes pure Bearer/JWT APIs, webhooks, and health probes). | `csurf` / `csrfProtect` / `SameSite=Strict` or `SameSite=Lax` cookies, or token-based `Authorization: Bearer` auth. |
-| **4** | `VF-IDOR-001` | `HIGH` | **Insecure Direct Object Reference (IDOR):** Authenticated route accepts a resource ID (`:id`, `{id}`, `[id]`) and executes a DB read/update/delete without scoping by caller identity—provable dynamically via User A vs User B sandbox probing. | Include caller ownership predicate (`user_id = req.user.id`, `owner_id`, `tenant_id`, `org_id`, `current_user`) and verify HTTP `401/403/404` across tenants. |
-| **5** | `VF-RACE-001`<br>`VF-ENG-DEADLOCK`<br>`VF-ENG-LEAK`<br>`VF-MEM-BOUNDS`<br>`VF-ENG-INT` | `CRITICAL`<br>`HIGH` | **Concurrency, Resource Leaks & Native Memory Safety:** Payment/balance double-spend races (`VF-RACE-001`), cross-function `A->B / B->A` lock-order inversions & sync locks held across `.await` (`VF-ENG-DEADLOCK`), unclosed file/socket/DB handles on early error returns (`VF-ENG-LEAK`), unbounded C/C++ copies (`strcpy`, `sprintf`, unchecked `memcpy`) & unguarded Rust `unsafe` slice/ptr access (`VF-MEM-BOUNDS`), and allocation integer overflow (`VF-ENG-INT`). | Enforce `withTransaction`/`SELECT ... FOR UPDATE`, canonical lock ordering (`std::scoped_lock`), drop mutexes before `.await`, use RAII/`defer`/`try-finally`, and validate bounds + checked arithmetic. |
-| **6** | `VF-FE-404`<br>`VF-FE-ERR`<br>`VF-FE-STORAGE`<br>`VF-FE-MSG`<br>`VF-FE-TABNAB` | `HIGH`<br>`MEDIUM`<br>`LOW` | **Frontend ↔ Backend Contract & Browser Security:** Frontend `fetch`/`axios`/`$fetch`/`useFetch`/`this.http.*` calling missing backend routes (`VF-FE-404`), dead `onClick` or unhandled async fetches (`VF-FE-ERR`), auth tokens/secrets persisted in `localStorage`/`sessionStorage` (`VF-FE-STORAGE`), unverified `postMessage` (`*` target origin or `.data` without `.origin` check, `VF-FE-MSG`), and `target="_blank"` missing `noopener` (`VF-FE-TABNAB`). | Align API contracts, handle rejections, store tokens in `httpOnly` cookies, enforce strict `event.origin` checks, and add `rel="noopener noreferrer"`. |
-| **Domain** | `VF-MOB-STORAGE`<br>`VF-MOB-IPC`<br>`VF-MOB-TLS` | `CRITICAL`<br>`HIGH`<br>`MEDIUM` | **Domain-Routed Mobile Security (`Android`/`iOS`/`Flutter`):** Activated automatically when mobile code/manifests (`AndroidManifest.xml`, `Info.plist`, `pubspec.yaml`) exist: plaintext `SharedPreferences` / `UserDefaults` credential storage (`VF-MOB-STORAGE`), exported permissionless Android components / dynamic receivers / WebView bridges (`VF-MOB-IPC`), and trust-all TLS verifiers / ATS bypasses (`VF-MOB-TLS`). | Use `EncryptedSharedPreferences`/Keychain/`FlutterSecureStorage`, enforce `android:exported="false"` or signature permissions, and enable strict TLS pinning. |
-| **Deep (`--deep`)** | `VF-FUZZ-SCHEMA`<br>`VF-FUZZ-TAMPER`<br>`VF-FUZZ-CRASH`<br>`VF-FUZZ-ENCODING` | `CRITICAL`<br>`HIGH` | **Schema Bounds & Targeted Route Fuzzing (`--deep`):** Extracts route schemas from AST handlers and OpenAPI/Swagger specs to flag unvalidated financial/quantity parameters (`VF-FUZZ-SCHEMA`) and probe live sandboxed routes for negative/zero tampering (`VF-FUZZ-TAMPER`), server 5xx/panic crashes (`VF-FUZZ-CRASH`), and null-byte / invalid UTF-8 (`\xff\xfe`) failures (`VF-FUZZ-ENCODING`). | Enforce finite positive schema validation (`amount > 0`, Zod `.finite().positive()`, Pydantic `gt=0`) and reject malformed/non-UTF-8 payloads with `400/422`. |
+| **1** | `SMG-SEC-AWS`<br>`SMG-SEC-STRIPE`<br>`SMG-SEC-GITHUB`<br>`SMG-SEC-OPENAI`<br>`SMG-SEC-ANTHROPIC`<br>`SMG-SEC-GOOGLE`<br>`SMG-SEC-SLACK`<br>`SMG-SEC-JWT`<br>`SMG-SEC-PRIVKEY`<br>`SMG-SEC-DBURL`<br>`SMG-SEC-CLIENT-ENV`<br>`SMG-SEC-ENTROPY` | `CRITICAL`<br>`HIGH` | **Secrets & Credential Exposure:** Provider-prefixed tokens, hardcoded JWT secrets (`SMG-SEC-JWT`), PEM private keys, inline credentials in `postgres://`/`mysql://`/`mongodb://`/`redis://` URLs, private secrets exposed in public frontend bundles (`NEXT_PUBLIC_*`, `VITE_*`, `REACT_APP_*`, `NUXT_PUBLIC_*`), and Shannon entropy ($H > 4.3$) secret literals. | Excluded on lockfiles, test fixtures, example placeholders (`EXAMPLE`, `YOUR_API_KEY`, `changeme`), URLs/SQL, and non-assignment strings. |
+| **1** | `SMG-SEC-ENV` | `HIGH` | **Unignored `.env` File:** `.env` or `.env.production` containing live secrets is not covered by `.gitignore`. | Add `.env` / `.env.*` to `.gitignore`. |
+| **1** | `SMG-CFG-CORS`<br>`SMG-CFG-JWT-LOGIC`<br>`SMG-CFG-TLS`<br>`SMG-CFG-DEBUG`<br>`SMG-CFG-COOKIE`<br>`SMG-CFG-DOCKER`<br>`SMG-CFG-PROTO`<br>`SMG-CFG-XXE`<br>`SMG-CFG-SQL-EXEC`<br>`SMG-CFG-SQL-SEARCHPATH`<br>`SMG-CFG-SQL-RLS`<br>`SMG-CFG-SQL-PRIV` | `CRITICAL`<br>`HIGH`<br>`MEDIUM` | **Security Misconfigurations & SQL Schema Policies:** Wildcard CORS (`origin: "*"`) with `credentials: true`, JWT bypasses (`alg: "none"`, `verify_signature: False`, unverified `jwt.decode`, weak hardcoded JWT secrets), TLS disabled, `DEBUG=True`, insecure cookies, non-root `USER`-less `Dockerfile`, JavaScript prototype pollution (`__proto__`/`constructor.prototype`), unsafe XML/XXE parsers, and `.sql` migration hazards (dynamic `EXECUTE format('%s')`, `SECURITY DEFINER` missing `SET search_path`, `DISABLE ROW LEVEL SECURITY`, `SUPERUSER`/over-privileged grants). | Restrict CORS, enforce strong verified JWT secrets/algorithms, keep TLS checks on, sanitize keys against `__proto__`, disable XML external entities/DTDs, and harden `.sql` procedures/grants. |
+| **2** | `SMG-DEP-001` | `HIGH`<br>`MEDIUM` | **Offline-First Dependency & Lockfile Audit:** Parses `package.json`, `package-lock.json`, `Cargo.toml`, `Cargo.lock`, `go.mod`, `requirements.txt`, `pyproject.toml`, `poetry.lock`, and `uv.lock` for unpinned `*`/`latest` versions, `http://` tarball registries, embedded high-risk advisories, and local SQLite OSV advisory index (`$XDG_CACHE_HOME/shellmind-guard/advisories.db`) synced opt-in via `smg deps sync`. | Pin deterministic semver ranges and upgrade affected packages (scans stay 100% offline with zero network calls). |
+| **3** | `SMG-SQLI-001`<br>`SMG-SQLI-NOSQL`<br>`SMG-SQLI-MASS` | `CRITICAL`<br>`HIGH` | **Cross-File SQL, NoSQL & ORM Injection:** Untrusted HTTP input flows into dynamic SQL (`knex.raw`, `sequelize.query`, `queryRunner.query`, `sql.unsafe`, `db.prepare`, `Fmt`/`f""`/`${...}`), MongoDB queries (`find`/`aggregate`/`$where`/`$function`/`$regex`) or Redis Lua `eval`/`evalsha`, or unvalidated ORM mass assignment (`prisma.create({ data: req.body })`, `bulkCreate`). | Parameterized queries (`$1`, `?`), safe tagged templates (`prisma.$queryRaw\`...\``), `$eq` / strict Zod/integer/UUID allowlists, and explicit field picking. |
+| **3** | `SMG-XSS-001` | `HIGH` | **Cross-Site Scripting (XSS):** Untrusted HTTP or DOM URL input (`window.location.search`, `window.location.hash`, `URLSearchParams`) flows into `dangerouslySetInnerHTML`, `innerHTML`, `res.send`/`html` responses, `template.HTML(...)`, or Python `Markup(...)`/`render_template_string` without an XSS sanitizer bit. | HTML escaping/sanitization (`DOMPurify.sanitize`, `bluemonday`, `bleach.clean`, `ammonia::clean`, `html.escape`) matching the XSS sink bit. |
+| **3** | `SMG-CMDI-001`<br>`SMG-CMDI-SSTI`<br>`SMG-CMDI-DESER` | `CRITICAL` | **Command, SSTI & Deserialization Execution:** Tainted input reaches `exec`/`os.system`/`subprocess.run(..., shell=True)`/`exec.Command`, unsafe template rendering (SSTI), or unsafe deserialization (`pickle.loads`, `yaml.load`, `unserialize`, `ObjectInputStream`). | Argument array execution without shell, `shlex.quote`, `yaml.safe_load`/JSON schemas, or strict allowlist/numeric parser. |
+| **3** | `SMG-PATH-001` | `HIGH` | **Path Traversal:** Tainted input reaches `fs.readFile`, `fs.writeFile`, `res.sendFile`, `os.Open`, `os.ReadFile`, `http.ServeFile`, `open()`, or `std::fs::read`. | `path.basename`, `filepath.Base`, `filepath.Clean` + `.startsWith(baseDir)` prefix check. |
+| **3** | `SMG-SSRF-001`<br>`SMG-SSRF-REDIRECT` | `HIGH` | **SSRF & Open Redirect:** Tainted URL reaches `fetch`, `axios`, `http.Get`, `requests.get`, `httpx.get`, `reqwest::get`, or unvalidated server/DOM redirects (`window.location.href`, `window.open`, `res.redirect`). | Explicit hostname allowlist (`allowedHosts`, `validateUrl`), scheme validation, and private/link-local CIDR block. |
+| **4** | `SMG-AUTH-001` | `HIGH` | **Missing Authentication Guard:** Reachable path from an HTTP route to a privileged state-mutating sink (`PaymentMutation`, `BalanceUpdate`, `SqlWrite`, `AuthMutation`, `ResourceDestroy`) without an active `Auth` guard. | Route/router middleware (`requireAuth`, `UseGuards`, `protectedProcedure`, `login_required`, `AuthMiddleware`) or `.shellmind-guard.toml` `public_routes`. |
+| **4** | `SMG-CSRF-001` | `HIGH` | **Cross-Site Request Forgery (CSRF):** Cookie/session-authenticated state-changing endpoints or explicit `@csrf_exempt` overrides without CSRF token middleware or `SameSite` cookie protection (excludes pure Bearer/JWT APIs, webhooks, and health probes). | `csurf` / `csrfProtect` / `SameSite=Strict` or `SameSite=Lax` cookies, or token-based `Authorization: Bearer` auth. |
+| **4** | `SMG-IDOR-001` | `HIGH` | **Insecure Direct Object Reference (IDOR):** Authenticated route accepts a resource ID (`:id`, `{id}`, `[id]`) and executes a DB read/update/delete without scoping by caller identity—provable dynamically via User A vs User B sandbox probing. | Include caller ownership predicate (`user_id = req.user.id`, `owner_id`, `tenant_id`, `org_id`, `current_user`) and verify HTTP `401/403/404` across tenants. |
+| **5** | `SMG-RACE-001`<br>`SMG-ENG-DEADLOCK`<br>`SMG-ENG-LEAK`<br>`SMG-MEM-BOUNDS`<br>`SMG-ENG-INT` | `CRITICAL`<br>`HIGH` | **Concurrency, Resource Leaks & Native Memory Safety:** Payment/balance double-spend races (`SMG-RACE-001`), cross-function `A->B / B->A` lock-order inversions & sync locks held across `.await` (`SMG-ENG-DEADLOCK`), unclosed file/socket/DB handles on early error returns (`SMG-ENG-LEAK`), unbounded C/C++ copies (`strcpy`, `sprintf`, unchecked `memcpy`) & unguarded Rust `unsafe` slice/ptr access (`SMG-MEM-BOUNDS`), and allocation integer overflow (`SMG-ENG-INT`). | Enforce `withTransaction`/`SELECT ... FOR UPDATE`, canonical lock ordering (`std::scoped_lock`), drop mutexes before `.await`, use RAII/`defer`/`try-finally`, and validate bounds + checked arithmetic. |
+| **6** | `SMG-FE-404`<br>`SMG-FE-ERR`<br>`SMG-FE-STORAGE`<br>`SMG-FE-MSG`<br>`SMG-FE-TABNAB` | `HIGH`<br>`MEDIUM`<br>`LOW` | **Frontend ↔ Backend Contract & Browser Security:** Frontend `fetch`/`axios`/`$fetch`/`useFetch`/`this.http.*` calling missing backend routes (`SMG-FE-404`), dead `onClick` or unhandled async fetches (`SMG-FE-ERR`), auth tokens/secrets persisted in `localStorage`/`sessionStorage` (`SMG-FE-STORAGE`), unverified `postMessage` (`*` target origin or `.data` without `.origin` check, `SMG-FE-MSG`), and `target="_blank"` missing `noopener` (`SMG-FE-TABNAB`). | Align API contracts, handle rejections, store tokens in `httpOnly` cookies, enforce strict `event.origin` checks, and add `rel="noopener noreferrer"`. |
+| **Domain** | `SMG-MOB-STORAGE`<br>`SMG-MOB-IPC`<br>`SMG-MOB-TLS` | `CRITICAL`<br>`HIGH`<br>`MEDIUM` | **Domain-Routed Mobile Security (`Android`/`iOS`/`Flutter`):** Activated automatically when mobile code/manifests (`AndroidManifest.xml`, `Info.plist`, `pubspec.yaml`) exist: plaintext `SharedPreferences` / `UserDefaults` credential storage (`SMG-MOB-STORAGE`), exported permissionless Android components / dynamic receivers / WebView bridges (`SMG-MOB-IPC`), and trust-all TLS verifiers / ATS bypasses (`SMG-MOB-TLS`). | Use `EncryptedSharedPreferences`/Keychain/`FlutterSecureStorage`, enforce `android:exported="false"` or signature permissions, and enable strict TLS pinning. |
+| **Deep (`--deep`)** | `SMG-FUZZ-SCHEMA`<br>`SMG-FUZZ-TAMPER`<br>`SMG-FUZZ-CRASH`<br>`SMG-FUZZ-ENCODING` | `CRITICAL`<br>`HIGH` | **Schema Bounds & Targeted Route Fuzzing (`--deep`):** Extracts route schemas from AST handlers and OpenAPI/Swagger specs to flag unvalidated financial/quantity parameters (`SMG-FUZZ-SCHEMA`) and probe live sandboxed routes for negative/zero tampering (`SMG-FUZZ-TAMPER`), server 5xx/panic crashes (`SMG-FUZZ-CRASH`), and null-byte / invalid UTF-8 (`\xff\xfe`) failures (`SMG-FUZZ-ENCODING`). | Enforce finite positive schema validation (`amount > 0`, Zod `.finite().positive()`, Pydantic `gt=0`) and reject malformed/non-UTF-8 payloads with `400/422`. |
 
 ### Supported Languages & Frameworks
 
@@ -131,8 +131,8 @@ ShellMind Guard executes all 6 verification layers in a single unified pass:
 | **Dart** (`.dart`) | `tree-sitter-dart` | **Dart Frog** (`routes/**` `onRequest`), **Shelf** (`shelf_router` `router.get/post`), `rawQuery`/`rawUpdate`/`Process.run` |
 | **C / C++** (`.c`, `.h`, `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hh`, `.hxx`) | `tree-sitter-c`, `tree-sitter-cpp` | Native engines & libraries (`#include` header-to-implementation edge resolution), **Crow** (`CROW_ROUTE(...).methods(...)`), **cpp-httplib** (`svr.Get/Post`), `sqlite3_prepare_v2`, `std::lock_guard` / `std::mutex` |
 | **Ruby** (`.rb`, `.rake`, `.ru`) | `tree-sitter-ruby` | **Ruby on Rails** (`routes.rb` `to: 'ctrl#act'`, `resources`, `before_action :authenticate_user!`, `skip_before_action :verify_authenticity_token`, ActiveRecord `.transaction` / `.where`), **Sinatra** (`get`/`post` blocks), `require_relative`, `Shellwords.escape` |
-| **Bash / Shell** (`.sh`, `.bash`, `.zsh`) | `tree-sitter-bash` | `source`/`.` cross-file linking, `eval` / `sh -c` / `curl \| bash` (`VF-CMDI-001`), `psql`/`mysql`/`sqlite3` SQLi, dynamic `curl`/`wget` SSRF, `rm -rf` path taint (clean on `mktemp`/`printf '%q'`/regex guards) |
-| **Terraform / HCL** (`.tf`, `.tfvars`) | `tree-sitter-hcl` | Local `module` `source` linking, public S3/GCS/RDS exposure (`VF-CFG-IAC-PUBLIC`), `0.0.0.0/0` non-web SG/firewall ingress (`VF-CFG-IAC-NET`), disabled encryption / TLS < 1.2 (`VF-CFG-IAC-CRYPTO`), IAM `*/*` wildcards (`VF-CFG-IAC-IAM`) |
+| **Bash / Shell** (`.sh`, `.bash`, `.zsh`) | `tree-sitter-bash` | `source`/`.` cross-file linking, `eval` / `sh -c` / `curl \| bash` (`SMG-CMDI-001`), `psql`/`mysql`/`sqlite3` SQLi, dynamic `curl`/`wget` SSRF, `rm -rf` path taint (clean on `mktemp`/`printf '%q'`/regex guards) |
+| **Terraform / HCL** (`.tf`, `.tfvars`) | `tree-sitter-hcl` | Local `module` `source` linking, public S3/GCS/RDS exposure (`SMG-CFG-IAC-PUBLIC`), `0.0.0.0/0` non-web SG/firewall ingress (`SMG-CFG-IAC-NET`), disabled encryption / TLS < 1.2 (`SMG-CFG-IAC-CRYPTO`), IAM `*/*` wildcards (`SMG-CFG-IAC-IAM`) |
 
 ---
 
@@ -163,16 +163,22 @@ curl -fsSL https://raw.githubusercontent.com/qira-dev/ShellMind-Guard/main/insta
 irm https://raw.githubusercontent.com/qira-dev/ShellMind-Guard/main/install.ps1 | iex
 ```
 
-**Use Standalone CLI or Load as an AI Coding Plugin (Claude Code / MCP + Skills + Commit Hook):**
+**Use Standalone CLI (`smg` or `shellmind-guard`) or Load as an AI Coding Plugin (Claude Code / MCP + Skills + Commit Hook):**
 
 ```bash
-# 1. Verify binary, sandbox backend, advisory cache & git hook readiness (Standalone)
-shellmind-guard doctor .
+# 0. Launch interactive TUI workspace directly (default when running `smg` in an interactive terminal)
+smg
+
+# 1. Verify binary, sandbox backend, cgroups v2, git, advisory cache & AI readiness (add --probe-ai to test Ollama/API)
+smg doctor .
 
 # 2. Install standalone Git pre-commit hook (blocks high/critical secrets & misconfigs locally)
-shellmind-guard hook install .
+smg hook install .
 
-# 3. Install as a Claude Code plugin from GitHub Marketplace (Claude Code 2.1.275+)
+# 3. Install shell auto-completions (bash, zsh, fish, powershell)
+smg completions bash > ~/.local/share/bash-completion/completions/smg
+
+# 4. Install as a Claude Code plugin from GitHub Marketplace (Claude Code 2.1.275+)
 /plugin marketplace add qira-dev/ShellMind-Guard
 /plugin install shellmind-guard@shellmind-guard
 
@@ -186,7 +192,7 @@ claude --plugin-dir /path/to/ShellMind-Guard
 git clone https://github.com/qira-dev/ShellMind-Guard.git
 cd ShellMind-Guard
 
-# Install the optimized release binary to ~/.cargo/bin/shellmind-guard
+# Install both `smg` (default short binary) and `shellmind-guard` into ~/.cargo/bin
 cargo install --path .
 ```
 
@@ -196,26 +202,33 @@ cargo install --path .
 
 ```bash
 # Auto-detect project stack, write .shellmind-guard.toml, and generate .github/workflows/shellmind-guard.yml
-shellmind-guard init /path/to/your/repo --ci
+smg init /path/to/your/repo --ci
 ```
 
-### 3. Run a Full 6-Layer Scan
+### 3. Run a Full 6-Layer Scan, Baseline & Rule Reference
 
 ```bash
-# Human-readable terminal report
-shellmind-guard scan /path/to/your/repo
+# Human-readable colored terminal report with rustc-style source snippets & summary bar
+smg scan /path/to/your/repo
 
-# Machine-readable JSON or SARIF 2.1.0 report
-shellmind-guard scan /path/to/your/repo --format json
-shellmind-guard scan /path/to/your/repo --format sarif
+# Machine-readable or PR-ready reports (text | compact | table | markdown | json | sarif)
+smg scan /path/to/your/repo --format table
+smg scan /path/to/your/repo --format markdown --output security-report.md
+smg scan /path/to/your/repo --format sarif
 
-# Filter specific layers or enforce a minimum confidence threshold (proven | confirmed | heuristic)
-shellmind-guard scan /path/to/your/repo --layers secrets,sqli,xss,csrf,idor,race --min-confidence confirmed
+# Filter layers, exclude noisy rules, snapshot baseline debt, or fail only on net-new issues
+smg scan /path/to/your/repo --layers secrets,sqli,xss,csrf,idor,race --min-confidence confirmed
+smg scan /path/to/your/repo --write-baseline .smg-baseline.json
+smg scan /path/to/your/repo --baseline .smg-baseline.json --exclude-rule SMG-CFG-001 --ci
+
+# Inspect all built-in guard rules or explain vulnerable vs fixed code patterns
+smg rules --layer race
+smg explain SMG-RACE-001
 
 # Opt-in sync of local offline SQLite OSV advisory DB (or import offline JSON bundle) & check status
-shellmind-guard deps sync /path/to/your/repo
-shellmind-guard deps sync --from-file /path/to/osv.json
-shellmind-guard deps status
+smg deps sync /path/to/your/repo
+smg deps sync --from-file /path/to/osv.json
+smg deps status
 ```
 
 ### 4. Prove Exploits in the Isolated Bubblewrap Sandbox
@@ -223,7 +236,7 @@ shellmind-guard deps status
 Run ShellMind Guard against the included vulnerable Node/TypeScript payment fixture (`fixtures/vuln-payment-node`) to see static `SUSPECT` findings upgraded to **`PROVEN`** via live sandbox execution and 12-way barrier-synchronized race probing (add `--deep` for Phase 10 schema & payload fuzzing, or `--sandbox-tls` / `--mock-shims` / `--sandbox-mem-mb 512` for hardened probing):
 
 ```bash
-shellmind-guard scan fixtures/vuln-payment-node \
+smg scan fixtures/vuln-payment-node \
   --deep \
   --boot-cmd "node server.mjs" \
   --sarif .shellmind-guard/report.sarif \
@@ -236,33 +249,33 @@ Sample output:
 ShellMind Guard Scan | 5 files (14 symbols, 5 edges, 3 routes) | 42ms (delta: +5 / 0 cached)
   [!] 5 finding(s) detected:
 
-  [HIGH] VF-AUTH-001 (VF-AUTH-001) -> Unauthenticated path to BalanceUpdate in `debitBalance`
+  [HIGH] SMG-AUTH-001 (SMG-AUTH-001) -> Unauthenticated path to BalanceUpdate in `debitBalance`
       Entry: POST /api/v1/checkout/withdraw
       [1] src/routes/checkout.ts:8  POST /api/v1/checkout/withdraw
       [2] src/services/ledger.ts:3  processWithdrawal
       [3] src/db/queries.ts:1       debitBalance
 
-  [CRITICAL] VF-RACE-002 (VF-RACE-001) -> Missing transaction/lock guard before `debitBalance` (Double-Spend Risk)
+  [CRITICAL] SMG-RACE-002 (SMG-RACE-001) -> Missing transaction/lock guard before `debitBalance` (Double-Spend Risk)
       Entry: POST /api/v1/checkout/withdraw
       [1] src/routes/checkout.ts:8  POST /api/v1/checkout/withdraw
       [2] src/services/ledger.ts:3  processWithdrawal
       [3] src/db/queries.ts:1       debitBalance
 
 ShellMind Guard Sandbox Proof (bwrap=isolated):
-  [PROVEN] VF-AUTH-001 (VF-AUTH-001) -> Unauthenticated POST /api/v1/checkout/withdraw returned HTTP 200 (body: {"ok":true,...})
-  [PROVEN] VF-RACE-002 (VF-RACE-001) -> 12/12 concurrent requests returned HTTP 200 (Last-Byte Sync, 1 distinct bodies)
+  [PROVEN] SMG-AUTH-001 (SMG-AUTH-001) -> Unauthenticated POST /api/v1/checkout/withdraw returned HTTP 200 (body: {"ok":true,...})
+  [PROVEN] SMG-RACE-002 (SMG-RACE-001) -> 12/12 concurrent requests returned HTTP 200 (Last-Byte Sync, 1 distinct bodies)
 ```
 
 ### 5. Replay a Finding, Generate Minimal Patch Context (<= 2 KB) & Verify Diffs (`--apply-check`)
 
 ```bash
 # Replay live exploit proof and print minimal <= 2048 B witness context
-shellmind-guard replay VF-RACE-002 fixtures/vuln-payment-node \
+smg replay SMG-RACE-002 fixtures/vuln-payment-node \
   --boot-cmd "node server.mjs" \
   --patch
 
 # Apply a unified diff inside an isolated temporary workspace and verify mitigation
-shellmind-guard replay VF-SQLI-001 /path/to/your/repo \
+smg replay SMG-SQLI-001 /path/to/your/repo \
   --patch-file fix.diff \
   --apply-check
 ```
@@ -270,15 +283,17 @@ shellmind-guard replay VF-SQLI-001 /path/to/your/repo \
 ### 6. Launch the Panic-Safe 60fps Terminal UI (`ratatui`)
 
 ```bash
-shellmind-guard ui fixtures/vuln-payment-node --boot-cmd "node server.mjs"
+# Simply run bare `smg` in any repository, or pass explicit UI/sandbox filters:
+smg ui fixtures/vuln-payment-node --deep --boot-cmd "node server.mjs"
 ```
 
-- **`[j]` / `[k]` or `↑` / `↓`:** Navigate findings across all 6 layers
-- **`[Enter]`:** Re-run live Bubblewrap sandbox PoC for the selected finding
-- **`[p]`:** Generate minimal (<= 2 KB) multi-file witness patch prompt
-- **`[f]`:** Cycle filter mode (`ALL` -> `UNMITIGATED` -> `PROVEN` -> `CONFIRMED+` -> `CRITICAL`)
-- **`[g]` / `[s]`:** Export interactive Carbon-Slate HTML/SVG graph and SARIF 2.1.0 report
-- **`[L]`:** Toggle internal sandbox & diagnostics ring-buffer drawer (zero stdout corruption)
+- **`[j]` / `[k]` / `↑` / `↓` / Mouse Click:** Navigate and select findings in the sorted queue (`PROVEN > SEVERITY > Confidence`)
+- **`[/]` / `[c]` / `[f/1-4]`:** Live fuzzy search (`/`), cycle Guard Category (`c`), or filter Severity/Status (`f`/`1-4`)
+- **`[Enter]` / `[r]`:** Run non-blocking background `bwrap` exploit replay or delta-cached live rescan with animated spinner
+- **`[z]` / `[` / `]` / `\`:** Toggle full-pane Source Inspector zoom (`z`) and scroll source code lines (`[`/`]` or mouse wheel)
+- **`[p]` (then `[a]` / `[y]`):** Generate & inspect colorized unified patch diff / `<= 2 KB` prompt, and run isolated `--apply-check` (`a`)
+- **`[e]` / `[y]`:** Open exact witness hop file:line in `$VISUAL`/`$EDITOR` (`e`), or copy finding/patch via OSC 52 (`y`)
+- **`[g]` / `[s]` / `[L]`:** Export HTML/SVG graph (`g`), SARIF 2.1.0 (`s`), or toggle Event Log drawer (`L`)
 
 ---
 
@@ -306,7 +321,7 @@ Add the following to your `.mcp.json`, `~/.claude.json`, or `.cursor/mcp.json`:
 | Tool Name | Input Schema | Description |
 | :--- | :--- | :--- |
 | `shellmind_guard_scan` | `{ "path"?: string, "layers"?: string[], "min_confidence"?: "proven"\|"confirmed"\|"heuristic", "deep"?: boolean }` | Runs the 16-language AST + Guard-Set Lattice scan (plus optional `deep` schema checks and `engine`/`memory`/`mobile` layers) and returns structured JSON findings with confidence, witness hops, and remediation. |
-| `shellmind_guard_explain_finding` | `{ "path"?: string, "finding_id": string }` | Resolves a finding by `id` (e.g. `VF-RACE-002`, `VF-FUZZ-001`) or `rule_id` (e.g. `VF-SQLI-001`) and returns exact source lines around every hop in `witness_path`, a <= 2 KB patch prompt, and concrete remediation guidance. |
+| `shellmind_guard_explain_finding` | `{ "path"?: string, "finding_id": string }` | Resolves a finding by `id` (e.g. `SMG-RACE-002`, `SMG-FUZZ-001`) or `rule_id` (e.g. `SMG-SQLI-001`) and returns exact source lines around every hop in `witness_path`, a <= 2 KB patch prompt, and concrete remediation guidance. |
 | `shellmind_guard_init` | `{ "path"?: string, "ci"?: boolean, "hook"?: boolean, "overwrite"?: boolean }` | Detects the repository language stack, writes `.shellmind-guard.toml`, and optionally scaffolds `.github/workflows/shellmind-guard.yml` or installs `.git/hooks/pre-commit`. |
 
 ---
@@ -330,7 +345,7 @@ lock_guards = [
   "BeginTx", "db.Transaction", "$transaction"
 ]
 
-# Intentionally unauthenticated routes (suppresses VF-AUTH-001 only; never suppresses SQLi/CMDi/Race)
+# Intentionally unauthenticated routes (suppresses SMG-AUTH-001 only; never suppresses SQLi/CMDi/Race)
 public_routes = [
   "/health", "/healthz", "/readyz", "/metrics",
   "/login", "/register", "/signup", "/webhook"
@@ -381,21 +396,24 @@ ShellMind-Guard/
 │   ├── guard-scan/SKILL.md        # `/shellmind-guard:guard-scan` MCP + CLI workflow
 │   └── guard-fix/SKILL.md         # `/shellmind-guard:guard-fix` all-rule remediation + `--apply-check`
 ├── src/
-│   ├── main.rs                    # Unified CLI (`init`, `index`, `scan`, `deps`, `replay`, `ui`, `mcp`, `hook`, `doctor`)
+│   ├── bin/smg.rs                 # Short primary CLI (`smg`; launches TUI directly on interactive TTY)
+│   ├── main.rs                    # Compatibility alias binary (`shellmind-guard`)
+│   ├── lib.rs                     # Unified CLI (`init`, `index`, `scan`, `deps`, `replay`, `ui`, `rules`, `explain`, `completions`, `mcp`, `hook`, `doctor`)
+│   ├── rules_catalog.rs           # Built-in rule docs catalog + bash/zsh/fish/powershell completions
 │   ├── deps_sync.rs               # Explicit opt-in OSV `/v1/querybatch` + `--from-file` advisory sync
 │   └── mcp.rs                     # Stdio JSON-RPC 2.0 Model Context Protocol server
 ├── crates/
-│   ├── sh-core/                   # .shellmind-guard.toml config, ignore::WalkParallel + BLAKE3 scanner,
+│   ├── smg-core/                   # .shellmind-guard.toml config, ignore::WalkParallel + BLAKE3 scanner,
 │   │                              # XDG SQLite WAL + FTS5 AST/findings store & local `advisories.db` index
-│   ├── sh-graph/                  # Parallel Tree-sitter AST across 16 languages (TS/JS/Go/Python/Rust
+│   ├── smg-graph/                  # Parallel Tree-sitter AST across 16 languages (TS/JS/Go/Python/Rust
 │   │                              # + modular langs/ for PHP/Java/C#/Kotlin/Swift/Dart/C/C++/Ruby/Bash/HCL),
 │   │                              # domain routing (`web`/`system_engine`/`mobile`), deep SQL/DOM/SSTI rules,
 │   │                              # Phase 9/10 cross-file field/closure taint, OpenAPI schemas & O(V+E) Lattice
-│   ├── sh-sandbox/                # Linux Bubblewrap (--unshare-all) + macOS/Windows sandbox helpers,
+│   ├── smg-sandbox/                # Linux Bubblewrap (--unshare-all) + macOS/Windows sandbox helpers,
 │   │                              # RLIMIT_AS/cgroups v2, rustls TLS loopback, mock shims & `--deep` fuzz prover
-│   ├── sh-report/                 # SARIF 2.1.0 & self-contained Carbon-Slate HTML/SVG graph exporter
-│   ├── sh-tui/                    # Panic-safe 60fps ratatui 3-pane workspace + ring-buffer log drawer
-│   └── sh-ai/                     # Opt-in minimal-context (<= 2 KB) HTTP/TLS patcher & safe diff applier
+│   ├── smg-report/                 # SARIF 2.1.0 & self-contained Carbon-Slate HTML/SVG graph exporter
+│   ├── smg-tui/                    # Panic-safe 60fps ratatui 3-pane workspace + ring-buffer log drawer
+│   └── smg-ai/                     # Opt-in minimal-context (<= 2 KB) HTTP/TLS patcher & safe diff applier
 └── fixtures/
     ├── vuln-payment-node/         # Runnable multi-file Node/TS double-spend race, SQLi & auth fixture
     └── vuln-auth-rust/            # Multi-file Rust Axum unauthenticated role-mutation fixture

@@ -25,7 +25,7 @@ lock_guards = [
   "$transaction",
 ]
 
-# Intentionally unauthenticated routes (suppresses VF-AUTH-001 only; never suppresses SQLi/CMDi/Race)
+# Intentionally unauthenticated routes (suppresses SMG-AUTH-001 only; never suppresses SQLi/CMDi/Race)
 public_routes = [
   "/health",
   "/healthz",
@@ -49,7 +49,7 @@ max_file_bytes = 2097152
 # Default boot command and optional loopback base_url for live bwrap proofs
 # boot_cmd = "node server.mjs"
 # base_url = "http://127.0.0.1:3000"
-# Seeded dual-tenant headers for live VF-IDOR-001 verification inside bwrap
+# Seeded dual-tenant headers for live SMG-IDOR-001 verification inside bwrap
 # user_a_header = "Authorization: Bearer token-user-a"
 # user_b_header = "Authorization: Bearer token-user-b"
 # probe_body = '{"amount": 100}'

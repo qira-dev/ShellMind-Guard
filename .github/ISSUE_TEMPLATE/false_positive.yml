@@ -8,7 +8,7 @@ body:
     attributes:
       label: Rule ID
       description: Which ShellMind Guard rule is involved?
-      placeholder: "e.g. VF-SQLI-001, VF-IDOR-001, VF-RACE-001, VF-SEC-ENTROPY"
+      placeholder: "e.g. SMG-SQLI-001, SMG-IDOR-001, SMG-RACE-001, SMG-SEC-ENTROPY"
     validations:
       required: true
 

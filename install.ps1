@@ -31,6 +31,12 @@ function Install-FromSource {
         }
         $BuiltExe = Join-Path $CargoRoot "bin\shellmind-guard.exe"
         Copy-Item -Path $BuiltExe -Destination (Join-Path $InstallDir "shellmind-guard.exe") -Force
+        $BuiltSmg = Join-Path $CargoRoot "bin\smg.exe"
+        if (Test-Path $BuiltSmg) {
+            Copy-Item -Path $BuiltSmg -Destination (Join-Path $InstallDir "smg.exe") -Force
+        } else {
+            Copy-Item -Path $BuiltExe -Destination (Join-Path $InstallDir "smg.exe") -Force
+        }
     } finally {
         Remove-Item -Recurse -Force $CargoRoot -ErrorAction SilentlyContinue
     }
@@ -57,9 +63,12 @@ if (-not $FromSource) {
         $ExpectedHash = ($ExpectedLine -split "\s+")[0].ToUpperInvariant()
         $ActualHash = (Get-FileHash -Path $ZipPath -Algorithm SHA256).Hash.ToUpperInvariant()
         if ($ExpectedHash -ne $ActualHash) {
-            throw "SHA256 checksum mismatch for $Asset! Expected $ExpectedHash, got $ActualHash"
+            throw [System.Security.SecurityException]"SHA256 checksum mismatch for $Asset! Expected $ExpectedHash, got $ActualHash"
         }
         Expand-Archive -Path $ZipPath -DestinationPath $InstallDir -Force
+    } catch [System.Security.SecurityException] {
+        Write-Error $_.Exception.Message
+        exit 1
     } catch {
         Write-Warning "Prebuilt release verification failed ($_); falling back to source build."
         Install-FromSource
@@ -71,15 +80,22 @@ if (-not $FromSource) {
 }
 
 $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
-if ($UserPath -notlike "*$InstallDir*") {
-    [Environment]::SetEnvironmentVariable("Path", "$UserPath;$InstallDir", "User")
-    $env:Path = "$env:Path;$InstallDir"
+$NormalizedUserPath = if ([string]::IsNullOrWhiteSpace($UserPath)) { "" } else { $UserPath.TrimEnd(';') }
+$PathParts = if ($NormalizedUserPath) { $NormalizedUserPath -split ';' } else { @() }
+if ($PathParts -notcontains $InstallDir) {
+    $NewUserPath = if ($NormalizedUserPath) { "$NormalizedUserPath;$InstallDir" } else { $InstallDir }
+    [Environment]::SetEnvironmentVariable("Path", $NewUserPath, "User")
+    $env:Path = if ([string]::IsNullOrWhiteSpace($env:Path)) { $InstallDir } else { "$($env:Path.TrimEnd(';'));$InstallDir" }
 }
 
-$ExePath = Join-Path $InstallDir "shellmind-guard.exe"
-if (Test-Path $ExePath) {
-    & $ExePath --version
-} else {
-    shellmind-guard --version
+$SmgExePath = Join-Path $InstallDir "smg.exe"
+$LegacyExePath = Join-Path $InstallDir "shellmind-guard.exe"
+if (-not (Test-Path $SmgExePath) -and (Test-Path $LegacyExePath)) {
+    Copy-Item -Path $LegacyExePath -Destination $SmgExePath -Force
 }
-Write-Host "[ShellMind Guard] Installed. Run 'shellmind-guard scan .' or 'shellmind-guard mcp'."
+if (Test-Path $SmgExePath) {
+    & $SmgExePath --version
+} else {
+    smg --version
+}
+Write-Host "[ShellMind Guard] Installed 'smg' (and 'shellmind-guard' alias). Run 'smg' for TUI, 'smg scan .', or 'smg mcp'."

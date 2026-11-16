@@ -50,29 +50,33 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
 
       - name: Build release binary
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Package Unix archive
         if: runner.os != 'Windows'
         run: |
           mkdir -p dist
+          cp "target/${{ matrix.target }}/release/smg" "dist/smg"
           cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.bin }}"
-          chmod +x "dist/${{ matrix.bin }}"
-          tar -czf "${{ matrix.artifact }}" -C dist "${{ matrix.bin }}"
+          chmod +x "dist/smg" "dist/${{ matrix.bin }}"
+          tar -czf "${{ matrix.artifact }}" -C dist smg "${{ matrix.bin }}"
 
       - name: Package Windows archive
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "target\${{ matrix.target }}\release\smg.exe" "dist\smg.exe"
           Copy-Item "target\${{ matrix.target }}\release\${{ matrix.bin }}" "dist\${{ matrix.bin }}"
-          Compress-Archive -Path "dist\${{ matrix.bin }}" -DestinationPath "${{ matrix.artifact }}" -Force
+          Compress-Archive -Path "dist\smg.exe","dist\${{ matrix.bin }}" -DestinationPath "${{ matrix.artifact }}" -Force
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4

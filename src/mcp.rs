@@ -1,9 +1,9 @@
 use crate::{ScanRunOptions, execute_scan_pipeline, write_ci_workflow};
 use anyhow::Result;
 use serde_json::{Value, json};
-use sh_ai::build_minimal_patch_prompt;
-use sh_core::{ShellMindGuardConfig, StateStore, scan_repository};
-use sh_graph::{analyze_codebase_cached, collect_deep_schema_findings};
+use smg_ai::build_minimal_patch_prompt;
+use smg_core::{ShellMindGuardConfig, StateStore, scan_repository};
+use smg_graph::{analyze_codebase_cached, collect_deep_schema_findings};
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
@@ -26,6 +26,21 @@ pub fn run_stdio_server() -> Result<()> {
             .read_line(&mut line)?;
         if n == 0 {
             break;
+        }
+        if n as u64 == MAX_MCP_LINE_BYTES && !line.ends_with('\n') {
+            // Drain remaining bytes up to newline or EOF so the stream does not split into two frames
+            let mut discard = Vec::new();
+            let _ = reader.read_until(b'\n', &mut discard);
+            let err_resp = json_error(
+                Value::Null,
+                -32600,
+                "Invalid Request: JSON-RPC line exceeds 4 MiB limit",
+            );
+            let encoded = serde_json::to_string(&err_resp)?;
+            writer.write_all(encoded.as_bytes())?;
+            writer.write_all(b"\n")?;
+            writer.flush()?;
+            continue;
         }
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -150,21 +165,21 @@ fn tool_definitions() -> Value {
                     },
                     "deep": {
                         "type": "boolean",
-                        "description": "Enable Phase 10 deep AST/OpenAPI schema validation (VF-FUZZ-SCHEMA)"
+                        "description": "Enable Phase 10 deep AST/OpenAPI schema validation (SMG-FUZZ-SCHEMA)"
                     }
                 }
             }
         },
         {
             "name": "shellmind_guard_explain_finding",
-            "description": "Inspect a specific finding ID (e.g. VF-RACE-002, VF-SQLI-001, VF-FUZZ-001) and return its full cross-file trace hops, source code excerpt, remediation, and replay command.",
+            "description": "Inspect a specific finding ID (e.g. SMG-RACE-002, SMG-SQLI-001, SMG-FUZZ-001) and return its full cross-file trace hops, source code excerpt, remediation, and replay command.",
             "inputSchema": {
                 "type": "object",
                 "required": ["finding_id"],
                 "properties": {
                     "finding_id": {
                         "type": "string",
-                        "description": "Finding ID or rule ID returned by shellmind_guard_scan (e.g. VF-AUTH-001, VF-FUZZ-SCHEMA)"
+                        "description": "Finding ID or rule ID returned by shellmind_guard_scan (e.g. SMG-AUTH-001, SMG-FUZZ-SCHEMA)"
                     },
                     "path": {
                         "type": "string",
@@ -246,7 +261,31 @@ fn validate_mcp_target_path(raw_path: &str) -> Result<PathBuf> {
         .unwrap_or_else(|_| PathBuf::from("."));
     let tmp = std::fs::canonicalize(std::env::temp_dir()).unwrap_or_else(|_| std::env::temp_dir());
     let canon = normalize_and_resolve_path(&cwd, Path::new(raw_path));
-    if !canon.starts_with(&cwd) && !canon.starts_with(&tmp) {
+
+    let env_root = std::env::var("SHELLMIND_GUARD_ROOT")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| normalize_and_resolve_path(&cwd, Path::new(s.trim())));
+
+    // Block sensitive credential/system dot-directories
+    let has_sensitive_component = canon.components().any(|c| {
+        matches!(
+            c.as_os_str().to_str(),
+            Some(".ssh" | ".gnupg" | ".aws" | ".kube" | ".docker" | ".netrc")
+        )
+    });
+    if has_sensitive_component {
+        anyhow::bail!(
+            "Refusing MCP access to sensitive credential path: {}",
+            canon.display()
+        );
+    }
+
+    let in_allowed = canon.starts_with(&cwd)
+        || canon.starts_with(&tmp)
+        || env_root.as_ref().is_some_and(|r| canon.starts_with(r));
+
+    if !in_allowed {
         anyhow::bail!(
             "Refusing MCP access outside workspace root ({}) or temp dir: {}",
             cwd.display(),
@@ -283,7 +322,7 @@ fn handle_tool_call(params: &Value) -> Result<Value> {
             let min_confidence = args
                 .get("min_confidence")
                 .and_then(|v| v.as_str())
-                .and_then(sh_graph::Confidence::parse);
+                .and_then(smg_graph::Confidence::parse);
 
             let deep = args.get("deep").and_then(|v| v.as_bool()).unwrap_or(false);
 
@@ -360,7 +399,7 @@ fn handle_tool_call(params: &Value) -> Result<Value> {
                 "finding": finding,
                 "remediation": finding.remediation,
                 "source_context": prompt_excerpt,
-                "replay_cmd": format!("shellmind-guard replay {}", finding.id),
+                "replay_cmd": format!("smg replay {}", finding.id),
             })
         }
         "shellmind_guard_init" => {
@@ -377,6 +416,16 @@ fn handle_tool_call(params: &Value) -> Result<Value> {
                 anyhow::bail!(
                     "{} already exists (pass overwrite: true to replace)",
                     cfg_target.display()
+                );
+            }
+            let wf_target = root
+                .join(".github")
+                .join("workflows")
+                .join("shellmind-guard.yml");
+            if ci && wf_target.exists() && !overwrite {
+                anyhow::bail!(
+                    "{} already exists (pass overwrite: true to replace)",
+                    wf_target.display()
                 );
             }
             let (detected, config_path) = ShellMindGuardConfig::detect_and_write_init(&root)?;
@@ -448,7 +497,7 @@ mod tests {
 
     #[test]
     fn test_mcp_shellmind_guard_scan_and_explain_end_to_end() {
-        let dir = std::env::temp_dir().join("sh_mcp_e2e_unit");
+        let dir = std::env::temp_dir().join("smg_mcp_e2e_unit");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("src")).unwrap();
         fs::write(
@@ -472,13 +521,13 @@ mod tests {
         let parsed: Value = serde_json::from_str(text).unwrap();
         let findings = parsed["findings"].as_array().unwrap();
         assert!(
-            findings.iter().any(|f| f["rule_id"] == "VF-SQLI-001"),
+            findings.iter().any(|f| f["rule_id"] == "SMG-SQLI-001"),
             "MCP scan must return SQLi finding: {}",
             text
         );
         let sqli_obj = findings
             .iter()
-            .find(|f| f["rule_id"] == "VF-SQLI-001")
+            .find(|f| f["rule_id"] == "SMG-SQLI-001")
             .unwrap();
         assert_eq!(sqli_obj["file"], "src/app.ts");
         assert_eq!(sqli_obj["line"], 1);
@@ -503,7 +552,7 @@ mod tests {
             .unwrap();
         assert!(exp_txt.contains("SELECT * FROM t"));
 
-        // Verify schema consistency (`deep` layer + `hook` init) and VF-FUZZ-SCHEMA resolution via explain_finding
+        // Verify schema consistency (`deep` layer + `hook` init) and SMG-FUZZ-SCHEMA resolution via explain_finding
         let defs = tool_definitions();
         let tools = defs.as_array().unwrap();
         let scan_schema_desc = tools[0]["inputSchema"]["properties"]["layers"]["description"]
@@ -534,8 +583,8 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .find(|f| f["rule_id"] == "VF-FUZZ-SCHEMA")
-            .expect("deep MCP scan must emit VF-FUZZ-SCHEMA");
+            .find(|f| f["rule_id"] == "SMG-FUZZ-SCHEMA")
+            .expect("deep MCP scan must emit SMG-FUZZ-SCHEMA");
         let explain_fuzz = json!({
             "jsonrpc": "2.0",
             "id": 13,

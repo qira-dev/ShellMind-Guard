@@ -1,10 +1,10 @@
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
-use sh_core::{
+use smg_core::{
     AdvisoryRecord, AdvisoryStore, Language, ShellMindGuardConfig, parse_osv_value_into_records,
     scan_repository,
 };
-use sh_graph::deps::{ResolvedDependency, extract_resolved_dependencies};
+use smg_graph::deps::{ResolvedDependency, extract_resolved_dependencies};
 use std::collections::BTreeSet;
 use std::fs;
 use std::net::IpAddr;
@@ -146,6 +146,22 @@ pub fn extract_project_dependencies(
     Ok(deps)
 }
 
+fn read_bounded_osv_body(resp: reqwest::blocking::Response) -> Result<String> {
+    use std::io::Read;
+    const MAX_OSV_BODY_BYTES: usize = 16 * 1024 * 1024;
+    let mut buf = Vec::new();
+    resp.take((MAX_OSV_BODY_BYTES + 1) as u64)
+        .read_to_end(&mut buf)
+        .context("Failed reading OSV response body")?;
+    if buf.len() > MAX_OSV_BODY_BYTES {
+        bail!(
+            "OSV response body exceeded {} bytes limit",
+            MAX_OSV_BODY_BYTES
+        );
+    }
+    String::from_utf8(buf).context("OSV response body is not valid UTF-8")
+}
+
 /// Queries OSV `/v1/querybatch` + `/v1/vulns/<id>` for `deps` and upserts parsed
 /// vulnerability records into the local SQLite `AdvisoryStore`.
 pub fn sync_osv_to_store(
@@ -182,7 +198,7 @@ pub fn sync_osv_to_store(
             .send()
             .with_context(|| format!("OSV querybatch request to '{}' failed", querybatch_url))?;
         let status = resp.status();
-        let body = resp.text().unwrap_or_default();
+        let body = read_bounded_osv_body(resp)?;
         if !status.is_success() {
             bail!(
                 "OSV querybatch endpoint returned HTTP {} ({} bytes)",
@@ -214,16 +230,24 @@ pub fn sync_osv_to_store(
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
 
-    let mut records: Vec<AdvisoryRecord> = Vec::new();
-    for vuln_id in &unique_ids {
+    let mut records_upserted = 0usize;
+    let mut batch: Vec<AdvisoryRecord> = Vec::new();
+    const UPSERT_BATCH_SIZE: usize = 25;
+    for vuln_id in unique_ids.iter().take(2000) {
         let vuln_url = append_endpoint_segments(&base_url, &["v1", "vulns", vuln_id])?;
         let resp = client
             .get(vuln_url.clone())
             .send()
             .with_context(|| format!("OSV vuln fetch for '{}' failed", vuln_id))?;
         let status = resp.status();
-        let body = resp.text().unwrap_or_default();
+        let body = read_bounded_osv_body(resp)?;
+        if status.as_u16() == 404 || status.as_u16() == 410 {
+            continue;
+        }
         if !status.is_success() {
+            if !batch.is_empty() {
+                let _ = store.upsert_advisories(&batch)?;
+            }
             bail!(
                 "OSV vuln endpoint returned HTTP {} for '{}'",
                 status.as_u16(),
@@ -233,14 +257,19 @@ pub fn sync_osv_to_store(
         let val: Value = serde_json::from_str(&body)
             .with_context(|| format!("OSV vuln '{}' returned invalid JSON", vuln_id))?;
         let mut parsed_records = parse_osv_value_into_records(&val, now_epoch)?;
-        records.append(&mut parsed_records);
+        batch.append(&mut parsed_records);
+        if batch.len() >= UPSERT_BATCH_SIZE {
+            records_upserted += store.upsert_advisories(&batch)?;
+            batch.clear();
+        }
     }
-
-    let records_upserted = store.upsert_advisories(&records)?;
+    if !batch.is_empty() {
+        records_upserted += store.upsert_advisories(&batch)?;
+    }
 
     Ok(DepsSyncSummary {
         dependencies_queried: deps.len(),
-        unique_vulns_fetched: unique_ids.len(),
+        unique_vulns_fetched: unique_ids.len().min(2000),
         records_upserted,
     })
 }
@@ -257,7 +286,7 @@ pub fn import_osv_file_to_store(file: &Path, store: &mut AdvisoryStore) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sh_graph::deps::scan_dependencies_with_store;
+    use smg_graph::deps::scan_dependencies_with_store;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
