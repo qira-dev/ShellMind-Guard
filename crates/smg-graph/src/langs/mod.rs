@@ -557,11 +557,7 @@ fn is_static_string_only_call(stmt: &str) -> bool {
     if trimmed.starts_with('"') && trimmed.ends_with('"') && !has_interp {
         return true;
     }
-    if trimmed.starts_with('\'') && trimmed.ends_with('\'') && !has_interp && !trimmed.contains('.')
-    {
-        return true;
-    }
-    false
+    trimmed.starts_with('\'') && trimmed.ends_with('\'') && !has_interp && !trimmed.contains('.')
 }
 
 /// Evaluates an extracted function/method/handler body across guards, sinks, IDOR, CSRF, and taint.

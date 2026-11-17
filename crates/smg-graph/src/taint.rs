@@ -865,7 +865,7 @@ fn has_ownership_filter_with_env(code: &str, env: Option<&TaintEnv>) -> bool {
     // Check if an authenticated user principal is passed into a DB CRUD statement (single or multi-line),
     // using active non-literal code so log strings containing `"req.user"` cannot spoof ownership.
     let active_low = strip_comments_and_non_attr_strings(&masked).to_ascii_lowercase();
-    if is_db_crud_stmt(&low)
+    is_db_crud_stmt(&low)
         && (active_low.contains("req.user")
             || active_low.contains("request.user")
             || active_low.contains("session.user")
@@ -873,10 +873,6 @@ fn has_ownership_filter_with_env(code: &str, env: Option<&TaintEnv>) -> bool {
             || active_low.contains("currentuser")
             || active_low.contains("auth.uid")
             || active_low.contains("claims."))
-    {
-        return true;
-    }
-    false
 }
 
 fn is_universal_sanitizer(expr: &str) -> bool {
@@ -1234,13 +1230,9 @@ fn is_db_crud_stmt(code: &str) -> bool {
     {
         return true;
     }
-    if (low.contains("select ") && low.contains(" from ") && low.contains(" where "))
+    (low.contains("select ") && low.contains(" from ") && low.contains(" where "))
         || (low.contains("update ") && low.contains(" set ") && low.contains(" where "))
         || (low.contains("delete from ") && low.contains(" where "))
-    {
-        return true;
-    }
-    false
 }
 
 #[derive(Clone, Copy)]
