@@ -3423,20 +3423,20 @@ pub fn run_tui(
 fn open_path_in_browser(path: &std::path::Path) -> std::io::Result<std::process::Child> {
     #[cfg(target_os = "macos")]
     {
-        return Command::new("open")
+        Command::new("open")
             .arg(path)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .spawn();
+            .spawn()
     }
     #[cfg(target_os = "windows")]
     {
-        return Command::new("cmd")
+        Command::new("cmd")
             .args(["/C", "start", ""])
             .arg(path)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .spawn();
+            .spawn()
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {

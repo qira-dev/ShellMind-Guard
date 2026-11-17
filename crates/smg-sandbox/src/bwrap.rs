@@ -948,13 +948,13 @@ mod imp {
         use std::os::windows::io::AsRawHandle;
         use std::process::Child;
 
-        type HANDLE = *mut core::ffi::c_void;
-        type BOOL = i32;
-        type DWORD = u32;
+        type WinHandle = *mut core::ffi::c_void;
+        type WinBool = i32;
+        type WinDword = u32;
 
         const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS: i32 = 9;
-        const JOB_OBJECT_LIMIT_PROCESS_MEMORY: DWORD = 0x0000_0100;
-        const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: DWORD = 0x0000_2000;
+        const JOB_OBJECT_LIMIT_PROCESS_MEMORY: WinDword = 0x0000_0100;
+        const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: WinDword = 0x0000_2000;
 
         #[repr(C)]
         struct IoCounters {
@@ -970,13 +970,13 @@ mod imp {
         struct JobObjectBasicLimitInformation {
             per_process_user_time_limit: i64,
             per_job_user_time_limit: i64,
-            limit_flags: DWORD,
+            limit_flags: WinDword,
             minimum_working_set_size: usize,
             maximum_working_set_size: usize,
-            active_process_limit: DWORD,
+            active_process_limit: WinDword,
             affinity: usize,
-            priority_class: DWORD,
-            scheduling_class: DWORD,
+            priority_class: WinDword,
+            scheduling_class: WinDword,
         }
 
         #[repr(C)]
@@ -993,19 +993,19 @@ mod imp {
             fn CreateJobObjectW(
                 lp_job_attributes: *mut core::ffi::c_void,
                 lp_name: *const u16,
-            ) -> HANDLE;
+            ) -> WinHandle;
             fn SetInformationJobObject(
-                h_job: HANDLE,
+                h_job: WinHandle,
                 job_object_information_class: i32,
                 lp_job_object_information: *const core::ffi::c_void,
-                cb_job_object_information_length: DWORD,
-            ) -> BOOL;
-            fn AssignProcessToJobObject(h_job: HANDLE, h_process: HANDLE) -> BOOL;
-            fn TerminateJobObject(h_job: HANDLE, u_exit_code: u32) -> BOOL;
-            fn CloseHandle(h_object: HANDLE) -> BOOL;
+                cb_job_object_information_length: WinDword,
+            ) -> WinBool;
+            fn AssignProcessToJobObject(h_job: WinHandle, h_process: WinHandle) -> WinBool;
+            fn TerminateJobObject(h_job: WinHandle, u_exit_code: u32) -> WinBool;
+            fn CloseHandle(h_object: WinHandle) -> WinBool;
         }
 
-        pub struct JobHandle(HANDLE);
+        pub struct JobHandle(WinHandle);
         // SAFETY: Win32 Job Object handles are kernel objects safe to close/terminate from any thread.
         unsafe impl Send for JobHandle {}
         unsafe impl Sync for JobHandle {}
@@ -1030,13 +1030,13 @@ mod imp {
                         h,
                         JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
                         (&raw const info).cast(),
-                        core::mem::size_of::<JobObjectExtendedLimitInformation>() as DWORD,
+                        core::mem::size_of::<JobObjectExtendedLimitInformation>() as WinDword,
                     );
                     if ok == 0 {
                         CloseHandle(h);
                         return None;
                     }
-                    let proc_h = child.as_raw_handle() as HANDLE;
+                    let proc_h = child.as_raw_handle() as WinHandle;
                     if AssignProcessToJobObject(h, proc_h) == 0 {
                         CloseHandle(h);
                         return None;
