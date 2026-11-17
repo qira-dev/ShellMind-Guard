@@ -156,7 +156,7 @@ fn tool_definitions() -> Value {
                     "layers": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Optional layer filters: auth, race, taint, sqli, cmdi, path, ssrf, xss, csrf, idor, secrets, config, deps, frontend, engine, memory, mobile, deep"
+                        "description": "Optional layer filters: auth, race, taint, sqli, cmdi, path, ssrf, xss, csrf, idor, secrets, config, deps, frontend, cicd, k8s, dos, zip, crypto, queue, api, ai, oauth, smuggle, state, engine, memory, mobile, hw, web3, pqc, deep"
                     },
                     "min_confidence": {
                         "type": "string",
@@ -343,27 +343,47 @@ fn handle_tool_call(params: &Value) -> Result<Value> {
             })?;
 
             const MAX_MCP_FINDINGS: usize = 50;
+            const MAX_MCP_RESPONSE_BYTES: usize = 32 * 1024;
             let total_findings = outcome.graph.findings.len();
-            let truncated = total_findings > MAX_MCP_FINDINGS;
-            let findings_slice: Vec<_> = outcome
+            let mut findings_slice: Vec<_> = outcome
                 .graph
                 .findings
                 .into_iter()
                 .take(MAX_MCP_FINDINGS)
                 .collect();
-
-            json!({
-                "ok": true,
-                "elapsed_ms": outcome.elapsed_ms,
-                "parsed_files": outcome.graph.parsed_files,
-                "symbol_count": outcome.graph.symbol_count,
-                "edge_count": outcome.graph.edge_count,
-                "route_entries": outcome.graph.route_entries,
-                "findings_count": total_findings,
-                "truncated": truncated,
-                "findings": findings_slice,
-                "delta": outcome.delta,
-            })
+            let mut budget_trimmed = false;
+            loop {
+                let candidate = json!({
+                    "ok": true,
+                    "elapsed_ms": outcome.elapsed_ms,
+                    "parsed_files": outcome.graph.parsed_files,
+                    "symbol_count": outcome.graph.symbol_count,
+                    "edge_count": outcome.graph.edge_count,
+                    "route_entries": outcome.graph.route_entries,
+                    "findings_count": total_findings,
+                    "returned_count": findings_slice.len(),
+                    "truncated": total_findings > findings_slice.len() || budget_trimmed,
+                    "budget_bytes": MAX_MCP_RESPONSE_BYTES,
+                    "findings": findings_slice,
+                    "delta": outcome.delta,
+                });
+                let encoded = candidate.to_string();
+                if encoded.len() <= MAX_MCP_RESPONSE_BYTES || findings_slice.is_empty() {
+                    let mut final_val = candidate;
+                    if let Some(obj) = final_val.as_object_mut() {
+                        obj.insert("response_bytes".into(), json!(encoded.len()));
+                    }
+                    break final_val;
+                }
+                budget_trimmed = true;
+                if let Some(long_witness) =
+                    findings_slice.iter_mut().find(|f| f.witness_path.len() > 2)
+                {
+                    long_witness.witness_path.truncate(2);
+                } else {
+                    findings_slice.pop();
+                }
+            }
         }
         "shellmind_guard_explain_finding" => {
             let finding_id = args
@@ -599,6 +619,43 @@ mod tests {
         });
         let explain_fuzz_resp = handle_jsonrpc_line(&explain_fuzz.to_string()).unwrap();
         assert_eq!(explain_fuzz_resp["result"]["isError"], false);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_mcp_scan_budget_caps_under_32_kib() {
+        let dir = std::env::temp_dir().join(format!("smg-mcp-budget-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("src")).unwrap();
+
+        let mut big_routes = String::new();
+        for i in 0..80 {
+            big_routes.push_str(&format!(
+                "app.post('/admin/item-{i}', (req, res) => {{ db.query(\"SELECT * FROM t WHERE x = \" + req.body.q{i}); res.send(req.body.q{i}); }});\n"
+            ));
+        }
+        fs::write(dir.join("src/many.ts"), big_routes).unwrap();
+
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": 99,
+            "method": "tools/call",
+            "params": {
+                "name": "shellmind_guard_scan",
+                "arguments": { "path": dir.display().to_string() }
+            }
+        });
+        let resp = handle_jsonrpc_line(&req.to_string()).unwrap();
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["ok"], true);
+        assert!(
+            text.len() <= 34 * 1024,
+            "Serialized MCP scan payload should obey <=32 KiB finding budget (got {} bytes)",
+            text.len()
+        );
+        assert!(parsed["response_bytes"].as_u64().unwrap() <= 32 * 1024);
 
         let _ = fs::remove_dir_all(&dir);
     }

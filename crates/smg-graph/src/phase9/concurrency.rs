@@ -595,7 +595,8 @@ fn scopes_compatible(
 /// Global Cross-Function Lock-Order Inversion Solver (`A -> B` and `B -> A` deadlock cycles).
 pub fn solve_cross_function_deadlocks(
     graph: &DiGraph<SymbolInfo, ()>,
-    resolved_callee_map: &HashMap<(usize, String), Vec<NodeIndex>>,
+    arena: &crate::arena::SymbolArena,
+    resolved_callee_map: &HashMap<(usize, crate::arena::SymbolId), Vec<NodeIndex>>,
 ) -> Vec<LatticeFinding> {
     let n = graph.node_count();
     if n == 0 {
@@ -629,7 +630,9 @@ pub fn solve_cross_function_deadlocks(
                 continue;
             }
             for callee in &cur_sym.calls {
-                if let Some(nexts) = resolved_callee_map.get(&(cur.index(), callee.clone())) {
+                if let Some(cid) = arena.get(callee)
+                    && let Some(nexts) = resolved_callee_map.get(&(cur.index(), cid))
+                {
                     for &nx in nexts {
                         if visited.insert(nx.index()) && visited.len() <= 128 {
                             q.push_back((nx, depth + 1));
@@ -658,7 +661,9 @@ pub fn solve_cross_function_deadlocks(
                 });
         }
         for lhc in &sym.locks_held_calls {
-            if let Some(callees) = resolved_callee_map.get(&(u.index(), lhc.callee.clone())) {
+            if let Some(cid) = arena.get(&lhc.callee)
+                && let Some(callees) = resolved_callee_map.get(&(u.index(), cid))
+            {
                 for &v in callees {
                     for (lock_b, hop_b) in &reachable_locks[v.index()] {
                         if &lhc.lock_name != lock_b {
@@ -735,6 +740,7 @@ pub fn solve_cross_function_deadlocks(
                 missing_guard: GuardKind::LockOrdering,
                 witness_path: witness,
                 remediation: "Enforce a single canonical lock acquisition hierarchy (`std::scoped_lock(a, b)`, consistent global ordering) across all call paths.".into(),
+                proof_reasons: vec!["LockOrderInversionCycle".into(), "U32SymbolArena".into()],
             });
         }
         for ((b2, c), raw_bc) in &order_edges {
@@ -783,6 +789,7 @@ pub fn solve_cross_function_deadlocks(
                     missing_guard: GuardKind::LockOrdering,
                     witness_path: witness,
                     remediation: "Enforce a single canonical lock acquisition hierarchy (`std::scoped_lock`, consistent global ordering) across all call paths.".into(),
+                    proof_reasons: vec!["LockOrder3Cycle".into(), "U32SymbolArena".into()],
                 });
             }
         }

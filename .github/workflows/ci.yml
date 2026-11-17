@@ -23,7 +23,9 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Run Workspace Tests
+        env:
+          SMG_ENFORCE_PRECISION_GATE: "1"
         run: cargo test --workspace --locked
       - name: Self-Scan Dogfood Gate (Ubuntu)
         if: runner.os == 'Linux'
-        run: cargo run --locked -- scan . --format sarif --sarif /tmp/self.sarif
+        run: cargo run --locked -- scan crates --ci --format sarif --sarif /tmp/self.sarif

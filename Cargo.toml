@@ -8,6 +8,10 @@ members = [
     "crates/smg-tui",
     "crates/smg-report",
     "crates/smg-ai",
+    "crates/smg-hw",
+    "crates/smg-web3",
+    "crates/smg-pqc",
+    "crates/smg-enterprise",
 ]
 
 [workspace.package]
@@ -84,8 +88,20 @@ smg-sandbox = { path = "crates/smg-sandbox" }
 smg-tui = { path = "crates/smg-tui" }
 smg-report = { path = "crates/smg-report" }
 smg-ai = { path = "crates/smg-ai" }
+smg-hw = { path = "crates/smg-hw", optional = true }
+smg-web3 = { path = "crates/smg-web3", optional = true }
+smg-pqc = { path = "crates/smg-pqc", optional = true }
+smg-enterprise = { path = "crates/smg-enterprise", optional = true }
+
+[features]
+default = ["hw", "web3", "pqc", "enterprise"]
+hw = ["dep:smg-hw"]
+web3 = ["dep:smg-web3"]
+pqc = ["dep:smg-pqc"]
+enterprise = ["dep:smg-enterprise"]
 
 [profile.release]
-codegen-units = 16
+codegen-units = 1
+lto = "thin"
 strip = true
-opt-level = 3
+opt-level = "s"

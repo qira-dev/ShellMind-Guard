@@ -1,0 +1,18 @@
+[package]
+name = "smg-enterprise"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+base64 = "0.23"
+blake3.workspace = true
+hex = "0.4"
+reqwest.workspace = true
+ring = "0.17"
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+smg-core = { path = "../smg-core" }
+smg-graph = { path = "../smg-graph" }

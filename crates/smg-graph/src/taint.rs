@@ -55,6 +55,12 @@ struct TaintEnv {
     var_cleared_masks: HashMap<String, u8>,
     /// Phase 10: `(obj_var, field_name) -> sanitizer bits cleared when creating object literal`.
     object_cleared_fields: HashMap<(String, String), u8>,
+    /// Wave 3A: variables known to hold pure compile-time/string literals (must hold on all paths).
+    safe_literals: HashSet<String>,
+    /// Wave 3A: handler/callback lookup maps (`handlers = { a: fnA, b: fnB }`).
+    handler_maps: HashMap<String, Vec<String>>,
+    /// Wave 3A: local callable alias bound from a handler map (`const fn = handlers[k]`).
+    handler_aliases: HashMap<String, Vec<String>>,
 }
 
 impl TaintEnv {
@@ -97,8 +103,29 @@ impl TaintEnv {
                 .entry(k.clone())
                 .or_insert_with(|| v.clone());
         }
-        // `var_cleared_masks` & `object_cleared_fields` are must-be-sanitized bitmasks:
-        // keep only bits guaranteed cleared along BOTH joined control-flow branches.
+        // `var_cleared_masks`, `object_cleared_fields`, and `safe_literals` are must-properties:
+        // keep only facts guaranteed along BOTH joined control-flow branches.
+        self.safe_literals.retain(|k| {
+            other.safe_literals.contains(k)
+                && !self.direct.contains_key(k)
+                && !self.params.contains_key(k)
+        });
+        for (map_var, targets) in &other.handler_maps {
+            let entry = self.handler_maps.entry(map_var.clone()).or_default();
+            for t in targets {
+                if !entry.contains(t) {
+                    entry.push(t.clone());
+                }
+            }
+        }
+        for (alias, targets) in &other.handler_aliases {
+            let entry = self.handler_aliases.entry(alias.clone()).or_default();
+            for t in targets {
+                if !entry.contains(t) {
+                    entry.push(t.clone());
+                }
+            }
+        }
         self.var_cleared_masks.retain(|k, prev| {
             if let Some(ov) = other.var_cleared_masks.get(k) {
                 *prev &= *ov;
@@ -194,7 +221,32 @@ fn sql_verb_re() -> &'static Regex {
 
 pub(crate) const MAX_AST_WALK_DEPTH: usize = 512;
 
-pub(crate) fn strip_comments_simple(src: &str) -> String {
+/// Returns `true` when a source line is a string-pattern matcher, regex definition,
+/// AST codemod literal replacement, or rule catalog example rather than a live runtime call/config.
+pub fn is_pattern_matcher_or_doc_line(line: &str) -> bool {
+    let t = line.trim();
+    t.contains(".contains(\"")
+        || t.contains(".contains('")
+        || t.contains("has_token_boundary(")
+        || t.contains("has_ident_word(")
+        || t.contains("has_boundary_match(")
+        || t.contains(".starts_with(\"")
+        || t.contains(".ends_with(\"")
+        || t.contains(".replace(\"")
+        || t.contains("Regex::new")
+        || t.starts_with("r#\"")
+        || t.starts_with("r\"")
+        || t.starts_with("vulnerable_example:")
+        || t.starts_with("fixed_example:")
+        || t.starts_with("title: \"")
+        || t.starts_with("description: \"")
+        || t.starts_with("remediation: \"")
+        || t.starts_with("algorithm: \"")
+        || (t.starts_with("(\"") && (t.ends_with("\"),") || t.ends_with("\")")))
+        || (t.starts_with('"') && t.ends_with("\","))
+}
+
+pub fn strip_comments_simple(src: &str) -> String {
     let bytes = src.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0usize;
@@ -1211,7 +1263,7 @@ fn has_html_markup_lit(text: &str) -> bool {
     html_markup_re().is_match(text)
 }
 
-fn is_call_sanitizer_for(ftxt: &str, full_txt: &str, sink_mask: u8) -> bool {
+pub(crate) fn is_call_sanitizer_for(ftxt: &str, full_txt: &str, sink_mask: u8) -> bool {
     if is_universal_sanitizer(full_txt) {
         return true;
     }
@@ -1632,13 +1684,47 @@ fn push_unique_hit(list: &mut Vec<LocalStaticFinding>, hit: LocalStaticFinding) 
 fn is_safe_sql_tagged_template(node: Node, src: &[u8]) -> bool {
     if let Some(func) = node.child_by_field_name("function") {
         let ftxt = node_text(func, src).trim();
-        if !ftxt.contains("Unsafe")
-            && (ftxt.ends_with("$queryRaw")
-                || ftxt.ends_with("$executeRaw")
-                || ftxt == "sql"
-                || ftxt.ends_with(".sql"))
-            && let Some(args) = node.child_by_field_name("arguments")
-            && args.kind() == "template_string"
+        let base_ftxt = ftxt.split('<').next().unwrap_or(ftxt).trim();
+        let is_safe_tag = !base_ftxt.contains("Unsafe")
+            && (base_ftxt.ends_with("$queryRaw")
+                || base_ftxt.ends_with("$executeRaw")
+                || base_ftxt == "sql"
+                || base_ftxt.ends_with(".sql"));
+        if is_safe_tag {
+            if let Some(args) = node.child_by_field_name("arguments")
+                && args.kind() == "template_string"
+            {
+                return true;
+            }
+            let mut c = node.walk();
+            if node
+                .named_children(&mut c)
+                .any(|ch| ch.kind() == "template_string")
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn contains_safe_sql_tagged_template(node: Node, src: &[u8]) -> bool {
+    if matches!(
+        node.kind(),
+        "call_expression" | "tagged_template_expression"
+    ) && is_safe_sql_tagged_template(node, src)
+    {
+        return true;
+    }
+    let mut c = node.walk();
+    for ch in node.named_children(&mut c) {
+        if matches!(
+            ch.kind(),
+            "await_expression"
+                | "parenthesized_expression"
+                | "call_expression"
+                | "tagged_template_expression"
+        ) && contains_safe_sql_tagged_template(ch, src)
         {
             return true;
         }
@@ -1658,7 +1744,220 @@ fn is_non_sql_log_or_ui_stmt(stmt_code: &str) -> bool {
         || trimmed.starts_with("throw new Error(")
 }
 
-fn has_dynamic_sql_interpolation(node: Node, src: &[u8]) -> bool {
+fn is_pure_safe_literal_expr(node: Node, src: &[u8], env: &TaintEnv) -> bool {
+    let k = node.kind();
+    let txt = node_text(node, src).trim();
+    if txt.is_empty() {
+        return false;
+    }
+    if matches!(
+        k,
+        "number"
+            | "integer_literal"
+            | "float_literal"
+            | "true"
+            | "false"
+            | "boolean_literal"
+            | "string_fragment"
+            | "string_content"
+    ) {
+        return true;
+    }
+    if matches!(
+        k,
+        "string" | "string_literal" | "interpreted_string_literal" | "raw_string_literal"
+    ) {
+        let mut c = node.walk();
+        let mut saw_interp = false;
+        for ch in node.children(&mut c) {
+            if matches!(
+                ch.kind(),
+                "interpolation" | "format_expression" | "template_substitution"
+            ) {
+                saw_interp = true;
+                let mut ic = ch.walk();
+                let mut any_expr = false;
+                for ich in ch.children(&mut ic) {
+                    if matches!(ich.kind(), "${" | "{" | "}" | "comment") {
+                        continue;
+                    }
+                    any_expr = true;
+                    if !is_pure_safe_literal_expr(ich, src, env) {
+                        return false;
+                    }
+                }
+                if !any_expr {
+                    return false;
+                }
+            }
+        }
+        if saw_interp {
+            return true;
+        }
+        if (txt.starts_with('`') && txt.contains("${"))
+            || ((txt.starts_with("f\"") || txt.starts_with("f'")) && txt.contains('{'))
+        {
+            if has_taint_source_expr(txt) {
+                return false;
+            }
+            let active = extract_active_code_for_taint_sources(txt);
+            for cap in ident_re().captures_iter(&active) {
+                let id = &cap[1];
+                if !env.safe_literals.contains(id)
+                    || env.direct.contains_key(id)
+                    || env.params.contains_key(id)
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+        return true;
+    }
+    if k == "template_string" {
+        if !txt.contains("${") {
+            return true;
+        }
+        let mut c = node.walk();
+        let mut saw_sub = false;
+        for ch in node.children(&mut c) {
+            if matches!(
+                ch.kind(),
+                "template_substitution" | "interpolation" | "format_expression"
+            ) {
+                saw_sub = true;
+                let mut ic = ch.walk();
+                let mut any_expr = false;
+                for ich in ch.children(&mut ic) {
+                    if matches!(ich.kind(), "${" | "{" | "}" | "comment") {
+                        continue;
+                    }
+                    any_expr = true;
+                    if !is_pure_safe_literal_expr(ich, src, env) {
+                        return false;
+                    }
+                }
+                if !any_expr {
+                    return false;
+                }
+            }
+        }
+        return saw_sub;
+    }
+    if k == "identifier" {
+        return env.safe_literals.contains(txt)
+            && !env.direct.contains_key(txt)
+            && !env.params.contains_key(txt);
+    }
+    if k == "parenthesized_expression" {
+        let mut c = node.walk();
+        let inner: Vec<Node> = node
+            .children(&mut c)
+            .filter(|ch| !matches!(ch.kind(), "(" | ")" | "comment"))
+            .collect();
+        return inner.len() == 1 && is_pure_safe_literal_expr(inner[0], src, env);
+    }
+    if matches!(k, "binary_expression" | "binary_operator") && txt.contains('+') {
+        let mut c = node.walk();
+        let mut any_child = false;
+        for ch in node.children(&mut c) {
+            if ch.kind() == "+" || ch.kind() == "comment" {
+                continue;
+            }
+            any_child = true;
+            if !is_pure_safe_literal_expr(ch, src, env) {
+                return false;
+            }
+        }
+        return any_child;
+    }
+    false
+}
+
+fn collect_plus_leaves<'a>(node: Node<'a>, out: &mut Vec<Node<'a>>) {
+    if matches!(node.kind(), "binary_expression" | "binary_operator") {
+        let mut c = node.walk();
+        let has_plus = node.children(&mut c).any(|ch| ch.kind() == "+");
+        if has_plus {
+            let mut c2 = node.walk();
+            for ch in node.children(&mut c2) {
+                if !matches!(ch.kind(), "+" | "comment") {
+                    collect_plus_leaves(ch, out);
+                }
+            }
+            return;
+        }
+    }
+    out.push(node);
+}
+
+fn extract_callable_target_name(node: Node, src: &[u8]) -> Option<String> {
+    let k = node.kind();
+    let txt = node_text(node, src).trim();
+    if k == "identifier" {
+        if is_plain_ident(txt)
+            && !matches!(
+                txt,
+                "true" | "false" | "null" | "undefined" | "None" | "nil" | "this" | "self"
+            )
+        {
+            return Some(txt.to_string());
+        }
+        return None;
+    }
+    if matches!(
+        k,
+        "member_expression" | "attribute" | "field_expression" | "selector_expression"
+    ) {
+        let short = txt.rsplit('.').next().unwrap_or(txt);
+        let short = short.rsplit("::").next().unwrap_or(short).trim();
+        if is_plain_ident(short) {
+            return Some(short.to_string());
+        }
+    }
+    None
+}
+
+fn collect_file_handler_maps(fn_node: Node, src: &[u8]) -> HashMap<String, Vec<String>> {
+    let mut maps: HashMap<String, Vec<String>> = HashMap::new();
+    let mut root = fn_node;
+    while let Some(p) = root.parent() {
+        root = p;
+    }
+    let mut cursor = root.walk();
+    for top in root.children(&mut cursor) {
+        let mut stmts = vec![top];
+        if top.kind() == "export_statement"
+            && let Some(decl) = top.child_by_field_name("declaration")
+        {
+            stmts.push(decl);
+        }
+        for stmt in stmts {
+            if let Some((lhs_names, _, rhs_node, is_aug)) = extract_assigned_targets(stmt, src)
+                && !is_aug
+                && lhs_names.len() == 1
+            {
+                let pairs = extract_object_pairs(rhs_node, src);
+                if !pairs.is_empty() {
+                    let mut targets = Vec::new();
+                    for (_, vn) in pairs {
+                        if let Some(t) = extract_callable_target_name(vn, src)
+                            && !targets.contains(&t)
+                        {
+                            targets.push(t);
+                        }
+                    }
+                    if !targets.is_empty() {
+                        maps.insert(lhs_names[0].clone(), targets);
+                    }
+                }
+            }
+        }
+    }
+    maps
+}
+
+fn has_dynamic_sql_interpolation_with_env(node: Node, src: &[u8], env: Option<&TaintEnv>) -> bool {
     let k = node.kind();
     let txt = node_text(node, src);
     if !sql_verb_re().is_match(txt) {
@@ -1672,6 +1971,11 @@ fn has_dynamic_sql_interpolation(node: Node, src: &[u8]) -> bool {
     if k == "template_string" && txt.contains("${") {
         if let Some(p) = node.parent()
             && is_safe_sql_tagged_template(p, src)
+        {
+            return false;
+        }
+        if let Some(e) = env
+            && is_pure_safe_literal_expr(node, src, e)
         {
             return false;
         }
@@ -1701,16 +2005,30 @@ fn has_dynamic_sql_interpolation(node: Node, src: &[u8]) -> bool {
             || txt.starts_with("fr\"")
             || txt.starts_with("rf\""))
     {
+        if let Some(e) = env
+            && is_pure_safe_literal_expr(node, src, e)
+        {
+            return false;
+        }
         return true;
     }
     if matches!(k, "binary_expression" | "binary_operator")
         && (txt.contains('+') || txt.contains('%'))
     {
-        // Confirm at least one child is a string literal with SQL verb
-        let mut c = node.walk();
+        let mut leaves = Vec::new();
+        if txt.contains('+') {
+            collect_plus_leaves(node, &mut leaves);
+        } else {
+            let mut c = node.walk();
+            for ch in node.children(&mut c) {
+                if !matches!(ch.kind(), "+" | "%" | "comment") {
+                    leaves.push(ch);
+                }
+            }
+        }
         let mut has_sql_lit = false;
         let mut has_non_lit = false;
-        for ch in node.children(&mut c) {
+        for ch in leaves {
             let ck = ch.kind();
             if matches!(
                 ck,
@@ -1719,12 +2037,17 @@ fn has_dynamic_sql_interpolation(node: Node, src: &[u8]) -> bool {
                 if sql_verb_re().is_match(node_text(ch, src)) {
                     has_sql_lit = true;
                 }
-            } else if !matches!(ck, "+" | "%") {
+            } else if env.is_some_and(|e| is_pure_safe_literal_expr(ch, src, e)) {
+                // Pure constant identifier/literal — not dynamic untrusted SQL
+            } else {
                 has_non_lit = true;
             }
         }
         if has_sql_lit && has_non_lit {
             return true;
+        }
+        if has_sql_lit && !has_non_lit {
+            return false;
         }
     }
 
@@ -1733,7 +2056,7 @@ fn has_dynamic_sql_interpolation(node: Node, src: &[u8]) -> bool {
         if matches!(ch.kind(), "statement_block" | "block") {
             continue;
         }
-        if has_dynamic_sql_interpolation(ch, src) {
+        if has_dynamic_sql_interpolation_with_env(ch, src, env) {
             return true;
         }
     }
@@ -1878,24 +2201,53 @@ fn check_call_taint_sinks(
                 }
             }
 
-            let (d_mask, p_mask) = ast_eval_masks(an, src, env);
-            if d_mask != 0 {
-                if !summary.tainted_calls.iter().any(|c| c == short) {
-                    summary.tainted_calls.push(short.to_string());
+            let mut callees: Vec<String> = Vec::new();
+            if matches!(func.kind(), "subscript_expression" | "index_expression") {
+                if let Some(obj_n) = func
+                    .child_by_field_name("object")
+                    .or_else(|| func.child_by_field_name("value"))
+                    .or_else(|| func.child_by_field_name("operand"))
+                {
+                    let obj_name = node_text(obj_n, src).trim();
+                    if let Some(targets) = env.handler_maps.get(obj_name) {
+                        callees.extend(targets.iter().cloned());
+                    }
                 }
-                *summary
-                    .tainted_call_masks
-                    .entry(short.to_string())
-                    .or_insert(0) |= d_mask;
+            } else if func.kind() == "identifier"
+                && let Some(targets) = env.handler_aliases.get(short)
+            {
+                callees.extend(targets.iter().cloned());
+                if !callees.iter().any(|c| c == short) {
+                    callees.push(short.to_string());
+                }
+            } else {
+                callees.push(short.to_string());
             }
-            if p_mask != 0 {
-                if !summary.param_forwarding_calls.iter().any(|c| c == short) {
-                    summary.param_forwarding_calls.push(short.to_string());
+
+            let (d_mask, p_mask) = ast_eval_masks(an, src, env);
+            for callee_name in &callees {
+                if d_mask != 0 {
+                    if !summary.tainted_calls.iter().any(|c| c == callee_name) {
+                        summary.tainted_calls.push(callee_name.clone());
+                    }
+                    *summary
+                        .tainted_call_masks
+                        .entry(callee_name.clone())
+                        .or_insert(0) |= d_mask;
                 }
-                *summary
-                    .tainted_call_masks
-                    .entry(short.to_string())
-                    .or_insert(0) |= p_mask;
+                if p_mask != 0 {
+                    if !summary
+                        .param_forwarding_calls
+                        .iter()
+                        .any(|c| c == callee_name)
+                    {
+                        summary.param_forwarding_calls.push(callee_name.clone());
+                    }
+                    *summary
+                        .tainted_call_masks
+                        .entry(callee_name.clone())
+                        .or_insert(0) |= p_mask;
+                }
             }
 
             // Field-level argument metadata when passing an object variable `helper(payload)`
@@ -1922,19 +2274,23 @@ fn check_call_taint_sinks(
                         }
                         if !field_pairs.is_empty() {
                             call_has_object_fields = true;
-                            summary
-                                .tainted_field_calls
-                                .entry(short.to_string())
-                                .or_default()
-                                .extend(field_pairs);
+                            for callee_name in &callees {
+                                summary
+                                    .tainted_field_calls
+                                    .entry(callee_name.clone())
+                                    .or_default()
+                                    .extend(field_pairs.iter().cloned());
+                            }
                         }
                     }
                 }
             }
-            // If an unrestricted (non-object-field) tainted call is also made to `short` in this function,
-            // remove field restriction for `short` so the unrestricted call is not suppressed.
+            // If an unrestricted (non-object-field) tainted call is also made to `callee` in this function,
+            // remove field restriction for `callee` so the unrestricted call is not suppressed.
             if (d_mask != 0 || p_mask != 0) && !call_has_object_fields {
-                summary.tainted_field_calls.remove(short);
+                for callee_name in &callees {
+                    summary.tainted_field_calls.remove(callee_name);
+                }
             }
 
             // Track wrapper provenance when calling `callee(cleanOrWrappedVar)`
@@ -1943,18 +2299,25 @@ fn check_call_taint_sinks(
                 && let Some(sa) = single_tainted_arg
                 && let Some((wfn, wf)) = extract_expr_wrapper(sa, src, env)
             {
-                summary
-                    .tainted_call_wrappers
-                    .push((short.to_string(), wfn, wf, d_mask));
+                for callee_name in &callees {
+                    summary.tainted_call_wrappers.push((
+                        callee_name.clone(),
+                        wfn.clone(),
+                        wf.clone(),
+                        d_mask,
+                    ));
+                }
             }
 
             // Record cross-file callback forwards `runTask(req.body.cmd, workerCb)`
             let cb_data_mask = non_cb_d | non_cb_p | recv_mask.0 | recv_mask.1;
             if cb_data_mask != 0 {
                 for cb_name in &named_cbs {
-                    let tup = (short.to_string(), cb_name.clone(), cb_data_mask);
-                    if !summary.callback_forwards.contains(&tup) {
-                        summary.callback_forwards.push(tup);
+                    for callee_name in &callees {
+                        let tup = (callee_name.clone(), cb_name.clone(), cb_data_mask);
+                        if !summary.callback_forwards.contains(&tup) {
+                            summary.callback_forwards.push(tup);
+                        }
                     }
                 }
             } else if matches!(short, "spawn" | "spawn_blocking" | "spawn_local")
@@ -2176,7 +2539,13 @@ fn check_call_taint_sinks(
                             || args_txt.contains("cmd")))))
             || matches!(ftxt, "os.system" | "os.popen")
             || (ftxt == "Command::new"
-                && (args_txt.contains("\"sh\"") || args_txt.contains("\"bash\"")));
+                && (args_txt.contains("\"sh\"") || args_txt.contains("\"bash\"")))
+            || ((ftxt.ends_with(".arg") || ftxt.ends_with(".args"))
+                && (ftxt.contains("Command::new(\"sh\")")
+                    || ftxt.contains("Command::new(\"bash\")")
+                    || ftxt.contains("Command::new(\"/bin/sh\")")
+                    || ftxt.contains("Command::new(\"/bin/bash\")"))
+                && !args_txt.trim().eq("\"-c\""));
 
         if is_shell_exec
             && !fn_guards.contains(&GuardKind::CmdSanitizer)
@@ -2651,19 +3020,17 @@ fn collect_cond_idents(cond_txt: &str) -> HashSet<String> {
 
 fn condition_narrow_mask(cond_txt: &str) -> u8 {
     let mut narrow_mask = 0u8;
-    if stmt_is_path_prefix_guard(cond_txt)
-        || cond_txt.to_ascii_lowercase().contains("isallowedpath")
-    {
+    let low = cond_txt.to_ascii_lowercase();
+    if stmt_is_path_prefix_guard(cond_txt) || low.contains("isallowedpath") {
         narrow_mask |= TAINT_PATH;
     }
     if expr_has_ssrf_sanitizer(cond_txt) && !is_universal_sanitizer(cond_txt) {
         narrow_mask |= TAINT_SSRF;
     }
-    if expr_has_cmd_sanitizer(cond_txt) && !is_universal_sanitizer(cond_txt) {
+    // Only boolean allowlist predicates narrow CMD taint in conditionals;
+    // value-returning transforms (`shlex.quote(x)`, `DOMPurify.sanitize(x)`) discard the clean result.
+    if low.contains("allowlist") {
         narrow_mask |= TAINT_CMD;
-    }
-    if expr_has_xss_sanitizer(cond_txt) && !is_universal_sanitizer(cond_txt) {
-        narrow_mask |= TAINT_XSS;
     }
     narrow_mask
 }
@@ -2754,9 +3121,9 @@ fn analyze_statement_block_depth(
             }
         }
 
-        // Check SQL injection dynamic construction in statement (ignoring non-SQL console/UI prose)
+        // Check SQL injection dynamic construction in statement (ignoring non-SQL console/UI prose and safe constant literals)
         if !is_non_sql_log_or_ui_stmt(&stmt_code)
-            && has_dynamic_sql_interpolation(stmt, src)
+            && has_dynamic_sql_interpolation_with_env(stmt, src, Some(env))
             && !is_universal_sanitizer(&stmt_code)
             && let Some(tkind) = stmt_taint_status(&stmt_code, TAINT_SQL, env)
         {
@@ -2797,7 +3164,8 @@ fn analyze_statement_block_depth(
         // Update local sink-typed variable taint state, `.innerHTML` assignment sink, and HTML/SQL builder vars
         if let Some((lhs_names, lhs_raws, rhs_node, is_aug)) = extract_assigned_targets(stmt, src) {
             let rhs_txt = node_text(rhs_node, src);
-            let rhs_has_sql = sql_verb_re().is_match(rhs_txt);
+            let rhs_is_safe_tagged_sql = contains_safe_sql_tagged_template(rhs_node, src);
+            let rhs_has_sql = !rhs_is_safe_tagged_sql && sql_verb_re().is_match(rhs_txt);
             if rhs_has_sql {
                 for n in &lhs_names {
                     env.sql_vars.insert(n.clone());
@@ -2851,7 +3219,8 @@ fn analyze_statement_block_depth(
             let touches_sql_var = lhs_names.iter().any(|n| env.sql_vars.contains(n))
                 || expr_references_any(rhs_txt, &env.sql_vars);
 
-            if ((rhs_direct_mask & TAINT_SQL != 0) || (rhs_param_mask & TAINT_SQL != 0))
+            if !rhs_is_safe_tagged_sql
+                && ((rhs_direct_mask & TAINT_SQL != 0) || (rhs_param_mask & TAINT_SQL != 0))
                 && touches_sql_var
                 && (is_aug || rhs_txt.contains('+') || rhs_txt.contains("${"))
             {
@@ -2885,8 +3254,20 @@ fn analyze_statement_block_depth(
                 }
             }
 
-            // Member field write `a.foo = ...` / `a.safe = "ok"` without clobbering sibling fields!
+            // Dynamic handler map index write `handlers[k] = fnC`
             if !is_aug
+                && lhs_raws.len() == 1
+                && let Some(idx_pos) = lhs_raws[0].find('[')
+                && let Some(base) =
+                    Some(lhs_raws[0][..idx_pos].trim()).filter(|b| is_plain_ident(b))
+            {
+                if let Some(target_fn) = extract_callable_target_name(rhs_node, src) {
+                    let entry = env.handler_maps.entry(base.to_string()).or_default();
+                    if !entry.contains(&target_fn) {
+                        entry.push(target_fn);
+                    }
+                }
+            } else if !is_aug
                 && lhs_raws.len() == 1
                 && let Some((base, field)) = split_simple_member(&lhs_raws[0])
             {
@@ -3005,13 +3386,23 @@ fn analyze_statement_block_depth(
                         } else {
                             if rhs_direct_mask != 0 {
                                 env.direct.insert(n.clone(), rhs_direct_mask);
+                                env.safe_literals.remove(&n);
                             } else {
                                 env.direct.remove(&n);
                             }
                             if rhs_param_mask != 0 {
                                 env.params.insert(n.clone(), rhs_param_mask);
+                                env.safe_literals.remove(&n);
                             } else {
                                 env.params.remove(&n);
+                            }
+                            if rhs_direct_mask == 0
+                                && rhs_param_mask == 0
+                                && is_pure_safe_literal_expr(rhs_node, src, env)
+                            {
+                                env.safe_literals.insert(n.clone());
+                            } else {
+                                env.safe_literals.remove(&n);
                             }
                             if rhs_cleared != 0 {
                                 env.var_cleared_masks.insert(
@@ -3024,9 +3415,30 @@ fn analyze_statement_block_depth(
                             } else {
                                 env.var_wrappers.remove(&n);
                             }
+                            // Track alias `const fn = handlers[action]` or `handlers.get(action)`
+                            if matches!(
+                                rhs_node.kind(),
+                                "subscript_expression" | "index_expression"
+                            ) && let Some(obj_n) = rhs_node
+                                .child_by_field_name("object")
+                                .or_else(|| rhs_node.child_by_field_name("value"))
+                                .or_else(|| rhs_node.child_by_field_name("operand"))
+                                && let Some(targets) =
+                                    env.handler_maps.get(node_text(obj_n, src).trim()).cloned()
+                            {
+                                env.handler_aliases.insert(n.clone(), targets);
+                            } else if !matches!(rhs_node.kind(), "call_expression" | "call") {
+                                env.handler_aliases.remove(&n);
+                            }
                             if !obj_pairs.is_empty() {
                                 env.object_vars.insert(n.clone());
+                                let mut handler_targets = Vec::new();
                                 for (k_opt, vn) in &obj_pairs {
+                                    if let Some(target_fn) = extract_callable_target_name(*vn, src)
+                                        && !handler_targets.contains(&target_fn)
+                                    {
+                                        handler_targets.push(target_fn);
+                                    }
                                     if let Some(fld) = k_opt {
                                         let (fd, fp) = ast_eval_masks(*vn, src, env);
                                         let fclr =
@@ -3063,6 +3475,9 @@ fn analyze_statement_block_depth(
                                             .collect();
                                         env.field_params.extend(sp_fp);
                                     }
+                                }
+                                if !handler_targets.is_empty() {
+                                    env.handler_maps.insert(n.clone(), handler_targets);
                                 }
                             }
                         }
@@ -3207,9 +3622,25 @@ pub fn analyze_function_taint(
         .map(|b| strip_comments_simple(node_text(b, src)))
         .unwrap_or_default();
 
-    let mut env = TaintEnv::default();
+    let mut env = TaintEnv {
+        handler_maps: collect_file_handler_maps(fn_node, src),
+        ..Default::default()
+    };
+    let params_raw = fn_node
+        .child_by_field_name("parameters")
+        .map(|p| node_text(p, src))
+        .unwrap_or("");
     for p in extract_param_names(fn_node, src) {
-        env.params.insert(p, TAINT_ALL);
+        let is_rust_http_extractor = lang == Language::Rust
+            && ["Json(", "Query(", "Path(", "Form("]
+                .iter()
+                .any(|ex| params_raw.contains(&format!("{}{}", ex, p)));
+        if is_rust_http_extractor {
+            env.direct.insert(p, TAINT_ALL);
+            summary.has_taint_source = true;
+        } else {
+            env.params.insert(p, TAINT_ALL);
+        }
     }
 
     if let Some(body) = fn_node.child_by_field_name("body") {

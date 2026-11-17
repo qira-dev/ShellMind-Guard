@@ -63,6 +63,8 @@ pub struct SandboxProbeConfig {
     pub mock_shims: bool,
     #[serde(default)]
     pub fuzz_routes: Vec<RouteSchema>,
+    #[serde(default)]
+    pub wire_diff_upstream_port: Option<u16>,
 }
 
 impl SandboxProbeConfig {
@@ -76,6 +78,7 @@ impl SandboxProbeConfig {
             use_tls: cfg.is_tls(),
             mock_shims: cfg.mock_shims,
             fuzz_routes: Vec::new(),
+            wire_diff_upstream_port: None,
         }
     }
 }
@@ -223,7 +226,7 @@ async fn send_http_probe(
     .await
 }
 
-async fn send_http_probe_with_tls(
+pub(crate) async fn send_http_probe_with_tls(
     port: u16,
     method: &str,
     path: &str,
@@ -508,8 +511,13 @@ pub async fn verify_auth_invariant_with_config(
 ) -> Result<VerifiedFinding> {
     let (method, raw_path) = parse_route(&finding.entry_route);
     let path = substitute_route_params(raw_path);
+    let synthesized = crate::wire_oracle::synthesize_schema_poc_body(finding, &cfg.fuzz_routes);
     let default_body = r#"{"userId":"test-user-1","amount":10}"#;
-    let body = cfg.probe_body.as_deref().unwrap_or(default_body);
+    let body = cfg
+        .probe_body
+        .as_deref()
+        .or(synthesized.as_deref())
+        .unwrap_or(default_body);
     let (status_code, resp_body, is_html) = send_http_probe_with_tls(
         port,
         method,
@@ -613,9 +621,11 @@ pub async fn verify_concurrency_invariant_with_config(
 
     let (method, raw_path) = parse_route(&finding.entry_route);
     let path = substitute_route_params(raw_path);
+    let synthesized = crate::wire_oracle::synthesize_schema_poc_body(finding, &cfg.fuzz_routes);
     let body = cfg
         .probe_body
         .as_deref()
+        .or(synthesized.as_deref())
         .unwrap_or(r#"{"userId":"test-user-1","amount":80}"#);
     let auth_hdr = format_optional_header(cfg.user_a_header.as_deref()).unwrap_or_default();
     let raw_req = format!(
@@ -932,6 +942,9 @@ pub async fn verify_finding_with_config(
             verify_concurrency_invariant_with_config(port, finding, concurrency, cfg).await
         }
         GuardKind::OwnershipCheck => verify_idor_invariant_with_config(port, finding, cfg).await,
+        GuardKind::SsrfSanitizer => {
+            crate::wire_oracle::verify_ssrf_oob_with_config(port, finding, cfg).await
+        }
         other => Ok(VerifiedFinding {
             finding_id: finding.id.clone(),
             rule_id: finding.rule_id.clone(),
@@ -1306,6 +1319,7 @@ pub async fn verify_route_fuzz_with_config(
                                     line: route.line.max(1),
                                 }],
                                 remediation: "Reject non-positive or non-finite numeric/financial fields with HTTP 400 before balance/order mutation.".into(),
+                                proof_reasons: vec!["DeepFuzzTamperingProbe".into()],
                             },
                             verified: VerifiedFinding {
                                 finding_id: fid.clone(),
@@ -1380,6 +1394,7 @@ pub async fn verify_route_fuzz_with_config(
                             line: route.line.max(1),
                         }],
                         remediation: "Validate types, sizes, and numeric parsing cleanly with HTTP 400 instead of throwing unhandled 5xx exceptions.".into(),
+                        proof_reasons: vec!["DeepFuzzCrashProbe".into()],
                     },
                     verified: VerifiedFinding {
                         finding_id: fid.clone(),
@@ -1452,6 +1467,7 @@ pub async fn verify_route_fuzz_with_config(
                         line: route.line.max(1),
                     }],
                     remediation: "Strictly validate UTF-8 decoding and reject NUL (`\\x00`) bytes in parsers/routers with HTTP 400.".into(),
+                    proof_reasons: vec!["DeepFuzzEncodingProbe".into()],
                 },
                 verified: VerifiedFinding {
                     finding_id: fid.clone(),
@@ -1465,6 +1481,23 @@ pub async fn verify_route_fuzz_with_config(
         }
     }
     hits
+}
+
+/// Promotes or annotates a Last-Byte Sync result with differential DB/Redis mutation frame counts
+/// recorded by `WireDiffProxy`.
+pub fn apply_wire_diff_corroboration(
+    mut verified: VerifiedFinding,
+    proxy: &crate::wire_oracle::WireDiffProxy,
+) -> (VerifiedFinding, usize) {
+    let writes = proxy.write_mutations();
+    if writes >= 2 {
+        verified.status = VerificationStatus::Proven;
+        verified.evidence = format!(
+            "{} [WireDiffProxy: {} non-idempotent write mutation frames]",
+            verified.evidence, writes
+        );
+    }
+    (verified, writes)
 }
 
 #[cfg(test)]
@@ -1614,6 +1647,7 @@ mod tests {
             missing_guard: GuardKind::TxLock,
             witness_path: Vec::new(),
             remediation: String::new(),
+            proof_reasons: Vec::new(),
         };
         let vf = verify_concurrency_invariant(port, &finding, 12)
             .await
@@ -1679,6 +1713,7 @@ mod tests {
             missing_guard: GuardKind::TxLock,
             witness_path: Vec::new(),
             remediation: String::new(),
+            proof_reasons: Vec::new(),
         };
         let vf = verify_concurrency_invariant(port, &finding, 12)
             .await
@@ -1732,6 +1767,7 @@ mod tests {
             missing_guard: GuardKind::OwnershipCheck,
             witness_path: Vec::new(),
             remediation: String::new(),
+            proof_reasons: Vec::new(),
         };
 
         // 1. Missing headers fails closed as SuspectUnverified
@@ -1838,6 +1874,7 @@ mod tests {
             missing_guard: GuardKind::Auth,
             witness_path: Vec::new(),
             remediation: String::new(),
+            proof_reasons: Vec::new(),
         };
         let auth_res = verify_finding_with_config(port, &auth_finding, 4, &cfg)
             .await
@@ -2100,5 +2137,80 @@ mod tests {
             "F-78: socket drop while GET / stays alive must downgrade to SuspectUnverified: {:?}",
             drop_hit
         );
+    }
+
+    #[tokio::test]
+    async fn test_wire_diff_corroborates_race_mutations() {
+        let db_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let db_port = db_listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = db_listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = s.read(&mut buf).await;
+                    let _ = s.write_all(b"OK\n").await;
+                });
+            }
+        });
+        let proxy = crate::wire_oracle::WireDiffProxy::spawn(db_port)
+            .await
+            .unwrap();
+        let proxy_port = proxy.listen_port;
+
+        let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http_port = http_listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = http_listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let _ = s.read(&mut buf).await;
+                    if let Ok(mut db) = TcpStream::connect(("127.0.0.1", proxy_port)).await {
+                        let _ = db
+                            .write_all(b"UPDATE balances SET amount = amount - 10 WHERE id = 1")
+                            .await;
+                    }
+                    let _ = s
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
+                        .await;
+                });
+            }
+        });
+
+        let finding = LatticeFinding {
+            id: "SMG-RACE-WD-1".into(),
+            rule_id: "SMG-RACE-001".into(),
+            severity: "CRITICAL".into(),
+            title: "Race".into(),
+            file: "src/pay.ts".into(),
+            line: 10,
+            status: "SUSPECT".into(),
+            confidence: Confidence::Confirmed,
+            entry_route: "POST /withdraw".into(),
+            sink_kind: SinkKind::BalanceUpdate,
+            missing_guard: GuardKind::TxLock,
+            witness_path: vec![],
+            remediation: String::new(),
+            proof_reasons: vec![],
+        };
+        let vf = verify_concurrency_invariant_with_config(
+            http_port,
+            &finding,
+            4,
+            &SandboxProbeConfig::default(),
+        )
+        .await
+        .unwrap();
+        let (promoted, writes) = apply_wire_diff_corroboration(vf, &proxy);
+        assert_eq!(promoted.status, VerificationStatus::Proven);
+        assert!(writes >= 2);
+        assert!(promoted.evidence.contains("WireDiffProxy"));
     }
 }

@@ -892,6 +892,7 @@ pub fn collect_deep_schema_findings(graph: &GraphAnalysisResult) -> Vec<LatticeF
                 line: rs.line.max(1),
             }],
             remediation: "Enforce explicit finite & strictly positive schema constraints (e.g., `Number.isFinite(amount) && amount > 0`, Zod `.finite().positive()`, or Pydantic `gt=0`) before applying financial mutations.".into(),
+            proof_reasons: vec!["RouteSchemaInference".into(), "MissingPositiveBound".into()],
         });
     }
     out

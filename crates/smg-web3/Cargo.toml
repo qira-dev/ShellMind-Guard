@@ -1,0 +1,16 @@
+[package]
+name = "smg-web3"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+revm = { version = "43.0.3", default-features = false, features = ["std", "portable", "secp256k1"] }
+serde.workspace = true
+serde_json.workspace = true
+smg-core = { path = "../smg-core" }
+smg-graph = { path = "../smg-graph" }
+tree-sitter.workspace = true
+tree-sitter-rust.workspace = true
+tree-sitter-solidity = "1.2.13"

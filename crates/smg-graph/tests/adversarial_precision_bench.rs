@@ -1,0 +1,1600 @@
+use smg_core::{IndexedFile, Language, ShellMindGuardConfig};
+use smg_graph::{GraphAnalysisResult, analyze_codebase};
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::time::Instant;
+
+#[derive(Clone, Copy, Debug)]
+struct BenchFile {
+    rel_path: &'static str,
+    lang: Language,
+    code: &'static str,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TrapKind {
+    BaselineVuln,
+    BaselineSafe,
+    ScopeCollisionTrap,
+    DominatorGuardTrap,
+    OneHopWrapperTrap,
+    CheckedBoundsTrap,
+}
+
+#[derive(Clone, Debug)]
+struct AdversarialCase {
+    id: &'static str,
+    family: &'static str,
+    expected_prefix: &'static str,
+    expect_finding: bool,
+    trap_kind: TrapKind,
+    files: Vec<BenchFile>,
+}
+
+fn build_indexed(files: &[BenchFile]) -> Vec<IndexedFile> {
+    files
+        .iter()
+        .map(|f| {
+            let bytes = f.code.as_bytes().to_vec();
+            let hash = blake3::hash(&bytes).to_hex().to_string();
+            IndexedFile {
+                rel_path: f.rel_path.to_string(),
+                abs_path: PathBuf::from(f.rel_path),
+                language: f.lang,
+                blake3_hash: hash,
+                mtime_ns: 0,
+                size_bytes: bytes.len() as u64,
+                cached_bytes: Some(bytes),
+            }
+        })
+        .collect()
+}
+
+fn matches_prefix(res: &GraphAnalysisResult, prefix: &str) -> bool {
+    res.findings
+        .iter()
+        .any(|f| f.rule_id.starts_with(prefix) || f.rule_id == prefix)
+}
+
+fn corpus() -> Vec<AdversarialCase> {
+    vec![
+        // -----------------------------------------------------------------
+        // 1. Auth Middleware & Route Mutation (TS / Python / Go / Rust)
+        // -----------------------------------------------------------------
+        AdversarialCase {
+            id: "ts_auth_vuln_unguarded_withdraw",
+            family: "AUTH",
+            expected_prefix: "SMG-AUTH",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "src/routes/billing.ts",
+                lang: Language::TypeScript,
+                code: r#"
+import express from 'express';
+const app = express();
+function debitBalance(userId: string, amount: number) {
+    return db.query('UPDATE accounts SET balance = balance - $1 WHERE id = $2', [amount, userId]);
+}
+app.post('/api/v1/checkout/withdraw', (req, res) => {
+    const out = debitBalance(req.body.userId, req.body.amount);
+    res.json(out);
+});
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "ts_auth_safe_dominator_early_return",
+            family: "AUTH",
+            expected_prefix: "SMG-AUTH",
+            expect_finding: false,
+            trap_kind: TrapKind::DominatorGuardTrap,
+            files: vec![BenchFile {
+                rel_path: "src/routes/billing_safe.ts",
+                lang: Language::TypeScript,
+                code: r#"
+import express from 'express';
+const app = express();
+app.post('/api/v1/checkout/withdraw', requireAuth, async (req, res) => {
+    if (!req.user?.id) {
+        return res.status(401).json({ error: 'unauthorized' });
+    }
+    await db.transaction(async (tx) => {
+        await tx.query('SELECT balance FROM accounts WHERE id = $1 FOR UPDATE', [req.user.id]);
+        await tx.query('UPDATE accounts SET balance = balance - $1 WHERE id = $2', [req.body.amount, req.user.id]);
+    });
+    res.json({ ok: true });
+});
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "ts_auth_vuln_non_dominating_branch_guard",
+            family: "AUTH",
+            expected_prefix: "SMG-AUTH",
+            expect_finding: true,
+            trap_kind: TrapKind::DominatorGuardTrap,
+            files: vec![BenchFile {
+                rel_path: "src/routes/partial_auth.ts",
+                lang: Language::TypeScript,
+                code: r#"
+import express from 'express';
+const app = express();
+function writeRefund(id: string) {
+    return db.query('UPDATE accounts SET balance = balance + 100 WHERE id = $1', [id]);
+}
+app.post('/api/v1/refund', (req, res) => {
+    if (req.query.strict === '1') {
+        requireAuth(req, res, () => {});
+    }
+    // Vulnerable: guard only executes when strict === '1'
+    writeRefund(req.body.id);
+    res.json({ ok: true });
+});
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "py_auth_vuln_flask_transfer",
+            family: "AUTH",
+            expected_prefix: "SMG-AUTH",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "app/routes.py",
+                lang: Language::Python,
+                code: r#"
+from flask import Flask, request
+app = Flask(__name__)
+
+def debit_wallet(uid, amount):
+    cursor.execute("UPDATE wallets SET balance = balance - %s WHERE user_id = %s", (amount, uid))
+
+@app.post("/api/wallet/debit")
+def handle_debit():
+    debit_wallet(request.json["user_id"], request.json["amount"])
+    return {"ok": True}
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "py_auth_safe_fastapi_depends",
+            family: "AUTH",
+            expected_prefix: "SMG-AUTH",
+            expect_finding: false,
+            trap_kind: TrapKind::BaselineSafe,
+            files: vec![BenchFile {
+                rel_path: "app/safe_routes.py",
+                lang: Language::Python,
+                code: r#"
+from fastapi import APIRouter, Depends
+router = APIRouter()
+
+@router.post("/api/wallet/debit")
+def handle_debit(user = Depends(require_auth)):
+    with db.transaction():
+        cursor.execute("UPDATE wallets SET balance = balance - %s WHERE user_id = %s", (10, user.id))
+    return {"ok": True}
+"#,
+            }],
+        },
+        // -----------------------------------------------------------------
+        // 2. Race Condition / Double Spend (TS / Go)
+        // -----------------------------------------------------------------
+        AdversarialCase {
+            id: "ts_race_vuln_balance_no_tx",
+            family: "RACE",
+            expected_prefix: "SMG-RACE",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "src/pay/withdraw.ts",
+                lang: Language::TypeScript,
+                code: r#"
+app.post('/api/pay/withdraw', requireAuth, async (req, res) => {
+    const row = await db.query('SELECT balance FROM wallets WHERE user_id = $1', [req.user.id]);
+    if (row.balance >= req.body.amount) {
+        await db.query('UPDATE wallets SET balance = balance - $1 WHERE user_id = $2', [req.body.amount, req.user.id]);
+    }
+    res.json({ ok: true });
+});
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "ts_race_safe_for_update_tx",
+            family: "RACE",
+            expected_prefix: "SMG-RACE",
+            expect_finding: false,
+            trap_kind: TrapKind::BaselineSafe,
+            files: vec![BenchFile {
+                rel_path: "src/pay/withdraw_safe.ts",
+                lang: Language::TypeScript,
+                code: r#"
+app.post('/api/pay/withdraw', requireAuth, async (req, res) => {
+    await db.transaction(async (tx) => {
+        await tx.query('SELECT balance FROM wallets WHERE user_id = $1 FOR UPDATE', [req.user.id]);
+        await tx.query('UPDATE wallets SET balance = balance - $1 WHERE user_id = $2', [req.body.amount, req.user.id]);
+    });
+    res.json({ ok: true });
+});
+"#,
+            }],
+        },
+        // -----------------------------------------------------------------
+        // 3. IDOR (Authenticated access without ownership predicate)
+        // -----------------------------------------------------------------
+        AdversarialCase {
+            id: "ts_idor_vuln_order_by_param_id",
+            family: "IDOR",
+            expected_prefix: "SMG-IDOR",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "src/orders/controller.ts",
+                lang: Language::TypeScript,
+                code: r#"
+app.get('/api/orders/:id', requireAuth, async (req, res) => {
+    const order = await Order.findById(req.params.id);
+    res.json(order);
+});
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "ts_idor_safe_scoped_owner",
+            family: "IDOR",
+            expected_prefix: "SMG-IDOR",
+            expect_finding: false,
+            trap_kind: TrapKind::BaselineSafe,
+            files: vec![BenchFile {
+                rel_path: "src/orders/controller_safe.ts",
+                lang: Language::TypeScript,
+                code: r#"
+app.get('/api/orders/:id', requireAuth, async (req, res) => {
+    const order = await Order.findOne({ _id: req.params.id, userId: req.user.id });
+    res.json(order);
+});
+"#,
+            }],
+        },
+        // -----------------------------------------------------------------
+        // 4. SQLi & Scope-Collision Adversarial Traps (JS/TS/Py/Go/Java)
+        // -----------------------------------------------------------------
+        AdversarialCase {
+            id: "js_sqli_vuln_template_interp",
+            family: "SQLI",
+            expected_prefix: "SMG-SQLI",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "src/users/search.js",
+                lang: Language::JavaScript,
+                code: r#"
+app.get('/users', requireAuth, async (req, res) => {
+    const name = req.query.q;
+    const rows = await db.query(`SELECT * FROM users WHERE name = '${name}'`);
+    res.json(rows);
+});
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "js_sqli_safe_parameterized_query",
+            family: "SQLI",
+            expected_prefix: "SMG-SQLI",
+            expect_finding: false,
+            trap_kind: TrapKind::BaselineSafe,
+            files: vec![BenchFile {
+                rel_path: "src/users/search_safe.js",
+                lang: Language::JavaScript,
+                code: r#"
+app.get('/users', requireAuth, async (req, res) => {
+    const name = req.query.q;
+    const rows = await db.query('SELECT * FROM users WHERE name = $1 AND owner_id = $2', [name, req.user.id]);
+    res.json(rows);
+});
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "go_sqli_vuln_sprintf",
+            family: "SQLI",
+            expected_prefix: "SMG-SQLI",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "internal/users/repo.go",
+                lang: Language::Go,
+                code: r#"
+package users
+import (
+    "database/sql"
+    "fmt"
+    "net/http"
+)
+func FindUser(db *sql.DB, w http.ResponseWriter, r *http.Request) {
+    q := r.URL.Query().Get("name")
+    stmt := fmt.Sprintf("SELECT id FROM users WHERE name = '%s'", q)
+    db.Query(stmt)
+}
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "go_sqli_safe_placeholder",
+            family: "SQLI",
+            expected_prefix: "SMG-SQLI",
+            expect_finding: false,
+            trap_kind: TrapKind::BaselineSafe,
+            files: vec![BenchFile {
+                rel_path: "internal/users/repo_safe.go",
+                lang: Language::Go,
+                code: r#"
+package users
+import (
+    "database/sql"
+    "net/http"
+)
+func FindUserSafe(db *sql.DB, w http.ResponseWriter, r *http.Request, callerId string) {
+    q := r.URL.Query().Get("name")
+    db.Query("SELECT id FROM users WHERE name = $1 AND user_id = $2", q, callerId)
+}
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "ts_scope_collision_unrelated_execute_not_sqli",
+            family: "SQLI",
+            expected_prefix: "SMG-SQLI",
+            expect_finding: false,
+            trap_kind: TrapKind::ScopeCollisionTrap,
+            files: vec![
+                BenchFile {
+                    rel_path: "src/analytics/metrics.ts",
+                    lang: Language::TypeScript,
+                    code: r#"
+export class LocalMetricsRunner {
+    query(metricName: string): number {
+        return 42 + metricName.length;
+    }
+}
+"#,
+                },
+                BenchFile {
+                    rel_path: "src/routes/metrics_route.ts",
+                    lang: Language::TypeScript,
+                    code: r#"
+import { LocalMetricsRunner } from '../analytics/metrics';
+const runner = new LocalMetricsRunner();
+app.get('/metrics', requireAuth, (req, res) => {
+    const count = runner.query(String(req.query.name || 'cpu'));
+    res.json({ count });
+});
+"#,
+                },
+            ],
+        },
+        // -----------------------------------------------------------------
+        // 5. Command Injection (Py / TS / Rust) & 1-Hop Sanitizer
+        // -----------------------------------------------------------------
+        AdversarialCase {
+            id: "py_cmdi_vuln_shell_true",
+            family: "CMDI",
+            expected_prefix: "SMG-CMDI",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "app/git_tools.py",
+                lang: Language::Python,
+                code: r#"
+import subprocess
+from flask import request
+
+def inspect_log():
+    branch = request.args.get("branch", "main")
+    return subprocess.run(f"git log {branch}", shell=True)
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "py_cmdi_safe_arg_list_shell_false",
+            family: "CMDI",
+            expected_prefix: "SMG-CMDI",
+            expect_finding: false,
+            trap_kind: TrapKind::BaselineSafe,
+            files: vec![BenchFile {
+                rel_path: "app/git_tools_safe.py",
+                lang: Language::Python,
+                code: r#"
+import subprocess
+from flask import request
+
+def inspect_log():
+    n = int(request.args.get("n", "5"))
+    return subprocess.run(["git", "log", "-n", str(n)], shell=False)
+"#,
+            }],
+        },
+        // -----------------------------------------------------------------
+        // 6. Path Traversal + 1-Hop Sanitizer Wrapper Trap
+        // -----------------------------------------------------------------
+        AdversarialCase {
+            id: "ts_path_vuln_raw_join",
+            family: "PATH",
+            expected_prefix: "SMG-PATH",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "src/files/download.ts",
+                lang: Language::TypeScript,
+                code: r#"
+import path from 'path';
+app.get('/download', requireAuth, (req, res) => {
+    const target = path.join('/srv/uploads', String(req.query.file));
+    res.sendFile(target);
+});
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "ts_path_safe_one_hop_wrapper",
+            family: "PATH",
+            expected_prefix: "SMG-PATH",
+            expect_finding: false,
+            trap_kind: TrapKind::OneHopWrapperTrap,
+            files: vec![
+                BenchFile {
+                    rel_path: "src/files/sanitize.ts",
+                    lang: Language::TypeScript,
+                    code: r#"
+import path from 'path';
+const BASE = '/srv/uploads';
+export function resolveSafeUploadPath(raw: string): string {
+    const clean = path.basename(String(raw));
+    const resolved = path.resolve(BASE, clean);
+    if (!resolved.startsWith(BASE + path.sep)) {
+        throw new Error('blocked traversal');
+    }
+    return resolved;
+}
+"#,
+                },
+                BenchFile {
+                    rel_path: "src/files/download_safe.ts",
+                    lang: Language::TypeScript,
+                    code: r#"
+import { resolveSafeUploadPath } from './sanitize';
+app.get('/download', requireAuth, (req, res) => {
+    const target = resolveSafeUploadPath(String(req.query.file));
+    res.sendFile(target);
+});
+"#,
+                },
+            ],
+        },
+        // -----------------------------------------------------------------
+        // 7. SSRF & XSS
+        // -----------------------------------------------------------------
+        AdversarialCase {
+            id: "ts_ssrf_vuln_unvalidated_fetch",
+            family: "SSRF",
+            expected_prefix: "SMG-SSRF",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "src/webhooks/proxy.ts",
+                lang: Language::TypeScript,
+                code: r#"
+app.post('/proxy', requireAuth, async (req, res) => {
+    const r = await fetch(req.body.webhookUrl);
+    res.send(await r.text());
+});
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "ts_xss_vuln_dangerously_set_inner_html",
+            family: "XSS",
+            expected_prefix: "SMG-XSS",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "src/ui/bio.tsx",
+                lang: Language::TypeScript,
+                code: r#"
+export function Bio({ req }: any) {
+    return <div dangerouslySetInnerHTML={{ __html: req.query.bio }} />;
+}
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "ts_xss_safe_dompurify",
+            family: "XSS",
+            expected_prefix: "SMG-XSS",
+            expect_finding: false,
+            trap_kind: TrapKind::BaselineSafe,
+            files: vec![BenchFile {
+                rel_path: "src/ui/bio_safe.tsx",
+                lang: Language::TypeScript,
+                code: r#"
+import DOMPurify from 'dompurify';
+export function BioSafe({ req }: any) {
+    const clean = DOMPurify.sanitize(String(req.query.bio || ''));
+    return <div dangerouslySetInnerHTML={{ __html: clean }} />;
+}
+"#,
+            }],
+        },
+        // -----------------------------------------------------------------
+        // 8. C/C++ Memory Bounds & Checked Allocation Trap + Cross-Lang Config/Secrets
+        // -----------------------------------------------------------------
+        AdversarialCase {
+            id: "c_mem_vuln_unchecked_mul_memcpy",
+            family: "MEM",
+            expected_prefix: "SMG-MEM",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "native/alloc.c",
+                lang: Language::C,
+                code: r#"
+#include <stdlib.h>
+#include <string.h>
+void* copy_items(void* src, size_t count, size_t item_sz, size_t n) {
+    void* buf = malloc(count * item_sz);
+    memcpy(buf, src, n);
+    return buf;
+}
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "c_mem_safe_checked_bounds",
+            family: "MEM",
+            expected_prefix: "SMG-MEM",
+            expect_finding: false,
+            trap_kind: TrapKind::CheckedBoundsTrap,
+            files: vec![BenchFile {
+                rel_path: "native/alloc_safe.c",
+                lang: Language::C,
+                code: r#"
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+void* copy_items_safe(const void* src, size_t count, size_t item_sz, size_t cap) {
+    if (item_sz == 0 || count > SIZE_MAX / item_sz) {
+        return NULL;
+    }
+    size_t total = count * item_sz;
+    if (total > cap) {
+        return NULL;
+    }
+    void* buf = calloc(count, item_sz);
+    if (!buf) return NULL;
+    memcpy(buf, src, total);
+    return buf;
+}
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "cfg_secret_vuln_jwt_decode_and_stripe",
+            family: "SEC_CFG",
+            expected_prefix: "SMG-",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "src/auth/jwt_bad.js",
+                lang: Language::JavaScript,
+                code: concat!(
+                    "\nconst STRIPE_LIVE_SECRET = \"sk_live_",
+                    "51H7FakeTestKey9999999999999999999999\";\n",
+                    "function parseUser(req) {\n",
+                    "    return jwt.decode(req.headers.authorization);\n",
+                    "}\n",
+                ),
+            }],
+        },
+        AdversarialCase {
+            id: "java_sqli_vuln_concat",
+            family: "SQLI",
+            expected_prefix: "SMG-SQLI",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "src/main/java/com/acme/UserDao.java",
+                lang: Language::Java,
+                code: r#"
+package com.acme;
+import java.sql.*;
+import javax.servlet.http.*;
+public class UserDao {
+    public ResultSet find(Connection conn, HttpServletRequest req) throws SQLException {
+        String name = req.getParameter("name");
+        Statement st = conn.createStatement();
+        return st.executeQuery("SELECT * FROM users WHERE name = '" + name + "'");
+    }
+}
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "php_cmdi_vuln_shell_exec",
+            family: "CMDI",
+            expected_prefix: "SMG-CMDI",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "public/ping.php",
+                lang: Language::Php,
+                code: r#"<?php
+$host = $_GET['host'];
+echo shell_exec("ping -c 1 " . $host);
+"#,
+            }],
+        },
+        // -----------------------------------------------------------------
+        // 9. Extended 40-Case Tough Multi-Language & Dominator Traps
+        // -----------------------------------------------------------------
+        AdversarialCase {
+            id: "ts_auth_vuln_guard_after_sink",
+            family: "AUTH",
+            expected_prefix: "SMG-AUTH",
+            expect_finding: true,
+            trap_kind: TrapKind::DominatorGuardTrap,
+            files: vec![BenchFile {
+                rel_path: "src/routes/late_guard.ts",
+                lang: Language::TypeScript,
+                code: r#"
+import express from 'express';
+const app = express();
+app.post('/api/v1/late-debit', async (req, res) => {
+    await db.query('UPDATE wallets SET balance = balance - $1 WHERE id = $2', [req.body.amt, req.body.id]);
+    requireAuth(req, res, () => {});
+    res.json({ ok: true });
+});
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "ts_auth_safe_diamond_both_branches",
+            family: "AUTH",
+            expected_prefix: "SMG-AUTH",
+            expect_finding: false,
+            trap_kind: TrapKind::DominatorGuardTrap,
+            files: vec![BenchFile {
+                rel_path: "src/routes/diamond_safe.ts",
+                lang: Language::TypeScript,
+                code: r#"
+import express from 'express';
+const app = express();
+app.post('/api/v1/diamond', async (req, res) => {
+    if (req.headers['x-mode'] === 'sso') {
+        verifyJwt(req);
+    } else {
+        requireAuth(req, res, () => {});
+    }
+    await db.transaction(async (tx) => {
+        await tx.query('SELECT balance FROM wallets WHERE id = $1 FOR UPDATE', [req.body.id]);
+        await tx.query('UPDATE wallets SET balance = balance - $1 WHERE id = $2', [req.body.amt, req.body.id]);
+    });
+    res.json({ ok: true });
+});
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "ts_sqli_safe_prisma_tagged_template",
+            family: "SQLI",
+            expected_prefix: "SMG-SQLI",
+            expect_finding: false,
+            trap_kind: TrapKind::BaselineSafe,
+            files: vec![BenchFile {
+                rel_path: "src/users/prisma_safe.ts",
+                lang: Language::TypeScript,
+                code: r#"
+app.get('/api/users/find', requireAuth, async (req, res) => {
+    const q = String(req.query.q || '');
+    const rows = await prisma.$queryRaw`SELECT id, email FROM users WHERE email = ${q} AND org_id = ${req.user.orgId}`;
+    res.json(rows);
+});
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "ts_sqli_vuln_prisma_raw_unsafe",
+            family: "SQLI",
+            expected_prefix: "SMG-SQLI",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "src/users/prisma_unsafe.ts",
+                lang: Language::TypeScript,
+                code: r#"
+app.get('/api/users/find', requireAuth, async (req, res) => {
+    const q = String(req.query.q || '');
+    const rows = await prisma.$queryRawUnsafe(`SELECT id FROM users WHERE email = '${q}'`);
+    res.json(rows);
+});
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "py_deser_vuln_yaml_load",
+            family: "CMDI",
+            expected_prefix: "SMG-CMDI",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "app/yaml_loader.py",
+                lang: Language::Python,
+                code: r#"
+import yaml
+from flask import request
+
+def parse_cfg():
+    raw = request.data
+    return yaml.load(raw)
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "py_deser_safe_yaml_safe_load",
+            family: "CMDI",
+            expected_prefix: "SMG-CMDI",
+            expect_finding: false,
+            trap_kind: TrapKind::BaselineSafe,
+            files: vec![BenchFile {
+                rel_path: "app/yaml_loader_safe.py",
+                lang: Language::Python,
+                code: r#"
+import yaml
+from flask import request
+
+def parse_cfg_safe():
+    raw = request.data
+    return yaml.safe_load(raw)
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "rust_sqli_safe_sqlx_bind",
+            family: "SQLI",
+            expected_prefix: "SMG-SQLI",
+            expect_finding: false,
+            trap_kind: TrapKind::BaselineSafe,
+            files: vec![BenchFile {
+                rel_path: "src/orders.rs",
+                lang: Language::Rust,
+                code: r#"
+pub async fn get_order(pool: &PgPool, id: i64, user_id: i64) {
+    let _ = sqlx::query("SELECT id FROM orders WHERE id = $1 AND user_id = $2")
+        .bind(id)
+        .bind(user_id)
+        .fetch_one(pool)
+        .await;
+}
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "rust_cmdi_vuln_sh_dash_c",
+            family: "CMDI",
+            expected_prefix: "SMG-CMDI",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "src/cli_exec.rs",
+                lang: Language::Rust,
+                code: r#"
+use std::process::Command;
+pub async fn run_user_cmd(Json(req_cmd): Json<String>) {
+    let _ = Command::new("sh").arg("-c").arg(format!("echo {}", req_cmd)).output();
+}
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "ruby_sqli_vuln_rails_interp",
+            family: "SQLI",
+            expected_prefix: "SMG-SQLI",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "app/controllers/users_controller.rb",
+                lang: Language::Ruby,
+                code: r#"
+class UsersController < ApplicationController
+  def search
+    name = params[:name]
+    @users = User.where("name = '#{name}'")
+    render json: @users
+  end
+end
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "ruby_sqli_safe_rails_placeholder",
+            family: "SQLI",
+            expected_prefix: "SMG-SQLI",
+            expect_finding: false,
+            trap_kind: TrapKind::BaselineSafe,
+            files: vec![BenchFile {
+                rel_path: "app/controllers/safe_users_controller.rb",
+                lang: Language::Ruby,
+                code: r#"
+class SafeUsersController < ApplicationController
+  before_action :authenticate_user!
+  def search
+    name = params[:name]
+    @users = User.where("name = ? AND account_id = ?", name, current_user.account_id)
+    render json: @users
+  end
+end
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "cs_sqli_vuln_interp",
+            family: "SQLI",
+            expected_prefix: "SMG-SQLI",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "Controllers/UsersController.cs",
+                lang: Language::CSharp,
+                code: r#"
+using Microsoft.AspNetCore.Mvc;
+public class UsersController : ControllerBase {
+    [HttpGet("/api/users/find")]
+    public IActionResult Find([FromQuery] string name) {
+        var q = $"SELECT * FROM Users WHERE Name = '{name}'";
+        var cmd = new SqlCommand(q);
+        return Ok();
+    }
+}
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "kotlin_cmdi_vuln_runtime_exec",
+            family: "CMDI",
+            expected_prefix: "SMG-CMDI",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "src/main/kotlin/ShellService.kt",
+                lang: Language::Kotlin,
+                code: r#"
+fun configureRoutes(routing: Routing) {
+    routing.post("/api/run") {
+        val userInput = call.parameters["cmd"] ?: ""
+        val cmd = "grep " + userInput + " /var/log/app.log"
+        Runtime.getRuntime().exec(cmd)
+    }
+}
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "cfg_jwt_safe_verify_rs256",
+            family: "SEC_CFG",
+            expected_prefix: "SMG-CFG-JWT",
+            expect_finding: false,
+            trap_kind: TrapKind::BaselineSafe,
+            files: vec![BenchFile {
+                rel_path: "src/auth/jwt_safe.js",
+                lang: Language::JavaScript,
+                code: r#"
+function verifyUser(req, pubKey) {
+    return jwt.verify(req.headers.authorization, pubKey, { algorithms: ['RS256'] });
+}
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "cross_file_same_name_isolation_safe",
+            family: "SQLI",
+            expected_prefix: "SMG-SQLI",
+            expect_finding: false,
+            trap_kind: TrapKind::ScopeCollisionTrap,
+            files: vec![
+                BenchFile {
+                    rel_path: "src/db/safe_repo.ts",
+                    lang: Language::TypeScript,
+                    code: r#"
+export async function runRecord(id: string, ownerId: string) {
+    return db.query('SELECT id FROM records WHERE id = $1 AND owner_id = $2', [id, ownerId]);
+}
+"#,
+                },
+                BenchFile {
+                    rel_path: "src/routes/safe_handler.ts",
+                    lang: Language::TypeScript,
+                    code: r#"
+import { runRecord } from '../db/safe_repo';
+app.get('/records/:id', requireAuth, async (req, res) => {
+    const out = await runRecord(req.params.id, req.user.id);
+    res.json(out);
+});
+"#,
+                },
+            ],
+        },
+        // -----------------------------------------------------------------
+        // 13. Wave 2 Core Domains: CI/CD, K8s, ReDoS, ZipSlip, Crypto, Async Queue
+        // -----------------------------------------------------------------
+        AdversarialCase {
+            id: "gha_cicd_vuln_pwn_request",
+            family: "CICD",
+            expected_prefix: "SMG-CICD",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: ".github/workflows/pr.yml",
+                lang: Language::Config,
+                code: r#"
+on:
+  pull_request_target:
+jobs:
+  greet:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "${{ github.event.pull_request.title }}"
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "gha_cicd_safe_env_bound_sha_pinned",
+            family: "CICD",
+            expected_prefix: "SMG-CICD",
+            expect_finding: false,
+            trap_kind: TrapKind::BaselineSafe,
+            files: vec![BenchFile {
+                rel_path: ".github/workflows/pr_safe.yml",
+                lang: Language::Config,
+                code: r#"
+on:
+  pull_request_target:
+permissions:
+  contents: read
+jobs:
+  greet:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
+      - env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: echo "$TITLE"
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "k8s_vuln_privileged_dockersock",
+            family: "K8S",
+            expected_prefix: "SMG-K8S",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "deploy/pod.yaml",
+                lang: Language::Config,
+                code: r#"
+apiVersion: v1
+kind: Pod
+spec:
+  hostPID: true
+  containers:
+    - name: runner
+      securityContext:
+        privileged: true
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "k8s_safe_restricted_pod",
+            family: "K8S",
+            expected_prefix: "SMG-K8S",
+            expect_finding: false,
+            trap_kind: TrapKind::BaselineSafe,
+            files: vec![BenchFile {
+                rel_path: "deploy/safe_pod.yaml",
+                lang: Language::Config,
+                code: r#"
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+    - name: app
+      securityContext:
+        privileged: false
+        allowPrivilegeEscalation: false
+        runAsNonRoot: true
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "ts_redos_vuln_nested_quantifier",
+            family: "DOS",
+            expected_prefix: "SMG-DOS",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "src/validate/email.ts",
+                lang: Language::TypeScript,
+                code: r#"
+export function isEmailFast(v: string) {
+    const re = new RegExp("^([a-zA-Z0-9]+)+$");
+    return re.test(v);
+}
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "ts_redos_safe_linear_pattern",
+            family: "DOS",
+            expected_prefix: "SMG-DOS",
+            expect_finding: false,
+            trap_kind: TrapKind::BaselineSafe,
+            files: vec![BenchFile {
+                rel_path: "src/validate/slug.ts",
+                lang: Language::TypeScript,
+                code: r#"
+export function isSlug(v: string) {
+    const re = new RegExp("^[a-z0-9_-]{3,32}$");
+    return re.test(v);
+}
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "py_zipslip_vuln_extractall",
+            family: "PATH",
+            expected_prefix: "SMG-ZIP",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "app/archive.py",
+                lang: Language::Python,
+                code: r#"
+import zipfile
+
+def extract_upload(p: str):
+    with zipfile.ZipFile(p) as z:
+        z.extractall("/var/data/uploads")
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "py_zipslip_safe_realpath_prefix",
+            family: "PATH",
+            expected_prefix: "SMG-ZIP",
+            expect_finding: false,
+            trap_kind: TrapKind::BaselineSafe,
+            files: vec![BenchFile {
+                rel_path: "app/archive_safe.py",
+                lang: Language::Python,
+                code: r#"
+import os, zipfile
+
+def extract_upload(p: str, root: str):
+    with zipfile.ZipFile(p) as z:
+        for member in z.infolist():
+            dst = os.path.realpath(os.path.join(root, member.filename))
+            if dst.startswith(os.path.realpath(root) + os.sep):
+                z.extract(member, root)
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "ts_crypto_vuln_timing_cmp",
+            family: "CRYPTO",
+            expected_prefix: "SMG-CRYPTO",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "src/webhooks/verify.ts",
+                lang: Language::TypeScript,
+                code: r#"
+export function verifyWebhook(signature: string, expectedSig: string) {
+    return signature === expectedSig;
+}
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "ts_crypto_safe_timing_safe_equal",
+            family: "CRYPTO",
+            expected_prefix: "SMG-CRYPTO",
+            expect_finding: false,
+            trap_kind: TrapKind::BaselineSafe,
+            files: vec![BenchFile {
+                rel_path: "src/webhooks/verify_safe.ts",
+                lang: Language::TypeScript,
+                code: r#"
+import crypto from 'node:crypto';
+export function verifyWebhook(signature: Buffer, expectedSig: Buffer) {
+    return crypto.timingSafeEqual(signature, expectedSig);
+}
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "ts_queue_vuln_missing_tenant_validation",
+            family: "QUEUE",
+            expected_prefix: "SMG-QUEUE",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "src/workers/jobs.ts",
+                lang: Language::TypeScript,
+                code: r#"
+const worker = new Worker('payout', async (job) => {
+    await exec(job.data.cmd);
+});
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "ts_queue_safe_validated_tenant_scoped",
+            family: "QUEUE",
+            expected_prefix: "SMG-QUEUE",
+            expect_finding: false,
+            trap_kind: TrapKind::BaselineSafe,
+            files: vec![BenchFile {
+                rel_path: "src/workers/jobs_safe.ts",
+                lang: Language::TypeScript,
+                code: r#"
+const worker = new Worker('payout', async (job) => {
+    const data = payoutSchema.parse(job.data);
+    await debitForTenant(data.tenantId, data.amount, data.idempotencyKey);
+});
+"#,
+            }],
+        },
+        // -----------------------------------------------------------------
+        // 14. Wave 3 Engine Precision + Protocols / AI / OAuth / State
+        // -----------------------------------------------------------------
+        AdversarialCase {
+            id: "wave3_constant_literal_sql_safe",
+            family: "SQLI",
+            expected_prefix: "SMG-SQLI",
+            expect_finding: false,
+            trap_kind: TrapKind::DominatorGuardTrap,
+            files: vec![BenchFile {
+                rel_path: "src/db/audit_safe.ts",
+                lang: Language::TypeScript,
+                code: r#"
+app.get('/api/logs', requireAuth, async (req, res) => {
+    const TABLE = "audit_logs";
+    const id = req.query.id;
+    const rows = await db.query("SELECT * FROM " + TABLE + " WHERE id = $1", [id]);
+    res.json(rows);
+});
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "wave3_discarded_sanitizer_xss_vuln",
+            family: "XSS",
+            expected_prefix: "SMG-XSS",
+            expect_finding: true,
+            trap_kind: TrapKind::CheckedBoundsTrap,
+            files: vec![BenchFile {
+                rel_path: "src/views/bio_discarded.ts",
+                lang: Language::TypeScript,
+                code: r#"
+app.post('/profile/bio', requireAuth, (req, res) => {
+    const bio = req.body.bio;
+    DOMPurify.sanitize(bio);
+    if (escapeHtml(bio)) {
+        res.send(`<div>${bio}</div>`);
+    }
+});
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "wave3_assigned_sanitizer_xss_safe",
+            family: "XSS",
+            expected_prefix: "SMG-XSS",
+            expect_finding: false,
+            trap_kind: TrapKind::CheckedBoundsTrap,
+            files: vec![BenchFile {
+                rel_path: "src/views/bio_clean.ts",
+                lang: Language::TypeScript,
+                code: r#"
+app.post('/profile/bio-clean', requireAuth, (req, res) => {
+    const bio = DOMPurify.sanitize(req.body.bio);
+    res.send(`<div>${bio}</div>`);
+});
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "wave3_dynamic_dispatch_cmdi_vuln",
+            family: "CMDI",
+            expected_prefix: "SMG-CMDI",
+            expect_finding: true,
+            trap_kind: TrapKind::OneHopWrapperTrap,
+            files: vec![BenchFile {
+                rel_path: "src/ops/dispatcher.ts",
+                lang: Language::TypeScript,
+                code: r#"
+const handlers = { diag: runDiag };
+function runDiag(cmd: string) {
+    execSync(cmd);
+}
+app.post('/api/ops', requireAuth, (req, res) => {
+    const action = req.body.action;
+    handlers[action](req.body.cmd);
+    res.json({ ok: true });
+});
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "wave3_graphql_ws_unauth_vuln",
+            family: "API",
+            expected_prefix: "SMG-API",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "src/api/graphql_ws.ts",
+                lang: Language::TypeScript,
+                code: r#"
+const server = new ApolloServer({ typeDefs, resolvers, introspection: true });
+wss.on('connection', (ws) => {
+    ws.on('message', (msg) => execSync(msg.toString()));
+});
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "wave3_graphql_ws_hardened_safe",
+            family: "API",
+            expected_prefix: "SMG-API",
+            expect_finding: false,
+            trap_kind: TrapKind::BaselineSafe,
+            files: vec![BenchFile {
+                rel_path: "src/api/graphql_ws_safe.ts",
+                lang: Language::TypeScript,
+                code: r#"
+const server = new ApolloServer({
+    typeDefs,
+    resolvers,
+    introspection: process.env.NODE_ENV !== 'production',
+    validationRules: [depthLimit(6)],
+});
+const wss = new WebSocketServer({ verifyClient: checkJwt });
+wss.on('connection', (ws) => {
+    ws.on('message', (msg) => {
+        jwt.verify(msg.token, process.env.JWT_PUBLIC_KEY);
+        console.log(msg.event);
+    });
+});
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "wave3_ai_llm_sql_vuln",
+            family: "AI",
+            expected_prefix: "SMG-AI",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "src/ai/agent_vuln.ts",
+                lang: Language::TypeScript,
+                code: r#"
+import OpenAI from 'openai';
+export async function askDb(prompt: string) {
+    const res = await openai.chat.completions.create({ model: 'gpt-4o', messages: [{ role: 'user', content: prompt }] });
+    const generatedSql = res.choices[0].message.content;
+    return db.query(generatedSql);
+}
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "wave3_ai_llm_allowlisted_safe",
+            family: "AI",
+            expected_prefix: "SMG-AI",
+            expect_finding: false,
+            trap_kind: TrapKind::BaselineSafe,
+            files: vec![BenchFile {
+                rel_path: "src/ai/agent_safe.ts",
+                lang: Language::TypeScript,
+                code: r#"
+import OpenAI from 'openai';
+export async function askDbSafe(prompt: string) {
+    const ALLOWED_TOOLS = { lookup: true };
+    const res = await openai.chat.completions.create({ model: 'gpt-4o', messages: [{ role: 'user', content: prompt }] });
+    const call = ToolSchema.safeParse(res.choices[0].message);
+    if (ALLOWED_TOOLS[call.tool]) {
+        return db.query('SELECT * FROM items WHERE id = $1', [call.id]);
+    }
+}
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "wave3_oauth_pkce_missing_vuln",
+            family: "OAUTH",
+            expected_prefix: "SMG-AUTH-PKCE",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "src/auth/oauth_bad.ts",
+                lang: Language::TypeScript,
+                code: r#"
+export function loginUrl(redirectUri: string, clientId: string) {
+    return `https://idp.example.com/oauth/authorize?response_type=code&client_id=${clientId}&redirect_uri=${redirectUri}`;
+}
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "wave3_oauth_pkce_hardened_safe",
+            family: "OAUTH",
+            expected_prefix: "SMG-AUTH-PKCE",
+            expect_finding: false,
+            trap_kind: TrapKind::BaselineSafe,
+            files: vec![BenchFile {
+                rel_path: "src/auth/oauth_safe.ts",
+                lang: Language::TypeScript,
+                code: r#"
+export function loginUrlSafe(state: string, codeChallenge: string) {
+    const ALLOWED_REDIRECT_URIS = ['https://app.example.com/callback'];
+    return `https://idp.example.com/oauth/authorize?response_type=code&client_id=app1&state=${state}&code_challenge=${codeChallenge}&code_challenge_method=S256`;
+}
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "wave3_http_crlf_host_vuln",
+            family: "SMUGGLE",
+            expected_prefix: "SMG-HTTP-SMUGGLE",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "src/routes/reset_vuln.ts",
+                lang: Language::TypeScript,
+                code: r#"
+app.post('/reset', requireAuth, (req, res) => {
+    res.setHeader('Location', req.query.next);
+    return `https://${req.headers['x-forwarded-host']}/reset?token=abc`;
+});
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "wave3_http_crlf_host_safe",
+            family: "SMUGGLE",
+            expected_prefix: "SMG-HTTP-SMUGGLE",
+            expect_finding: false,
+            trap_kind: TrapKind::BaselineSafe,
+            files: vec![BenchFile {
+                rel_path: "src/routes/reset_safe.ts",
+                lang: Language::TypeScript,
+                code: r#"
+app.post('/reset-safe', requireAuth, (req, res) => {
+    const next = encodeURIComponent(String(req.query.next || ''));
+    res.setHeader('Location', next);
+    return `${process.env.APP_URL}/reset?token=abc`;
+});
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "wave3_workflow_state_skip_vuln",
+            family: "STATE",
+            expected_prefix: "SMG-STATE",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "src/orders/ship_vuln.ts",
+                lang: Language::TypeScript,
+                code: r#"
+export async function shipOrder(req, db) {
+    await db.query("UPDATE orders SET status = 'SHIPPED' WHERE id = $1", [req.params.id]);
+}
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "wave3_workflow_state_guarded_safe",
+            family: "STATE",
+            expected_prefix: "SMG-STATE",
+            expect_finding: false,
+            trap_kind: TrapKind::BaselineSafe,
+            files: vec![BenchFile {
+                rel_path: "src/orders/ship_safe.ts",
+                lang: Language::TypeScript,
+                code: r#"
+export async function shipOrderSafe(req, db) {
+    const order = await db.findOne(req.params.id);
+    if (order.status !== 'PAID') throw new Error('Order not paid');
+    await db.query("UPDATE orders SET status = 'SHIPPED' WHERE id = $1 AND status = 'PAID'", [req.params.id]);
+}
+"#,
+            }],
+        },
+    ]
+}
+
+fn run_synthetic_scale_repo(num_modules: usize) -> Vec<f64> {
+    let mut files = Vec::with_capacity(num_modules);
+    for i in 0..num_modules {
+        let code = format!(
+            r#"
+import express from 'express';
+const app{i} = express();
+export function helper{i}(v: string) {{
+    return v.trim();
+}}
+app{i}.get('/api/items/{i}/:id', requireAuth, async (req, res) => {{
+    const row = await db.query('SELECT id, name FROM items WHERE id = $1 AND user_id = $2', [req.params.id, req.user.id]);
+    res.json(row);
+}});
+"#
+        );
+        let bytes = code.into_bytes();
+        let hash = blake3::hash(&bytes).to_hex().to_string();
+        files.push(IndexedFile {
+            rel_path: format!("src/mod_{i}.ts"),
+            abs_path: PathBuf::from(format!("src/mod_{i}.ts")),
+            language: Language::TypeScript,
+            blake3_hash: hash,
+            mtime_ns: 0,
+            size_bytes: bytes.len() as u64,
+            cached_bytes: Some(bytes),
+        });
+    }
+
+    let cfg = ShellMindGuardConfig::default();
+    let mut samples_ms = Vec::with_capacity(10);
+    for _ in 0..10 {
+        let t0 = Instant::now();
+        let res = analyze_codebase(&files, &cfg).expect("scale analyze_codebase should not fail");
+        assert!(res.parsed_files >= num_modules);
+        samples_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+    }
+    samples_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    samples_ms
+}
+
+#[test]
+fn test_adversarial_precision_recall_and_latency_benchmark() {
+    let cfg = ShellMindGuardConfig::default();
+    let cases = corpus();
+
+    let mut tp = 0usize;
+    let mut fp = 0usize;
+    let mut tn = 0usize;
+    let mut fn_count = 0usize;
+    let mut per_case_ms = Vec::with_capacity(cases.len());
+    let mut misses: Vec<String> = Vec::new();
+    let mut by_family: BTreeMap<&'static str, (usize, usize, usize, usize)> = BTreeMap::new();
+
+    for case in &cases {
+        let indexed = build_indexed(&case.files);
+        let t0 = Instant::now();
+        let res = analyze_codebase(&indexed, &cfg).expect("analyze_codebase must not panic");
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        per_case_ms.push(elapsed_ms);
+
+        let hit = matches_prefix(&res, case.expected_prefix);
+        let entry = by_family.entry(case.family).or_insert((0, 0, 0, 0));
+
+        match (case.expect_finding, hit) {
+            (true, true) => {
+                tp += 1;
+                entry.0 += 1;
+            }
+            (false, true) => {
+                fp += 1;
+                entry.1 += 1;
+                misses.push(format!(
+                    "FP [{}] ({:?}) emitted {:?}",
+                    case.id,
+                    case.trap_kind,
+                    res.findings
+                        .iter()
+                        .map(|f| format!("{}:{}", f.rule_id, f.file))
+                        .collect::<Vec<_>>()
+                ));
+            }
+            (false, false) => {
+                tn += 1;
+                entry.2 += 1;
+            }
+            (true, false) => {
+                fn_count += 1;
+                entry.3 += 1;
+                misses.push(format!(
+                    "FN [{}] ({:?}) missed prefix {} (emitted {:?})",
+                    case.id,
+                    case.trap_kind,
+                    case.expected_prefix,
+                    res.findings
+                        .iter()
+                        .map(|f| f.rule_id.as_str())
+                        .collect::<Vec<_>>()
+                ));
+            }
+        }
+    }
+
+    let precision = if tp + fp == 0 {
+        1.0
+    } else {
+        tp as f64 / (tp + fp) as f64
+    };
+    let recall = if tp + fn_count == 0 {
+        1.0
+    } else {
+        tp as f64 / (tp + fn_count) as f64
+    };
+    let f1 = if precision + recall == 0.0 {
+        0.0
+    } else {
+        2.0 * precision * recall / (precision + recall)
+    };
+
+    per_case_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let case_p99 = per_case_ms[((per_case_ms.len() * 99) / 100).min(per_case_ms.len() - 1)];
+
+    let scale_samples = run_synthetic_scale_repo(120);
+    let scale_p50 = scale_samples[scale_samples.len() / 2];
+    let scale_p99 = scale_samples[scale_samples.len() - 1];
+
+    eprintln!(
+        "\n=== SMG Adversarial Benchmark Summary ===\n\
+         Cases={} | TP={} FP={} TN={} FN={}\n\
+         Precision={:.2}% | Recall={:.2}% | F1={:.2}%\n\
+         Micro-Case P99={:.2}ms | 120-Module Repo P50={:.2}ms P99={:.2}ms",
+        cases.len(),
+        tp,
+        fp,
+        tn,
+        fn_count,
+        precision * 100.0,
+        recall * 100.0,
+        f1 * 100.0,
+        case_p99,
+        scale_p50,
+        scale_p99
+    );
+    for (fam, (ftp, ffp, ftn, ffn)) in &by_family {
+        eprintln!("  [{fam}] TP={ftp} FP={ffp} TN={ftn} FN={ffn}");
+    }
+    for m in &misses {
+        eprintln!("  MISS: {m}");
+    }
+
+    // Permanent precision, recall, and latency non-regression gates:
+    assert!(scale_p99.is_finite() && scale_p99 > 0.0);
+    assert!(
+        tp >= 20,
+        "core precision benchmark suffered recall drop (tp={tp})"
+    );
+    assert!(
+        precision >= 0.98,
+        "precision {:.2}% < 98.00% target! Misses: {:?}",
+        precision * 100.0,
+        misses
+    );
+    assert!(
+        recall >= 0.95,
+        "recall {:.2}% < 95.00% target! Misses: {:?}",
+        recall * 100.0,
+        misses
+    );
+    assert!(
+        scale_p99 < 2000.0,
+        "120-module P99 {:.2}ms >= 2000ms budget",
+        scale_p99
+    );
+}

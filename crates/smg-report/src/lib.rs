@@ -1,7 +1,24 @@
 use serde_json::json;
+use smg_graph::deps::ResolvedDependency;
 use smg_graph::{Confidence, GraphAnalysisResult, LatticeFinding};
 use smg_sandbox::{VerificationStatus, VerifiedFinding};
 use std::collections::HashMap;
+
+fn compute_attestation_digest(findings: &[LatticeFinding], verified: &[VerifiedFinding]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
+    for f in findings {
+        hasher.update(f.id.as_bytes());
+        hasher.update(f.rule_id.as_bytes());
+        hasher.update(f.file.as_bytes());
+        hasher.update(&f.line.to_le_bytes());
+    }
+    for v in verified {
+        hasher.update(v.finding_id.as_bytes());
+        hasher.update(format!("{:?}", v.status).as_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
+}
 
 fn security_severity_score(sev: &str) -> &'static str {
     match sev {
@@ -153,6 +170,7 @@ pub fn to_sarif_json(findings: &[LatticeFinding], verified: &[VerifiedFinding]) 
         })
         .collect();
 
+    let digest = compute_attestation_digest(findings, verified);
     let sarif = json!({
         "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
         "version": "2.1.0",
@@ -165,11 +183,108 @@ pub fn to_sarif_json(findings: &[LatticeFinding], verified: &[VerifiedFinding]) 
                     "rules": rules
                 }
             },
+            "properties": {
+                "blake3ReportDigest": digest
+            },
             "results": results
         }]
     });
 
     serde_json::to_string_pretty(&sarif).unwrap_or_else(|_| "{}".into())
+}
+
+/// Exports a combined CycloneDX 1.5 SBOM + VEX document tagging `SMG-DEP-*` vulnerabilities as
+/// `exploitable` (import-reachable) vs `not_affected` (`code_not_reachable`, declared in lockfile only),
+/// sealed with a deterministic BLAKE3 policy/findings digest.
+pub fn to_cyclonedx_vex_json(
+    project_name: &str,
+    deps: &[ResolvedDependency],
+    findings: &[LatticeFinding],
+    verified: &[VerifiedFinding],
+) -> String {
+    let ver_map: HashMap<&str, &VerifiedFinding> = verified
+        .iter()
+        .map(|v| (v.finding_id.as_str(), v))
+        .collect();
+    let components: Vec<serde_json::Value> = deps
+        .iter()
+        .map(|d| {
+            let eco_low = d.ecosystem.to_ascii_lowercase();
+            let purl_eco = match eco_low.as_str() {
+                "npm" => "npm",
+                "crates.io" | "cargo" => "cargo",
+                "go" | "golang" => "golang",
+                "pypi" => "pypi",
+                other => other,
+            };
+            json!({
+                "type": "library",
+                "bom-ref": format!("pkg:{}/{}@{}", purl_eco, d.name, d.version),
+                "name": d.name,
+                "version": d.version,
+                "purl": format!("pkg:{}/{}@{}", purl_eco, d.name, d.version),
+            })
+        })
+        .collect();
+
+    let vulnerabilities: Vec<serde_json::Value> = findings
+        .iter()
+        .filter(|f| f.rule_id.starts_with("SMG-DEP-") || f.rule_id.starts_with("SMG-CICD-"))
+        .map(|f| {
+            let v_opt = ver_map.get(f.id.as_str()).copied();
+            let is_declared_unused = f.proof_reasons.iter().any(|r| r == "DeclaredUnusedVEX");
+            let is_proven = v_opt.is_some_and(|v| v.status == VerificationStatus::Proven)
+                || f.confidence == Confidence::Proven;
+            let (state, justification, detail) = if is_proven {
+                ("exploitable", "requires_configuration", "Verified exploitable inside isolated sandbox")
+            } else if is_declared_unused {
+                ("not_affected", "code_not_reachable", "Declared in manifest/lockfile with zero static source imports")
+            } else {
+                ("in_triage", "requires_environment", "Package imported or referenced in codebase")
+            };
+            json!({
+                "id": f.id,
+                "source": { "name": "ShellMind Guard", "url": "https://github.com/qira-dev/ShellMind-Guard" },
+                "description": f.title,
+                "ratings": [{ "severity": f.severity.to_ascii_lowercase(), "method": "other" }],
+                "analysis": {
+                    "state": state,
+                    "justification": justification,
+                    "detail": detail,
+                },
+                "properties": [
+                    { "name": "smg:rule_id", "value": f.rule_id },
+                    { "name": "smg:file", "value": f.file },
+                    { "name": "smg:proof_reasons", "value": f.proof_reasons.join(",") }
+                ]
+            })
+        })
+        .collect();
+
+    let digest = compute_attestation_digest(findings, verified);
+    let doc = json!({
+        "bomFormat": "CycloneDX",
+        "specVersion": "1.5",
+        "version": 1,
+        "metadata": {
+            "component": {
+                "type": "application",
+                "name": project_name
+            },
+            "tools": [{
+                "vendor": "ShellMind Guard",
+                "name": "smg",
+                "version": env!("CARGO_PKG_VERSION")
+            }],
+            "properties": [
+                { "name": "smg:blake3_digest", "value": digest }
+            ]
+        },
+        "components": components,
+        "vulnerabilities": vulnerabilities
+    });
+
+    serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into())
 }
 
 /// Generates a self-contained GitHub Carbon Slate HTML + inline SVG multi-file flow report.
@@ -388,5 +503,67 @@ mod tests {
             percent_encode_uri_path("crates\\smg-graph\\src\\ast.rs"),
             "crates/smg-graph/src/ast.rs"
         );
+    }
+
+    #[test]
+    fn test_cyclonedx_vex_and_sarif_digest() {
+        let deps = vec![
+            ResolvedDependency {
+                ecosystem: "npm".into(),
+                name: "axios".into(),
+                version: "1.5.0".into(),
+                line: 4,
+            },
+            ResolvedDependency {
+                ecosystem: "npm".into(),
+                name: "lodash".into(),
+                version: "4.17.20".into(),
+                line: 5,
+            },
+        ];
+        let findings = vec![
+            LatticeFinding {
+                id: "SMG-DEP-001".into(),
+                rule_id: "SMG-DEP-001".into(),
+                severity: "HIGH".into(),
+                title: "Vulnerable dependency `axios@1.5.0`".into(),
+                file: "package-lock.json".into(),
+                line: 4,
+                status: "SUSPECT".into(),
+                confidence: Confidence::Confirmed,
+                entry_route: "package-lock.json:4".into(),
+                sink_kind: smg_graph::SinkKind::DependencyRisk,
+                missing_guard: smg_graph::GuardKind::DependencyPolicy,
+                witness_path: Vec::new(),
+                remediation: "Upgrade axios.".into(),
+                proof_reasons: vec!["ManifestVersionMatch".into(), "ReachableImport".into()],
+            },
+            LatticeFinding {
+                id: "SMG-DEP-002".into(),
+                rule_id: "SMG-DEP-001".into(),
+                severity: "HIGH".into(),
+                title: "Vulnerable dependency `lodash@4.17.20`".into(),
+                file: "package-lock.json".into(),
+                line: 5,
+                status: "SUSPECT".into(),
+                confidence: Confidence::Confirmed,
+                entry_route: "package-lock.json:5".into(),
+                sink_kind: smg_graph::SinkKind::DependencyRisk,
+                missing_guard: smg_graph::GuardKind::DependencyPolicy,
+                witness_path: Vec::new(),
+                remediation: "Upgrade lodash.".into(),
+                proof_reasons: vec!["ManifestVersionMatch".into(), "DeclaredUnusedVEX".into()],
+            },
+        ];
+
+        let sarif = to_sarif_json(&findings, &[]);
+        assert!(sarif.contains("blake3ReportDigest"));
+
+        let vex = to_cyclonedx_vex_json("demo-app", &deps, &findings, &[]);
+        assert!(vex.contains("CycloneDX"));
+        assert!(vex.contains("pkg:npm/axios@1.5.0"));
+        assert!(vex.contains("not_affected"));
+        assert!(vex.contains("code_not_reachable"));
+        assert!(vex.contains("smg:blake3_digest"));
     }
 }

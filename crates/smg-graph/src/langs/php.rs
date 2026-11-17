@@ -99,6 +99,36 @@ pub(crate) const PROFILE: LangProfile = LangProfile {
 
 pub(crate) fn extract(root: Node, ctx: &mut ExtractContext<'_>) {
     walk_node(root, ctx, "", &HashSet::new());
+    // Analyze top-level procedural PHP entrypoints (outside classes/functions) such as `ping.php`.
+    let has_named_unit = ctx
+        .symbols
+        .iter()
+        .any(|s| matches!(s.kind, SymbolKind::Function | SymbolKind::Sink));
+    if !has_named_unit {
+        let low = strip_comments(node_text(root, ctx.src)).to_ascii_lowercase();
+        let has_php_source_or_sink = PROFILE.taint_sources.iter().any(|s| low.contains(s))
+            || PROFILE.cmd_sinks.iter().any(|s| low.contains(s))
+            || PROFILE.sql_sinks.iter().any(|s| low.contains(s))
+            || PROFILE.path_sinks.iter().any(|s| low.contains(s));
+        if has_php_source_or_sink {
+            let sym = build_analyzed_symbol(
+                ctx,
+                &PROFILE,
+                format!("php:{}:__script__:1", ctx.rel_path),
+                "__script__".to_string(),
+                SymbolKind::Function,
+                1,
+                root.end_position().row + 1,
+                "",
+                "",
+                Some(root),
+                root,
+                None,
+                &[],
+            );
+            ctx.symbols.push(sym);
+        }
+    }
 }
 
 fn walk_node(

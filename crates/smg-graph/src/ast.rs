@@ -389,6 +389,18 @@ pub fn parse_file_ast_with_hash(
 
     let mut static_findings =
         crate::secrets_config::scan_secrets_and_config(&file.rel_path, source);
+    if !matches!(file.language, Language::Solidity | Language::Move) {
+        static_findings.extend(crate::infra_dos::scan_infra_dos_crypto_and_queues(
+            &file.rel_path,
+            file.language,
+            source,
+        ));
+        static_findings.extend(crate::protocols_ai::scan_protocols_ai_and_workflow(
+            &file.rel_path,
+            file.language,
+            source,
+        ));
+    }
     if matches!(file.language, Language::Manifest) {
         static_findings.extend(crate::deps::scan_dependencies(&file.rel_path, source));
     }
@@ -401,7 +413,7 @@ pub fn parse_file_ast_with_hash(
 
     if matches!(
         file.language,
-        Language::Config | Language::Manifest | Language::Sql
+        Language::Config | Language::Manifest | Language::Sql | Language::Solidity | Language::Move
     ) {
         let domain_hints =
             crate::phase9::detect_domain_hints(file.language, &file.rel_path, source, &[]);
@@ -425,44 +437,33 @@ pub fn parse_file_ast_with_hash(
     }
 
     let mut parser = Parser::new();
-
-    match file.language {
-        Language::TypeScript => {
-            let is_tsx = file.rel_path.ends_with(".tsx");
-            let lang = if is_tsx {
-                tree_sitter_typescript::LANGUAGE_TSX.into()
-            } else {
-                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
-            };
-            parser.set_language(&lang).ok()?;
-        }
-        Language::JavaScript => {
-            parser
-                .set_language(&tree_sitter_javascript::LANGUAGE.into())
-                .ok()?;
-        }
-        Language::Rust => {
-            parser
-                .set_language(&tree_sitter_rust::LANGUAGE.into())
-                .ok()?;
-        }
-        Language::Python => {
-            parser
-                .set_language(&tree_sitter_python::LANGUAGE.into())
-                .ok()?;
-        }
-        Language::Go => {
-            parser.set_language(&tree_sitter_go::LANGUAGE.into()).ok()?;
-        }
-        other => {
-            let ts_lang = crate::langs::ts_language_for(other)?;
-            parser.set_language(&ts_lang).ok()?;
-        }
+    if !configure_parser_language(&mut parser, file.language, &file.rel_path) {
+        return None;
     }
 
     let tree = parser.parse(source, None)?;
     let root = tree.root_node();
     let src_bytes = source.as_bytes();
+
+    if file.language == Language::Rust {
+        let mut test_ranges: Vec<(usize, usize)> = Vec::new();
+        let mut rc = root.walk();
+        for ch in root.children(&mut rc) {
+            if is_rust_test_item(ch, src_bytes) {
+                test_ranges.push((ch.start_position().row + 1, ch.end_position().row + 1));
+            }
+        }
+        if !test_ranges.is_empty() {
+            static_findings.retain(|sf| {
+                let in_cfg_test = test_ranges
+                    .iter()
+                    .any(|(s, e)| sf.line >= *s && sf.line <= *e);
+                !in_cfg_test
+                    || sf.missing_guard == GuardKind::SecretPolicy
+                    || sf.rule_id.starts_with("SMG-SEC-")
+            });
+        }
+    }
 
     let mut imports = Vec::new();
     let mut symbols = Vec::new();
@@ -513,11 +514,14 @@ pub fn parse_file_ast_with_hash(
         &mut static_findings,
     );
 
+    let scope_table = crate::scope::extract_file_scope(root, src_bytes, file.language, &imports);
+
     crate::deep_stack::scan_ast_deep(
         root,
         src_bytes,
         &file.rel_path,
         file.language,
+        &scope_table,
         &mut symbols,
         &mut static_findings,
     );
@@ -566,6 +570,59 @@ pub fn parse_file_ast_with_hash(
             route_schemas,
         },
     ))
+}
+
+fn configure_parser_language(parser: &mut Parser, language: Language, rel_path: &str) -> bool {
+    match language {
+        Language::TypeScript => {
+            let is_tsx = rel_path.ends_with(".tsx");
+            let lang = if is_tsx {
+                tree_sitter_typescript::LANGUAGE_TSX.into()
+            } else {
+                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
+            };
+            parser.set_language(&lang).is_ok()
+        }
+        Language::JavaScript => parser
+            .set_language(&tree_sitter_javascript::LANGUAGE.into())
+            .is_ok(),
+        Language::Rust => parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .is_ok(),
+        Language::Python => parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .is_ok(),
+        Language::Go => parser
+            .set_language(&tree_sitter_go::LANGUAGE.into())
+            .is_ok(),
+        other => crate::langs::ts_language_for(other)
+            .is_some_and(|ts_lang| parser.set_language(&ts_lang).is_ok()),
+    }
+}
+
+/// Validates syntax cleanly using the embedded Tree-sitter parser before running sandbox checks.
+pub fn check_source_syntax(language: Language, rel_path: &str, source: &str) -> anyhow::Result<()> {
+    if matches!(
+        language,
+        Language::Config | Language::Manifest | Language::Sql | Language::Solidity | Language::Move
+    ) {
+        if rel_path.ends_with(".json") {
+            serde_json::from_str::<serde_json::Value>(source)
+                .map_err(|e| anyhow::anyhow!("JSON syntax error in {}: {}", rel_path, e))?;
+        }
+        return Ok(());
+    }
+    let mut parser = Parser::new();
+    if !configure_parser_language(&mut parser, language, rel_path) {
+        return Ok(());
+    }
+    let tree = parser
+        .parse(source, None)
+        .ok_or_else(|| anyhow::anyhow!("Tree-sitter failed to parse {}", rel_path))?;
+    if tree.root_node().has_error() {
+        anyhow::bail!("Syntax error detected by Tree-sitter in {}", rel_path);
+    }
+    Ok(())
 }
 
 pub fn parse_file_ast(file: &IndexedFile, cfg: &ShellMindGuardConfig) -> Option<FileAstSummary> {
@@ -640,7 +697,7 @@ pub(crate) fn classify_guards(text: &str, cfg: &ShellMindGuardConfig) -> HashSet
     g
 }
 
-fn collect_call_names_shallow(node: Node, src: &[u8], out: &mut Vec<String>) {
+pub(crate) fn collect_call_names_shallow(node: Node, src: &[u8], out: &mut Vec<String>) {
     collect_call_names_shallow_depth(node, src, out, 0);
 }
 
@@ -678,10 +735,18 @@ fn collect_call_names_shallow_depth(node: Node, src: &[u8], out: &mut Vec<String
     }
 }
 
-fn stmt_has_sink_or_mutation(stmt: Node, src: &[u8]) -> bool {
+pub(crate) fn stmt_has_sink_or_mutation(stmt: Node, src: &[u8]) -> bool {
+    let raw_low = strip_comments(node_text(stmt, src)).to_ascii_lowercase();
     let txt = crate::taint::strip_comments_and_non_attr_strings(node_text(stmt, src))
         .to_ascii_lowercase();
-    txt.contains("stripe.")
+    let has_sql_write_call = (raw_low.contains(".query(")
+        || raw_low.contains(".execute(")
+        || raw_low.contains(".exec("))
+        && (raw_low.contains("update ")
+            || raw_low.contains("insert into ")
+            || raw_low.contains("delete from "));
+    has_sql_write_call
+        || txt.contains("stripe.")
         || txt.contains("charges.create")
         || txt.contains("paymentintent")
         || txt.contains("update ")
@@ -692,106 +757,13 @@ fn stmt_has_sink_or_mutation(stmt: Node, src: &[u8]) -> bool {
         || txt.contains("balance")
 }
 
-/// Control-flow & statement-order aware guard extractor (B02):
-/// - Ignores guards inside string literals, comments, `if` branches, or uncalled nested functions.
-/// - Requires unconditional guard call to execute BEFORE the first mutation/sink statement
-///   (or wrap it via `withTransaction(...)`).
+/// Control-flow & Dominator-tree aware guard extractor backed by `crate::cfg`.
 fn classify_fn_guards_cfg(
     fn_node: Node,
     src: &[u8],
     cfg: &ShellMindGuardConfig,
 ) -> HashSet<GuardKind> {
-    let mut guards = HashSet::new();
-    let Some(body) = fn_node.child_by_field_name("body") else {
-        return guards;
-    };
-
-    let mut seen_mutation = false;
-    let mut cursor = body.walk();
-    for stmt in body.children(&mut cursor) {
-        let sk = stmt.kind();
-        if matches!(sk, "{" | "}" | "comment" | "line_comment" | "block_comment") {
-            continue;
-        }
-        // Skip Python docstrings / standalone string literal statements
-        if sk == "expression_statement" {
-            let mut sc = stmt.walk();
-            let children: Vec<Node> = stmt.named_children(&mut sc).collect();
-            if children.len() == 1 && matches!(children[0].kind(), "string" | "string_literal") {
-                continue;
-            }
-        }
-        // Allow early-return guard checks (`if (!verifyJwt(req)) return ...;` / `if err := verifyJwt(req); err != nil { return }`)
-        if sk == "if_statement" && !seen_mutation && !stmt_has_sink_or_mutation(stmt, src) {
-            let if_code = strip_comments(node_text(stmt, src)).to_ascii_lowercase();
-            let is_early_exit = if_code.contains("return")
-                || if_code.contains("throw ")
-                || if_code.contains("bail!")
-                || if_code.contains("abort")
-                || if_code.contains("http.error(");
-            if is_early_exit {
-                let mut if_calls = Vec::new();
-                collect_calls(stmt, src, &mut if_calls);
-                for c in &if_calls {
-                    if is_auth_guard_ident(c, cfg) {
-                        guards.insert(GuardKind::Auth);
-                    }
-                    if is_lock_guard_ident(c, cfg) {
-                        guards.insert(GuardKind::TxLock);
-                    }
-                }
-            }
-        }
-        // Skip conditional branches & uncalled nested functions for unconditional guard proof
-        if matches!(
-            sk,
-            "if_statement"
-                | "switch_statement"
-                | "for_statement"
-                | "while_statement"
-                | "function_declaration"
-                | "function_item"
-                | "function_definition"
-        ) {
-            if stmt_has_sink_or_mutation(stmt, src) {
-                seen_mutation = true;
-            }
-            continue;
-        }
-
-        // Check wrapper transaction like `return withTransaction(async () => { ... })`
-        let mut calls = Vec::new();
-        collect_call_names_shallow(stmt, src, &mut calls);
-
-        for c in &calls {
-            if !seen_mutation && is_auth_guard_ident(c, cfg) {
-                guards.insert(GuardKind::Auth);
-            }
-            if !seen_mutation && is_lock_guard_ident(c, cfg) {
-                guards.insert(GuardKind::TxLock);
-            }
-        }
-
-        // Also allow SQL-level `SELECT ... FOR UPDATE` or Python `with transaction.atomic():` before mutation
-        let stmt_code = strip_comments(node_text(stmt, src)).to_ascii_lowercase();
-        if !seen_mutation
-            && ((stmt_code.contains("select ") && stmt_code.contains("for update"))
-                || (sk == "with_statement"
-                    && cfg
-                        .guards
-                        .lock_guards
-                        .iter()
-                        .any(|pat| stmt_code.contains(&pat.to_ascii_lowercase()))))
-        {
-            guards.insert(GuardKind::TxLock);
-        }
-
-        if stmt_has_sink_or_mutation(stmt, src) {
-            seen_mutation = true;
-        }
-    }
-
-    guards
+    crate::cfg::compute_cfg_guard_dominance(fn_node, src, cfg)
 }
 
 pub(crate) fn classify_sink(name: &str, body: &str) -> Option<SinkKind> {
@@ -1645,6 +1617,8 @@ fn extract_single_node<'a>(
             && let Some(name_node) = fnode.child_by_field_name("name")
         {
             let fn_name = node_text(name_node, src).trim().to_string();
+            let sig_guards = crate::cfg::extract_param_signature_guards(fnode, src, cfg).to_set();
+            dec_guards.extend(sig_guards);
             let line_start = node.start_position().row + 1;
             let line_end = fnode.end_position().row + 1;
             let has_res_id = crate::taint::has_resource_id_expr("", Some(&rp));
@@ -2730,7 +2704,11 @@ def withdraw(amount: int):
             Language::Rust => tree_sitter_rust::LANGUAGE.into(),
             Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
             Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-            Language::Sql | Language::Config | Language::Manifest => unreachable!(),
+            Language::Sql
+            | Language::Config
+            | Language::Manifest
+            | Language::Solidity
+            | Language::Move => unreachable!(),
             other => crate::langs::ts_language_for(other).expect("supported tree-sitter language"),
         };
         parser.set_language(&ts_lang).unwrap();
@@ -3044,6 +3022,31 @@ function runSafeTagged(req: any) {
                 .iter()
                 .all(|s| s.local_taint_hits.is_empty()),
             "prisma.$queryRaw tagged template must NOT trigger SMG-SQLI-001"
+        );
+    }
+
+    #[test]
+    fn test_wave4_rust_cfg_test_and_detector_literal_suppression() {
+        let cfg = ShellMindGuardConfig::default();
+        let rust_with_tests = r#"
+pub fn safe_prod_fn(url: &str) -> bool {
+    url.contains("rejectUnauthorized: false")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn mock_vuln() {
+        let _ = "new ApolloServer({ introspection: true })";
+        let _re = regex::Regex::new("^([a-zA-Z0-9]+)+$");
+    }
+}
+"#;
+        let rust_ast = parse_inline_file("src/detector.rs", rust_with_tests, &cfg);
+        assert!(
+            rust_ast.static_findings.is_empty(),
+            "Pattern matchers and #[cfg(test)] blocks in Rust files must produce 0 non-secret findings: {:?}",
+            rust_ast.static_findings
         );
     }
 }

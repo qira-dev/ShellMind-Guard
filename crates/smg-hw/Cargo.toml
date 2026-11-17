@@ -1,0 +1,17 @@
+[package]
+name = "smg-hw"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+regex = "1"
+serde.workspace = true
+serde_json.workspace = true
+tree-sitter.workspace = true
+tree-sitter-c.workspace = true
+tree-sitter-cpp.workspace = true
+tree-sitter-rust.workspace = true
+smg-core = { path = "../smg-core" }
+smg-graph = { path = "../smg-graph" }

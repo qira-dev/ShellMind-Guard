@@ -67,6 +67,8 @@ pub fn ts_language_for(lang: Language) -> Option<tree_sitter::Language> {
         | Language::Python
         | Language::Go
         | Language::Sql
+        | Language::Solidity
+        | Language::Move
         | Language::Config
         | Language::Manifest => None,
     }
@@ -113,6 +115,8 @@ pub(crate) fn extract_extension_language(
         | Language::Python
         | Language::Go
         | Language::Sql
+        | Language::Solidity
+        | Language::Move
         | Language::Config
         | Language::Manifest => {}
     }
@@ -502,7 +506,7 @@ fn has_quoted_dollar_interp(stmt: &str) -> bool {
     false
 }
 
-fn is_dynamic_sql_stmt(stmt: &str, has_sql_var_taint: bool) -> bool {
+fn is_dynamic_sql_stmt(stmt: &str, has_sql_var_taint: bool, has_dyn_sql_var: bool) -> bool {
     let has_concat_or_interp = stmt.contains('+')
         || stmt.contains(" . ")
         || stmt.contains(".$")
@@ -518,10 +522,10 @@ fn is_dynamic_sql_stmt(stmt: &str, has_sql_var_taint: bool) -> bool {
         || stmt.contains("@id")
         || stmt.contains(":id")
         || stmt.contains("$1");
-    if has_param_placeholder && !has_concat_or_interp {
+    if has_param_placeholder && !has_concat_or_interp && !has_dyn_sql_var {
         return false;
     }
-    (sql_verb_re().is_match(stmt) || has_sql_var_taint) && has_concat_or_interp
+    ((sql_verb_re().is_match(stmt) || has_sql_var_taint) && has_concat_or_interp) || has_dyn_sql_var
 }
 
 fn is_static_string_only_call(stmt: &str) -> bool {
@@ -634,6 +638,7 @@ pub(crate) fn build_analyzed_symbol(
 
     // Intra-procedural line-by-line taint & sanitizer propagation
     let mut tainted_vars: HashMap<String, u8> = HashMap::new();
+    let mut dynamic_sql_vars: HashSet<String> = HashSet::new();
     let mut param_vars: HashSet<String> = param_names.iter().cloned().collect();
 
     // Seed parameters annotated with explicit HTTP input attributes/extractors
@@ -684,6 +689,16 @@ pub(crate) fn build_analyzed_symbol(
             rhs_mask |= expr_var_taint(rhs, &tainted_vars);
             let rhs_san = stmt_sanitizer_mask(rhs, profile);
             let net = rhs_mask & !rhs_san;
+            let rhs_builds_dyn_sql = rhs_san == 0
+                && (is_dynamic_sql_stmt(rhs, net != 0, false)
+                    || dynamic_sql_vars
+                        .iter()
+                        .any(|dv| ident_re().find_iter(rhs).any(|m| m.as_str() == dv)));
+            if rhs_builds_dyn_sql {
+                dynamic_sql_vars.insert(lhs_var.clone());
+            } else if !is_compound {
+                dynamic_sql_vars.remove(&lhs_var);
+            }
             if is_compound {
                 if net != 0 {
                     *tainted_vars.entry(lhs_var).or_insert(0) |= net;
@@ -787,7 +802,12 @@ pub(crate) fn build_analyzed_symbol(
             if is_static_string_only_call(stmt) {
                 continue;
             }
-            if bit == TAINT_SQL && !is_dynamic_sql_stmt(stmt, (active_taint & TAINT_SQL) != 0) {
+            let uses_dyn_sql_var = dynamic_sql_vars
+                .iter()
+                .any(|dv| ident_re().find_iter(stmt).any(|m| m.as_str() == dv));
+            if bit == TAINT_SQL
+                && !is_dynamic_sql_stmt(stmt, (active_taint & TAINT_SQL) != 0, uses_dyn_sql_var)
+            {
                 continue;
             }
             if (active_taint & bit) != 0 {

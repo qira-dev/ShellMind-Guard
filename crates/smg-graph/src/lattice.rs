@@ -1,3 +1,4 @@
+use crate::arena::{GuardBitset, SymbolArena, SymbolId};
 use crate::ast::{
     Confidence, FileAstSummary, GuardKind, LocalStaticFinding, SinkKind, SymbolInfo, SymbolKind,
     resolve_import_target,
@@ -35,6 +36,44 @@ pub struct LatticeFinding {
     pub witness_path: Vec<TraceHop>,
     #[serde(default)]
     pub remediation: String,
+    #[serde(default)]
+    pub proof_reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuleHitStat {
+    pub rule_id: String,
+    pub total: usize,
+    pub proven: usize,
+    pub confirmed: usize,
+    pub heuristic: usize,
+}
+
+/// Computes per-rule hit counts broken down by verification/confidence tier (`PROVEN`/`CONFIRMED`/`HEURISTIC`).
+pub fn compute_rule_telemetry(findings: &[LatticeFinding]) -> Vec<RuleHitStat> {
+    let mut map: HashMap<String, RuleHitStat> = HashMap::new();
+    for f in findings {
+        let entry = map.entry(f.rule_id.clone()).or_insert_with(|| RuleHitStat {
+            rule_id: f.rule_id.clone(),
+            total: 0,
+            proven: 0,
+            confirmed: 0,
+            heuristic: 0,
+        });
+        entry.total += 1;
+        match f.confidence {
+            Confidence::Proven => entry.proven += 1,
+            Confidence::Confirmed => entry.confirmed += 1,
+            Confidence::Heuristic => entry.heuristic += 1,
+        }
+    }
+    let mut out: Vec<RuleHitStat> = map.into_values().collect();
+    out.sort_by(|a, b| {
+        b.total
+            .cmp(&a.total)
+            .then_with(|| a.rule_id.cmp(&b.rule_id))
+    });
+    out
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,12 +126,12 @@ fn go_parent_dir(rel_path: &str) -> String {
     }
 }
 
-#[allow(clippy::type_complexity)]
 fn resolve_symbol_in_file(
-    target_file: &str,
-    symbol_name: &str,
-    file_symbols_map: &HashMap<(String, String), Vec<NodeIndex>>,
-    file_imports: &HashMap<String, Vec<(String, String, String)>>,
+    target_file: SymbolId,
+    symbol_name: SymbolId,
+    file_symbols_map: &HashMap<(SymbolId, SymbolId), Vec<NodeIndex>>,
+    file_imports: &HashMap<SymbolId, Vec<(SymbolId, SymbolId, SymbolId)>>,
+    wildcard_id: SymbolId,
     depth: usize,
 ) -> Vec<NodeIndex> {
     let mut visited = HashSet::new();
@@ -101,24 +140,25 @@ fn resolve_symbol_in_file(
         symbol_name,
         file_symbols_map,
         file_imports,
+        wildcard_id,
         depth,
         &mut visited,
     )
 }
 
-#[allow(clippy::type_complexity)]
 fn resolve_symbol_in_file_memo(
-    target_file: &str,
-    symbol_name: &str,
-    file_symbols_map: &HashMap<(String, String), Vec<NodeIndex>>,
-    file_imports: &HashMap<String, Vec<(String, String, String)>>,
+    target_file: SymbolId,
+    symbol_name: SymbolId,
+    file_symbols_map: &HashMap<(SymbolId, SymbolId), Vec<NodeIndex>>,
+    file_imports: &HashMap<SymbolId, Vec<(SymbolId, SymbolId, SymbolId)>>,
+    wildcard_id: SymbolId,
     depth: usize,
-    visited: &mut HashSet<(String, String)>,
+    visited: &mut HashSet<(SymbolId, SymbolId)>,
 ) -> Vec<NodeIndex> {
-    if !visited.insert((target_file.to_string(), symbol_name.to_string())) {
+    if !visited.insert((target_file, symbol_name)) {
         return Vec::new();
     }
-    if let Some(indices) = file_symbols_map.get(&(target_file.to_string(), symbol_name.to_string()))
+    if let Some(indices) = file_symbols_map.get(&(target_file, symbol_name))
         && !indices.is_empty()
     {
         return indices.clone();
@@ -126,17 +166,18 @@ fn resolve_symbol_in_file_memo(
     if depth >= 6 {
         return Vec::new();
     }
-    let Some(imps) = file_imports.get(target_file) else {
+    let Some(imps) = file_imports.get(&target_file) else {
         return Vec::new();
     };
     let mut out = Vec::new();
-    for (local_name, next_file, remote_name) in imps {
+    for &(local_name, next_file, remote_name) in imps {
         if local_name == symbol_name {
             let resolved = resolve_symbol_in_file_memo(
                 next_file,
                 remote_name,
                 file_symbols_map,
                 file_imports,
+                wildcard_id,
                 depth + 1,
                 visited,
             );
@@ -145,12 +186,13 @@ fn resolve_symbol_in_file_memo(
                     out.push(idx);
                 }
             }
-        } else if local_name == "*" {
+        } else if local_name == wildcard_id {
             let resolved = resolve_symbol_in_file_memo(
                 next_file,
                 symbol_name,
                 file_symbols_map,
                 file_imports,
+                wildcard_id,
                 depth + 1,
                 visited,
             );
@@ -254,10 +296,29 @@ pub fn finding_matches_layer(f: &LatticeFinding, layer: &str) -> bool {
         "deep" | "fuzz" | "schema" => {
             f.missing_guard == GuardKind::InputValidation || f.rule_id.starts_with("SMG-FUZZ-")
         }
-        "3" | "layer3" | "deps" | "dep" | "dependencies" => {
-            f.missing_guard == GuardKind::DependencyPolicy
+        "3" | "layer3" | "deps" | "dep" | "dependencies" | "vex" | "reachable" => {
+            f.missing_guard == GuardKind::DependencyPolicy || f.rule_id.starts_with("SMG-DEP-")
         }
         "4" | "layer4" | "config" | "misconfig" => f.missing_guard == GuardKind::ConfigPolicy,
+        "cicd" | "gha" | "actions" => f.rule_id.starts_with("SMG-CICD-"),
+        "k8s" | "kubernetes" | "helm" | "rbac" => {
+            f.rule_id.starts_with("SMG-K8S-") || f.rule_id == "SMG-CFG-DOCKER"
+        }
+        "dos" | "redos" => f.rule_id.starts_with("SMG-DOS-"),
+        "zip" | "zipslip" => f.rule_id.starts_with("SMG-ZIP-"),
+        "crypto" => f.rule_id.starts_with("SMG-CRYPTO-") || f.rule_id == "SMG-CFG-CRYPTO",
+        "queue" | "async" | "mq" => f.rule_id.starts_with("SMG-QUEUE-"),
+        "api" | "graphql" | "ws" | "websocket" | "grpc" => f.rule_id.starts_with("SMG-API-"),
+        "ai" | "llm" | "agent" | "prompt" => f.rule_id.starts_with("SMG-AI-"),
+        "oauth" | "pkce" => f.rule_id == "SMG-AUTH-PKCE",
+        "smuggle" | "crlf" | "header" => f.rule_id == "SMG-HTTP-SMUGGLE",
+        "state" | "workflow" => f.rule_id.starts_with("SMG-STATE-"),
+        "hw" | "hardware" | "firmware" | "embedded" => {
+            f.rule_id.starts_with("SMG-HW-") || f.missing_guard == GuardKind::MemoryBounds
+        }
+        "web3" | "blockchain" | "smartcontract" | "solidity" | "evm" | "solana" | "move"
+        | "defi" => f.rule_id.starts_with("SMG-WEB3-"),
+        "pqc" | "quantum" | "post-quantum" | "cbom" => f.rule_id.starts_with("SMG-PQC-"),
         "5" | "layer5" | "6" | "layer6" | "race" => f.missing_guard == GuardKind::TxLock,
         "concurrency" => matches!(f.missing_guard, GuardKind::TxLock | GuardKind::LockOrdering),
         "engine" | "deadlock" | "leak" | "int" => {
@@ -425,102 +486,105 @@ pub fn solve_guard_lattice_with_public(
     summaries: &[FileAstSummary],
     public_routes: &[String],
 ) -> GraphAnalysisResult {
+    let mut arena = SymbolArena::default();
+    let wildcard_id = arena.intern("*");
     let mut graph = DiGraph::<SymbolInfo, ()>::new();
-    let mut id_to_idx: HashMap<String, NodeIndex> = HashMap::new();
-    let mut file_symbols_map: HashMap<(String, String), Vec<NodeIndex>> = HashMap::new();
-    let mut go_dir_map: HashMap<(String, String), Vec<NodeIndex>> = HashMap::new();
-    let mut pkg_dir_map: HashMap<(String, String), Vec<NodeIndex>> = HashMap::new();
-    let mut go_exported_map: HashMap<String, Vec<NodeIndex>> = HashMap::new();
+    let mut id_to_idx: HashMap<SymbolId, NodeIndex> = HashMap::new();
+    let mut file_symbols_map: HashMap<(SymbolId, SymbolId), Vec<NodeIndex>> = HashMap::new();
+    let mut go_dir_map: HashMap<(SymbolId, SymbolId), Vec<NodeIndex>> = HashMap::new();
+    let mut pkg_dir_map: HashMap<(SymbolId, SymbolId), Vec<NodeIndex>> = HashMap::new();
+    let mut go_exported_map: HashMap<SymbolId, Vec<NodeIndex>> = HashMap::new();
     let mut known_files: HashSet<String> = HashSet::new();
 
     for f in summaries {
         known_files.insert(f.rel_path.clone());
+        let file_id = arena.intern(&f.rel_path);
         let is_go = f.rel_path.ends_with(".go");
         let is_pkg = is_phase8_pkg_scoped(&f.rel_path);
-        let dir_key = if is_go || is_pkg {
-            go_parent_dir(&f.rel_path)
+        let dir_id = if is_go || is_pkg {
+            arena.intern(&go_parent_dir(&f.rel_path))
         } else {
-            String::new()
+            SymbolId(0)
         };
         for sym in &f.symbols {
             let idx = graph.add_node(sym.clone());
-            id_to_idx.insert(sym.id.clone(), idx);
+            let sym_uid = arena.intern(&sym.id);
+            let name_id = arena.intern(&sym.name);
+            id_to_idx.insert(sym_uid, idx);
             file_symbols_map
-                .entry((f.rel_path.clone(), sym.name.clone()))
+                .entry((file_id, name_id))
                 .or_default()
                 .push(idx);
             if is_go {
-                go_dir_map
-                    .entry((dir_key.clone(), sym.name.clone()))
-                    .or_default()
-                    .push(idx);
+                go_dir_map.entry((dir_id, name_id)).or_default().push(idx);
                 if sym.name.chars().next().is_some_and(|c| c.is_uppercase()) {
-                    go_exported_map
-                        .entry(sym.name.clone())
-                        .or_default()
-                        .push(idx);
+                    go_exported_map.entry(name_id).or_default().push(idx);
                 }
             } else if is_pkg {
-                pkg_dir_map
-                    .entry((dir_key.clone(), sym.name.clone()))
-                    .or_default()
-                    .push(idx);
+                pkg_dir_map.entry((dir_id, name_id)).or_default().push(idx);
             }
         }
     }
 
-    let mut file_imports: HashMap<String, Vec<(String, String, String)>> = HashMap::new();
+    let mut file_imports: HashMap<SymbolId, Vec<(SymbolId, SymbolId, SymbolId)>> = HashMap::new();
     for f in summaries {
         let mut imps = Vec::new();
         for imp in &f.imports {
             if let Some(target_file) =
                 resolve_import_target(&f.rel_path, &imp.from_specifier, &known_files)
             {
-                let remote = imp
-                    .remote_name
-                    .as_deref()
-                    .unwrap_or(&imp.symbol_name)
-                    .to_string();
-                imps.push((imp.symbol_name.clone(), target_file, remote));
+                let remote = imp.remote_name.as_deref().unwrap_or(&imp.symbol_name);
+                let local_id = arena.intern(&imp.symbol_name);
+                let target_id = arena.intern(&target_file);
+                let remote_id = arena.intern(remote);
+                imps.push((local_id, target_id, remote_id));
             }
         }
         if !imps.is_empty() {
-            file_imports.insert(f.rel_path.clone(), imps);
+            let fid = arena.intern(&f.rel_path);
+            file_imports.insert(fid, imps);
         }
     }
 
-    // B11: O(1) edge deduplication via HashSet<(usize, usize)> instead of petgraph::update_edge O(deg)
+    // B11: O(1) edge deduplication via HashSet<(usize, usize)> & u32 SymbolId arena keys
     let mut seen_edges: HashSet<(usize, usize)> = HashSet::new();
-    let mut resolved_callee_map: HashMap<(usize, String), Vec<NodeIndex>> = HashMap::new();
+    let mut resolved_callee_map: HashMap<(usize, SymbolId), Vec<NodeIndex>> = HashMap::new();
 
     for f in summaries {
+        let file_id = arena.intern(&f.rel_path);
         let is_go = f.rel_path.ends_with(".go");
         let go_dir = if is_go {
             go_parent_dir(&f.rel_path)
         } else {
             String::new()
         };
+        let go_dir_id = arena.intern(&go_dir);
+        let pkg_dir_id = if is_phase8_pkg_scoped(&f.rel_path) {
+            arena.intern(&go_parent_dir(&f.rel_path))
+        } else {
+            SymbolId(0)
+        };
         for sym in &f.symbols {
-            let Some(&src_idx) = id_to_idx.get(&sym.id) else {
+            let Some(&src_idx) = arena.get(&sym.id).and_then(|sid| id_to_idx.get(&sid)) else {
                 continue;
             };
             let mut resolve_one = |callee: &String, add_edge: bool| {
+                let callee_id = arena.intern(callee);
                 let mut dst_indices: Vec<NodeIndex> = Vec::new();
-                if let Some(same_file_idxs) =
-                    file_symbols_map.get(&(f.rel_path.clone(), callee.clone()))
-                {
+                if let Some(same_file_idxs) = file_symbols_map.get(&(file_id, callee_id)) {
                     dst_indices.extend(same_file_idxs.iter().copied());
                 }
                 if dst_indices.is_empty()
-                    && let Some(imps) = file_imports.get(&f.rel_path)
+                    && let Some(imps) = file_imports.get(&file_id)
                 {
-                    for (local_name, target_file, remote_name) in imps {
-                        if local_name == callee {
+                    for &(local_name_id, target_file_id, remote_name_id) in imps {
+                        if local_name_id == callee_id {
                             let resolved = resolve_symbol_in_file(
-                                target_file,
-                                remote_name,
+                                target_file_id,
+                                remote_name_id,
                                 &file_symbols_map,
                                 &file_imports,
+                                wildcard_id,
                                 0,
                             );
                             for idx in resolved {
@@ -528,12 +592,13 @@ pub fn solve_guard_lattice_with_public(
                                     dst_indices.push(idx);
                                 }
                             }
-                        } else if local_name == "*" {
+                        } else if local_name_id == wildcard_id {
                             let resolved = resolve_symbol_in_file(
-                                target_file,
-                                callee,
+                                target_file_id,
+                                callee_id,
                                 &file_symbols_map,
                                 &file_imports,
+                                wildcard_id,
                                 0,
                             );
                             for idx in resolved {
@@ -545,11 +610,11 @@ pub fn solve_guard_lattice_with_public(
                     }
                 }
                 if dst_indices.is_empty() && is_go {
-                    if let Some(same_pkg_idxs) = go_dir_map.get(&(go_dir.clone(), callee.clone())) {
+                    if let Some(same_pkg_idxs) = go_dir_map.get(&(go_dir_id, callee_id)) {
                         dst_indices.extend(same_pkg_idxs.iter().copied());
                     }
                     if dst_indices.is_empty()
-                        && let Some(exp_idxs) = go_exported_map.get(callee)
+                        && let Some(exp_idxs) = go_exported_map.get(&callee_id)
                     {
                         if exp_idxs.len() == 1 {
                             dst_indices.extend(exp_idxs.iter().copied());
@@ -574,9 +639,8 @@ pub fn solve_guard_lattice_with_public(
                         }
                     }
                 } else if dst_indices.is_empty()
-                    && is_phase8_pkg_scoped(&f.rel_path)
-                    && let Some(same_dir_idxs) =
-                        pkg_dir_map.get(&(go_parent_dir(&f.rel_path), callee.clone()))
+                    && pkg_dir_id != SymbolId(0)
+                    && let Some(same_dir_idxs) = pkg_dir_map.get(&(pkg_dir_id, callee_id))
                 {
                     dst_indices.extend(same_dir_idxs.iter().copied());
                 }
@@ -584,7 +648,7 @@ pub fn solve_guard_lattice_with_public(
                 for dst_idx in dst_indices {
                     if src_idx != dst_idx {
                         let entry = resolved_callee_map
-                            .entry((src_idx.index(), callee.clone()))
+                            .entry((src_idx.index(), callee_id))
                             .or_default();
                         if !entry.contains(&dst_idx) {
                             entry.push(dst_idx);
@@ -614,10 +678,12 @@ pub fn solve_guard_lattice_with_public(
     let mut cb_graph_edges: Vec<(NodeIndex, NodeIndex)> = Vec::new();
     for u in graph.node_indices() {
         for (runner, cb_name, _) in &graph[u].callback_forwards {
-            if let (Some(runners), Some(cbs)) = (
-                resolved_callee_map.get(&(u.index(), runner.clone())),
-                resolved_callee_map.get(&(u.index(), cb_name.clone())),
-            ) {
+            if let (Some(rid), Some(cid)) = (arena.get(runner), arena.get(cb_name))
+                && let (Some(runners), Some(cbs)) = (
+                    resolved_callee_map.get(&(u.index(), rid)),
+                    resolved_callee_map.get(&(u.index(), cid)),
+                )
+            {
                 for &rn in runners {
                     if graph[rn].invokes_callback_mask != 0 {
                         for &cn in cbs {
@@ -659,12 +725,16 @@ pub fn solve_guard_lattice_with_public(
         }
     }
 
-    // O(V + E) Worklist Fixed-Point Guard-Set Lattice:
+    // O(V + E) Worklist Fixed-Point Guard-Set Lattice using Copy-only 4-byte GuardBitset(u32):
     // G(v) = Intersection_{p in Pred(v)} ( G(p) ) U NodeGuards(v)
     let node_count = graph.node_count();
+    let sym_guard_bits: Vec<GuardBitset> = graph
+        .node_indices()
+        .map(|idx| GuardBitset::from_set(&graph[idx].guards))
+        .collect();
     let mut reachable = vec![false; node_count];
-    let mut guard_in: Vec<Option<HashSet<GuardKind>>> = vec![None; node_count];
-    let mut guard_out: Vec<HashSet<GuardKind>> = vec![HashSet::new(); node_count];
+    let mut guard_in: Vec<Option<GuardBitset>> = vec![None; node_count];
+    let mut guard_out: Vec<GuardBitset> = vec![GuardBitset::EMPTY; node_count];
     let mut queue = VecDeque::new();
     let mut route_entries = 0usize;
 
@@ -673,31 +743,27 @@ pub fn solve_guard_lattice_with_public(
         if sym.kind == SymbolKind::Route {
             route_entries += 1;
             reachable[idx.index()] = true;
-            guard_in[idx.index()] = Some(HashSet::new());
-            guard_out[idx.index()] = sym.guards.clone();
+            guard_in[idx.index()] = Some(GuardBitset::EMPTY);
+            guard_out[idx.index()] = sym_guard_bits[idx.index()];
             queue.push_back(idx);
         }
     }
 
     while let Some(u) = queue.pop_front() {
-        let u_out = guard_out[u.index()].clone();
+        let u_out = guard_out[u.index()];
         for v in graph.neighbors_directed(u, Direction::Outgoing) {
             let vi = v.index();
             let changed = if !reachable[vi] {
                 reachable[vi] = true;
-                guard_in[vi] = Some(u_out.clone());
-                let mut next_out = u_out.clone();
-                next_out.extend(graph[v].guards.iter().copied());
-                guard_out[vi] = next_out;
+                guard_in[vi] = Some(u_out);
+                guard_out[vi] = u_out.union(sym_guard_bits[vi]);
                 true
             } else {
-                let prev_in = guard_in[vi].as_ref().unwrap();
-                let intersected: HashSet<GuardKind> =
-                    prev_in.intersection(&u_out).copied().collect();
-                if intersected.len() < prev_in.len() {
-                    guard_in[vi] = Some(intersected.clone());
-                    let mut next_out = intersected;
-                    next_out.extend(graph[v].guards.iter().copied());
+                let prev_in = guard_in[vi].unwrap_or(GuardBitset::EMPTY);
+                let intersected = prev_in.intersect(u_out);
+                if intersected != prev_in {
+                    guard_in[vi] = Some(intersected);
+                    let next_out = intersected.union(sym_guard_bits[vi]);
                     if next_out != guard_out[vi] {
                         guard_out[vi] = next_out;
                         true
@@ -722,9 +788,10 @@ pub fn solve_guard_lattice_with_public(
     // Phase 10 helper: resolve cross-file sanitizer wrapper clear bitmask for `(caller, wrapper_fn, field_opt)`
     let resolved_wrapper_clear_mask =
         |caller_idx: NodeIndex, wrapper_fn: &str, field_opt: Option<&str>| -> u8 {
-            let Some(targets) =
-                resolved_callee_map.get(&(caller_idx.index(), wrapper_fn.to_string()))
-            else {
+            let Some(wid) = arena.get(wrapper_fn) else {
+                return 0;
+            };
+            let Some(targets) = resolved_callee_map.get(&(caller_idx.index(), wid)) else {
                 return 0;
             };
             if targets.is_empty() {
@@ -755,7 +822,8 @@ pub fn solve_guard_lattice_with_public(
 
     #[allow(clippy::too_many_arguments)]
     let push_field_taint_edges =
-        |resolved_callee_map: &HashMap<(usize, String), Vec<NodeIndex>>,
+        |arena: &SymbolArena,
+         resolved_callee_map: &HashMap<(usize, SymbolId), Vec<NodeIndex>>,
          src_node: NodeIndex,
          callee: &str,
          out_mask: u8,
@@ -770,7 +838,10 @@ pub fn solve_guard_lattice_with_public(
             if out_mask == 0 {
                 return;
             }
-            if let Some(vs) = resolved_callee_map.get(&(src_node.index(), callee.to_string())) {
+            let Some(cid) = arena.get(callee) else {
+                return;
+            };
+            if let Some(vs) = resolved_callee_map.get(&(src_node.index(), cid)) {
                 for &v in vs {
                     let vi = v.index();
                     if taint_parents[vi].is_none() {
@@ -851,6 +922,7 @@ pub fn solve_guard_lattice_with_public(
                     .get(callee)
                     .map(|v| v.as_slice());
                 push_field_taint_edges(
+                    &arena,
                     &resolved_callee_map,
                     u,
                     callee,
@@ -867,12 +939,13 @@ pub fn solve_guard_lattice_with_public(
             }
             // Phase 10: cross-file callback dispatch (`dispatchTask(req.body.cmd, workerCb)`)
             for (runner, cb_name, cb_mask) in &graph[u].callback_forwards {
-                let Some(runner_targets) = resolved_callee_map.get(&(u.index(), runner.clone()))
-                else {
+                let (Some(rid), Some(cid)) = (arena.get(runner), arena.get(cb_name)) else {
                     continue;
                 };
-                let Some(cb_targets) = resolved_callee_map.get(&(u.index(), cb_name.clone()))
-                else {
+                let Some(runner_targets) = resolved_callee_map.get(&(u.index(), rid)) else {
+                    continue;
+                };
+                let Some(cb_targets) = resolved_callee_map.get(&(u.index(), cid)) else {
                     continue;
                 };
                 if let Some(&runner_node) = runner_targets
@@ -929,6 +1002,7 @@ pub fn solve_guard_lattice_with_public(
                 .get(callee)
                 .map(|v| v.as_slice());
             push_field_taint_edges(
+                &arena,
                 &resolved_callee_map,
                 w,
                 callee,
@@ -964,6 +1038,7 @@ pub fn solve_guard_lattice_with_public(
                 None
             };
             push_field_taint_edges(
+                &arena,
                 &resolved_callee_map,
                 w,
                 callee,
@@ -982,6 +1057,7 @@ pub fn solve_guard_lattice_with_public(
                 && (w_unrest & edge_mask) != 0
             {
                 push_field_taint_edges(
+                    &arena,
                     &resolved_callee_map,
                     w,
                     callee,
@@ -998,10 +1074,13 @@ pub fn solve_guard_lattice_with_public(
             }
         }
         for (runner, cb_name, cb_mask) in &graph[w].callback_forwards {
-            let Some(runner_targets) = resolved_callee_map.get(&(w.index(), runner.clone())) else {
+            let (Some(rid), Some(cid)) = (arena.get(runner), arena.get(cb_name)) else {
                 continue;
             };
-            let Some(cb_targets) = resolved_callee_map.get(&(w.index(), cb_name.clone())) else {
+            let Some(runner_targets) = resolved_callee_map.get(&(w.index(), rid)) else {
+                continue;
+            };
+            let Some(cb_targets) = resolved_callee_map.get(&(w.index(), cid)) else {
                 continue;
             };
             if let Some(&runner_node) = runner_targets
@@ -1054,13 +1133,13 @@ pub fn solve_guard_lattice_with_public(
     for idx in graph.node_indices() {
         let vi = idx.index();
         let sym = &graph[idx];
-        let active_guards = &guard_out[vi];
+        let active_guards = guard_out[vi];
 
         // Layer 1 & Layer 2 (Auth & Concurrency/TxLock) — requires reachable Route + SinkKind
         if reachable[vi]
             && let Some(sink_kind) = sym.sink_kind
         {
-            if !active_guards.contains(&GuardKind::Auth)
+            if !active_guards.contains(GuardKind::Auth)
                 && can_improve_witness(&best_by_key, &graph, &auth_parents, idx, "SMG-AUTH-001")
                 && let Some((entry_name, witness)) = reconstruct_witness(&graph, &auth_parents, idx)
                 && !is_public_route(&entry_name, public_routes)
@@ -1081,6 +1160,11 @@ pub fn solve_guard_lattice_with_public(
                         missing_guard: GuardKind::Auth,
                         witness_path: witness,
                         remediation: remediation_for_guard(GuardKind::Auth).into(),
+                        proof_reasons: vec![
+                            "O(V+E)Lattice".into(),
+                            "CFGDominated".into(),
+                            "AuthGuardMissing".into(),
+                        ],
                     },
                 );
             }
@@ -1088,7 +1172,7 @@ pub fn solve_guard_lattice_with_public(
             if matches!(
                 sink_kind,
                 SinkKind::PaymentMutation | SinkKind::BalanceUpdate
-            ) && !active_guards.contains(&GuardKind::TxLock)
+            ) && !active_guards.contains(GuardKind::TxLock)
                 && can_improve_witness(&best_by_key, &graph, &lock_parents, idx, "SMG-RACE-001")
                 && let Some((entry_name, witness)) = reconstruct_witness(&graph, &lock_parents, idx)
             {
@@ -1111,6 +1195,11 @@ pub fn solve_guard_lattice_with_public(
                         missing_guard: GuardKind::TxLock,
                         witness_path: witness,
                         remediation: remediation_for_guard(GuardKind::TxLock).into(),
+                        proof_reasons: vec![
+                            "O(V+E)Lattice".into(),
+                            "CFGDominated".into(),
+                            "TxLockMissing".into(),
+                        ],
                     },
                 );
             }
@@ -1118,7 +1207,7 @@ pub fn solve_guard_lattice_with_public(
 
         // Layer 2a: Intra-procedural Injection / Path / SSRF / XSS hits (`Source -> Sink` inside node)
         for hit in &sym.local_taint_hits {
-            if reachable[vi] && active_guards.contains(&hit.missing_guard) {
+            if reachable[vi] && active_guards.contains(hit.missing_guard) {
                 continue;
             }
             let req_bit = sink_bit_for_guard(hit.missing_guard);
@@ -1163,6 +1252,7 @@ pub fn solve_guard_lattice_with_public(
                     missing_guard: hit.missing_guard,
                     witness_path: witness,
                     remediation: hit.remediation.clone(),
+                    proof_reasons: vec!["IntraProceduralTaint".into(), "ReceiverTyped".into()],
                 },
             );
         }
@@ -1186,7 +1276,7 @@ pub fn solve_guard_lattice_with_public(
                         continue;
                     }
                 }
-                if reachable[vi] && active_guards.contains(&hit.missing_guard) {
+                if reachable[vi] && active_guards.contains(hit.missing_guard) {
                     continue;
                 }
                 if let Some((entry_route, mut witness)) = reconstruct_taint_witness(
@@ -1216,6 +1306,7 @@ pub fn solve_guard_lattice_with_public(
                             missing_guard: hit.missing_guard,
                             witness_path: witness,
                             remediation: hit.remediation.clone(),
+                            proof_reasons: vec!["CrossFileTaint".into(), "ParamForwarding".into()],
                         },
                     );
                 }
@@ -1226,7 +1317,7 @@ pub fn solve_guard_lattice_with_public(
         if reachable[vi]
             && sym.has_db_crud_sink
             && idor_res_reaches[vi]
-            && !active_guards.contains(&GuardKind::OwnershipCheck)
+            && !active_guards.contains(GuardKind::OwnershipCheck)
             && can_improve_witness(&best_by_key, &graph, &idor_parents, idx, "SMG-IDOR-001")
             && let Some((entry_name, mut witness)) = reconstruct_witness(&graph, &idor_parents, idx)
             && !is_public_route(&entry_name, public_routes)
@@ -1256,6 +1347,7 @@ pub fn solve_guard_lattice_with_public(
                     missing_guard: GuardKind::OwnershipCheck,
                     witness_path: witness,
                     remediation: remediation_for_guard(GuardKind::OwnershipCheck).into(),
+                    proof_reasons: vec!["O(V+E)Lattice".into(), "OwnershipCheckMissing".into()],
                 },
             );
         }
@@ -1299,18 +1391,19 @@ pub fn solve_guard_lattice_with_public(
                     missing_guard: GuardKind::CsrfProtection,
                     witness_path: witness,
                     remediation: remediation_for_guard(GuardKind::CsrfProtection).into(),
+                    proof_reasons: vec!["CsrfExemptExplicit".into()],
                 },
             );
         } else if sym.kind == SymbolKind::Route
             && !is_webhook_or_health
-            && !active_guards.contains(&GuardKind::CsrfProtection)
+            && !active_guards.contains(GuardKind::CsrfProtection)
             && !repo_has_global_csrf
             && !sym.has_bearer_header_auth
         {
             let method = sym.name.split_whitespace().next().unwrap_or("");
             let is_state_changing = matches!(method, "POST" | "PUT" | "PATCH" | "DELETE");
             let cookie_session_route = sym.has_cookie_session_auth
-                || (active_guards.contains(&GuardKind::Auth)
+                || (active_guards.contains(GuardKind::Auth)
                     && repo_has_cookie_session
                     && !repo_bearer_only);
             if is_state_changing
@@ -1340,6 +1433,7 @@ pub fn solve_guard_lattice_with_public(
                             line: sym.line_start,
                         }],
                         remediation: remediation_for_guard(GuardKind::CsrfProtection).into(),
+                        proof_reasons: vec!["CookieSessionStateChange".into()],
                     },
                 );
             }
@@ -1446,6 +1540,7 @@ pub fn solve_guard_lattice_with_public(
                             line: call.line,
                         }],
                         remediation: "Verify the backend route path, HTTP method, and router prefix match the frontend API call.".into(),
+                        proof_reasons: vec!["FrontendBackendContractMismatch".into()],
                     });
                 }
             }
@@ -1455,9 +1550,11 @@ pub fn solve_guard_lattice_with_public(
     // Phase 9: Domain-Aware Analyzer Routing + Cross-Function Lock-Order Deadlock Solver
     let active_domains = crate::phase9::resolve_repo_domains(summaries);
     let active_domain_set: HashSet<&str> = active_domains.iter().map(|s| s.as_str()).collect();
-    for deadlock_hit in
-        crate::phase9::concurrency::solve_cross_function_deadlocks(&graph, &resolved_callee_map)
-    {
+    for deadlock_hit in crate::phase9::concurrency::solve_cross_function_deadlocks(
+        &graph,
+        &arena,
+        &resolved_callee_map,
+    ) {
         insert_shorter(&mut best_by_key, deadlock_hit);
     }
 
@@ -1484,6 +1581,19 @@ pub fn solve_guard_lattice_with_public(
     }
 
     let mut deduped: Vec<LatticeFinding> = best_by_key.into_values().collect();
+    let reachable_pkgs = crate::deps::compute_reachable_packages(summaries);
+    for finding in &mut deduped {
+        if let Some(reach) = crate::deps::assess_dependency_reachability(finding, &reachable_pkgs) {
+            match reach {
+                crate::deps::ReachableVulnStatus::Reachable => {
+                    finding.proof_reasons.push("ReachableImport".into());
+                }
+                crate::deps::ReachableVulnStatus::DeclaredUnused => {
+                    finding.proof_reasons.push("DeclaredUnusedVEX".into());
+                }
+            }
+        }
+    }
     deduped.sort_by(|a, b| {
         let ta = if matches!(a.missing_guard, GuardKind::Auth | GuardKind::TxLock) {
             0u8
@@ -1557,10 +1667,97 @@ fn insert_shorter(best: &mut HashMap<(String, String), LatticeFinding>, cand: La
     }
 }
 
+fn proof_reasons_for_static_rule(rule_id: &str) -> Vec<String> {
+    if rule_id.starts_with("SMG-CICD-") {
+        vec!["YamlStructuralAudit".into(), "ExpressionInjection".into()]
+    } else if rule_id.starts_with("SMG-K8S-") || rule_id == "SMG-CFG-DOCKER" {
+        vec!["ManifestStructuralAudit".into(), "PrivilegeBoundary".into()]
+    } else if rule_id.starts_with("SMG-DOS-") || rule_id.starts_with("SMG-ZIP-") {
+        vec!["AstStructuralSink".into(), "BoundsMissing".into()]
+    } else if rule_id.starts_with("SMG-CRYPTO-") || rule_id == "SMG-CFG-CRYPTO" {
+        vec!["CryptoPrimitiveAudit".into()]
+    } else if rule_id.starts_with("SMG-QUEUE-") {
+        vec!["AsyncQueueContextLoss".into()]
+    } else if rule_id.starts_with("SMG-DEP-") {
+        vec!["ManifestVersionMatch".into()]
+    } else if rule_id.starts_with("SMG-HW-") {
+        vec![
+            "HardwareDomainProof".into(),
+            "ReducedProductInterval".into(),
+        ]
+    } else if rule_id.starts_with("SMG-WEB3-") {
+        vec![
+            "Web3StorageEffectGraph".into(),
+            "RevmConcreteExecutionOracle".into(),
+        ]
+    } else if rule_id.starts_with("SMG-PQC-") {
+        vec![
+            "PostQuantumBitReductionLattice".into(),
+            "MoscaHndlUrgency".into(),
+        ]
+    } else if rule_id.starts_with("SMG-SEC-") {
+        vec!["EntropyAndTokenPattern".into()]
+    } else {
+        vec!["StaticPatternVerified".into()]
+    }
+}
+
+/// Converts and appends isolated crate static findings (such as `smg-hw`) into `findings`
+/// with deduplicated deterministic sequential IDs and proof metadata.
+pub fn append_local_static_findings(
+    findings: &mut Vec<LatticeFinding>,
+    extra: &[LocalStaticFinding],
+) {
+    if extra.is_empty() {
+        return;
+    }
+    let mut seq = findings.len();
+    for sf in extra {
+        let entry_route = format!("{}:{}", sf.rel_path, sf.line);
+        if findings
+            .iter()
+            .any(|f| f.rule_id == sf.rule_id && f.entry_route == entry_route)
+        {
+            continue;
+        }
+        seq += 1;
+        findings.push(LatticeFinding {
+            id: format!("{}-{}", sf.rule_id, seq),
+            rule_id: sf.rule_id.clone(),
+            severity: sf.severity.clone(),
+            title: sf.title.clone(),
+            file: sf.rel_path.clone(),
+            line: sf.line,
+            status: if matches!(sf.confidence, Confidence::Proven) {
+                "PROVEN".into()
+            } else {
+                "SUSPECT_UNGUARDED".into()
+            },
+            confidence: sf.confidence,
+            entry_route,
+            sink_kind: sf.sink_kind,
+            missing_guard: sf.missing_guard,
+            witness_path: vec![TraceHop {
+                file: sf.rel_path.clone(),
+                symbol: sf.symbol.clone(),
+                line: sf.line,
+            }],
+            remediation: sf.remediation.clone(),
+            proof_reasons: proof_reasons_for_static_rule(&sf.rule_id),
+        });
+    }
+}
+
 fn insert_static_finding(
     best: &mut HashMap<(String, String), LatticeFinding>,
     sf: &LocalStaticFinding,
 ) {
+    if smg_core::is_test_source_path(&sf.rel_path)
+        && sf.missing_guard != GuardKind::SecretPolicy
+        && !sf.rule_id.starts_with("SMG-SEC-")
+    {
+        return;
+    }
     let entry_route = format!("{}:{}", sf.rel_path, sf.line);
     let dedup_rule_key = if sf.rule_id.starts_with("SMG-DEP-") {
         format!("{}#{}", sf.rule_id, sf.title)
@@ -1586,6 +1783,7 @@ fn insert_static_finding(
             line: sf.line,
         }],
         remediation: sf.remediation.clone(),
+        proof_reasons: proof_reasons_for_static_rule(&sf.rule_id),
     });
 }
 
@@ -1653,7 +1851,7 @@ fn build_any_route_bfs_tree(graph: &DiGraph<SymbolInfo, ()>) -> BfsTree {
 /// non-public, non-admin `Route` entries without `OwnershipCheck`, prioritizing routes with `has_resource_id`.
 fn build_idor_unguarded_bfs_tree(
     graph: &DiGraph<SymbolInfo, ()>,
-    guard_out: &[HashSet<GuardKind>],
+    guard_out: &[GuardBitset],
     public_routes: &[String],
 ) -> (BfsTree, Vec<bool>) {
     let n = graph.node_count();
@@ -1670,7 +1868,7 @@ fn build_idor_unguarded_bfs_tree(
             let sym = &graph[idx];
             if sym.kind == SymbolKind::Route
                 && sym.has_resource_id == pass_has_res
-                && guard_out[i].contains(&GuardKind::Auth)
+                && guard_out[i].contains(GuardKind::Auth)
                 && !sym.guards.contains(&GuardKind::OwnershipCheck)
                 && !is_public_route(&sym.name, public_routes)
                 && !is_admin_route(&sym.name)
@@ -2666,6 +2864,153 @@ paths:
                 .params
                 .iter()
                 .any(|p| p.name == "amount" && !p.has_positive_bound)
+        );
+    }
+
+    #[test]
+    fn dense_cyclic_call_graph_linear_termination() {
+        let mut syms = Vec::new();
+        for i in 0..40 {
+            let calls = vec![
+                format!("fn_{}", (i + 1) % 40),
+                format!("fn_{}", (i + 7) % 40),
+                format!("fn_{}", (i + 13) % 40),
+            ];
+            let mut sym = SymbolInfo::base(
+                format!("fn_{}", i),
+                "src/cycle.ts",
+                if i == 0 {
+                    "POST /cycle-entry".into()
+                } else {
+                    format!("fn_{}", i)
+                },
+                if i == 0 {
+                    SymbolKind::Route
+                } else if i == 39 {
+                    SymbolKind::Sink
+                } else {
+                    SymbolKind::Function
+                },
+                if i == 39 {
+                    Some(SinkKind::CommandInjection)
+                } else {
+                    None
+                },
+                i + 1,
+                i + 2,
+                HashSet::new(),
+                calls,
+                if i == 0 {
+                    Some("/cycle-entry".into())
+                } else {
+                    None
+                },
+            );
+            sym.has_taint_source = i == 0;
+            if i < 39 {
+                let nxt = format!("fn_{}", (i + 1) % 40);
+                sym.tainted_calls.push(nxt.clone());
+                sym.tainted_call_masks.insert(nxt, crate::taint::TAINT_ALL);
+            }
+            sym.param_forwarding_calls
+                .push(format!("fn_{}", (i + 7) % 40));
+            syms.push(sym);
+        }
+        let ast = FileAstSummary {
+            rel_path: "src/cycle.ts".into(),
+            symbols: syms,
+            ..Default::default()
+        };
+        let t0 = std::time::Instant::now();
+        let res = solve_guard_lattice(&[ast]);
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(2),
+            "Dense 40-node cyclic graph must terminate linearly: {:?}",
+            t0.elapsed()
+        );
+        assert!(
+            res.findings
+                .iter()
+                .any(|f| f.sink_kind == SinkKind::CommandInjection),
+            "Must report sink reachability cleanly through dense cycle: {:?}",
+            res.findings
+        );
+    }
+
+    #[test]
+    fn wave3a_precision_constant_literal_and_discarded_sanitizer_and_dynamic_dispatch() {
+        let code = r#"
+const handlers = { run: execHelper };
+
+function execHelper(cmd) {
+    execSync(cmd);
+}
+
+app.post('/safe-literal-sql', requireAuth, async (req, res) => {
+    const TABLE = "audit_logs";
+    const id = req.query.id;
+    return db.query("SELECT * FROM " + TABLE + " WHERE id = $1", [id]);
+});
+
+app.post('/discarded-sanitizer', requireAuth, async (req, res) => {
+    const html = req.body.bio;
+    DOMPurify.sanitize(html);
+    if (escapeHtml(html)) {
+        res.send(`<div>${html}</div>`);
+    }
+});
+
+app.post('/clean-sanitizer', requireAuth, async (req, res) => {
+    const clean = DOMPurify.sanitize(req.body.bio);
+    res.send(`<div>${clean}</div>`);
+});
+
+app.post('/dynamic-dispatch', requireAuth, async (req, res) => {
+    const action = req.body.action;
+    const cmd = req.body.cmd;
+    handlers[action](cmd);
+});
+"#;
+        let f = IndexedFile {
+            abs_path: std::path::PathBuf::from("src/wave3a.ts"),
+            rel_path: "src/wave3a.ts".into(),
+            language: Language::TypeScript,
+            size_bytes: code.len() as u64,
+            mtime_ns: 0,
+            blake3_hash: String::new(),
+            cached_bytes: Some(code.as_bytes().to_vec()),
+        };
+        let cfg = ShellMindGuardConfig::default();
+        let ast = parse_file_ast(&f, &cfg).expect("parse wave3a ts");
+        let res = solve_guard_lattice_with_public(&[ast], &cfg.guards.public_routes);
+        assert!(
+            !res.findings
+                .iter()
+                .any(|f| f.rule_id == "SMG-SQLI-001" && f.entry_route.contains("/safe-literal-sql")),
+            "Pure constant TABLE literal in parameterized query must not trigger SQLi: {:?}",
+            res.findings
+        );
+        assert!(
+            res.findings
+                .iter()
+                .any(|f| f.rule_id == "SMG-XSS-001"
+                    && f.entry_route.contains("/discarded-sanitizer")),
+            "Discarded DOMPurify/escapeHtml statements must still trigger XSS: {:?}",
+            res.findings
+        );
+        assert!(
+            !res.findings
+                .iter()
+                .any(|f| f.rule_id == "SMG-XSS-001" && f.entry_route.contains("/clean-sanitizer")),
+            "Assigned DOMPurify.sanitize(html) must suppress XSS: {:?}",
+            res.findings
+        );
+        assert!(
+            res.findings
+                .iter()
+                .any(|f| f.rule_id == "SMG-CMDI-001" && f.entry_route.contains("/dynamic-dispatch")),
+            "Dynamic handler map dispatch handlers[action](cmd) must propagate taint to sink: {:?}",
+            res.findings
         );
     }
 }

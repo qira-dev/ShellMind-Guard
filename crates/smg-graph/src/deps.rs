@@ -1,4 +1,5 @@
-use crate::ast::{Confidence, GuardKind, LocalStaticFinding, SinkKind};
+use crate::ast::{Confidence, FileAstSummary, GuardKind, LocalStaticFinding, SinkKind};
+use serde::{Deserialize, Serialize};
 use smg_core::advisories::{
     AdvisoryRecord, AdvisoryStore, normalize_package_name, parse_semver_with_prerelease,
     version_matches_range,
@@ -6,7 +7,7 @@ use smg_core::advisories::{
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Ecosystem {
     Npm,
     Cargo,
@@ -25,12 +26,158 @@ impl Ecosystem {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ResolvedDependency {
     pub ecosystem: String,
     pub name: String,
     pub version: String,
     pub line: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReachableVulnStatus {
+    Reachable,
+    DeclaredUnused,
+}
+
+fn norm_pkg_key(raw: &str) -> String {
+    normalize_package_name("PyPI", raw)
+}
+
+fn expand_pkg_aliases(raw: &str, out: &mut HashSet<String>) {
+    let trimmed = raw.trim().trim_matches(['"', '\'', '`']);
+    if trimmed.is_empty() || trimmed.starts_with('.') || trimmed.starts_with('/') {
+        return;
+    }
+    let norm = norm_pkg_key(trimmed);
+    if !norm.is_empty() {
+        out.insert(norm.clone());
+    }
+    let low = trimmed.to_ascii_lowercase();
+    if !low.is_empty() {
+        out.insert(low);
+    }
+    // Scoped npm `@org/pkg/subpath` -> `@org/pkg` and unscoped `pkg/subpath` -> `pkg`
+    let base = if trimmed.starts_with('@') {
+        let mut parts = trimmed.splitn(3, '/');
+        match (parts.next(), parts.next()) {
+            (Some(scope), Some(pkg)) => format!("{}/{}", scope, pkg),
+            _ => trimmed.to_string(),
+        }
+    } else if !trimmed.starts_with("github.com/") && !trimmed.starts_with("golang.org/") {
+        trimmed
+            .split(['/', ':', '.'])
+            .next()
+            .unwrap_or(trimmed)
+            .to_string()
+    } else {
+        trimmed.to_string()
+    };
+    let base_norm = norm_pkg_key(&base);
+    if !base_norm.is_empty() {
+        out.insert(base_norm.clone());
+    }
+    let base_low = base.to_ascii_lowercase();
+    if !base_low.is_empty() {
+        out.insert(base_low);
+    }
+    // Common Python distribution-to-import aliases
+    match base_norm.as_str() {
+        "yaml" => {
+            out.insert("pyyaml".to_string());
+        }
+        "pil" => {
+            out.insert("pillow".to_string());
+        }
+        "bs4" => {
+            out.insert("beautifulsoup4".to_string());
+        }
+        "sklearn" => {
+            out.insert("scikit-learn".to_string());
+        }
+        "cv2" => {
+            out.insert("opencv-python".to_string());
+        }
+        "jwt" => {
+            out.insert("pyjwt".to_string());
+            out.insert("jsonwebtoken".to_string());
+        }
+        _ => {}
+    }
+}
+
+/// Computes normalized package identifiers actively imported by source code files.
+pub fn compute_reachable_packages(summaries: &[FileAstSummary]) -> HashSet<String> {
+    let mut pkgs = HashSet::new();
+    for s in summaries {
+        for imp in &s.imports {
+            expand_pkg_aliases(&imp.from_specifier, &mut pkgs);
+        }
+    }
+    pkgs
+}
+
+/// Classifies whether an `SMG-DEP-*` finding refers to a package imported in source code
+/// (`Reachable`) or merely declared in lockfiles/manifests (`DeclaredUnused`).
+pub fn assess_dependency_reachability(
+    finding: &crate::lattice::LatticeFinding,
+    reachable_pkgs: &HashSet<String>,
+) -> Option<ReachableVulnStatus> {
+    if !finding.rule_id.starts_with("SMG-DEP-") {
+        return None;
+    }
+    if reachable_pkgs.is_empty() {
+        return Some(ReachableVulnStatus::DeclaredUnused);
+    }
+    // Extract package identifiers delimited by backticks, single quotes, or before '@' version suffixes
+    let title = finding.title.as_str();
+    let mut matched_pkg = false;
+    let mut in_tick = false;
+    let mut buf = String::new();
+    for ch in title.chars() {
+        if ch == '`' || ch == '\'' {
+            if in_tick {
+                let candidate = buf.split('@').next().unwrap_or(&buf).trim();
+                let norm = norm_pkg_key(candidate);
+                let low = candidate.to_ascii_lowercase();
+                if (!norm.is_empty() && reachable_pkgs.contains(&norm))
+                    || (!low.is_empty() && reachable_pkgs.contains(&low))
+                {
+                    matched_pkg = true;
+                    break;
+                }
+                buf.clear();
+                in_tick = false;
+            } else {
+                in_tick = true;
+            }
+        } else if in_tick {
+            buf.push(ch);
+        }
+    }
+    if !matched_pkg {
+        for tok in title.split_whitespace() {
+            let clean = tok
+                .trim_matches([':', ',', ';', '(', ')', '[', ']', '\'', '`', '"'])
+                .split('@')
+                .next()
+                .unwrap_or("");
+            let norm = norm_pkg_key(clean);
+            let low = clean.to_ascii_lowercase();
+            if (!norm.is_empty() && reachable_pkgs.contains(&norm))
+                || (!low.is_empty() && reachable_pkgs.contains(&low))
+            {
+                matched_pkg = true;
+                break;
+            }
+        }
+    }
+    Some(if matched_pkg {
+        ReachableVulnStatus::Reachable
+    } else {
+        ReachableVulnStatus::DeclaredUnused
+    })
 }
 
 struct Advisory {
@@ -1485,5 +1632,52 @@ version = "0.37.0"
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
         let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn test_reachable_dependency_vex_assessment() {
+        use crate::ast::ImportRef;
+        let summaries = vec![FileAstSummary {
+            rel_path: "src/app.ts".into(),
+            imports: vec![ImportRef {
+                symbol_name: "axios".into(),
+                from_specifier: "axios/lib/core".into(),
+                remote_name: None,
+            }],
+            ..Default::default()
+        }];
+        let reachable = compute_reachable_packages(&summaries);
+        assert!(reachable.contains("axios"));
+        assert!(!reachable.contains("lodash"));
+
+        let f_axios = crate::lattice::LatticeFinding {
+            id: "SMG-DEP-001".into(),
+            rule_id: "SMG-DEP-001".into(),
+            severity: "HIGH".into(),
+            title: "Vulnerable dependency `axios@1.5.0`: SSRF".into(),
+            file: "package-lock.json".into(),
+            line: 1,
+            status: "SUSPECT".into(),
+            confidence: Confidence::Confirmed,
+            entry_route: "package-lock.json:1".into(),
+            sink_kind: SinkKind::DependencyRisk,
+            missing_guard: GuardKind::DependencyPolicy,
+            witness_path: Vec::new(),
+            remediation: String::new(),
+            proof_reasons: Vec::new(),
+        };
+        assert_eq!(
+            assess_dependency_reachability(&f_axios, &reachable),
+            Some(ReachableVulnStatus::Reachable)
+        );
+
+        let f_lodash = crate::lattice::LatticeFinding {
+            title: "Vulnerable dependency `lodash@4.17.20`: CmdI".into(),
+            ..f_axios
+        };
+        assert_eq!(
+            assess_dependency_reachability(&f_lodash, &reachable),
+            Some(ReachableVulnStatus::DeclaredUnused)
+        );
     }
 }

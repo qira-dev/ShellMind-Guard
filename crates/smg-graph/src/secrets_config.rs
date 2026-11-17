@@ -673,11 +673,12 @@ pub fn scan_secrets_and_config(rel_path: &str, content: &str) -> Vec<LocalStatic
             cors_cred_lines.push(ln);
         }
 
-        if (line.contains("rejectUnauthorized")
-            || line.contains("InsecureSkipVerify")
-            || line.contains("verify")
-            || line.contains("NODE_TLS_REJECT_UNAUTHORIZED")
-            || line.contains("danger_accept_invalid_certs"))
+        if !crate::taint::is_pattern_matcher_or_doc_line(line)
+            && (line.contains("rejectUnauthorized")
+                || line.contains("InsecureSkipVerify")
+                || line.contains("verify")
+                || line.contains("NODE_TLS_REJECT_UNAUTHORIZED")
+                || line.contains("danger_accept_invalid_certs"))
             && tls_disabled_re().is_match(line)
         {
             findings.push(make_cfg_finding(

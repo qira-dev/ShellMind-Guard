@@ -8,6 +8,8 @@ license.workspace = true
 anyhow.workspace = true
 crossterm = "0.28"
 ratatui = "0.29"
+serde.workspace = true
+serde_json.workspace = true
 smg-ai = { path = "../smg-ai" }
 smg-core = { path = "../smg-core" }
 smg-graph = { path = "../smg-graph" }

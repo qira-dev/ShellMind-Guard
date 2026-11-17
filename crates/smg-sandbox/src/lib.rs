@@ -1,5 +1,6 @@
 pub mod bwrap;
 pub mod verifier;
+pub mod wire_oracle;
 
 use anyhow::Result;
 use smg_graph::LatticeFinding;
@@ -10,14 +11,18 @@ pub use bwrap::{
     build_macos_seatbelt_profile, build_macos_seatbelt_profile_with_extras,
     build_windows_job_wrapper_script, detect_sandbox_backend, has_bwrap, has_isolated_sandbox,
     kill_active_sandbox_pgid, run_deep_fuzz_in_isolated_netns, run_finding_in_isolated_netns,
-    run_finding_in_isolated_netns_with_config, spawn_sandboxed_server,
-    spawn_sandboxed_server_with_config,
+    run_finding_in_isolated_netns_with_config, run_findings_batch_in_isolated_netns_with_config,
+    spawn_sandboxed_server, spawn_sandboxed_server_with_config,
 };
 pub use verifier::{
     FuzzProbeHit, MockShimHandle, SandboxProbeConfig, VerificationStatus, VerifiedFinding,
-    classify_boot_failure, mock_shim_env_vars, spawn_mock_shim_server,
-    spawn_mock_shim_server_on_port, verify_finding, verify_finding_with_config,
-    verify_route_fuzz_with_config,
+    apply_wire_diff_corroboration, classify_boot_failure, mock_shim_env_vars,
+    spawn_mock_shim_server, spawn_mock_shim_server_on_port, verify_finding,
+    verify_finding_with_config, verify_route_fuzz_with_config,
+};
+pub use wire_oracle::{
+    OobSsrfCatcher, WireDiffProxy, capture_fs_digests, diff_fs_digests, synthesize_schema_poc_body,
+    verify_ssrf_oob_with_config,
 };
 
 fn is_dynamic_probe_target(finding: &LatticeFinding) -> bool {
@@ -26,6 +31,7 @@ fn is_dynamic_probe_target(finding: &LatticeFinding) -> bool {
         smg_graph::GuardKind::Auth
             | smg_graph::GuardKind::TxLock
             | smg_graph::GuardKind::OwnershipCheck
+            | smg_graph::GuardKind::SsrfSanitizer
     )
 }
 
@@ -183,6 +189,46 @@ pub fn verify_finding_blocking_with_config(
     )
 }
 
+/// Verifies a batch of findings sequentially inside one warm namespace probe container, waiting
+/// once for server startup and fast-failing all findings to `Unbootable` on premature exit.
+pub fn verify_findings_batch_blocking_with_config(
+    port: u16,
+    findings: &[LatticeFinding],
+    concurrency: usize,
+    probe_cfg: &SandboxProbeConfig,
+) -> Result<Vec<VerifiedFinding>> {
+    let (srv_pid, boot_log) = read_boot_monitor_env();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async move {
+        let _shim = maybe_start_netns_shim(port, probe_cfg).await;
+        if let Err(reason) = wait_for_port_or_boot_exit(port, srv_pid, boot_log.as_deref()).await {
+            if reason.contains("UNBOOTABLE:") || srv_pid.is_some() {
+                return Ok(findings
+                    .iter()
+                    .map(|finding| VerifiedFinding {
+                        finding_id: finding.id.clone(),
+                        rule_id: finding.rule_id.clone(),
+                        entry_route: finding.entry_route.clone(),
+                        status: VerificationStatus::Unbootable,
+                        evidence: reason.clone(),
+                        replay_cmd: format!("smg replay {}", finding.id),
+                    })
+                    .collect());
+            }
+            anyhow::bail!("{}", reason);
+        }
+        let mut out = Vec::with_capacity(findings.len());
+        for finding in findings {
+            out.push(
+                verifier::verify_finding_with_config(port, finding, concurrency, probe_cfg).await?,
+            );
+        }
+        Ok(out)
+    })
+}
+
 /// Verifies one finding against loopback `port`, fast-failing to `VerificationStatus::Unbootable`
 /// if `srv_pid` terminates before `port` begins listening.
 pub fn verify_finding_blocking_with_boot_monitor(
@@ -283,25 +329,59 @@ pub fn verify_findings_in_sandbox_with_config(
             );
         }
 
-        let mut results = Vec::with_capacity(findings.len());
-        // B-NET + B-DRAIN: Run BOTH the target server AND `smg __probe-netns` inside the OS sandbox
-        // (Linux/WSL2 bwrap `--unshare-all`, or macOS `sandbox-exec` Seatbelt) for each dynamic finding!
+        let mut results: Vec<Option<VerifiedFinding>> = vec![None; findings.len()];
+        let dynamic_indices: Vec<usize> = findings
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, f)| is_dynamic_probe_target(f).then_some(idx))
+            .collect();
+
+        // B-NET + B-DRAIN + Wave 3C Shared Warm Sandbox Pool:
+        // Boot ONE isolated `--unshare-all` sandbox across all dynamic findings (`--mode verify-batch`)
+        // when more than 1 dynamic finding exists, eliminating N repeated full server boots.
         if use_isolated {
-            for f in findings {
-                let res = if is_dynamic_probe_target(f) {
-                    match run_finding_in_isolated_netns_with_config(
-                        project_root,
-                        boot_cmd,
-                        port,
-                        f,
-                        concurrency,
-                        probe_cfg,
-                    ) {
-                        Ok(vf) => vf,
-                        Err(e) => {
-                            let msg = e.to_string();
-                            let is_unbootable = msg.contains("UNBOOTABLE:");
-                            VerifiedFinding {
+            if dynamic_indices.len() > 1 {
+                let dyn_findings: Vec<LatticeFinding> = dynamic_indices
+                    .iter()
+                    .map(|&idx| findings[idx].clone())
+                    .collect();
+                match run_findings_batch_in_isolated_netns_with_config(
+                    project_root,
+                    boot_cmd,
+                    port,
+                    &dyn_findings,
+                    concurrency,
+                    probe_cfg,
+                ) {
+                    Ok(batch_out) if batch_out.len() == dynamic_indices.len() => {
+                        for (pos, vf) in dynamic_indices.iter().zip(batch_out) {
+                            results[*pos] = Some(vf);
+                        }
+                    }
+                    Ok(batch_out) => {
+                        let by_id: std::collections::HashMap<String, VerifiedFinding> = batch_out
+                            .into_iter()
+                            .map(|vf| (vf.finding_id.clone(), vf))
+                            .collect();
+                        for &pos in &dynamic_indices {
+                            let f = &findings[pos];
+                            let vf = by_id.get(&f.id).cloned().unwrap_or_else(|| VerifiedFinding {
+                                finding_id: f.id.clone(),
+                                rule_id: f.rule_id.clone(),
+                                entry_route: f.entry_route.clone(),
+                                status: VerificationStatus::SuspectUnverified,
+                                evidence: "Warm batch sandbox omitted finding result".into(),
+                                replay_cmd: format!("smg replay {}", f.id),
+                            });
+                            results[pos] = Some(vf);
+                        }
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        let is_unbootable = msg.contains("UNBOOTABLE:");
+                        for &pos in &dynamic_indices {
+                            let f = &findings[pos];
+                            results[pos] = Some(VerifiedFinding {
                                 finding_id: f.id.clone(),
                                 rule_id: f.rule_id.clone(),
                                 entry_route: f.entry_route.clone(),
@@ -312,15 +392,51 @@ pub fn verify_findings_in_sandbox_with_config(
                                 },
                                 evidence: format!("Sandbox verification inconclusive: {}", msg),
                                 replay_cmd: format!("smg replay {}", f.id),
-                            }
+                            });
                         }
                     }
-                } else {
-                    verifier::verify_finding_with_config(port, f, concurrency, probe_cfg).await?
+                }
+            } else if dynamic_indices.len() == 1 {
+                let pos = dynamic_indices[0];
+                let f = &findings[pos];
+                let vf = match run_finding_in_isolated_netns_with_config(
+                    project_root,
+                    boot_cmd,
+                    port,
+                    f,
+                    concurrency,
+                    probe_cfg,
+                ) {
+                    Ok(vf) => vf,
+                    Err(e) => {
+                        let msg = e.to_string();
+                        let is_unbootable = msg.contains("UNBOOTABLE:");
+                        VerifiedFinding {
+                            finding_id: f.id.clone(),
+                            rule_id: f.rule_id.clone(),
+                            entry_route: f.entry_route.clone(),
+                            status: if is_unbootable {
+                                VerificationStatus::Unbootable
+                            } else {
+                                VerificationStatus::SuspectUnverified
+                            },
+                            evidence: format!("Sandbox verification inconclusive: {}", msg),
+                            replay_cmd: format!("smg replay {}", f.id),
+                        }
+                    }
                 };
-                results.push(res);
+                results[pos] = Some(vf);
             }
-            return Ok((true, results));
+
+            for (pos, f) in findings.iter().enumerate() {
+                if results[pos].is_none() {
+                    results[pos] = Some(
+                        verifier::verify_finding_with_config(port, f, concurrency, probe_cfg)
+                            .await?,
+                    );
+                }
+            }
+            return Ok((true, results.into_iter().flatten().collect()));
         }
 
         let shim_handle = if has_dynamic_findings && probe_cfg.mock_shims {
@@ -333,52 +449,61 @@ pub fn verify_findings_in_sandbox_with_config(
             .map(|h| mock_shim_env_vars(h.port))
             .unwrap_or_default();
 
+        // Wave 3C Loopback Warm Server Pool: reuse one spawned target server across all dynamic probes.
+        let mut warm_guard: Option<SandboxGuard> = None;
+        let mut warm_boot_err: Option<String> = None;
+        if !dynamic_indices.is_empty() {
+            match spawn_sandboxed_server_with_config(
+                project_root,
+                boot_cmd,
+                port,
+                allow_unsafe_host_fallback,
+                &extra_env,
+                probe_cfg,
+            )
+            .await
+            {
+                Ok(guard) => warm_guard = Some(guard),
+                Err(e) => warm_boot_err = Some(classify_boot_failure(&e.to_string())),
+            }
+        }
+
+        let mut final_results = Vec::with_capacity(findings.len());
         for f in findings {
             let res = if is_dynamic_probe_target(f) {
-                match spawn_sandboxed_server_with_config(
-                    project_root,
-                    boot_cmd,
-                    port,
-                    allow_unsafe_host_fallback,
-                    &extra_env,
-                    probe_cfg,
-                )
-                .await
-                {
-                    Ok(guard) => {
-                        let out =
-                            match verify_finding_with_config(port, f, concurrency, probe_cfg).await
-                            {
-                                Ok(vf) => vf,
-                                Err(e) => VerifiedFinding {
-                                    finding_id: f.id.clone(),
-                                    rule_id: f.rule_id.clone(),
-                                    entry_route: f.entry_route.clone(),
-                                    status: VerificationStatus::SuspectUnverified,
-                                    evidence: format!("Sandbox probe error: {}", e),
-                                    replay_cmd: format!("smg replay {}", f.id),
-                                },
-                            };
-                        drop(guard);
-                        out
+                if warm_guard.is_some() {
+                    match verify_finding_with_config(port, f, concurrency, probe_cfg).await {
+                        Ok(vf) => vf,
+                        Err(e) => VerifiedFinding {
+                            finding_id: f.id.clone(),
+                            rule_id: f.rule_id.clone(),
+                            entry_route: f.entry_route.clone(),
+                            status: VerificationStatus::SuspectUnverified,
+                            evidence: format!("Sandbox probe error: {}", e),
+                            replay_cmd: format!("smg replay {}", f.id),
+                        },
                     }
-                    Err(e) => VerifiedFinding {
+                } else {
+                    VerifiedFinding {
                         finding_id: f.id.clone(),
                         rule_id: f.rule_id.clone(),
                         entry_route: f.entry_route.clone(),
                         status: VerificationStatus::Unbootable,
-                        evidence: classify_boot_failure(&e.to_string()),
+                        evidence: warm_boot_err
+                            .clone()
+                            .unwrap_or_else(|| "UNBOOTABLE: failed to boot target server".into()),
                         replay_cmd: format!("smg replay {}", f.id),
-                    },
+                    }
                 }
             } else {
                 verify_finding_with_config(port, f, concurrency, probe_cfg).await?
             };
-            results.push(res);
+            final_results.push(res);
         }
 
+        drop(warm_guard);
         drop(shim_handle);
-        Ok((false, results))
+        Ok((false, final_results))
     })
 }
 
@@ -509,6 +634,7 @@ mod tests {
             missing_guard: smg_graph::GuardKind::Auth,
             witness_path: vec![],
             remediation: String::new(),
+            proof_reasons: vec![],
         };
 
         let start = Instant::now();
@@ -536,5 +662,67 @@ mod tests {
         assert!(
             verified.evidence.contains("PostgreSQL") || verified.evidence.contains("ECONNREFUSED")
         );
+    }
+
+    #[test]
+    fn test_warm_batch_verifies_multiple_findings_on_single_listener() {
+        use std::io::{Read, Write};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_srv = Arc::clone(&hits);
+
+        let srv = std::thread::spawn(move || {
+            for _ in 0..8 {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buf = [0u8; 2048];
+                    let _ = stream.read(&mut buf);
+                    hits_srv.fetch_add(1, Ordering::SeqCst);
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+                    );
+                }
+            }
+        });
+
+        let mk_auth_finding = |id: &str, route: &str| LatticeFinding {
+            id: id.into(),
+            rule_id: "SMG-AUTH-001".into(),
+            severity: "HIGH".into(),
+            title: "Missing auth".into(),
+            file: "src/app.ts".into(),
+            line: 10,
+            status: "SUSPECT".into(),
+            confidence: smg_graph::Confidence::Confirmed,
+            entry_route: route.into(),
+            sink_kind: smg_graph::SinkKind::AuthMutation,
+            missing_guard: smg_graph::GuardKind::Auth,
+            witness_path: vec![],
+            remediation: String::new(),
+            proof_reasons: vec![],
+        };
+        let batch = vec![
+            mk_auth_finding("SMG-AUTH-W1", "POST /api/a"),
+            mk_auth_finding("SMG-AUTH-W2", "POST /api/b"),
+        ];
+        let out = verify_findings_batch_blocking_with_config(
+            port,
+            &batch,
+            2,
+            &SandboxProbeConfig::default(),
+        )
+        .unwrap();
+        drop(srv);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].finding_id, "SMG-AUTH-W1");
+        assert_eq!(out[1].finding_id, "SMG-AUTH-W2");
+        assert_eq!(out[0].status, VerificationStatus::Proven);
+        assert_eq!(out[1].status, VerificationStatus::Proven);
+        assert!(hits.load(Ordering::SeqCst) >= 2);
     }
 }

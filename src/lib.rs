@@ -7,19 +7,25 @@ use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use rules_catalog::{CompletionShell, RULE_CATALOG, find_rule_doc, render_shell_completions};
 use smg_ai::{
-    ApplyCheckParams, build_minimal_patch_prompt, generate_patch_plan, provider_from_config,
+    ApplyCheckParams, build_minimal_patch_prompt, export_regression_tests, generate_patch_plan,
+    provider_from_config, run_cegis_patch_loop, synthesize_deterministic_codemod_diff,
     verify_patch_in_isolated_copy,
 };
-use smg_core::{DeltaStats, ShellMindGuardConfig, StateStore, scan_repository};
+use smg_core::{
+    DeltaStats, ScanOptions, ShellMindGuardConfig, StateStore, scan_repository,
+    scan_repository_with_options,
+};
 use smg_graph::{
     Confidence, GraphAnalysisResult, GuardKind, LatticeFinding, analyze_codebase_cached,
-    collect_deep_schema_findings, finding_matches_layer,
+    analyze_codebase_cached_changed_since, collect_deep_schema_findings, collect_git_changed_files,
+    compute_rule_telemetry, deps::extract_resolved_dependencies, finding_matches_layer,
 };
-use smg_report::{to_html_graph, to_sarif_json};
+use smg_report::{to_cyclonedx_vex_json, to_html_graph, to_sarif_json};
 use smg_sandbox::{
     SandboxProbeConfig, VerificationStatus, VerifiedFinding, detect_sandbox_backend,
     verify_deep_fuzz_blocking_with_config, verify_deep_fuzz_in_sandbox,
-    verify_finding_blocking_with_config, verify_findings_in_sandbox_with_config,
+    verify_finding_blocking_with_config, verify_findings_batch_blocking_with_config,
+    verify_findings_in_sandbox_with_config,
 };
 use smg_tui::{TuiLaunchConfig, run_tui};
 use std::collections::{HashMap, HashSet};
@@ -109,6 +115,8 @@ impl AnsiPalette {
 enum ProbeMode {
     #[default]
     Verify,
+    #[value(name = "verify-batch")]
+    VerifyBatch,
     Fuzz,
 }
 
@@ -181,6 +189,54 @@ enum DepsAction {
     Status,
 }
 
+#[derive(Subcommand, Debug)]
+enum EnterpriseAction {
+    /// Inspect local Linux Confidential Compute TEE device nodes (`/dev/nsm`, `/dev/tdx_guest`, `/dev/sev-guest`)
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Verify a fail-closed Ed25519 signed commercial license token and optional binary digest pin
+    VerifyLicense {
+        #[arg(long, value_name = "FILE")]
+        license: PathBuf,
+        #[arg(long, help = "32-byte Ed25519 public key (64-char hex or base64)")]
+        pubkey: String,
+        #[arg(long, default_value = "enterprise-tee")]
+        tier: String,
+        #[arg(long, value_name = "BIN")]
+        binary: Option<PathBuf>,
+    },
+    /// Verify a remote TEE attestation quote (`aws-nitro`, `intel-tdx`, `amd-sev-snp`) against pinned PCR0/MRTD & nonce
+    VerifyAttestation {
+        #[arg(long, value_name = "FILE")]
+        quote: PathBuf,
+        #[arg(long, help = "32-byte Ed25519 attestation authority public key")]
+        pubkey: String,
+        #[arg(long, help = "Expected PCR0 / MRTD measurement hex")]
+        pcr0: String,
+        #[arg(long, help = "Expected single-use hex nonce challenge")]
+        nonce: String,
+        #[arg(long, default_value = "aws-nitro")]
+        platform: String,
+    },
+    /// Dispatch a remote TEE confidential scan over HTTPS with fail-closed PCR0 quote verification
+    RemoteScan {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        #[arg(long, help = "Remote enclave endpoint (https:// required remotely)")]
+        endpoint: String,
+        #[arg(long)]
+        pubkey: String,
+        #[arg(long)]
+        pcr0: String,
+        #[arg(long, default_value = "aws-nitro")]
+        platform: String,
+        #[arg(long, value_name = "FILE")]
+        license: Option<PathBuf>,
+    },
+}
+
 pub(crate) struct ScanRunOptions<'a> {
     pub path: &'a Path,
     pub layers: &'a [String],
@@ -218,6 +274,144 @@ struct Cli {
     command: Option<Commands>,
 }
 
+#[derive(clap::Args, Debug)]
+struct ScanCmdArgs {
+    #[arg(default_value = ".")]
+    path: PathBuf,
+    #[arg(long, help = "Shorthand for --format json")]
+    json: bool,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+    #[arg(
+        long,
+        value_name = "FILE",
+        help = "Write formatted scan output to FILE instead of stdout (disables ANSI colors)"
+    )]
+    output: Option<PathBuf>,
+    #[arg(
+        long,
+        value_delimiter = ',',
+        help = "Filter active layers (auth,race,taint,sqli,cmdi,path,ssrf,xss,csrf,idor,secrets,config,deps,frontend,engine,memory,mobile,hw,web3,pqc,deep)"
+    )]
+    layers: Vec<String>,
+    #[arg(
+        long,
+        value_name = "POLICY",
+        help = "Enable opt-in compliance analyzers (e.g. `pqc` for NIST PQC bit reduction & Mosca HNDL urgency)"
+    )]
+    compliance: Option<String>,
+    #[arg(
+        long,
+        value_name = "FILE",
+        help = "Write CycloneDX 1.5 Static Source & Config Cryptography Inventory (CBOM JSON) to FILE"
+    )]
+    cbom: Option<PathBuf>,
+    #[arg(
+        long,
+        value_delimiter = ',',
+        help = "Suppress findings matching specific rule IDs (e.g. SMG-CFG-001,SMG-MOBILE-001)"
+    )]
+    exclude_rule: Vec<String>,
+    #[arg(
+        long,
+        value_name = "FILE",
+        help = "Suppress findings already recorded in a baseline JSON snapshot"
+    )]
+    baseline: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "FILE",
+        help = "Write current unmitigated findings snapshot JSON to FILE as baseline"
+    )]
+    write_baseline: Option<PathBuf>,
+    #[arg(
+        long,
+        value_enum,
+        help = "Hide findings below this confidence tier (proven, confirmed, heuristic)"
+    )]
+    min_confidence: Option<MinConfidenceArg>,
+    #[arg(
+        long,
+        help = "Enable Phase 10 deep schema validation (SMG-FUZZ-SCHEMA) & targeted route payload fuzzing"
+    )]
+    deep: bool,
+    #[arg(long)]
+    boot_cmd: Option<String>,
+    #[arg(long, default_value_t = 39911)]
+    port: u16,
+    #[arg(long, default_value_t = 12)]
+    sync_race: usize,
+    #[arg(
+        long,
+        value_name = "MB",
+        help = "Optional RLIMIT_AS / cgroups v2 memory limit (MiB) inside sandbox"
+    )]
+    sandbox_mem_mb: Option<u64>,
+    #[arg(
+        long,
+        help = "Probe sandbox target over local loopback TLS using rustls"
+    )]
+    sandbox_tls: bool,
+    #[arg(
+        long,
+        help = "Start deterministic loopback mock shims (/v1/charges, /oauth/token, /webhooks) inside sandbox"
+    )]
+    mock_shims: bool,
+    #[arg(
+        long,
+        help = "Enforce systemd-run user cgroups v2 memory/task limits when available"
+    )]
+    cgroup_v2: bool,
+    #[arg(long)]
+    sarif: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "FILE",
+        help = "Write CycloneDX 1.5 SBOM + VEX report (with BLAKE3 attestation digest) to FILE"
+    )]
+    cyclonedx: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "DIR",
+        help = "Generate self-contained regression test suite into DIR for active findings"
+    )]
+    export_test: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "GIT_REF",
+        help = "Scan only files changed since GIT_REF plus reverse-caller/callee subgraph (auto-falls back on lockfile/middleware edits)"
+    )]
+    changed_since: Option<String>,
+    #[arg(
+        long,
+        help = "Include generated stub files (*.pb.go, *.min.js, etc.) usually skipped by default"
+    )]
+    include_generated: bool,
+    #[arg(long)]
+    html: Option<PathBuf>,
+    #[arg(long)]
+    patch: bool,
+    /// Allow unsafe host execution if `/usr/bin/bwrap` is unavailable
+    #[arg(long)]
+    unsafe_host_fallback: bool,
+    /// Trust `sandbox.boot_cmd` defined in the scanned repo's `.shellmind-guard.toml`
+    #[arg(long)]
+    trust_repo_config: bool,
+    #[arg(long)]
+    ci: bool,
+    #[arg(
+        long,
+        value_enum,
+        help = "Exit non-zero if any unmitigated finding meets this severity"
+    )]
+    fail_on: Option<FailSeverity>,
+    #[arg(
+        long,
+        help = "Continuously watch repository and re-scan on file changes"
+    )]
+    watch: bool,
+}
+
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Initialize `.shellmind-guard.toml` (and optionally `.github/workflows/shellmind-guard.yml` or git hook)
@@ -237,107 +431,7 @@ enum Commands {
         json: bool,
     },
     /// Scan a repository across all 6 ShellMind Guard layers (with optional sandbox, baseline, SARIF, HTML, patch & CI gate)
-    Scan {
-        #[arg(default_value = ".")]
-        path: PathBuf,
-        #[arg(long, help = "Shorthand for --format json")]
-        json: bool,
-        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
-        format: OutputFormat,
-        #[arg(
-            long,
-            value_name = "FILE",
-            help = "Write formatted scan output to FILE instead of stdout (disables ANSI colors)"
-        )]
-        output: Option<PathBuf>,
-        #[arg(
-            long,
-            value_delimiter = ',',
-            help = "Filter active layers (auth,race,taint,sqli,cmdi,path,ssrf,xss,csrf,idor,secrets,config,deps,frontend,engine,memory,mobile,deep)"
-        )]
-        layers: Vec<String>,
-        #[arg(
-            long,
-            value_delimiter = ',',
-            help = "Suppress findings matching specific rule IDs (e.g. SMG-CFG-001,SMG-MOBILE-001)"
-        )]
-        exclude_rule: Vec<String>,
-        #[arg(
-            long,
-            value_name = "FILE",
-            help = "Suppress findings already recorded in a baseline JSON snapshot"
-        )]
-        baseline: Option<PathBuf>,
-        #[arg(
-            long,
-            value_name = "FILE",
-            help = "Write current unmitigated findings snapshot JSON to FILE as baseline"
-        )]
-        write_baseline: Option<PathBuf>,
-        #[arg(
-            long,
-            value_enum,
-            help = "Hide findings below this confidence tier (proven, confirmed, heuristic)"
-        )]
-        min_confidence: Option<MinConfidenceArg>,
-        #[arg(
-            long,
-            help = "Enable Phase 10 deep schema validation (SMG-FUZZ-SCHEMA) & targeted route payload fuzzing"
-        )]
-        deep: bool,
-        #[arg(long)]
-        boot_cmd: Option<String>,
-        #[arg(long, default_value_t = 39911)]
-        port: u16,
-        #[arg(long, default_value_t = 12)]
-        sync_race: usize,
-        #[arg(
-            long,
-            value_name = "MB",
-            help = "Optional RLIMIT_AS / cgroups v2 memory limit (MiB) inside sandbox"
-        )]
-        sandbox_mem_mb: Option<u64>,
-        #[arg(
-            long,
-            help = "Probe sandbox target over local loopback TLS using rustls"
-        )]
-        sandbox_tls: bool,
-        #[arg(
-            long,
-            help = "Start deterministic loopback mock shims (/v1/charges, /oauth/token, /webhooks) inside sandbox"
-        )]
-        mock_shims: bool,
-        #[arg(
-            long,
-            help = "Enforce systemd-run user cgroups v2 memory/task limits when available"
-        )]
-        cgroup_v2: bool,
-        #[arg(long)]
-        sarif: Option<PathBuf>,
-        #[arg(long)]
-        html: Option<PathBuf>,
-        #[arg(long)]
-        patch: bool,
-        /// Allow unsafe host execution if `/usr/bin/bwrap` is unavailable
-        #[arg(long)]
-        unsafe_host_fallback: bool,
-        /// Trust `sandbox.boot_cmd` defined in the scanned repo's `.shellmind-guard.toml`
-        #[arg(long)]
-        trust_repo_config: bool,
-        #[arg(long)]
-        ci: bool,
-        #[arg(
-            long,
-            value_enum,
-            help = "Exit non-zero if any unmitigated finding meets this severity"
-        )]
-        fail_on: Option<FailSeverity>,
-        #[arg(
-            long,
-            help = "Continuously watch repository and re-scan on file changes"
-        )]
-        watch: bool,
-    },
+    Scan(Box<ScanCmdArgs>),
     /// Replay the exact sandbox PoC for a specific finding ID (e.g., SMG-RACE-002 or SMG-AUTH-001)
     Replay {
         finding_id: String,
@@ -408,7 +502,7 @@ enum Commands {
     Rules {
         #[arg(
             long,
-            help = "Filter rules by layer (auth, race, idor, sqli, cmdi, secrets, config, deps, engine, mobile, frontend, deep)"
+            help = "Filter rules by layer (auth, race, idor, sqli, cmdi, secrets, config, deps, cicd, k8s, dos, zip, crypto, queue, engine, mobile, frontend, deep)"
         )]
         layer: Option<String>,
         #[arg(long)]
@@ -439,6 +533,11 @@ enum Commands {
         #[command(subcommand)]
         action: DepsAction,
     },
+    /// Confidential Compute Remote TEE Attestation & Commercial Ed25519 License Management
+    Enterprise {
+        #[command(subcommand)]
+        action: Box<EnterpriseAction>,
+    },
     /// Inspect local environment, sandbox (`bwrap`), cgroups v2, git, and AI readiness
     Doctor {
         #[arg(default_value = ".")]
@@ -459,6 +558,142 @@ enum Commands {
         #[arg(long, value_enum, default_value_t = ProbeMode::Verify)]
         mode: ProbeMode,
     },
+}
+
+#[cfg(feature = "enterprise")]
+fn handle_enterprise_command(action: EnterpriseAction) -> Result<()> {
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    match action {
+        EnterpriseAction::Status { json } => {
+            let probe = smg_enterprise::probe_local_tee_hardware();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&probe)?);
+            } else {
+                println!(
+                    "ShellMind Guard Enterprise & TEE | AWS Nitro `/dev/nsm`: {} | Intel TDX: {} | AMD SEV-SNP: {}",
+                    if probe.nitro_nsm_present {
+                        "READY"
+                    } else {
+                        "NOT ATTACHED (host-only)"
+                    },
+                    if probe.intel_tdx_present {
+                        "READY"
+                    } else {
+                        "NOT ATTACHED"
+                    },
+                    if probe.amd_sev_present {
+                        "READY"
+                    } else {
+                        "NOT ATTACHED"
+                    },
+                );
+                println!(
+                    "Local Open-Source Core: Apache-2.0 Unrestricted | Commercial Verification: Ed25519 Signed License + Pinning Ready"
+                );
+            }
+        }
+        EnterpriseAction::VerifyLicense {
+            license,
+            pubkey,
+            tier,
+            binary,
+        } => {
+            let pk = smg_enterprise::decode_pubkey_32(&pubkey)?;
+            let raw = fs::read_to_string(&license)?;
+            let tok: smg_enterprise::SignedLicenseToken = serde_json::from_str(&raw)?;
+            let req_tier = smg_enterprise::LicenseTier::parse(&tier)?;
+            let actual_digest = match binary {
+                Some(ref p) => Some(smg_enterprise::compute_binary_blake3(p)?),
+                None => None,
+            };
+            let claims = smg_enterprise::verify_license_fail_closed(
+                &tok,
+                &pk,
+                now_unix,
+                req_tier,
+                actual_digest.as_deref(),
+            )?;
+            println!(
+                "ShellMind Guard Enterprise | License `{}` VERIFIED | org={} | tier={:?} | seats={}",
+                claims.license_id, claims.organization, claims.tier, claims.max_seats
+            );
+        }
+        EnterpriseAction::VerifyAttestation {
+            quote,
+            pubkey,
+            pcr0,
+            nonce,
+            platform,
+        } => {
+            let pk = smg_enterprise::decode_pubkey_32(&pubkey)?;
+            let raw = fs::read_to_string(&quote)?;
+            let q: smg_enterprise::TeeAttestationQuote = serde_json::from_str(&raw)?;
+            let plat = smg_enterprise::TeePlatform::parse(&platform)?;
+            let policy = smg_enterprise::AttestationPolicy {
+                expected_platform: plat,
+                allowed_pcr0_hex: vec![pcr0],
+                expected_nonce_hex: nonce,
+                max_age_secs: 300,
+                authority_pubkey_32: pk,
+            };
+            let session = smg_enterprise::verify_tee_attestation_quote(&q, &policy, now_unix)?;
+            println!(
+                "ShellMind Guard TEE | Attestation VERIFIED | platform={:?} | pcr0={} | session={}",
+                session.platform, session.pcr0_verified, session.session_id
+            );
+        }
+        EnterpriseAction::RemoteScan {
+            path,
+            endpoint,
+            pubkey,
+            pcr0,
+            platform,
+            license,
+        } => {
+            let pk = smg_enterprise::decode_pubkey_32(&pubkey)?;
+            let plat = smg_enterprise::TeePlatform::parse(&platform)?;
+            let cfg = ShellMindGuardConfig::load_from_dir(&path)?;
+            let summary = scan_repository(&path, &cfg)?;
+            let lic_raw = match license {
+                Some(p) => Some(fs::read_to_string(p)?),
+                None => None,
+            };
+            let nonce_hex = smg_enterprise::generate_challenge_nonce_hex()?;
+            let policy = smg_enterprise::AttestationPolicy {
+                expected_platform: plat,
+                allowed_pcr0_hex: vec![pcr0],
+                expected_nonce_hex: nonce_hex,
+                max_age_secs: 300,
+                authority_pubkey_32: pk,
+            };
+            let (session, resp) = smg_enterprise::execute_remote_tee_scan(
+                &endpoint,
+                &summary.files,
+                lic_raw.as_deref(),
+                &policy,
+                now_unix,
+            )?;
+            println!(
+                "ShellMind Guard TEE Scan | platform={:?} | session={} | findings={} | {}ms",
+                session.platform,
+                session.session_id,
+                resp.findings.len(),
+                resp.scan_elapsed_ms
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "enterprise"))]
+fn handle_enterprise_command(action: EnterpriseAction) -> Result<()> {
+    let _ = action;
+    anyhow::bail!(
+        "This binary was built without `--features enterprise`. Recompile with `--features enterprise`."
+    );
 }
 
 pub(crate) fn write_ci_workflow(root: &Path) -> Result<PathBuf> {
@@ -632,6 +867,71 @@ fn is_inline_suppressed(
         }
     }
     false
+}
+
+fn count_stale_smg_ignores(root: &Path, pre_findings: &[LatticeFinding]) -> usize {
+    let Ok(cfg) = ShellMindGuardConfig::load_from_dir(root) else {
+        return 0;
+    };
+    let Ok(summary) = scan_repository(root, &cfg) else {
+        return 0;
+    };
+    let mut active_by_file: HashMap<String, Vec<&LatticeFinding>> = HashMap::new();
+    for f in pre_findings {
+        if !f.file.is_empty() {
+            active_by_file.entry(f.file.clone()).or_default().push(f);
+        }
+        if let Some(last) = f.witness_path.last()
+            && !last.file.is_empty()
+            && last.file != f.file
+        {
+            active_by_file.entry(last.file.clone()).or_default().push(f);
+        }
+    }
+
+    let mut stale = 0usize;
+    for file in &summary.files {
+        let Some(bytes) = &file.cached_bytes else {
+            continue;
+        };
+        let Ok(txt) = std::str::from_utf8(bytes) else {
+            continue;
+        };
+        if !txt.to_ascii_lowercase().contains("smg-ignore") {
+            continue;
+        }
+        let candidates = active_by_file.get(&file.rel_path);
+        for (idx, line) in txt.lines().enumerate() {
+            if !line.to_ascii_lowercase().contains("smg-ignore") {
+                continue;
+            }
+            if !line.contains("//")
+                && !line.contains('#')
+                && !line.contains("/*")
+                && !line.contains("--")
+                && !line.contains("<!--")
+            {
+                continue;
+            }
+            let comment_ln = idx + 1;
+            let matched = candidates.is_some_and(|list| {
+                list.iter().any(|f| {
+                    let hit_ln = f
+                        .witness_path
+                        .last()
+                        .map(|h| h.line)
+                        .filter(|&l| l > 0)
+                        .unwrap_or(f.line);
+                    (hit_ln == comment_ln || hit_ln == comment_ln + 1)
+                        && line_suppresses_finding(line, &f.rule_id, &f.id)
+                })
+            });
+            if !matched {
+                stale += 1;
+            }
+        }
+    }
+    stale
 }
 
 fn load_baseline_entries(path: &Path) -> Result<HashSet<BaselineEntry>> {
@@ -886,17 +1186,107 @@ fn resolve_sandbox_port(cli_port: u16, cfg: &ShellMindGuardConfig) -> Result<u16
 }
 
 pub(crate) fn execute_scan_pipeline(opts: ScanRunOptions<'_>) -> Result<ScanOutcome> {
+    execute_scan_pipeline_with_wave2(opts, None, false)
+}
+
+pub(crate) fn execute_scan_pipeline_with_wave2(
+    opts: ScanRunOptions<'_>,
+    changed_since: Option<&str>,
+    include_generated: bool,
+) -> Result<ScanOutcome> {
+    execute_scan_pipeline_full(opts, changed_since, include_generated, false, None)
+}
+
+pub(crate) fn execute_scan_pipeline_full(
+    opts: ScanRunOptions<'_>,
+    changed_since: Option<&str>,
+    include_generated: bool,
+    pqc_compliance: bool,
+    cbom_path: Option<&Path>,
+) -> Result<ScanOutcome> {
     let t0 = Instant::now();
     let cfg = ShellMindGuardConfig::load_from_dir(opts.path)?;
-    let summary = scan_repository(opts.path, &cfg)?;
+    let summary =
+        scan_repository_with_options(opts.path, &cfg, &ScanOptions { include_generated })?;
     let mut store = StateStore::open(opts.path)?;
     let (delta, _) = store.sync_files(&summary.files)?;
-    let mut graph_res = analyze_codebase_cached(&summary.files, &cfg, &mut store)?;
+    let mut graph_res = if let Some(git_ref) = changed_since {
+        let changed = collect_git_changed_files(opts.path, git_ref)?;
+        let (fallback, res) =
+            analyze_codebase_cached_changed_since(&summary.files, &cfg, &mut store, &changed)?;
+        if std::io::stderr().is_terminal() {
+            eprintln!(
+                "[SMG] --changed-since {} ({} modified file(s), fallback={})",
+                git_ref,
+                changed.len(),
+                fallback
+            );
+        }
+        res
+    } else {
+        analyze_codebase_cached(&summary.files, &cfg, &mut store)?
+    };
 
     if opts.deep {
         graph_res
             .findings
             .extend(collect_deep_schema_findings(&graph_res));
+    }
+    #[cfg(feature = "hw")]
+    {
+        let force_hw = opts.layers.iter().any(|l| {
+            matches!(
+                l.trim().to_ascii_lowercase().as_str(),
+                "hw" | "hardware" | "firmware" | "embedded"
+            )
+        });
+        let hw_hits = smg_hw::scan_hardware_repo(opts.path, &summary.files, force_hw);
+        smg_graph::append_local_static_findings(&mut graph_res.findings, &hw_hits);
+    }
+    #[cfg(feature = "web3")]
+    {
+        let force_web3 = opts.layers.iter().any(|l| {
+            matches!(
+                l.trim().to_ascii_lowercase().as_str(),
+                "web3"
+                    | "blockchain"
+                    | "smartcontract"
+                    | "solidity"
+                    | "evm"
+                    | "solana"
+                    | "move"
+                    | "defi"
+            )
+        });
+        let web3_hits = smg_web3::scan_web3_repo(opts.path, &summary.files, force_web3);
+        smg_graph::append_local_static_findings(&mut graph_res.findings, &web3_hits);
+    }
+    #[cfg(feature = "pqc")]
+    {
+        let wants_pqc = pqc_compliance
+            || cbom_path.is_some()
+            || opts.layers.iter().any(|l| {
+                matches!(
+                    l.trim().to_ascii_lowercase().as_str(),
+                    "pqc" | "quantum" | "post-quantum" | "cbom"
+                )
+            });
+        if wants_pqc {
+            let pqc_res = smg_pqc::scan_pqc_repo(opts.path, &summary.files, 3);
+            smg_graph::append_local_static_findings(&mut graph_res.findings, &pqc_res.findings);
+            if let Some(cbom_out) = cbom_path {
+                if let Some(parent) = cbom_out.parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(cbom_out, &pqc_res.cbom_json)?;
+            }
+        }
+    }
+    #[cfg(not(feature = "pqc"))]
+    {
+        let _ = (pqc_compliance, cbom_path);
     }
     let mut all_findings = graph_res.findings.clone();
 
@@ -930,7 +1320,10 @@ pub(crate) fn execute_scan_pipeline(opts: ScanRunOptions<'_>) -> Result<ScanOutc
     let has_dynamic_targets = graph_res.findings.iter().any(|f| {
         matches!(
             f.missing_guard,
-            GuardKind::Auth | GuardKind::TxLock | GuardKind::OwnershipCheck
+            GuardKind::Auth
+                | GuardKind::TxLock
+                | GuardKind::OwnershipCheck
+                | GuardKind::SsrfSanitizer
         )
     });
 
@@ -1222,62 +1615,82 @@ pub fn run_cli() -> Result<ExitCode> {
                 );
             }
         }
-        Commands::Scan {
-            path,
-            json,
-            format,
-            output,
-            layers,
-            exclude_rule,
-            baseline,
-            write_baseline,
-            min_confidence,
-            deep,
-            boot_cmd,
-            port,
-            sync_race,
-            sandbox_mem_mb,
-            sandbox_tls,
-            mock_shims,
-            cgroup_v2,
-            sarif,
-            html,
-            patch,
-            unsafe_host_fallback,
-            trust_repo_config,
-            ci,
-            fail_on,
-            watch,
-        } => {
+        Commands::Scan(boxed_scan) => {
+            let ScanCmdArgs {
+                path,
+                json,
+                format,
+                output,
+                layers,
+                compliance,
+                cbom,
+                exclude_rule,
+                baseline,
+                write_baseline,
+                min_confidence,
+                deep,
+                boot_cmd,
+                port,
+                sync_race,
+                sandbox_mem_mb,
+                sandbox_tls,
+                mock_shims,
+                cgroup_v2,
+                sarif,
+                cyclonedx,
+                export_test,
+                changed_since,
+                include_generated,
+                html,
+                patch,
+                unsafe_host_fallback,
+                trust_repo_config,
+                ci,
+                fail_on,
+                watch,
+            } = *boxed_scan;
             let effective_format = if json { OutputFormat::Json } else { format };
             let min_conf = min_confidence.map(|m| m.to_confidence());
+            let run_pqc = compliance.as_deref().is_some_and(|c| {
+                matches!(
+                    c.trim().to_ascii_lowercase().as_str(),
+                    "pqc" | "quantum" | "post-quantum"
+                )
+            });
             if boot_cmd.is_some() && std::io::stderr().is_terminal() {
                 eprintln!(
                     "[SMG] Scanning {} with live sandbox exploit verification...",
                     path.display()
                 );
             }
-            let mut outcome = execute_scan_pipeline(ScanRunOptions {
-                path: &path,
-                layers: &layers,
-                min_confidence: min_conf,
-                boot_cmd: boot_cmd.clone(),
-                port,
-                sync_race,
-                unsafe_host_fallback,
-                trust_repo_config,
-                deep,
-                sandbox_mem_mb,
-                sandbox_tls,
-                mock_shims,
-                cgroup_v2,
-            })?;
+            let mut outcome = execute_scan_pipeline_full(
+                ScanRunOptions {
+                    path: &path,
+                    layers: &layers,
+                    min_confidence: min_conf,
+                    boot_cmd: boot_cmd.clone(),
+                    port,
+                    sync_race,
+                    unsafe_host_fallback,
+                    trust_repo_config,
+                    deep,
+                    sandbox_mem_mb,
+                    sandbox_tls,
+                    mock_shims,
+                    cgroup_v2,
+                },
+                changed_since.as_deref(),
+                include_generated,
+                run_pqc,
+                cbom.as_deref(),
+            )?;
             let mut verified_list: Vec<VerifiedFinding> = outcome
                 .sandbox
                 .as_ref()
                 .map(|(_, v)| v.clone())
                 .unwrap_or_default();
 
+            let pre_suppression_findings = outcome.graph.findings.clone();
             apply_suppressions_and_baseline(
                 &path,
                 &mut outcome,
@@ -1286,6 +1699,38 @@ pub fn run_cli() -> Result<ExitCode> {
                 baseline.as_deref(),
                 write_baseline.as_deref(),
             )?;
+
+            let _ = append_audit_event(
+                &path,
+                "scan",
+                outcome.graph.findings.len(),
+                verified_list.len(),
+                "scan-complete",
+            );
+
+            if ci {
+                let stale = count_stale_smg_ignores(&path, &pre_suppression_findings);
+                if stale > 0 {
+                    eprintln!(
+                        "[SMG CI] Notice: {} inline `smg-ignore` comment(s) did not suppress any active finding (possibly stale).",
+                        stale
+                    );
+                }
+                let stats = compute_rule_telemetry(&outcome.graph.findings);
+                if !stats.is_empty() && effective_format != OutputFormat::Json {
+                    let top: Vec<String> = stats
+                        .iter()
+                        .take(5)
+                        .map(|s| {
+                            format!(
+                                "{}={}(P:{} C:{})",
+                                s.rule_id, s.total, s.proven, s.confirmed
+                            )
+                        })
+                        .collect();
+                    eprintln!("[SMG Telemetry] {}", top.join(" · "));
+                }
+            }
 
             let sarif_payload = if sarif.is_some() || effective_format == OutputFormat::Sarif {
                 Some(to_sarif_json(&outcome.graph.findings, &verified_list))
@@ -1302,6 +1747,42 @@ pub fn run_cli() -> Result<ExitCode> {
                     fs::create_dir_all(parent)?;
                 }
                 fs::write(sarif_path, payload)?;
+            }
+            if let Some(ref cdx_path) = cyclonedx {
+                let cfg = ShellMindGuardConfig::load_from_dir(&path)?;
+                let dep_summary =
+                    scan_repository_with_options(&path, &cfg, &ScanOptions { include_generated })?;
+                let mut resolved_deps = Vec::new();
+                for f in dep_summary
+                    .files
+                    .iter()
+                    .filter(|f| f.language == smg_core::Language::Manifest)
+                {
+                    if let Ok(raw) = fs::read_to_string(&f.abs_path) {
+                        resolved_deps.extend(extract_resolved_dependencies(&f.rel_path, &raw));
+                    }
+                }
+                let cdx_json = to_cyclonedx_vex_json(
+                    &path.display().to_string(),
+                    &resolved_deps,
+                    &outcome.graph.findings,
+                    &verified_list,
+                );
+                if let Some(parent) = cdx_path.parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(cdx_path, cdx_json)?;
+            }
+            if let Some(ref test_dir) = export_test {
+                let exported =
+                    export_regression_tests(test_dir, &outcome.graph.findings, &verified_list)?;
+                eprintln!(
+                    "[SMG] Exported {} regression test file(s) -> {}",
+                    exported.len(),
+                    test_dir.display()
+                );
             }
             if let Some(ref html_path) = html {
                 if let Some(parent) = html_path.parent()
@@ -1562,47 +2043,79 @@ pub fn run_cli() -> Result<ExitCode> {
                         }
                     }
                 } else if patch {
-                    let p = build_minimal_patch_prompt(&path, &finding, verified.first())?;
-                    println!("\n=== Minimal Patch Context ({} bytes) ===\n{}", p.len(), p);
+                    if let Some(det) = synthesize_deterministic_codemod_diff(&path, &finding) {
+                        println!("\n=== Deterministic AST Codemod Diff ===\n{}", det);
+                        ai_patch_text = Some(det);
+                    } else {
+                        let p = build_minimal_patch_prompt(&path, &finding, verified.first())?;
+                        println!("\n=== Minimal Patch Context ({} bytes) ===\n{}", p.len(), p);
+                    }
                 }
             }
 
             if apply_check {
-                let raw_diff = if let Some(ref pf) = patch_file {
-                    fs::read_to_string(pf).with_context(|| {
+                if let Some(ref pf) = patch_file {
+                    let raw_diff = fs::read_to_string(pf).with_context(|| {
                         format!("Failed to read --patch-file '{}'", pf.display())
-                    })?
-                } else if let Some(diff_reply) = ai_patch_text {
-                    diff_reply
+                    })?;
+                    let outcome = verify_patch_apply_check(&ApplyCheckParams {
+                        project_root: &path,
+                        cfg: &cfg,
+                        finding: &finding,
+                        raw_diff: &raw_diff,
+                        boot_cmd: effective_boot.as_deref(),
+                        port: effective_port,
+                        sync_race,
+                        unsafe_host_fallback,
+                        probe_cfg: &probe_cfg,
+                    })?;
+                    println!(
+                        "\n=== Isolated Patch Verification (modified: {:?}, hunks: {}) ===",
+                        outcome.modified_files, outcome.hunks_applied
+                    );
+                    if outcome.mitigated {
+                        println!("  [MITIGATED] {}", outcome.summary);
+                    } else {
+                        eprintln!("  [UNMITIGATED] {}", outcome.summary);
+                        return Ok(ExitCode::from(2));
+                    }
+                } else if ai_patch_text.is_some()
+                    || (cfg.ai.is_enabled() && trust_repo_config)
+                    || synthesize_deterministic_codemod_diff(&path, &finding).is_some()
+                {
+                    let provider = if cfg.ai.is_enabled() && trust_repo_config {
+                        provider_from_config(&cfg.ai)?
+                    } else {
+                        smg_ai::AiProvider::Disabled
+                    };
+                    let cegis = run_cegis_patch_loop(
+                        &path,
+                        &finding,
+                        verified.first(),
+                        &cfg,
+                        &provider,
+                        effective_boot.as_deref(),
+                        effective_port,
+                        sync_race,
+                        unsafe_host_fallback,
+                    )?;
+                    println!(
+                        "\n=== 3-Iter CEGIS Verification ({} iter(s), source={}) ===",
+                        cegis.iterations_used, cegis.source_tag
+                    );
+                    if cegis.mitigated {
+                        println!("  [MITIGATED] {}", cegis.summary);
+                    } else {
+                        eprintln!("  [UNMITIGATED] {}", cegis.summary);
+                        return Ok(ExitCode::from(2));
+                    }
                 } else {
                     anyhow::bail!(
-                        "--apply-check requires --patch-file <FILE> or an enabled [ai] provider in .shellmind-guard.toml (with --trust-repo-config)"
+                        "--apply-check requires --patch-file <FILE>, a supported deterministic codemod, or an enabled [ai] provider (with --trust-repo-config)"
                     );
-                };
-
-                let outcome = verify_patch_apply_check(&ApplyCheckParams {
-                    project_root: &path,
-                    cfg: &cfg,
-                    finding: &finding,
-                    raw_diff: &raw_diff,
-                    boot_cmd: effective_boot.as_deref(),
-                    port: effective_port,
-                    sync_race,
-                    unsafe_host_fallback,
-                    probe_cfg: &probe_cfg,
-                })?;
-
-                println!(
-                    "\n=== Isolated Patch Verification (modified: {:?}, hunks: {}) ===",
-                    outcome.modified_files, outcome.hunks_applied
-                );
-                if outcome.mitigated {
-                    println!("  [MITIGATED] {}", outcome.summary);
-                } else {
-                    eprintln!("  [UNMITIGATED] {}", outcome.summary);
-                    return Ok(ExitCode::from(2));
                 }
             }
+            let _ = append_audit_event(&path, "replay", 1, verified.len(), &finding.id);
         }
         Commands::Ui {
             path,
@@ -1860,6 +2373,9 @@ pub fn run_cli() -> Result<ExitCode> {
                 }
             }
         },
+        Commands::Enterprise { action } => {
+            handle_enterprise_command(*action)?;
+        }
         Commands::Doctor { path, probe_ai } => {
             run_doctor(&path, probe_ai);
         }
@@ -1883,6 +2399,17 @@ pub fn run_cli() -> Result<ExitCode> {
                     let finding: LatticeFinding = serde_json::from_str(&finding_json)?;
                     let res =
                         verify_finding_blocking_with_config(port, &finding, sync_race, &probe_cfg)?;
+                    println!("{}", serde_json::to_string(&res)?);
+                }
+                ProbeMode::VerifyBatch => {
+                    let batch_json = match std::env::var("SMG_FINDING_FILE") {
+                        Ok(p) => std::fs::read_to_string(p)?,
+                        Err(_) => std::env::var("SMG_FINDING_JSON")?,
+                    };
+                    let findings: Vec<LatticeFinding> = serde_json::from_str(&batch_json)?;
+                    let res = verify_findings_batch_blocking_with_config(
+                        port, &findings, sync_race, &probe_cfg,
+                    )?;
                     println!("{}", serde_json::to_string(&res)?);
                 }
                 ProbeMode::Fuzz => {
@@ -3297,6 +3824,44 @@ fn run_doctor(path: &Path, probe_ai: bool) {
     }
 }
 
+/// Appends one non-secret audit ledger event to `.shellmind-guard/audit-history.jsonl`
+/// (avoiding test fixture directories by routing fixture runs to no-op).
+pub(crate) fn append_audit_event(
+    project_root: &Path,
+    action: &str,
+    findings_count: usize,
+    verified_count: usize,
+    detail: &str,
+) -> Result<Option<PathBuf>> {
+    let canon = fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    if canon
+        .components()
+        .any(|c| c.as_os_str() == std::ffi::OsStr::new("fixtures"))
+    {
+        return Ok(None);
+    }
+    let dir = project_root.join(".shellmind-guard");
+    fs::create_dir_all(&dir)?;
+    let log_path = dir.join("audit-history.jsonl");
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let rec = serde_json::json!({
+        "ts": ts,
+        "action": action,
+        "findings_count": findings_count,
+        "verified_count": verified_count,
+        "detail": detail,
+    });
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+    writeln!(f, "{}", rec)?;
+    Ok(Some(log_path))
+}
+
 #[cfg(test)]
 struct TempDirCleanup(PathBuf);
 
@@ -3458,6 +4023,7 @@ mod main_tests {
             missing_guard: GuardKind::Auth,
             witness_path: vec![],
             remediation: String::new(),
+            proof_reasons: vec![],
         };
         assert!(!should_fail_gate(std::slice::from_ref(&med), true, None));
         assert!(should_fail_gate(
@@ -3924,5 +4490,318 @@ mod main_tests {
             .unwrap();
             assert!(!rendered.is_empty());
         }
+
+        let _ = append_audit_event(&root, "scan", 1, 0, "unit-test").unwrap();
+        let audit_file = root.join(".shellmind-guard").join("audit-history.jsonl");
+        let audit_txt = fs::read_to_string(&audit_file).unwrap();
+        assert!(audit_txt.contains("\"action\":\"scan\""));
+        assert!(audit_txt.contains("\"findings_count\":1"));
+        assert!(!audit_txt.contains("Bearer "));
+    }
+
+    #[cfg(feature = "hw")]
+    #[test]
+    fn test_hw_feature_scan_cli_rules_and_layers() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("smg_hw_cli_test_{}", nanos));
+        let _cleanup = TempDirCleanup(root.clone());
+        fs::create_dir_all(root.join("firmware")).unwrap();
+        fs::write(
+            root.join("board.ld"),
+            "MEMORY {\n  FLASH (rx) : ORIGIN = 0x08000000, LENGTH = 256K\n  SRAM (rwx) : ORIGIN = 0x20000000, LENGTH = 64K\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("firmware/boot.c"),
+            r#"
+void ota_apply(const uint8_t *img, uint32_t len) {
+    volatile uint32_t *flash = (volatile uint32_t *)0x08001000;
+    *flash = 0x1;
+    flash_write(0x08010000, img, len);
+}
+"#,
+        )
+        .unwrap();
+
+        let hw_layers = vec!["hw".to_string()];
+        let outcome = execute_scan_pipeline(ScanRunOptions {
+            path: &root,
+            layers: &hw_layers,
+            min_confidence: None,
+            boot_cmd: None,
+            port: 39921,
+            sync_race: 4,
+            unsafe_host_fallback: false,
+            trust_repo_config: false,
+            deep: false,
+            sandbox_mem_mb: None,
+            sandbox_tls: false,
+            mock_shims: false,
+            cgroup_v2: false,
+        })
+        .unwrap();
+
+        let ids: Vec<&str> = outcome
+            .graph
+            .findings
+            .iter()
+            .map(|f| f.rule_id.as_str())
+            .collect();
+        assert!(ids.contains(&"SMG-HW-MMIO"), "missing MMIO: {:?}", ids);
+        assert!(ids.contains(&"SMG-HW-BOOT"), "missing BOOT: {:?}", ids);
+        assert!(find_rule_doc("SMG-HW-MMIO").is_some());
+        assert!(find_rule_doc("SMG-HW-IRQ").is_some());
+    }
+
+    #[cfg(feature = "web3")]
+    #[test]
+    fn test_web3_feature_scan_cli_rules_and_layers() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("smg_web3_cli_test_{}", nanos));
+        let _cleanup = TempDirCleanup(root.clone());
+        fs::create_dir_all(root.join("contracts")).unwrap();
+        fs::write(
+            root.join("foundry.toml"),
+            "[profile.default]\nsrc = \"contracts\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("contracts/Vault.sol"),
+            r#"
+pragma solidity ^0.8.20;
+contract Vault {
+    address public owner;
+    mapping(address => uint256) public balances;
+    function initialize(address _owner) external {
+        owner = _owner;
+    }
+    function withdraw() external {
+        uint256 bal = balances[msg.sender];
+        (bool ok, ) = msg.sender.call{value: bal}("");
+        require(ok);
+        balances[msg.sender] = 0;
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        let web3_layers = vec!["web3".to_string()];
+        let outcome = execute_scan_pipeline(ScanRunOptions {
+            path: &root,
+            layers: &web3_layers,
+            min_confidence: None,
+            boot_cmd: None,
+            port: 39923,
+            sync_race: 4,
+            unsafe_host_fallback: false,
+            trust_repo_config: false,
+            deep: false,
+            sandbox_mem_mb: None,
+            sandbox_tls: false,
+            mock_shims: false,
+            cgroup_v2: false,
+        })
+        .unwrap();
+
+        let ids: Vec<&str> = outcome
+            .graph
+            .findings
+            .iter()
+            .map(|f| f.rule_id.as_str())
+            .collect();
+        assert!(
+            ids.contains(&"SMG-WEB3-REENTRANCY"),
+            "missing REENTRANCY: {:?}",
+            ids
+        );
+        assert!(
+            ids.contains(&"SMG-WEB3-ACCESS"),
+            "missing ACCESS: {:?}",
+            ids
+        );
+        assert!(find_rule_doc("SMG-WEB3-REENTRANCY").is_some());
+        assert!(find_rule_doc("SMG-WEB3-STORAGE").is_some());
+    }
+
+    #[cfg(feature = "pqc")]
+    #[test]
+    fn test_pqc_feature_compliance_cbom_and_layers() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("smg_pqc_cli_test_{}", nanos));
+        let _cleanup = TempDirCleanup(root.clone());
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/tls.rs"),
+            r#"
+pub fn configure_tls() {
+    let suite = "ECDHE-RSA-AES128-GCM-SHA256";
+    let downgrade = "mlkem_fallback_to_rsa";
+    let seed = [0u8; 32]; ml_kem_keygen(seed);
+}
+"#,
+        )
+        .unwrap();
+
+        let cbom_file = root.join("out/cbom.json");
+        let default_outcome = execute_scan_pipeline_full(
+            ScanRunOptions {
+                path: &root,
+                layers: &[],
+                min_confidence: None,
+                boot_cmd: None,
+                port: 39925,
+                sync_race: 4,
+                unsafe_host_fallback: false,
+                trust_repo_config: false,
+                deep: false,
+                sandbox_mem_mb: None,
+                sandbox_tls: false,
+                mock_shims: false,
+                cgroup_v2: false,
+            },
+            None,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            !default_outcome
+                .graph
+                .findings
+                .iter()
+                .any(|f| f.rule_id.starts_with("SMG-PQC-")),
+            "default scan must not emit PQC advisories when unrequested"
+        );
+
+        let pqc_layers = vec!["pqc".to_string()];
+        let outcome = execute_scan_pipeline_full(
+            ScanRunOptions {
+                path: &root,
+                layers: &pqc_layers,
+                min_confidence: None,
+                boot_cmd: None,
+                port: 39926,
+                sync_race: 4,
+                unsafe_host_fallback: false,
+                trust_repo_config: false,
+                deep: false,
+                sandbox_mem_mb: None,
+                sandbox_tls: false,
+                mock_shims: false,
+                cgroup_v2: false,
+            },
+            None,
+            false,
+            true,
+            Some(&cbom_file),
+        )
+        .unwrap();
+
+        let ids: Vec<&str> = outcome
+            .graph
+            .findings
+            .iter()
+            .map(|f| f.rule_id.as_str())
+            .collect();
+        assert!(ids.contains(&"SMG-PQC-HNDL"), "missing HNDL: {:?}", ids);
+        assert!(ids.contains(&"SMG-PQC-GROVER"), "missing GROVER: {:?}", ids);
+        assert!(
+            ids.contains(&"SMG-PQC-DOWNGRADE"),
+            "missing DOWNGRADE: {:?}",
+            ids
+        );
+        assert!(ids.contains(&"SMG-PQC-PARAMS"), "missing PARAMS: {:?}", ids);
+
+        let cbom_raw = fs::read_to_string(&cbom_file).unwrap();
+        assert!(cbom_raw.contains("CycloneDX"));
+        assert!(cbom_raw.contains("\"runtimeUnobserved\": true"));
+        assert!(find_rule_doc("SMG-PQC-HNDL").is_some());
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn test_enterprise_license_and_tee_attestation_fail_closed() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("smg_ent_cli_test_{}", nanos));
+        let _cleanup = TempDirCleanup(root.clone());
+        fs::create_dir_all(&root).unwrap();
+
+        let (pkcs8, pubkey) = smg_enterprise::generate_ed25519_keypair().unwrap();
+        let pub_hex = smg_enterprise::encode_hex(&pubkey);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let claims = smg_enterprise::LicenseClaims {
+            license_id: "ent-cli-001".into(),
+            organization: "ShellMind Enterprise Test".into(),
+            tier: smg_enterprise::LicenseTier::EnterpriseTee,
+            issued_at_unix: now.saturating_sub(10),
+            expires_at_unix: now + 3600,
+            max_seats: 10,
+            features: vec!["hw".into(), "web3".into(), "pqc".into(), "tee".into()],
+            pinned_binary_blake3: None,
+        };
+        let token = smg_enterprise::sign_license_claims(&pkcs8, &claims).unwrap();
+        let lic_path = root.join("license.json");
+        fs::write(&lic_path, serde_json::to_string_pretty(&token).unwrap()).unwrap();
+
+        handle_enterprise_command(EnterpriseAction::VerifyLicense {
+            license: lic_path.clone(),
+            pubkey: pub_hex.clone(),
+            tier: "enterprise-tee".into(),
+            binary: None,
+        })
+        .unwrap();
+
+        let pcr0 = "d".repeat(96);
+        let nonce = "0102030405060708";
+        let quote = smg_enterprise::sign_tee_quote(
+            &pkcs8,
+            smg_enterprise::TeePlatform::AwsNitro,
+            &pcr0,
+            nonce,
+            now,
+            "nitro-cli-01",
+        )
+        .unwrap();
+        let quote_path = root.join("quote.json");
+        fs::write(&quote_path, serde_json::to_string_pretty(&quote).unwrap()).unwrap();
+
+        handle_enterprise_command(EnterpriseAction::VerifyAttestation {
+            quote: quote_path,
+            pubkey: pub_hex.clone(),
+            pcr0,
+            nonce: nonce.into(),
+            platform: "aws-nitro".into(),
+        })
+        .unwrap();
+
+        // Bad public key must fail closed cleanly
+        let bad_pub = "0".repeat(64);
+        assert!(
+            handle_enterprise_command(EnterpriseAction::VerifyLicense {
+                license: lic_path,
+                pubkey: bad_pub,
+                tier: "enterprise-tee".into(),
+                binary: None,
+            })
+            .is_err()
+        );
     }
 }

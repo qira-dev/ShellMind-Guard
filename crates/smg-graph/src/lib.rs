@@ -1,62 +1,50 @@
+pub mod arena;
 pub mod ast;
+pub mod cfg;
 pub mod deep_stack;
 pub mod deps;
+pub mod infra_dos;
 pub mod langs;
 pub mod lattice;
 pub mod phase10;
 pub mod phase9;
+pub mod protocols_ai;
+pub mod rules;
+pub mod scope;
 pub mod secrets_config;
+pub mod subgraph;
 pub mod taint;
 
 use anyhow::Result;
 use rayon::prelude::*;
 use smg_core::{IndexedFile, ShellMindGuardConfig, StateStore};
+use std::collections::HashSet;
 
 pub use ast::{
     Confidence, FileAstSummary, FrontendApiCall, GuardKind, LocalStaticFinding, SinkKind,
-    parse_file_ast, parse_file_ast_with_hash,
+    check_source_syntax, parse_file_ast, parse_file_ast_with_hash,
 };
+pub use deps::{ReachableVulnStatus, assess_dependency_reachability, compute_reachable_packages};
 pub use lattice::{
-    GraphAnalysisResult, LatticeFinding, TraceHop, finding_matches_layer, solve_guard_lattice,
+    GraphAnalysisResult, LatticeFinding, RuleHitStat, TraceHop, append_local_static_findings,
+    compute_rule_telemetry, finding_matches_layer, solve_guard_lattice,
     solve_guard_lattice_with_public,
 };
 pub use phase10::{ParamTypeHint, RouteParamSpec, RouteSchema, collect_deep_schema_findings};
+pub use rules::{RULE_CATALOG, RuleDoc, find_rule_doc};
+pub use subgraph::{
+    collect_git_changed_files, should_force_full_scan_on_diff, slice_summaries_for_changed_files,
+};
 
-pub fn analyze_codebase(
-    files: &[IndexedFile],
-    cfg: &ShellMindGuardConfig,
-) -> Result<GraphAnalysisResult> {
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(cfg.scan.max_threads)
-        .stack_size(8 * 1024 * 1024)
-        .build()?;
-
-    let summaries: Vec<FileAstSummary> = pool.install(|| {
-        files
-            .par_iter()
-            .filter_map(|f| parse_file_ast(f, cfg))
-            .collect()
-    });
-
-    Ok(solve_guard_lattice_with_public(
-        &summaries,
-        &cfg.guards.public_routes,
-    ))
-}
-
-/// Two-Phase Incremental AST Cache + Global Guard-Set Lattice Linker:
-/// 1. Unchanged files load their `FileAstSummary` directly from SQLite (`ast_cache`) in <15ms.
-/// 2. Only new or modified files run `Tree-sitter` in parallel via Rayon and update `ast_cache`.
-/// 3. Global cross-file edges and the O(V+E) Guard-Set Lattice ALWAYS run across all files in RAM.
-pub fn analyze_codebase_cached(
+fn load_or_parse_summaries_cached(
     files: &[IndexedFile],
     cfg: &ShellMindGuardConfig,
     store: &mut StateStore,
-) -> Result<GraphAnalysisResult> {
+) -> Result<Vec<FileAstSummary>> {
     let cfg_json = serde_json::to_string(&cfg.guards).unwrap_or_default();
     let adv_stamp = smg_core::advisories_db_stamp();
     let versioned_cfg = format!(
-        "v12-phase10-deep-dataflow-{}|{}|{}",
+        "v17-web3-sol-move-clean-{}|{}|{}",
         env!("CARGO_PKG_VERSION"),
         adv_stamp,
         cfg_json
@@ -104,8 +92,71 @@ pub fn analyze_codebase_cached(
         store.save_ast_cache(&cfg_hash, &cache_rows)?;
     }
 
+    Ok(all_summaries)
+}
+
+pub fn analyze_codebase(
+    files: &[IndexedFile],
+    cfg: &ShellMindGuardConfig,
+) -> Result<GraphAnalysisResult> {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(cfg.scan.max_threads)
+        .stack_size(8 * 1024 * 1024)
+        .build()?;
+
+    let summaries: Vec<FileAstSummary> = pool.install(|| {
+        files
+            .par_iter()
+            .filter_map(|f| parse_file_ast(f, cfg))
+            .collect()
+    });
+
+    Ok(solve_guard_lattice_with_public(
+        &summaries,
+        &cfg.guards.public_routes,
+    ))
+}
+
+/// Two-Phase Incremental AST Cache + Global Guard-Set Lattice Linker.
+pub fn analyze_codebase_cached(
+    files: &[IndexedFile],
+    cfg: &ShellMindGuardConfig,
+    store: &mut StateStore,
+) -> Result<GraphAnalysisResult> {
+    let all_summaries = load_or_parse_summaries_cached(files, cfg, store)?;
     Ok(solve_guard_lattice_with_public(
         &all_summaries,
         &cfg.guards.public_routes,
+    ))
+}
+
+/// `--changed-since <git-ref>` affected-subgraph analyzer: solves ONLY touched files +
+/// reverse callers/callees unless global config/lockfile/middleware changed (auto-fallback).
+pub fn analyze_codebase_cached_changed_since(
+    files: &[IndexedFile],
+    cfg: &ShellMindGuardConfig,
+    store: &mut StateStore,
+    changed: &HashSet<String>,
+) -> Result<(bool, GraphAnalysisResult)> {
+    let all_summaries = load_or_parse_summaries_cached(files, cfg, store)?;
+    let (full_fallback, sliced) = slice_summaries_for_changed_files(&all_summaries, changed);
+    if sliced.is_empty() {
+        return Ok((
+            full_fallback,
+            GraphAnalysisResult {
+                parsed_files: 0,
+                symbol_count: 0,
+                edge_count: 0,
+                route_entries: 0,
+                active_domains: Vec::new(),
+                findings: Vec::new(),
+                route_schemas: Vec::new(),
+            },
+        ));
+    }
+    let owned_slice: Vec<FileAstSummary> = sliced.into_iter().cloned().collect();
+    Ok((
+        full_fallback,
+        solve_guard_lattice_with_public(&owned_slice, &cfg.guards.public_routes),
     ))
 }

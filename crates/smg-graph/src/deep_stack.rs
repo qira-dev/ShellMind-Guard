@@ -255,6 +255,7 @@ pub fn scan_ast_deep(
     src: &[u8],
     rel_path: &str,
     lang: Language,
+    scope: &crate::scope::FileScopeTable,
     symbols: &mut [SymbolInfo],
     static_findings: &mut Vec<LocalStaticFinding>,
 ) {
@@ -288,6 +289,7 @@ pub fn scan_ast_deep(
             src,
             rel_path,
             full_src,
+            scope,
             &existing_xss_lines,
             static_findings,
         );
@@ -301,6 +303,7 @@ fn scan_frontend_ast(
     src: &[u8],
     rel_path: &str,
     full_src: &str,
+    scope: &crate::scope::FileScopeTable,
     existing_xss_lines: &HashSet<usize>,
     out: &mut Vec<LocalStaticFinding>,
 ) {
@@ -311,11 +314,7 @@ fn scan_frontend_ast(
     if kind == "jsx_attribute" {
         let txt = node_text(node, src);
         if txt.starts_with("dangerouslySetInnerHTML") {
-            let low = txt.to_ascii_lowercase();
-            let has_san = low.contains("dompurify")
-                || low.contains("sanitizehtml")
-                || low.contains("sanitize_html")
-                || low.contains("escapehtml");
+            let has_san = crate::scope::is_safe_jsx_html_attribute(txt, scope);
             let is_static_lit = is_static_dangerously_html(txt);
             if !has_san && !is_static_lit && !existing_xss_lines.contains(&line) {
                 out.push(make_deep_finding(
@@ -506,7 +505,7 @@ fn scan_frontend_ast(
 
     let mut c = node.walk();
     for ch in node.children(&mut c) {
-        scan_frontend_ast(ch, src, rel_path, full_src, existing_xss_lines, out);
+        scan_frontend_ast(ch, src, rel_path, full_src, scope, existing_xss_lines, out);
     }
 }
 

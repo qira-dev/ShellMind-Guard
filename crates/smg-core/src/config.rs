@@ -157,10 +157,16 @@ impl SandboxConfig {
 fn default_auth_guards() -> Vec<String> {
     vec![
         "requireAuth".into(),
+        "require_auth".into(),
         "authenticate".into(),
         "verifyJwt".into(),
+        "verify_jwt".into(),
+        "verify_token".into(),
         "withAuth".into(),
+        "with_auth".into(),
         "requireAdmin".into(),
+        "require_admin".into(),
+        "get_current_user".into(),
         "ensureAuthenticated".into(),
         "AuthGuard".into(),
         "UseGuards".into(),

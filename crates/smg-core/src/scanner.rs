@@ -27,6 +27,8 @@ pub enum Language {
     Bash,
     Hcl,
     Sql,
+    Solidity,
+    Move,
     Config,
     Manifest,
 }
@@ -51,6 +53,8 @@ impl Language {
             Language::Bash => "bash",
             Language::Hcl => "hcl",
             Language::Sql => "sql",
+            Language::Solidity => "solidity",
+            Language::Move => "move",
             Language::Config => "config",
             Language::Manifest => "manifest",
         }
@@ -118,6 +122,8 @@ impl Language {
             "sh" | "bash" | "zsh" => Some(Language::Bash),
             "tf" | "tfvars" => Some(Language::Hcl),
             "sql" => Some(Language::Sql),
+            "sol" => Some(Language::Solidity),
+            "move" => Some(Language::Move),
             "dockerfile" | "yml" | "yaml" | "toml" | "json" | "ini" | "cfg" | "conf"
             | "properties" | "pem" | "key" => Some(Language::Config),
             _ => None,
@@ -137,6 +143,12 @@ pub struct IndexedFile {
     pub cached_bytes: Option<Vec<u8>>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ScanOptions {
+    #[serde(default)]
+    pub include_generated: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanSummary {
     pub total_entries_seen: usize,
@@ -146,7 +158,136 @@ pub struct ScanSummary {
     pub files: Vec<IndexedFile>,
 }
 
+/// Returns true when a file path matches generated/protobuf/minified stub conventions.
+pub fn is_generated_file_path(rel_path: &str) -> bool {
+    let low = rel_path.replace('\\', "/").to_ascii_lowercase();
+    let fname = low.rsplit('/').next().unwrap_or(&low);
+    fname.ends_with(".pb.go")
+        || fname.ends_with("_pb2.py")
+        || fname.ends_with("_pb2_grpc.py")
+        || fname.ends_with(".generated.ts")
+        || fname.ends_with(".generated.js")
+        || fname.ends_with(".generated.tsx")
+        || fname.ends_with(".generated.rs")
+        || fname.ends_with(".g.dart")
+        || fname.ends_with(".freezed.dart")
+        || fname.ends_with(".min.js")
+        || fname.ends_with(".bundle.js")
+        || low.starts_with("dist/")
+        || low.contains("/dist/")
+        || low.starts_with("build/generated/")
+        || low.contains("/generated/")
+}
+
+/// Detects standard compiler/protobuf generated headers within the first 512 bytes.
+pub fn has_generated_header(bytes: &[u8]) -> bool {
+    let prefix = std::str::from_utf8(&bytes[..bytes.len().min(512)]).unwrap_or("");
+    let low = prefix.to_ascii_lowercase();
+    (low.contains("code generated") && low.contains("do not edit"))
+        || low.contains("@generated")
+        || low.contains("auto-generated file. do not edit")
+}
+
+/// Identifies dedicated unit/integration test paths so scanners can suppress noisy
+/// non-secret findings while preserving secret/credential leak checks.
+pub fn is_test_source_path(rel_path: &str) -> bool {
+    let low = rel_path.replace('\\', "/").to_ascii_lowercase();
+    let fname = low.rsplit('/').next().unwrap_or(&low);
+    let has_test_dir = low
+        .split('/')
+        .any(|seg| matches!(seg, "tests" | "test" | "__tests__" | "spec" | "testdata"));
+    has_test_dir
+        || fname.ends_with("_test.go")
+        || fname.ends_with("_test.rs")
+        || fname.ends_with("_test.py")
+        || (fname.starts_with("test_") && fname.ends_with(".py"))
+        || fname.ends_with(".test.ts")
+        || fname.ends_with(".spec.ts")
+        || fname.ends_with(".test.tsx")
+        || fname.ends_with(".spec.tsx")
+        || fname.ends_with(".test.js")
+        || fname.ends_with(".spec.js")
+        || fname.ends_with(".test.jsx")
+        || fname.ends_with(".spec.jsx")
+        || fname.ends_with("_spec.rb")
+        || fname.ends_with("_test.rb")
+        || fname.ends_with(".t.sol")
+}
+
+fn should_visit_entry(entry: &ignore::DirEntry, root: &Path, ignore_set: &[String]) -> bool {
+    let name = entry.file_name().to_string_lossy();
+    if matches!(
+        name.as_ref(),
+        ".git"
+            | ".hg"
+            | ".svn"
+            | ".shellmind-guard"
+            | "node_modules"
+            | "__pycache__"
+            | ".pytest_cache"
+            | ".mypy_cache"
+            | ".venv"
+            | "venv"
+            | ".next"
+            | ".nuxt"
+            | "__tests__"
+            | "testdata"
+    ) {
+        return false;
+    }
+    if let Ok(rel) = entry.path().strip_prefix(root) {
+        let rel_norm = rel.to_string_lossy().replace('\\', "/");
+        if rel_norm.is_empty() {
+            return true;
+        }
+        let parent_is_source_pkg = rel_norm
+            .rsplit_once('/')
+            .map(|(parent, _)| {
+                parent.split('/').any(|seg| {
+                    matches!(
+                        seg,
+                        "src"
+                            | "internal"
+                            | "pkg"
+                            | "cmd"
+                            | "lib"
+                            | "app"
+                            | "controllers"
+                            | "services"
+                            | "routes"
+                            | "handlers"
+                            | "domain"
+                            | "core"
+                            | "models"
+                    )
+                })
+            })
+            .unwrap_or(false);
+
+        if !parent_is_source_pkg
+            && (name == "target" || ignore_set.iter().any(|ig| ig == name.as_ref()))
+        {
+            return false;
+        }
+        if ignore_set.iter().any(|ig| {
+            let clean = ig.trim_matches('/');
+            !clean.is_empty() && (rel_norm == clean || rel_norm.starts_with(&format!("{}/", clean)))
+        }) {
+            return false;
+        }
+    }
+    true
+}
+
 pub fn scan_repository(root: &Path, cfg: &ShellMindGuardConfig) -> Result<ScanSummary> {
+    scan_repository_with_options(root, cfg, &ScanOptions::default())
+}
+
+pub fn scan_repository_with_options(
+    root: &Path,
+    cfg: &ShellMindGuardConfig,
+    opts: &ScanOptions,
+) -> Result<ScanSummary> {
     let start = Instant::now();
     let canon_root = fs::canonicalize(root)?;
     let total_seen = AtomicUsize::new(0);
@@ -161,80 +302,18 @@ pub fn scan_repository(root: &Path, cfg: &ShellMindGuardConfig) -> Result<ScanSu
 
     let mut candidate_paths: Vec<(PathBuf, String, Language)> = Vec::new();
     let root_for_filter = canon_root.clone();
+    let ignore_for_filter = ignore_set.clone();
 
     let walker = WalkBuilder::new(&canon_root)
         .hidden(false)
+        .follow_links(false)
         .require_git(false)
         .ignore(true)
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
         .threads(cfg.scan.max_threads)
-        .filter_entry(move |entry| {
-            let name = entry.file_name().to_string_lossy();
-            if matches!(
-                name.as_ref(),
-                ".git"
-                    | ".hg"
-                    | ".svn"
-                    | ".shellmind-guard"
-                    | "node_modules"
-                    | "__pycache__"
-                    | ".pytest_cache"
-                    | ".mypy_cache"
-                    | ".venv"
-                    | "venv"
-                    | ".next"
-                    | ".nuxt"
-                    | "__tests__"
-                    | "testdata"
-            ) {
-                return false;
-            }
-            if let Ok(rel) = entry.path().strip_prefix(&root_for_filter) {
-                let rel_norm = rel.to_string_lossy().replace('\\', "/");
-                if rel_norm.is_empty() {
-                    return true;
-                }
-                let parent_is_source_pkg = rel_norm
-                    .rsplit_once('/')
-                    .map(|(parent, _)| {
-                        parent.split('/').any(|seg| {
-                            matches!(
-                                seg,
-                                "src"
-                                    | "internal"
-                                    | "pkg"
-                                    | "cmd"
-                                    | "lib"
-                                    | "app"
-                                    | "controllers"
-                                    | "services"
-                                    | "routes"
-                                    | "handlers"
-                                    | "domain"
-                                    | "core"
-                                    | "models"
-                            )
-                        })
-                    })
-                    .unwrap_or(false);
-
-                if !parent_is_source_pkg
-                    && (name == "target" || ignore_set.iter().any(|ig| ig == name.as_ref()))
-                {
-                    return false;
-                }
-                if ignore_set.iter().any(|ig| {
-                    let clean = ig.trim_matches('/');
-                    !clean.is_empty()
-                        && (rel_norm == clean || rel_norm.starts_with(&format!("{}/", clean)))
-                }) {
-                    return false;
-                }
-            }
-            true
-        })
+        .filter_entry(move |entry| should_visit_entry(entry, &root_for_filter, &ignore_for_filter))
         .build();
 
     for entry in walker.flatten() {
@@ -277,14 +356,15 @@ pub fn scan_repository(root: &Path, cfg: &ShellMindGuardConfig) -> Result<ScanSu
             skipped.fetch_add(1, Ordering::Relaxed);
             continue;
         }
-        if let Some(lang) = Language::from_path(path) {
-            if let Ok(rel) = path.strip_prefix(&canon_root) {
-                candidate_paths.push((
-                    path.to_path_buf(),
-                    rel.to_string_lossy().replace('\\', "/"),
-                    lang,
-                ));
+        if let Some(lang) = Language::from_path(path)
+            && let Ok(rel) = path.strip_prefix(&canon_root)
+        {
+            let rel_norm = rel.to_string_lossy().replace('\\', "/");
+            if !opts.include_generated && is_generated_file_path(&rel_norm) {
+                skipped.fetch_add(1, Ordering::Relaxed);
+                continue;
             }
+            candidate_paths.push((path.to_path_buf(), rel_norm, lang));
         } else {
             skipped.fetch_add(1, Ordering::Relaxed);
         }
@@ -295,11 +375,16 @@ pub fn scan_repository(root: &Path, cfg: &ShellMindGuardConfig) -> Result<ScanSu
         .build()?;
 
     let max_bytes = cfg.scan.max_file_bytes;
+    let include_generated = opts.include_generated;
     let files: Vec<IndexedFile> = pool.install(|| {
         candidate_paths
             .into_par_iter()
             .filter_map(|(abs_path, rel_path, language)| {
-                let meta = fs::metadata(&abs_path).ok()?;
+                let canon_file = fs::canonicalize(&abs_path).ok()?;
+                if !canon_file.starts_with(&canon_root) {
+                    return None;
+                }
+                let meta = fs::metadata(&canon_file).ok()?;
                 let size_bytes = meta.len();
                 let limit = if language == Language::Manifest {
                     max_bytes.max(16 * 1024 * 1024)
@@ -316,7 +401,11 @@ pub fn scan_repository(root: &Path, cfg: &ShellMindGuardConfig) -> Result<ScanSu
                     .map(|d| d.as_nanos() as i64)
                     .unwrap_or(0);
 
-                let bytes = fs::read(&abs_path).ok()?;
+                let bytes = fs::read(&canon_file).ok()?;
+                if !include_generated && has_generated_header(&bytes) {
+                    skipped.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
                 let hash = blake3::hash(&bytes).to_hex().to_string();
                 let cached_bytes = if bytes.len() <= 256 * 1024 {
                     Some(bytes)
@@ -326,7 +415,7 @@ pub fn scan_repository(root: &Path, cfg: &ShellMindGuardConfig) -> Result<ScanSu
 
                 Some(IndexedFile {
                     rel_path,
-                    abs_path,
+                    abs_path: canon_file,
                     language,
                     blake3_hash: hash,
                     mtime_ns,
@@ -360,78 +449,17 @@ pub fn scan_repository_metadata_signature(
         .map(|s| s.trim_matches('/').to_string())
         .collect();
     let root_for_filter = canon_root.clone();
+    let ignore_for_filter = ignore_set.clone();
     let walker = WalkBuilder::new(&canon_root)
         .hidden(false)
+        .follow_links(false)
         .require_git(false)
         .ignore(true)
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
         .threads(cfg.scan.max_threads)
-        .filter_entry(move |entry| {
-            let name = entry.file_name().to_string_lossy();
-            if matches!(
-                name.as_ref(),
-                ".git"
-                    | ".hg"
-                    | ".svn"
-                    | ".shellmind-guard"
-                    | "node_modules"
-                    | "__pycache__"
-                    | ".pytest_cache"
-                    | ".mypy_cache"
-                    | ".venv"
-                    | "venv"
-                    | ".next"
-                    | ".nuxt"
-                    | "__tests__"
-                    | "testdata"
-            ) {
-                return false;
-            }
-            if let Ok(rel) = entry.path().strip_prefix(&root_for_filter) {
-                let rel_norm = rel.to_string_lossy().replace('\\', "/");
-                if rel_norm.is_empty() {
-                    return true;
-                }
-                let parent_is_source_pkg = rel_norm
-                    .rsplit_once('/')
-                    .map(|(parent, _)| {
-                        parent.split('/').any(|seg| {
-                            matches!(
-                                seg,
-                                "src"
-                                    | "internal"
-                                    | "pkg"
-                                    | "cmd"
-                                    | "lib"
-                                    | "app"
-                                    | "controllers"
-                                    | "services"
-                                    | "routes"
-                                    | "handlers"
-                                    | "domain"
-                                    | "core"
-                                    | "models"
-                            )
-                        })
-                    })
-                    .unwrap_or(false);
-                if !parent_is_source_pkg
-                    && (name == "target" || ignore_set.iter().any(|ig| ig == name.as_ref()))
-                {
-                    return false;
-                }
-                if ignore_set.iter().any(|ig| {
-                    let clean = ig.trim_matches('/');
-                    !clean.is_empty()
-                        && (rel_norm == clean || rel_norm.starts_with(&format!("{}/", clean)))
-                }) {
-                    return false;
-                }
-            }
-            true
-        })
+        .filter_entry(move |entry| should_visit_entry(entry, &root_for_filter, &ignore_for_filter))
         .build();
 
     let max_bytes = cfg.scan.max_file_bytes;
@@ -508,6 +536,43 @@ mod tests {
             .find(|f| f.rel_path == "pyproject.toml")
             .expect("pyproject.toml must be indexed");
         assert_eq!(pyproj.language, Language::Manifest);
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_scanner_skips_generated_stubs_by_default_with_override() {
+        let tmp = std::env::temp_dir().join(format!("smg_gen_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join("src")).unwrap();
+        fs::write(tmp.join("src/api.pb.go"), "package api\nfunc Call() {}\n").unwrap();
+        fs::write(
+            tmp.join("src/custom_gen.go"),
+            "// Code generated by protoc-gen-go. DO NOT EDIT.\npackage api\n",
+        )
+        .unwrap();
+        fs::write(tmp.join("src/app.ts"), "export const x = 1;\n").unwrap();
+
+        let cfg = ShellMindGuardConfig::default();
+        let def_res = scan_repository(&tmp, &cfg).unwrap();
+        let rels: Vec<&str> = def_res.files.iter().map(|f| f.rel_path.as_str()).collect();
+        assert!(rels.contains(&"src/app.ts"));
+        assert!(!rels.contains(&"src/api.pb.go"));
+        assert!(!rels.contains(&"src/custom_gen.go"));
+
+        let opt_res = scan_repository_with_options(
+            &tmp,
+            &cfg,
+            &ScanOptions {
+                include_generated: true,
+            },
+        )
+        .unwrap();
+        let rels_all: Vec<&str> = opt_res.files.iter().map(|f| f.rel_path.as_str()).collect();
+        assert!(rels_all.contains(&"src/api.pb.go"));
+        assert!(rels_all.contains(&"src/custom_gen.go"));
+        assert!(is_test_source_path("tests/auth_spec.ts"));
+        assert!(!is_test_source_path("fixtures/vuln-auth-rust/src/main.rs"));
 
         let _ = fs::remove_dir_all(&tmp);
     }

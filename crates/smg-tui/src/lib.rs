@@ -1,11 +1,19 @@
+mod palette;
+mod session;
+mod views;
+
 use anyhow::Result;
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
-    MouseEventKind,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
+use palette::{
+    DetailTab, SlashAction, WorkspaceTab, complete_slash_input, filter_slash_commands,
+    ghost_hint_for_input, parse_slash_command,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -15,28 +23,33 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
 };
 use ratatui::{Frame, Terminal};
+use session::{
+    BaselineEntry, TuiSessionPrefs, copy_clipboard, finding_baseline_key, load_baseline_keys,
+    load_session_prefs, save_session_prefs, write_baseline_file,
+};
 use smg_ai::{
     ApplyCheckParams, build_minimal_patch_prompt, generate_patch_plan, provider_from_config,
     verify_patch_in_isolated_copy,
 };
 use smg_core::{ShellMindGuardConfig, StateStore, scan_repository};
 use smg_graph::{
-    Confidence, GraphAnalysisResult, GuardKind, LatticeFinding, SinkKind, analyze_codebase_cached,
-    collect_deep_schema_findings, finding_matches_layer,
+    Confidence, GraphAnalysisResult, GuardKind, LatticeFinding, RULE_CATALOG, SinkKind,
+    analyze_codebase_cached, collect_deep_schema_findings, finding_matches_layer,
 };
 use smg_report::{to_html_graph, to_sarif_json};
 use smg_sandbox::{
     SandboxProbeConfig, VerificationStatus, VerifiedFinding, verify_findings_in_sandbox_with_config,
 };
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::{self, Stdout, Write};
+use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 const MAX_LOG_LINES: usize = 200;
+const MAX_WIRE_FEED: usize = 256;
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 // ============================================================================
@@ -48,23 +61,23 @@ const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦
 // - PURPLE     (#bc8cff): Concurrency / Race Category & Language Keywords
 // - CORAL      (#ffa657): Auth / Access Category & Target Symbols
 // ============================================================================
-const BG_CANVAS: Color = Color::Rgb(13, 17, 23);
-const BG_CARD_SELECTED: Color = Color::Rgb(24, 34, 50);
-const BG_VULN_LINE: Color = Color::Rgb(62, 22, 28);
-const BG_PILL_DARK: Color = Color::Rgb(33, 38, 45);
-const BORDER_SUBTLE: Color = Color::Rgb(48, 54, 61);
-const BORDER_ACTIVE: Color = Color::Rgb(88, 166, 255);
+pub(crate) const BG_CANVAS: Color = Color::Rgb(13, 17, 23);
+pub(crate) const BG_CARD_SELECTED: Color = Color::Rgb(24, 34, 50);
+pub(crate) const BG_VULN_LINE: Color = Color::Rgb(62, 22, 28);
+pub(crate) const BG_PILL_DARK: Color = Color::Rgb(33, 38, 45);
+pub(crate) const BORDER_SUBTLE: Color = Color::Rgb(48, 54, 61);
+pub(crate) const BORDER_ACTIVE: Color = Color::Rgb(88, 166, 255);
 
-const FG_PRIMARY: Color = Color::Rgb(230, 237, 243);
-const FG_SECONDARY: Color = Color::Rgb(149, 157, 165);
+pub(crate) const FG_PRIMARY: Color = Color::Rgb(230, 237, 243);
+pub(crate) const FG_SECONDARY: Color = Color::Rgb(149, 157, 165);
 const FG_DIM: Color = Color::Rgb(110, 118, 129);
 
-const SEM_PROVEN_RED: Color = Color::Rgb(248, 81, 73);
-const SEM_SUSPECT_AMBER: Color = Color::Rgb(210, 153, 34);
-const SEM_SAFE_GREEN: Color = Color::Rgb(63, 185, 80);
-const SEM_BRAND_CYAN: Color = Color::Rgb(88, 166, 255);
-const SEM_RACE_PURPLE: Color = Color::Rgb(188, 140, 255);
-const SEM_AUTH_CORAL: Color = Color::Rgb(255, 166, 87);
+pub(crate) const SEM_PROVEN_RED: Color = Color::Rgb(248, 81, 73);
+pub(crate) const SEM_SUSPECT_AMBER: Color = Color::Rgb(210, 153, 34);
+pub(crate) const SEM_SAFE_GREEN: Color = Color::Rgb(63, 185, 80);
+pub(crate) const SEM_BRAND_CYAN: Color = Color::Rgb(88, 166, 255);
+pub(crate) const SEM_RACE_PURPLE: Color = Color::Rgb(188, 140, 255);
+pub(crate) const SEM_AUTH_CORAL: Color = Color::Rgb(255, 166, 87);
 const SYN_STRING_BLUE: Color = Color::Rgb(165, 214, 255);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +104,24 @@ impl FilterMode {
             FilterMode::ProvenOnly => "PROVEN ONLY",
             FilterMode::ConfirmedOrProven => "CONFIRMED+",
             FilterMode::CriticalOnly => "CRITICAL ONLY",
+        }
+    }
+
+    fn slug(self) -> &'static str {
+        match self {
+            FilterMode::All => "all",
+            FilterMode::ProvenOnly => "proven",
+            FilterMode::ConfirmedOrProven => "confirmed",
+            FilterMode::CriticalOnly => "critical",
+        }
+    }
+
+    fn from_slug(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "proven" => Self::ProvenOnly,
+            "confirmed" => Self::ConfirmedOrProven,
+            "critical" => Self::CriticalOnly,
+            _ => Self::All,
         }
     }
 }
@@ -135,6 +166,39 @@ impl CategoryFilter {
             CategoryFilter::Mobile => "MOBILE",
             CategoryFilter::FrontendFuzz => "FE/FUZZ",
         }
+    }
+
+    fn slug(self) -> &'static str {
+        match self {
+            CategoryFilter::All => "all",
+            CategoryFilter::Auth => "auth",
+            CategoryFilter::RaceLock => "race",
+            CategoryFilter::Injection => "inj",
+            CategoryFilter::SecretsCfg => "sec",
+            CategoryFilter::Deps => "deps",
+            CategoryFilter::EngineMem => "eng",
+            CategoryFilter::Mobile => "mob",
+            CategoryFilter::FrontendFuzz => "fe",
+        }
+    }
+
+    fn from_slug_strict(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "all" | "" => Some(Self::All),
+            "auth" | "idor" | "csrf" => Some(Self::Auth),
+            "race" | "lock" => Some(Self::RaceLock),
+            "inj" | "taint" | "sqli" | "xss" | "cmdi" | "ssrf" | "path" => Some(Self::Injection),
+            "sec" | "secret" | "cfg" | "config" => Some(Self::SecretsCfg),
+            "deps" | "dep" => Some(Self::Deps),
+            "eng" | "engine" | "mem" | "memory" => Some(Self::EngineMem),
+            "mob" | "mobile" => Some(Self::Mobile),
+            "fe" | "frontend" | "fuzz" => Some(Self::FrontendFuzz),
+            _ => None,
+        }
+    }
+
+    fn from_slug(s: &str) -> Self {
+        Self::from_slug_strict(s).unwrap_or(Self::All)
     }
 
     fn matches(self, f: &LatticeFinding) -> bool {
@@ -274,13 +338,24 @@ impl Drop for TerminalGuard {
     }
 }
 
-struct TuiState {
-    project_root: PathBuf,
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FilterSignature {
+    filter_mode: FilterMode,
+    category_filter: CategoryFilter,
+    hide_baselined: bool,
+    findings_len: usize,
+    verified_len: usize,
+    baseline_len: usize,
+    search_query: String,
+}
+
+pub(crate) struct TuiState {
+    pub(crate) project_root: PathBuf,
     canon_root: Option<PathBuf>,
-    graph: GraphAnalysisResult,
-    verified_map: HashMap<String, VerifiedFinding>,
-    elapsed_ms: u128,
-    selected_idx: usize,
+    pub(crate) graph: GraphAnalysisResult,
+    pub(crate) verified_map: HashMap<String, VerifiedFinding>,
+    pub(crate) elapsed_ms: u128,
+    pub(crate) selected_idx: usize,
     selected_hop: usize,
     source_scroll: isize,
     zoom_source: bool,
@@ -290,16 +365,34 @@ struct TuiState {
     category_filter: CategoryFilter,
     search_mode: bool,
     search_query: String,
+    workspace: WorkspaceTab,
+    detail_tab: DetailTab,
+    palette_mode: bool,
+    palette_input: String,
+    palette_selected: usize,
+    pub(crate) rules_selected: usize,
+    pub(crate) wire_feed: VecDeque<String>,
+    pub(crate) sandbox_scroll: usize,
+    pub(crate) baseline_keys: HashSet<BaselineEntry>,
+    pub(crate) hide_baselined: bool,
+    pub(crate) sandbox_port: u16,
+    pub(crate) sandbox_tls: bool,
+    pub(crate) sandbox_cgroup_v2: bool,
+    pub(crate) sandbox_mem_mb: Option<u64>,
+    pub(crate) sandbox_mock_shims: bool,
+    pub(crate) sandbox_has_boot_cmd: bool,
+    cached_filtered_indices: Vec<usize>,
+    cache_sig: Option<FilterSignature>,
     show_logs: bool,
     show_help: bool,
     patch_modal: Option<(String, String)>,
-    patch_diff: Option<String>,
+    pub(crate) patch_diff: Option<String>,
     patch_scroll: u16,
     bg_running: Option<(String, usize)>,
     bg_rx: Option<Receiver<BgEvent>>,
     logs: VecDeque<String>,
     file_cache: HashMap<String, Vec<String>>,
-    sandbox_isolated: bool,
+    pub(crate) sandbox_isolated: bool,
     last_action: String,
 }
 
@@ -342,12 +435,22 @@ impl TuiState {
     ) -> Self {
         let canon_root = fs::canonicalize(project_root).ok();
         let mut verified_map = HashMap::new();
+        let mut wire_feed = VecDeque::new();
         for v in verified {
+            if wire_feed.len() < MAX_WIRE_FEED {
+                wire_feed.push_back(format!(
+                    "[INIT] {} ({:?}) -> {} — {}",
+                    v.finding_id, v.status, v.entry_route, v.evidence
+                ));
+            }
             verified_map.insert(v.finding_id.clone(), v);
         }
         Self::sort_findings(&mut graph.findings, &verified_map);
+
+        let prefs = load_session_prefs(project_root);
+        let baseline_keys = load_baseline_keys(project_root);
         let init_msg = format!(
-            "Ready — Scanned {} files ({} sym · {} edges · {} routes) in {}ms. [/] Search  [r] Rescan",
+            "Ready — Scanned {} files ({} sym · {} edges · {} routes) in {}ms. [/] Commands · [Ctrl+F] Search",
             graph.parsed_files,
             graph.symbol_count,
             graph.edge_count,
@@ -357,13 +460,14 @@ impl TuiState {
         let logs = VecDeque::from([
             init_msg.clone(),
             format!(
-                "SMG Sandbox: {} ({} findings verified).",
+                "SMG Sandbox: {} ({} findings verified · {} baselined).",
                 if smg_sandbox::has_bwrap() {
                     "Bubblewrap --unshare-all (PID/IPC/UTS/Net isolated)"
                 } else {
                     "Host Loopback"
                 },
-                verified_map.len()
+                verified_map.len(),
+                baseline_keys.len()
             ),
         ]);
         let mut list_state = ListState::default();
@@ -371,7 +475,7 @@ impl TuiState {
             list_state.select(Some(0));
         }
 
-        Self {
+        let mut st = Self {
             project_root: project_root.to_path_buf(),
             canon_root,
             graph,
@@ -383,10 +487,28 @@ impl TuiState {
             zoom_source: false,
             queue_area: Rect::default(),
             list_state,
-            filter_mode: FilterMode::All,
-            category_filter: CategoryFilter::All,
+            filter_mode: FilterMode::from_slug(&prefs.filter_mode),
+            category_filter: CategoryFilter::from_slug(&prefs.category_filter),
             search_mode: false,
             search_query: String::new(),
+            workspace: prefs.parse_workspace(),
+            detail_tab: prefs.parse_detail_tab(),
+            palette_mode: false,
+            palette_input: String::new(),
+            palette_selected: 0,
+            rules_selected: 0,
+            wire_feed,
+            sandbox_scroll: 0,
+            baseline_keys,
+            hide_baselined: prefs.hide_baselined,
+            sandbox_port: 39911,
+            sandbox_tls: false,
+            sandbox_cgroup_v2: false,
+            sandbox_mem_mb: None,
+            sandbox_mock_shims: false,
+            sandbox_has_boot_cmd: false,
+            cached_filtered_indices: Vec::new(),
+            cache_sig: None,
             show_logs: false,
             show_help: false,
             patch_modal: None,
@@ -398,37 +520,71 @@ impl TuiState {
             file_cache: HashMap::new(),
             sandbox_isolated: smg_sandbox::has_bwrap(),
             last_action: init_msg,
+        };
+        st.refresh_filter_cache();
+        st
+    }
+
+    fn apply_launch_config(&mut self, cfg: &TuiLaunchConfig) {
+        self.sandbox_port = cfg.port;
+        self.sandbox_tls = cfg.sandbox_tls;
+        self.sandbox_cgroup_v2 = cfg.cgroup_v2;
+        self.sandbox_mem_mb = cfg.sandbox_mem_mb;
+        self.sandbox_mock_shims = cfg.mock_shims;
+        self.sandbox_has_boot_cmd = cfg.boot_cmd.is_some();
+    }
+
+    fn persist_prefs(&self) {
+        let workspace = match self.workspace {
+            WorkspaceTab::Overview => "overview",
+            WorkspaceTab::Findings => "findings",
+            WorkspaceTab::Sandbox => "sandbox",
+            WorkspaceTab::Rules => "rules",
+        };
+        let detail_tab = match self.detail_tab {
+            DetailTab::TraceSource => "trace",
+            DetailTab::ProofDiff => "proof",
+            DetailTab::RuleDocs => "rules",
+        };
+        let prefs = TuiSessionPrefs {
+            workspace: workspace.to_string(),
+            filter_mode: self.filter_mode.slug().to_string(),
+            category_filter: self.category_filter.slug().to_string(),
+            detail_tab: detail_tab.to_string(),
+            hide_baselined: self.hide_baselined,
+        };
+        save_session_prefs(&self.project_root, &prefs);
+    }
+
+    fn filter_signature(&self) -> FilterSignature {
+        FilterSignature {
+            filter_mode: self.filter_mode,
+            category_filter: self.category_filter,
+            hide_baselined: self.hide_baselined,
+            findings_len: self.graph.findings.len(),
+            verified_len: self.verified_map.len(),
+            baseline_len: self.baseline_keys.len(),
+            search_query: self.search_query.clone(),
         }
     }
 
-    fn set_selected(&mut self, idx: usize) {
-        let count = self.filtered_findings().len();
-        if count == 0 {
-            self.selected_idx = 0;
-            self.list_state.select(None);
-        } else {
-            let clamped = idx.min(count - 1);
-            self.selected_idx = clamped;
-            self.list_state.select(Some(clamped));
-        }
-        self.selected_hop = 0;
-        self.source_scroll = 0;
+    fn invalidate_filter_cache(&mut self) {
+        self.cache_sig = None;
     }
 
-    fn push_log(&mut self, msg: String) {
-        if self.logs.len() >= MAX_LOG_LINES {
-            self.logs.pop_front();
-        }
-        self.last_action = msg.clone();
-        self.logs.push_back(msg);
-    }
-
-    fn filtered_findings(&self) -> Vec<&LatticeFinding> {
+    fn compute_filtered_indices(&self) -> Vec<usize> {
         let q = self.search_query.trim().to_ascii_lowercase();
         self.graph
             .findings
             .iter()
-            .filter(|f| {
+            .enumerate()
+            .filter(|(_, f)| {
+                if self.hide_baselined
+                    && !self.baseline_keys.is_empty()
+                    && self.baseline_keys.contains(&finding_baseline_key(f))
+                {
+                    return false;
+                }
                 let status_ok = match self.filter_mode {
                     FilterMode::All => true,
                     FilterMode::ProvenOnly => matches!(
@@ -459,10 +615,68 @@ impl TuiState {
                             || h.file.to_ascii_lowercase().contains(&q)
                     })
             })
+            .map(|(i, _)| i)
             .collect()
     }
 
-    fn current_finding(&self) -> Option<LatticeFinding> {
+    pub(crate) fn refresh_filter_cache(&mut self) {
+        let sig = self.filter_signature();
+        if self.cache_sig.as_ref() != Some(&sig) {
+            self.cached_filtered_indices = self.compute_filtered_indices();
+            self.cache_sig = Some(sig);
+        }
+    }
+
+    fn filtered_len_mut(&mut self) -> usize {
+        self.refresh_filter_cache();
+        self.cached_filtered_indices.len()
+    }
+
+    fn set_selected(&mut self, idx: usize) {
+        let count = self.filtered_len_mut();
+        if count == 0 {
+            self.selected_idx = 0;
+            self.list_state.select(None);
+        } else {
+            let clamped = idx.min(count - 1);
+            self.selected_idx = clamped;
+            self.list_state.select(Some(clamped));
+        }
+        self.selected_hop = 0;
+        self.source_scroll = 0;
+    }
+
+    fn push_log(&mut self, msg: String) {
+        if self.logs.len() >= MAX_LOG_LINES {
+            self.logs.pop_front();
+        }
+        self.last_action = msg.clone();
+        self.logs.push_back(msg);
+    }
+
+    fn push_wire_event(&mut self, msg: String) {
+        if self.wire_feed.len() >= MAX_WIRE_FEED {
+            self.wire_feed.pop_front();
+        }
+        self.wire_feed.push_back(msg);
+    }
+
+    fn filtered_findings(&self) -> Vec<&LatticeFinding> {
+        let sig = self.filter_signature();
+        if self.cache_sig.as_ref() == Some(&sig) {
+            return self
+                .cached_filtered_indices
+                .iter()
+                .filter_map(|&idx| self.graph.findings.get(idx))
+                .collect();
+        }
+        self.compute_filtered_indices()
+            .into_iter()
+            .filter_map(|idx| self.graph.findings.get(idx))
+            .collect()
+    }
+
+    pub(crate) fn current_finding(&self) -> Option<LatticeFinding> {
         let list = self.filtered_findings();
         if list.is_empty() {
             return None;
@@ -493,7 +707,7 @@ impl TuiState {
         lines_out
     }
 
-    fn proof_counts(&self) -> (usize, usize, usize) {
+    pub(crate) fn proof_counts(&self) -> (usize, usize, usize) {
         let mut proven = 0;
         let mut mitigated = 0;
         let mut suspect = 0;
@@ -517,7 +731,7 @@ fn truncate_left_chars(s: &str, max_chars: usize) -> String {
     format!("…{}", tail)
 }
 
-fn clip_right_chars(s: &str, max_chars: usize) -> String {
+pub(crate) fn clip_right_chars(s: &str, max_chars: usize) -> String {
     let len = s.chars().count();
     if len <= max_chars || max_chars == 0 {
         return s.to_string();
@@ -537,6 +751,8 @@ fn render_ui(f: &mut Frame, state: &mut TuiState) {
 
     let footer_h = if state.show_logs {
         if compact { 6 } else { 8 }
+    } else if state.palette_mode || state.search_mode || state.bg_running.is_some() {
+        4
     } else if compact {
         3
     } else {
@@ -547,59 +763,38 @@ fn render_ui(f: &mut Frame, state: &mut TuiState) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
-            Constraint::Min(10),
+            Constraint::Length(1),
+            Constraint::Min(9),
             Constraint::Length(footer_h),
         ])
         .split(area);
 
     render_brand_header(f, root_chunks[0], state);
+    views::render_workspace_tab_bar(f, root_chunks[1], state);
 
-    if state.zoom_source {
-        state.queue_area = Rect::default();
-        let zoom_chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(6),
-                Constraint::Length(if compact { 6 } else { 8 }),
-            ])
-            .split(root_chunks[1]);
-        render_source_inspector(f, zoom_chunks[0], state);
-        render_proof_and_remediation(f, zoom_chunks[1], state, compact);
-    } else {
-        let body_chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
-            .split(root_chunks[1]);
-
-        // Left Column: Top Telemetry Card + Bottom Scrollable Vulnerability Queue
-        let left_chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(if compact { 5 } else { 6 }),
-                Constraint::Min(6),
-            ])
-            .split(body_chunks[0]);
-
-        render_system_legend_card(f, left_chunks[0], state);
-        state.queue_area = left_chunks[1];
-        render_findings_queue(f, left_chunks[1], state);
-
-        // Right Column: Top Cross-File Pipeline + Middle Source Inspector + Bottom Proof & Remediation
-        let right_chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(if compact { 5 } else { 6 }),
-                Constraint::Min(5),
-                Constraint::Length(if compact { 6 } else { 9 }),
-            ])
-            .split(body_chunks[1]);
-
-        render_pipeline_card(f, right_chunks[0], state);
-        render_source_inspector(f, right_chunks[1], state);
-        render_proof_and_remediation(f, right_chunks[2], state, compact);
+    match state.workspace {
+        WorkspaceTab::Overview => {
+            state.queue_area = Rect::default();
+            views::render_overview_workspace(f, root_chunks[2], state, compact);
+        }
+        WorkspaceTab::Findings => {
+            views::render_findings_workspace(f, root_chunks[2], state, compact);
+        }
+        WorkspaceTab::Sandbox => {
+            state.queue_area = Rect::default();
+            views::render_sandbox_workspace(f, root_chunks[2], state, compact);
+        }
+        WorkspaceTab::Rules => {
+            state.queue_area = Rect::default();
+            views::render_rules_workspace(f, root_chunks[2], state);
+        }
     }
 
-    render_footer(f, root_chunks[2], state, compact);
+    render_footer(f, root_chunks[3], state, compact);
+
+    if state.palette_mode {
+        views::render_slash_palette_popup(f, area, root_chunks[3].y, state);
+    }
 
     if state.show_help {
         render_help_modal(f, area);
@@ -698,7 +893,7 @@ fn render_brand_header(f: &mut Frame, area: Rect, state: &TuiState) {
     f.render_widget(header, area);
 }
 
-fn render_system_legend_card(f: &mut Frame, area: Rect, state: &TuiState) {
+pub(crate) fn render_system_legend_card(f: &mut Frame, area: Rect, state: &TuiState) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -776,23 +971,23 @@ fn render_system_legend_card(f: &mut Frame, area: Rect, state: &TuiState) {
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn render_findings_queue(f: &mut Frame, area: Rect, state: &mut TuiState) {
+pub(crate) fn render_findings_queue(f: &mut Frame, area: Rect, state: &mut TuiState) {
+    state.refresh_filter_cache();
     let total_findings = state.graph.findings.len();
     let filter_label = state.filter_mode.label();
-    let filtered_ids: Vec<LatticeFinding> =
-        state.filtered_findings().into_iter().cloned().collect();
-    let sel_idx = if filtered_ids.is_empty() {
+    let filtered_count = state.cached_filtered_indices.len();
+    let sel_idx = if filtered_count == 0 {
         0
     } else {
-        state.selected_idx.min(filtered_ids.len() - 1)
+        state.selected_idx.min(filtered_count - 1)
     };
-    if filtered_ids.is_empty() {
+    if filtered_count == 0 {
         state.list_state.select(None);
     } else {
         state.list_state.select(Some(sel_idx));
     }
 
-    let items: Vec<ListItem> = if filtered_ids.is_empty() {
+    let items: Vec<ListItem> = if filtered_count == 0 {
         vec![ListItem::new(vec![
             Line::from(""),
             Line::from(Span::styled(
@@ -803,10 +998,12 @@ fn render_findings_queue(f: &mut Frame, area: Rect, state: &mut TuiState) {
             )),
         ])]
     } else {
-        filtered_ids
+        state
+            .cached_filtered_indices
             .iter()
             .enumerate()
-            .map(|(idx, item)| {
+            .filter_map(|(idx, &raw_idx)| {
+                let item = state.graph.findings.get(raw_idx)?;
                 let is_sel = idx == sel_idx;
                 let row_bg = if is_sel { BG_CARD_SELECTED } else { BG_CANVAS };
 
@@ -922,7 +1119,7 @@ fn render_findings_queue(f: &mut Frame, area: Rect, state: &mut TuiState) {
                 let cursor_str = if is_sel { "▌ " } else { "  " };
                 let cursor_color = if is_sel { SEM_BRAND_CYAN } else { BG_CANVAS };
 
-                ListItem::new(vec![
+                Some(ListItem::new(vec![
                     Line::from(vec![
                         Span::styled(
                             cursor_str,
@@ -994,7 +1191,7 @@ fn render_findings_queue(f: &mut Frame, area: Rect, state: &mut TuiState) {
                         ),
                     ])
                     .style(Style::default().bg(row_bg)),
-                ])
+                ]))
             })
             .collect()
     };
@@ -1016,12 +1213,8 @@ fn render_findings_queue(f: &mut Frame, area: Rect, state: &mut TuiState) {
             .border_style(Style::default().fg(BORDER_ACTIVE))
             .title(Span::styled(
                 format!(
-                    " ◆ SMG Queue ({}/{}) · {}{}{} [f/1-4/c] ",
-                    filtered_ids.len(),
-                    total_findings,
-                    filter_label,
-                    cat_part,
-                    search_part,
+                    " ◆ SMG Queue ({}/{}) · {}{}{} [f/c/b] ",
+                    filtered_count, total_findings, filter_label, cat_part, search_part,
                 ),
                 Style::default()
                     .fg(SEM_BRAND_CYAN)
@@ -1031,7 +1224,7 @@ fn render_findings_queue(f: &mut Frame, area: Rect, state: &mut TuiState) {
     f.render_stateful_widget(list, area, &mut state.list_state);
 }
 
-fn render_pipeline_card(f: &mut Frame, area: Rect, state: &TuiState) {
+pub(crate) fn render_pipeline_card(f: &mut Frame, area: Rect, state: &TuiState) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -1287,7 +1480,7 @@ fn highlight_code_line(line: &str, row_bg: Color) -> Vec<Span<'static>> {
     spans
 }
 
-fn render_source_inspector(f: &mut Frame, area: Rect, state: &mut TuiState) {
+pub(crate) fn render_source_inspector(f: &mut Frame, area: Rect, state: &mut TuiState) {
     let cur_opt = state.current_finding();
     let hop_opt = cur_opt.as_ref().and_then(|c| {
         let idx = state
@@ -1413,7 +1606,12 @@ fn render_source_inspector(f: &mut Frame, area: Rect, state: &mut TuiState) {
     f.render_widget(Paragraph::new(rendered_lines).block(block), area);
 }
 
-fn render_proof_and_remediation(f: &mut Frame, area: Rect, state: &TuiState, compact: bool) {
+pub(crate) fn render_proof_and_remediation(
+    f: &mut Frame,
+    area: Rect,
+    state: &TuiState,
+    compact: bool,
+) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -1563,17 +1761,16 @@ fn render_footer(f: &mut Frame, area: Rect, state: &TuiState, compact: bool) {
     } else {
         let mut key_spans = vec![Span::raw("  ")];
         for (k, lbl) in [
-            ("[/]", " Search "),
-            ("[c]", " Cat "),
-            ("[r]", " Scan "),
-            ("[f/1-4]", " Filter "),
+            ("[1-4]", " View "),
+            ("[/]", " Cmd "),
+            ("[Ctrl+F]", " Search "),
+            ("[t]", " Tab "),
             ("[z]", " Zoom "),
-            ("[\\[/\\]]", " Scroll "),
+            ("[j/k/g/G]", " Nav "),
             ("[Enter]", " Replay "),
             ("[p]", " Patch "),
-            ("[e]", " Edit "),
+            ("[o/e]", " Edit "),
             ("[y]", " Copy "),
-            ("[g/s]", " Export "),
             ("[L]", " Log "),
             ("[?]", " Help "),
             ("[q]", " Quit"),
@@ -1582,10 +1779,32 @@ fn render_footer(f: &mut Frame, area: Rect, state: &TuiState, compact: bool) {
         }
         let keys_line = Line::from(key_spans);
 
-        let status_line = if state.search_mode {
+        let status_line = if state.palette_mode {
+            let mut spans = vec![
+                Span::styled(
+                    "  smg> ",
+                    Style::default()
+                        .fg(SEM_BRAND_CYAN)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    state.palette_input.clone(),
+                    Style::default().fg(FG_PRIMARY).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("▏", Style::default().fg(SEM_BRAND_CYAN)),
+            ];
+            if let Some(ghost) = ghost_hint_for_input(&state.palette_input) {
+                spans.push(Span::styled(ghost, Style::default().fg(FG_DIM)));
+            }
+            spans.push(Span::styled(
+                "   (Tab complete · ↑/↓ pick · Enter run · Esc cancel)",
+                Style::default().fg(FG_SECONDARY),
+            ));
+            Line::from(spans)
+        } else if state.search_mode {
             Line::from(vec![
                 Span::styled(
-                    "  [/] Search : ",
+                    "  [Ctrl+F] Search : ",
                     Style::default()
                         .fg(SEM_BRAND_CYAN)
                         .add_modifier(Modifier::BOLD),
@@ -1613,7 +1832,7 @@ fn render_footer(f: &mut Frame, area: Rect, state: &TuiState, compact: bool) {
         } else {
             Line::from(vec![
                 Span::styled(
-                    "  Status : ",
+                    "  smg> ",
                     Style::default()
                         .fg(SEM_BRAND_CYAN)
                         .add_modifier(Modifier::BOLD),
@@ -1622,16 +1841,18 @@ fn render_footer(f: &mut Frame, area: Rect, state: &TuiState, compact: bool) {
             ])
         };
 
-        let lines = if compact && !state.search_mode && state.bg_running.is_none() {
-            vec![keys_line]
-        } else {
-            vec![status_line, keys_line]
-        };
+        let lines =
+            if compact && !state.palette_mode && !state.search_mode && state.bg_running.is_none() {
+                vec![keys_line]
+            } else {
+                vec![status_line, keys_line]
+            };
+        let active_prompt = state.palette_mode || state.search_mode;
         let footer = Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(if state.search_mode {
+                .border_style(Style::default().fg(if active_prompt {
                     BORDER_ACTIVE
                 } else {
                     BORDER_SUBTLE
@@ -1716,30 +1937,39 @@ fn render_help_modal(f: &mut Frame, area: Rect) {
             "2. Keyboard & Mouse Shortcuts:",
             Style::default().fg(FG_PRIMARY).add_modifier(Modifier::BOLD),
         )),
-        Line::from("   ↑/↓ / j/k / PgUp/Dn / Home/End : Scroll & jump findings in queue"),
+        Line::from(
+            "   1 / 2 / 3 / 4                  : Switch Workspace (Overview / Findings / Sandbox / Rules)",
+        ),
+        Line::from(
+            "   /                              : Open bottom smg> Slash Command Palette + autocomplete",
+        ),
+        Line::from(
+            "   Ctrl+F                         : Instant fuzzy queue filter (ID, rule, file, route, symbol)",
+        ),
+        Line::from(
+            "   ↑/↓ / j/k / Ctrl+d/u / g/G     : Vim scroll & jump findings, wire feed, or rule catalog",
+        ),
         Line::from("   ←/→ / h/l / Tab                : Step through Cross-File Witness Hops"),
+        Line::from(
+            "   t                              : Cycle Detail Pane (Trace+Source / Proof+Diff / Rule Docs)",
+        ),
         Line::from("   [ / ] / \\  (or mouse wheel)    : Scroll Source Inspector / reset [\\]"),
         Line::from("   z                              : Toggle Source Inspector full-pane zoom"),
         Line::from(
-            "   /                              : Live fuzzy search (ID, rule, file, route, symbol)",
+            "   c / f / b                      : Cycle Category [c], Status Filter [f], Net-New Baseline [b]",
         ),
         Line::from(
-            "   c                              : Cycle Guard Category filter (AUTH/RACE/INJ/...)",
+            "   r                              : Background delta-cached live rescan (/rescan)",
         ),
-        Line::from(
-            "   f or 1 / 2 / 3 / 4             : Filter Status (ALL / PROVEN / CONFIRMED+ / CRIT)",
-        ),
-        Line::from("   r                              : Background delta-cached live rescan"),
-        Line::from("   Enter                          : Background bwrap exploit replay (spinner)"),
+        Line::from("   Enter                          : Background bwrap exploit replay (/replay)"),
         Line::from(
             "   p (then a / y / ↑↓)            : Patch Context/Diff · [a] Apply-Check · [y] Copy",
         ),
         Line::from(
-            "   e / y                          : Open in $EDITOR/$VISUAL [e] · OSC 52 Copy [y]",
+            "   o / e / y                      : Open in $VISUAL/$EDITOR [o/e] · Clipboard Copy [y]",
         ),
-        Line::from(
-            "   g / s / L / ? / q              : HTML [g], SARIF [s], Logs [L], Help [?], Quit [q]",
-        ),
+        Line::from("   s / /export sarif|html         : Export SARIF [s] or HTML graph report"),
+        Line::from("   L / ? / q                      : Event Log Drawer [L], Help [?], Quit [q]"),
         Line::from(
             "   Mouse Click / Scroll           : Click queue item or scroll queue/source panes",
         ),
@@ -1758,7 +1988,7 @@ fn render_help_modal(f: &mut Frame, area: Rect) {
     );
 }
 
-fn style_diff_line(line: &str) -> Line<'static> {
+pub(crate) fn style_diff_line(line: &str) -> Line<'static> {
     if line.starts_with("+++") || line.starts_with("---") || line.starts_with("diff ") {
         Line::from(Span::styled(
             line.to_string(),
@@ -1789,6 +2019,72 @@ fn style_diff_line(line: &str) -> Line<'static> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SideBySideDiffRow {
+    left: Option<String>,
+    right: Option<String>,
+    tag: char,
+}
+
+fn build_side_by_side_diff_rows(diff: &str) -> Vec<SideBySideDiffRow> {
+    let mut rows = Vec::new();
+    let mut removed: Vec<String> = Vec::new();
+    let mut added: Vec<String> = Vec::new();
+
+    let flush_hunk =
+        |removed: &mut Vec<String>, added: &mut Vec<String>, out: &mut Vec<SideBySideDiffRow>| {
+            let pairs = removed.len().max(added.len());
+            for i in 0..pairs {
+                let l = removed.get(i).cloned();
+                let r = added.get(i).cloned();
+                let tag = match (&l, &r) {
+                    (Some(_), Some(_)) => '~',
+                    (Some(_), None) => '-',
+                    (None, Some(_)) => '+',
+                    (None, None) => ' ',
+                };
+                out.push(SideBySideDiffRow {
+                    left: l,
+                    right: r,
+                    tag,
+                });
+            }
+            removed.clear();
+            added.clear();
+        };
+
+    for raw in diff.lines() {
+        if raw.starts_with("--- ") || raw.starts_with("+++ ") {
+            flush_hunk(&mut removed, &mut added, &mut rows);
+            rows.push(SideBySideDiffRow {
+                left: Some(raw.to_string()),
+                right: Some(raw.to_string()),
+                tag: 'h',
+            });
+        } else if raw.starts_with("@@ ") {
+            flush_hunk(&mut removed, &mut added, &mut rows);
+            rows.push(SideBySideDiffRow {
+                left: Some(raw.to_string()),
+                right: Some(raw.to_string()),
+                tag: '@',
+            });
+        } else if let Some(rest) = raw.strip_prefix('-') {
+            removed.push(format!("-{}", rest));
+        } else if let Some(rest) = raw.strip_prefix('+') {
+            added.push(format!("+{}", rest));
+        } else {
+            flush_hunk(&mut removed, &mut added, &mut rows);
+            rows.push(SideBySideDiffRow {
+                left: Some(raw.to_string()),
+                right: Some(raw.to_string()),
+                tag: ' ',
+            });
+        }
+    }
+    flush_hunk(&mut removed, &mut added, &mut rows);
+    rows
+}
+
 fn render_patch_modal(
     f: &mut Frame,
     area: Rect,
@@ -1799,6 +2095,100 @@ fn render_patch_modal(
 ) {
     let modal = centered_rect(82, 80, area);
     f.render_widget(Clear, modal);
+
+    if let Some(diff) = diff_opt
+        && modal.width >= 110
+    {
+        let outer = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .style(Style::default().bg(BG_CANVAS))
+            .border_style(Style::default().fg(SEM_BRAND_CYAN))
+            .title(format!(
+                " ◆ SMG Patch — {} (Side-by-Side Diff · {} B, L{}, a Apply-Check) [↑/↓ scroll · y Copy · Esc/p close] ",
+                fid,
+                prompt_txt.len(),
+                scroll + 1,
+            ));
+        let inner = outer.inner(modal);
+        f.render_widget(outer, modal);
+
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+            .split(inner);
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(split[0]);
+
+        let sbs_rows = build_side_by_side_diff_rows(diff);
+        let left_lines: Vec<Line> = sbs_rows
+            .iter()
+            .map(|r| match (&r.left, r.tag) {
+                (Some(t), '-' | '~') => style_diff_line(t),
+                (Some(t), '@') => style_diff_line(t),
+                (Some(t), _) => {
+                    Line::from(Span::styled(t.clone(), Style::default().fg(FG_SECONDARY)))
+                }
+                (None, _) => Line::from(Span::styled("·".to_string(), Style::default().fg(FG_DIM))),
+            })
+            .collect();
+        let right_lines: Vec<Line> = sbs_rows
+            .iter()
+            .map(|r| match (&r.right, r.tag) {
+                (Some(t), '+' | '~') => style_diff_line(t),
+                (Some(t), '@') => style_diff_line(t),
+                (Some(t), _) => {
+                    Line::from(Span::styled(t.clone(), Style::default().fg(FG_PRIMARY)))
+                }
+                (None, _) => Line::from(Span::styled("·".to_string(), Style::default().fg(FG_DIM))),
+            })
+            .collect();
+
+        f.render_widget(
+            Paragraph::new(left_lines)
+                .wrap(Wrap { trim: false })
+                .scroll((scroll, 0))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(SEM_PROVEN_RED))
+                        .title(" Original (-) "),
+                ),
+            cols[0],
+        );
+        f.render_widget(
+            Paragraph::new(right_lines)
+                .wrap(Wrap { trim: false })
+                .scroll((scroll, 0))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(SEM_SAFE_GREEN))
+                        .title(" Patched (+) "),
+                ),
+            cols[1],
+        );
+        let ctx_lines: Vec<Line> = prompt_txt
+            .lines()
+            .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(FG_PRIMARY))))
+            .collect();
+        f.render_widget(
+            Paragraph::new(ctx_lines).wrap(Wrap { trim: false }).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(BORDER_SUBTLE))
+                    .title(" Witness Context (<= 2 KB) "),
+            ),
+            split[1],
+        );
+        return;
+    }
+
     let mut lines: Vec<Line> = Vec::new();
     if let Some(diff) = diff_opt {
         lines.push(Line::from(Span::styled(
@@ -1867,37 +2257,6 @@ fn build_probe_config(
     probe
 }
 
-fn encode_base64(input: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    for chunk in input.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-        out.push(TABLE[((triple >> 18) & 0x3F) as usize] as char);
-        out.push(TABLE[((triple >> 12) & 0x3F) as usize] as char);
-        out.push(if chunk.len() > 1 {
-            TABLE[((triple >> 6) & 0x3F) as usize] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            TABLE[(triple & 0x3F) as usize] as char
-        } else {
-            '='
-        });
-    }
-    out
-}
-
-fn copy_osc52(text: &str) -> io::Result<()> {
-    let b64 = encode_base64(text.as_bytes());
-    let mut stdout = io::stdout();
-    write!(stdout, "\x1b]52;c;{}\x07", b64)?;
-    stdout.flush()
-}
-
 fn format_finding_clipboard_summary(
     finding: &LatticeFinding,
     verified: Option<&VerifiedFinding>,
@@ -1921,10 +2280,49 @@ fn format_finding_clipboard_summary(
 }
 
 fn select_finding_by_id(state: &mut TuiState, fid: &str) {
-    if let Some(pos) = state.filtered_findings().iter().position(|f| f.id == fid) {
+    state.refresh_filter_cache();
+    if let Some(pos) = state
+        .cached_filtered_indices
+        .iter()
+        .position(|&idx| state.graph.findings.get(idx).is_some_and(|f| f.id == fid))
+    {
         state.set_selected(pos);
     } else {
         state.set_selected(0);
+    }
+}
+
+fn export_report(state: &mut TuiState, fmt: &str) {
+    let verified_vec: Vec<VerifiedFinding> = state.verified_map.values().cloned().collect();
+    let dir = state.project_root.join(".shellmind-guard");
+    match fmt {
+        "html" => {
+            let out = dir.join("report.html");
+            let html = to_html_graph(
+                &state.project_root.display().to_string(),
+                &state.graph,
+                &verified_vec,
+            );
+            match fs::create_dir_all(&dir).and_then(|_| fs::write(&out, html)) {
+                Ok(_) => {
+                    let _ = open_path_in_browser(&out);
+                    state.push_log(format!("Opened HTML graph -> {}", out.display()));
+                }
+                Err(e) => state.push_log(format!("HTML export error: {}", e)),
+            }
+        }
+        "sarif" => {
+            let out = dir.join("report.sarif");
+            let sarif = to_sarif_json(&state.graph.findings, &verified_vec);
+            match fs::create_dir_all(&dir).and_then(|_| fs::write(&out, sarif)) {
+                Ok(_) => state.push_log(format!("Exported SARIF -> {}", out.display())),
+                Err(e) => state.push_log(format!("SARIF export error: {}", e)),
+            }
+        }
+        other => state.push_log(format!(
+            "Unknown export format `{}` (use sarif|html).",
+            other
+        )),
     }
 }
 
@@ -1957,14 +2355,20 @@ fn handle_bg_events(state: &mut TuiState) {
                     let msg = format!("Replay {}: {:?} — {}", fid, v.status, v.evidence);
                     state.verified_map.insert(fid.clone(), v);
                     TuiState::sort_findings(&mut state.graph.findings, &state.verified_map);
+                    state.invalidate_filter_cache();
                     select_finding_by_id(state, &fid);
+                    state.push_wire_event(msg.clone());
                     state.push_log(msg);
                 }
                 Ok((_, None)) => {
-                    state.push_log(format!("Replay {} returned no verification result.", fid));
+                    let msg = format!("Replay {} returned no verification result.", fid);
+                    state.push_wire_event(msg.clone());
+                    state.push_log(msg);
                 }
                 Err(e) => {
-                    state.push_log(format!("Replay {} failed: {}", fid, e));
+                    let msg = format!("Replay {} FAILED: {}", fid, e);
+                    state.push_wire_event(msg.clone());
+                    state.push_log(msg);
                 }
             },
             BgEvent::Rescan { result } => {
@@ -1975,6 +2379,7 @@ fn handle_bg_events(state: &mut TuiState) {
                         TuiState::sort_findings(&mut graph.findings, &state.verified_map);
                         state.graph = graph;
                         state.elapsed_ms = elapsed_ms;
+                        state.invalidate_filter_cache();
                         if let Some(id) = prev_id {
                             select_finding_by_id(state, &id);
                         } else {
@@ -2013,7 +2418,9 @@ fn handle_bg_events(state: &mut TuiState) {
                 } else {
                     "STILL EXPOSED"
                 };
-                state.push_log(format!("Apply-Check {} ({}): {}", fid, tag, summary));
+                let msg = format!("Apply-Check {} ({}): {}", fid, tag, summary);
+                state.push_wire_event(msg.clone());
+                state.push_log(msg);
             }
         }
     }
@@ -2330,6 +2737,229 @@ fn point_in_rect(col: u16, row: u16, rect: Rect) -> bool {
     col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
 }
 
+fn copy_current_finding(state: &mut TuiState) {
+    if let Some(cur) = state.current_finding() {
+        let summary = format_finding_clipboard_summary(
+            &cur,
+            state.verified_map.get(&cur.id),
+            &state.project_root,
+        );
+        match copy_clipboard(&summary) {
+            Ok(method) => state.push_log(format!("Copied {} details via {}.", cur.id, method)),
+            Err(e) => state.push_log(format!("Clipboard copy failed: {}", e)),
+        }
+    } else {
+        state.push_log("No finding selected to copy.".into());
+    }
+}
+
+fn edit_current_finding(guard: &mut TerminalGuard, state: &mut TuiState) {
+    if let Some(cur) = state.current_finding() {
+        let (file, line) = cur
+            .witness_path
+            .get(
+                state
+                    .selected_hop
+                    .min(cur.witness_path.len().saturating_sub(1)),
+            )
+            .map(|h| (h.file.clone(), h.line))
+            .unwrap_or_else(|| (cur.file.clone(), cur.line));
+        launch_editor_for_hop(guard, state, &file, line);
+    } else {
+        state.push_log("No finding selected to edit.".into());
+    }
+}
+
+fn step_workspace_selection(state: &mut TuiState, delta: isize, jump: Option<bool>) {
+    match state.workspace {
+        WorkspaceTab::Findings => {
+            let len = state.filtered_len_mut();
+            if len == 0 {
+                return;
+            }
+            let target = match jump {
+                Some(false) => 0,
+                Some(true) => len - 1,
+                None if delta == 1 => (state.selected_idx + 1) % len,
+                None if delta == -1 => {
+                    if state.selected_idx == 0 {
+                        len - 1
+                    } else {
+                        state.selected_idx - 1
+                    }
+                }
+                None if delta > 0 => (state.selected_idx + delta as usize).min(len - 1),
+                None => state.selected_idx.saturating_sub((-delta) as usize),
+            };
+            state.set_selected(target);
+        }
+        WorkspaceTab::Rules => {
+            let len = RULE_CATALOG.len();
+            if len == 0 {
+                return;
+            }
+            state.rules_selected = match jump {
+                Some(false) => 0,
+                Some(true) => len - 1,
+                None if delta >= 0 => (state.rules_selected + delta as usize).min(len - 1),
+                None => state.rules_selected.saturating_sub((-delta) as usize),
+            };
+        }
+        WorkspaceTab::Sandbox => {
+            let len = state.wire_feed.len().max(1);
+            state.sandbox_scroll = match jump {
+                Some(false) => 0,
+                Some(true) => len.saturating_sub(1),
+                None if delta >= 0 => (state.sandbox_scroll + delta as usize).min(len - 1),
+                None => state.sandbox_scroll.saturating_sub((-delta) as usize),
+            };
+        }
+        WorkspaceTab::Overview => {}
+    }
+}
+
+fn execute_slash_action(
+    action: SlashAction,
+    guard: &mut TerminalGuard,
+    state: &mut TuiState,
+    launch_cfg: &TuiLaunchConfig,
+) -> bool {
+    match action {
+        SlashAction::Workspace(tab) => {
+            state.workspace = tab;
+            state.persist_prefs();
+            state.push_log(format!("Switched to Workspace [{}].", tab.label()));
+        }
+        SlashAction::FilterQuery(q) => {
+            state.workspace = WorkspaceTab::Findings;
+            state.search_query = q;
+            state.invalidate_filter_cache();
+            state.set_selected(0);
+            let cnt = state.filtered_len_mut();
+            state.push_log(format!("Filter applied ({} matching findings).", cnt));
+        }
+        SlashAction::CategoryLayer(arg) => {
+            if let Some(cat) = CategoryFilter::from_slug_strict(&arg) {
+                state.workspace = WorkspaceTab::Findings;
+                state.category_filter = cat;
+                state.invalidate_filter_cache();
+                state.set_selected(0);
+                state.persist_prefs();
+                state.push_log(format!("Category layer: {}", cat.label()));
+            } else {
+                state.push_log(format!(
+                    "Unknown layer `{}` (expected all|auth|race|inj|sec|deps|eng|mob|fe).",
+                    arg
+                ));
+            }
+        }
+        SlashAction::FilterStatus(status) => {
+            state.workspace = WorkspaceTab::Findings;
+            state.filter_mode = match status {
+                "proven" => FilterMode::ProvenOnly,
+                "confirmed" => FilterMode::ConfirmedOrProven,
+                "critical" => FilterMode::CriticalOnly,
+                _ => FilterMode::All,
+            };
+            state.invalidate_filter_cache();
+            state.set_selected(0);
+            state.persist_prefs();
+            state.push_log(format!("Status filter: {}", state.filter_mode.label()));
+        }
+        SlashAction::ReplaySelected => {
+            if state.bg_running.is_some() {
+                state.push_log("Background job already running...".into());
+            } else if let Some(cur) = state.current_finding() {
+                state.push_wire_event(format!("[QUEUE] Starting bwrap replay for {}...", cur.id));
+                spawn_bg_replay(state, launch_cfg, cur);
+            }
+        }
+        SlashAction::Rescan => {
+            if state.bg_running.is_some() {
+                state.push_log("Background job already running...".into());
+            } else {
+                spawn_bg_rescan(state, launch_cfg);
+            }
+        }
+        SlashAction::PatchSelected => {
+            if state.bg_running.is_some() {
+                state.push_log("Background job already running...".into());
+            } else if let Some(cur) = state.current_finding() {
+                let v_opt = state.verified_map.get(&cur.id).cloned();
+                spawn_bg_patch(state, launch_cfg, cur, v_opt);
+            }
+        }
+        SlashAction::ApplyCheck => {
+            if state.bg_running.is_some() {
+                state.push_log("Background job already running...".into());
+            } else if let (Some(diff), Some(cur)) =
+                (state.patch_diff.clone(), state.current_finding())
+            {
+                spawn_bg_apply_check(state, launch_cfg, cur, diff);
+            } else {
+                state.push_log("No AI diff active; run `/patch` or press [p] first.".into());
+            }
+        }
+        SlashAction::BaselineOp(op) => match op.as_str() {
+            "write" | "save" => {
+                match write_baseline_file(&state.project_root, &state.graph.findings) {
+                    Ok(n) => {
+                        state.baseline_keys = load_baseline_keys(&state.project_root);
+                        state.invalidate_filter_cache();
+                        state.set_selected(0);
+                        state.push_log(format!(
+                            "Wrote {} entries -> .shellmind-guard/baseline.json",
+                            n
+                        ));
+                    }
+                    Err(e) => state.push_log(format!("Baseline write failed: {}", e)),
+                }
+            }
+            "load" | "reload" => {
+                state.baseline_keys = load_baseline_keys(&state.project_root);
+                state.invalidate_filter_cache();
+                state.set_selected(0);
+                state.push_log(format!(
+                    "Loaded {} baseline entries from `.shellmind-guard/baseline.json`.",
+                    state.baseline_keys.len()
+                ));
+            }
+            "on" => {
+                state.hide_baselined = true;
+                state.invalidate_filter_cache();
+                state.set_selected(0);
+                state.persist_prefs();
+                state.push_log("Baseline mode: ON (showing Net-New findings only).".into());
+            }
+            "off" => {
+                state.hide_baselined = false;
+                state.invalidate_filter_cache();
+                state.set_selected(0);
+                state.persist_prefs();
+                state.push_log("Baseline mode: OFF (showing all findings).".into());
+            }
+            _ => {
+                state.hide_baselined = !state.hide_baselined;
+                state.invalidate_filter_cache();
+                state.set_selected(0);
+                state.persist_prefs();
+                state.push_log(if state.hide_baselined {
+                    "Baseline mode: ON (showing Net-New findings only).".into()
+                } else {
+                    "Baseline mode: OFF (showing all findings).".into()
+                });
+            }
+        },
+        SlashAction::ExportFormat(fmt) => export_report(state, &fmt),
+        SlashAction::CopySelected => copy_current_finding(state),
+        SlashAction::OpenEditor => edit_current_finding(guard, state),
+        SlashAction::ToggleLogs => state.show_logs = !state.show_logs,
+        SlashAction::ToggleHelp => state.show_help = !state.show_help,
+        SlashAction::Quit => return true,
+    }
+    false
+}
+
 pub fn run_tui(
     project_root: &Path,
     graph: GraphAnalysisResult,
@@ -2339,6 +2969,7 @@ pub fn run_tui(
 ) -> Result<()> {
     let mut guard = TerminalGuard::init()?;
     let mut state = TuiState::new(project_root, graph, verified, elapsed_ms);
+    state.apply_launch_config(&launch_cfg);
     let mut last_tick = Instant::now();
 
     loop {
@@ -2373,7 +3004,7 @@ pub fn run_tui(
                     continue;
                 }
                 let in_queue = point_in_rect(mouse.column, mouse.row, state.queue_area);
-                let filtered_len = state.filtered_findings().len();
+                let filtered_len = state.filtered_len_mut();
                 match mouse.kind {
                     MouseEventKind::Down(MouseButton::Left) if in_queue && filtered_len > 0 => {
                         let inner_top = state.queue_area.y.saturating_add(1);
@@ -2412,6 +3043,11 @@ pub fn run_tui(
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+                {
+                    break;
+                }
                 if state.show_help {
                     if matches!(
                         key.code,
@@ -2447,10 +3083,11 @@ pub fn run_tui(
                                 .clone()
                                 .or_else(|| state.patch_modal.as_ref().map(|(_, p)| p.clone()))
                                 .unwrap_or_default();
-                            match copy_osc52(&clip_text) {
-                                Ok(_) => {
-                                    state.push_log("Copied patch modal content via OSC 52.".into())
-                                }
+                            match copy_clipboard(&clip_text) {
+                                Ok(method) => state.push_log(format!(
+                                    "Copied patch modal content via {}.",
+                                    method
+                                )),
                                 Err(e) => state.push_log(format!("Clipboard copy failed: {}", e)),
                             }
                         }
@@ -2471,6 +3108,114 @@ pub fn run_tui(
                     }
                     continue;
                 }
+                if state.palette_mode {
+                    match key.code {
+                        KeyCode::Esc => {
+                            state.palette_mode = false;
+                            state.palette_input.clear();
+                            state.palette_selected = 0;
+                        }
+                        KeyCode::Up => {
+                            let matches = filter_slash_commands(&state.palette_input);
+                            if !matches.is_empty() {
+                                state.palette_selected = if state.palette_selected == 0 {
+                                    matches.len() - 1
+                                } else {
+                                    state.palette_selected - 1
+                                };
+                            }
+                        }
+                        KeyCode::Down => {
+                            let matches = filter_slash_commands(&state.palette_input);
+                            if !matches.is_empty() {
+                                state.palette_selected =
+                                    (state.palette_selected + 1) % matches.len();
+                            }
+                        }
+                        KeyCode::Tab => {
+                            let matches = filter_slash_commands(&state.palette_input);
+                            if let Some(spec) = matches
+                                .get(state.palette_selected.min(matches.len().saturating_sub(1)))
+                            {
+                                state.palette_input = if spec.usage.contains('<') {
+                                    format!("{} ", spec.cmd)
+                                } else {
+                                    spec.cmd.to_string()
+                                };
+                                state.palette_selected = 0;
+                            } else if let Some(done) = complete_slash_input(&state.palette_input) {
+                                state.palette_input = done;
+                                state.palette_selected = 0;
+                            }
+                        }
+                        KeyCode::Backspace => {
+                            state.palette_input.pop();
+                            if state.palette_input.is_empty() {
+                                state.palette_mode = false;
+                            }
+                            state.palette_selected = 0;
+                        }
+                        KeyCode::Enter => {
+                            let trimmed = state.palette_input.trim().to_string();
+                            let matches = filter_slash_commands(&trimmed);
+                            let picked = if !trimmed.contains(' ') {
+                                if matches.iter().any(|s| s.cmd == trimmed) {
+                                    None
+                                } else {
+                                    matches.get(
+                                        state.palette_selected.min(matches.len().saturating_sub(1)),
+                                    )
+                                }
+                            } else {
+                                None
+                            };
+
+                            if let Some(spec) = picked {
+                                if spec.usage.contains('<') {
+                                    state.palette_input = format!("{} ", spec.cmd);
+                                    state.palette_selected = 0;
+                                    continue;
+                                }
+                                state.palette_mode = false;
+                                state.palette_input.clear();
+                                state.palette_selected = 0;
+                                if let Ok(action) = parse_slash_command(spec.cmd)
+                                    && execute_slash_action(
+                                        action,
+                                        &mut guard,
+                                        &mut state,
+                                        &launch_cfg,
+                                    )
+                                {
+                                    break;
+                                }
+                            } else {
+                                state.palette_mode = false;
+                                state.palette_input.clear();
+                                state.palette_selected = 0;
+                                match parse_slash_command(&trimmed) {
+                                    Ok(action) => {
+                                        if execute_slash_action(
+                                            action,
+                                            &mut guard,
+                                            &mut state,
+                                            &launch_cfg,
+                                        ) {
+                                            break;
+                                        }
+                                    }
+                                    Err(err) => state.push_log(err),
+                                }
+                            }
+                        }
+                        KeyCode::Char(c) => {
+                            state.palette_input.push(c);
+                            state.palette_selected = 0;
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
                 if state.search_mode {
                     match key.code {
                         KeyCode::Esc => {
@@ -2481,7 +3226,7 @@ pub fn run_tui(
                         }
                         KeyCode::Enter => {
                             state.search_mode = false;
-                            let count = state.filtered_findings().len();
+                            let count = state.filtered_len_mut();
                             state.push_log(format!(
                                 "Search locked: '{}' ({} matches)",
                                 state.search_query, count
@@ -2500,18 +3245,71 @@ pub fn run_tui(
                     continue;
                 }
 
-                let filtered_len = state.filtered_findings().len();
+                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    match key.code {
+                        KeyCode::Char('f') | KeyCode::Char('F') => {
+                            state.workspace = WorkspaceTab::Findings;
+                            state.search_mode = true;
+                            continue;
+                        }
+                        KeyCode::Char('d') | KeyCode::Char('D') => {
+                            step_workspace_selection(&mut state, 8, None);
+                            continue;
+                        }
+                        KeyCode::Char('u') | KeyCode::Char('U') => {
+                            step_workspace_selection(&mut state, -8, None);
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => break,
                     KeyCode::Char('?') => {
                         state.show_help = !state.show_help;
                     }
                     KeyCode::Char('/') => {
-                        state.search_mode = true;
+                        state.palette_mode = true;
+                        state.palette_input = "/".to_string();
+                        state.palette_selected = 0;
+                    }
+                    KeyCode::Char('1') => {
+                        state.workspace = WorkspaceTab::Overview;
+                        state.persist_prefs();
+                    }
+                    KeyCode::Char('2') => {
+                        state.workspace = WorkspaceTab::Findings;
+                        state.persist_prefs();
+                    }
+                    KeyCode::Char('3') => {
+                        state.workspace = WorkspaceTab::Sandbox;
+                        state.persist_prefs();
+                    }
+                    KeyCode::Char('4') => {
+                        state.workspace = WorkspaceTab::Rules;
+                        state.persist_prefs();
+                    }
+                    KeyCode::Char('t') => {
+                        state.detail_tab = state.detail_tab.next();
+                        state.persist_prefs();
+                        state.push_log(format!("Detail tab: {}", state.detail_tab.label()));
+                    }
+                    KeyCode::Char('b') => {
+                        state.hide_baselined = !state.hide_baselined;
+                        state.invalidate_filter_cache();
+                        state.set_selected(0);
+                        state.persist_prefs();
+                        state.push_log(if state.hide_baselined {
+                            "Baseline filter: ON (Net-New only).".into()
+                        } else {
+                            "Baseline filter: OFF (showing all findings).".into()
+                        });
                     }
                     KeyCode::Char('c') => {
                         state.category_filter = state.category_filter.next();
                         state.set_selected(0);
+                        state.persist_prefs();
                         state.push_log(format!(
                             "Category filter: {}",
                             state.category_filter.label()
@@ -2537,65 +3335,26 @@ pub fn run_tui(
                     KeyCode::Char('f') => {
                         state.filter_mode = state.filter_mode.next();
                         state.set_selected(0);
+                        state.persist_prefs();
                         state.push_log(format!("Filter set to: {}", state.filter_mode.label()));
                     }
-                    KeyCode::Char('1') => {
-                        state.filter_mode = FilterMode::All;
-                        state.set_selected(0);
-                        state.push_log("Filter set to: ALL".into());
-                    }
-                    KeyCode::Char('2') => {
-                        state.filter_mode = FilterMode::ProvenOnly;
-                        state.set_selected(0);
-                        state.push_log("Filter set to: PROVEN ONLY".into());
-                    }
-                    KeyCode::Char('3') => {
-                        state.filter_mode = FilterMode::ConfirmedOrProven;
-                        state.set_selected(0);
-                        state.push_log("Filter set to: CONFIRMED+".into());
-                    }
-                    KeyCode::Char('4') => {
-                        state.filter_mode = FilterMode::CriticalOnly;
-                        state.set_selected(0);
-                        state.push_log("Filter set to: CRITICAL ONLY".into());
-                    }
                     KeyCode::Down | KeyCode::Char('j') => {
-                        if filtered_len > 0 {
-                            let next = (state.selected_idx + 1) % filtered_len;
-                            state.set_selected(next);
-                        }
+                        step_workspace_selection(&mut state, 1, None);
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
-                        if filtered_len > 0 {
-                            let prev = if state.selected_idx == 0 {
-                                filtered_len - 1
-                            } else {
-                                state.selected_idx - 1
-                            };
-                            state.set_selected(prev);
-                        }
+                        step_workspace_selection(&mut state, -1, None);
                     }
                     KeyCode::PageDown => {
-                        if filtered_len > 0 {
-                            let next = (state.selected_idx + 5).min(filtered_len - 1);
-                            state.set_selected(next);
-                        }
+                        step_workspace_selection(&mut state, 5, None);
                     }
                     KeyCode::PageUp => {
-                        if filtered_len > 0 {
-                            let prev = state.selected_idx.saturating_sub(5);
-                            state.set_selected(prev);
-                        }
+                        step_workspace_selection(&mut state, -5, None);
                     }
-                    KeyCode::Home => {
-                        if filtered_len > 0 {
-                            state.set_selected(0);
-                        }
+                    KeyCode::Home | KeyCode::Char('g') => {
+                        step_workspace_selection(&mut state, 0, Some(false));
                     }
-                    KeyCode::End => {
-                        if filtered_len > 0 {
-                            state.set_selected(filtered_len - 1);
-                        }
+                    KeyCode::End | KeyCode::Char('G') => {
+                        step_workspace_selection(&mut state, 0, Some(true));
                     }
                     KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => {
                         if let Some(cur) = state.current_finding()
@@ -2621,6 +3380,10 @@ pub fn run_tui(
                         if state.bg_running.is_some() {
                             state.push_log("Background job already running...".into());
                         } else if let Some(cur) = state.current_finding() {
+                            state.push_wire_event(format!(
+                                "[QUEUE] Starting bwrap replay for {}...",
+                                cur.id
+                            ));
                             spawn_bg_replay(&mut state, &launch_cfg, cur);
                         }
                     }
@@ -2639,76 +3402,14 @@ pub fn run_tui(
                             spawn_bg_patch(&mut state, &launch_cfg, cur, v_opt);
                         }
                     }
-                    KeyCode::Char('e') => {
-                        if let Some(cur) = state.current_finding() {
-                            let (file, line) = cur
-                                .witness_path
-                                .get(
-                                    state
-                                        .selected_hop
-                                        .min(cur.witness_path.len().saturating_sub(1)),
-                                )
-                                .map(|h| (h.file.clone(), h.line))
-                                .unwrap_or_else(|| (cur.file.clone(), cur.line));
-                            launch_editor_for_hop(&mut guard, &mut state, &file, line);
-                        }
+                    KeyCode::Char('e') | KeyCode::Char('o') => {
+                        edit_current_finding(&mut guard, &mut state);
                     }
-                    KeyCode::Char('y') => {
-                        if let Some(cur) = state.current_finding() {
-                            let summary = format_finding_clipboard_summary(
-                                &cur,
-                                state.verified_map.get(&cur.id),
-                                &state.project_root,
-                            );
-                            match copy_osc52(&summary) {
-                                Ok(_) => state.push_log(format!(
-                                    "Copied {} details to clipboard via OSC 52.",
-                                    cur.id
-                                )),
-                                Err(e) => state.push_log(format!("Clipboard copy failed: {}", e)),
-                            }
-                        }
-                    }
+                    KeyCode::Char('y') => copy_current_finding(&mut state),
                     KeyCode::Char('L') => {
                         state.show_logs = !state.show_logs;
                     }
-                    KeyCode::Char('g') => {
-                        let out = state
-                            .project_root
-                            .join(".shellmind-guard")
-                            .join("report.html");
-                        let verified_vec: Vec<VerifiedFinding> =
-                            state.verified_map.values().cloned().collect();
-                        let html = to_html_graph(
-                            &state.project_root.display().to_string(),
-                            &state.graph,
-                            &verified_vec,
-                        );
-                        match fs::create_dir_all(state.project_root.join(".shellmind-guard"))
-                            .and_then(|_| fs::write(&out, html))
-                        {
-                            Ok(_) => {
-                                let _ = open_path_in_browser(&out);
-                                state.push_log(format!("Opened HTML graph -> {}", out.display()));
-                            }
-                            Err(e) => state.push_log(format!("HTML export error: {}", e)),
-                        }
-                    }
-                    KeyCode::Char('s') => {
-                        let out = state
-                            .project_root
-                            .join(".shellmind-guard")
-                            .join("report.sarif");
-                        let verified_vec: Vec<VerifiedFinding> =
-                            state.verified_map.values().cloned().collect();
-                        let sarif = to_sarif_json(&state.graph.findings, &verified_vec);
-                        match fs::create_dir_all(state.project_root.join(".shellmind-guard"))
-                            .and_then(|_| fs::write(&out, sarif))
-                        {
-                            Ok(_) => state.push_log(format!("Exported SARIF -> {}", out.display())),
-                            Err(e) => state.push_log(format!("SARIF export error: {}", e)),
-                        }
-                    }
+                    KeyCode::Char('s') => export_report(&mut state, "sarif"),
                     _ => {}
                 }
             }
@@ -2750,6 +3451,7 @@ fn open_path_in_browser(path: &std::path::Path) -> std::io::Result<std::process:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::encode_base64;
     use ratatui::backend::TestBackend;
     use smg_graph::{GuardKind, SinkKind, TraceHop};
 
@@ -2787,6 +3489,7 @@ mod tests {
                     },
                 ],
                 remediation: String::new(),
+                proof_reasons: Vec::new(),
             }],
         };
         let verified = vec![VerifiedFinding {
@@ -2834,6 +3537,7 @@ mod tests {
                     line: 8,
                 }],
                 remediation: "Attach requireAuth middleware.".into(),
+                proof_reasons: Vec::new(),
             });
         }
         let graph = GraphAnalysisResult {
@@ -2887,6 +3591,7 @@ mod tests {
                 line: 12,
             }],
             remediation: "Use parameterized query.".into(),
+            proof_reasons: Vec::new(),
         };
         let f2 = LatticeFinding {
             id: "SMG-AUTH-002".into(),
@@ -2906,6 +3611,7 @@ mod tests {
                 line: 5,
             }],
             remediation: "Require auth middleware.".into(),
+            proof_reasons: Vec::new(),
         };
         let f3 = LatticeFinding {
             id: "SMG-RACE-003".into(),
@@ -2921,6 +3627,7 @@ mod tests {
             missing_guard: GuardKind::TxLock,
             witness_path: vec![],
             remediation: "Use DB transaction.".into(),
+            proof_reasons: Vec::new(),
         };
         let graph = GraphAnalysisResult {
             parsed_files: 3,
@@ -2991,6 +3698,7 @@ mod tests {
                     line: 8,
                 }],
                 remediation: "Lock transaction.".into(),
+                proof_reasons: Vec::new(),
             }],
         };
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -3022,5 +3730,188 @@ mod tests {
         let backend = TestBackend::new(110, 32);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| render_ui(f, &mut state)).unwrap();
+    }
+
+    #[test]
+    fn test_tui_workspaces_detail_tabs_and_slash_palette_render() {
+        let graph = GraphAnalysisResult {
+            parsed_files: 4,
+            symbol_count: 10,
+            edge_count: 7,
+            route_entries: 3,
+            active_domains: vec!["web".into(), "concurrency".into()],
+            route_schemas: Vec::new(),
+            findings: vec![LatticeFinding {
+                id: "SMG-RACE-002".into(),
+                rule_id: "SMG-RACE-001".into(),
+                severity: "CRITICAL".into(),
+                title: "Missing tx lock".into(),
+                file: "src/db/queries.ts".into(),
+                line: 1,
+                status: "PROVEN".into(),
+                confidence: Confidence::Proven,
+                entry_route: "POST /api/v1/checkout/withdraw".into(),
+                sink_kind: SinkKind::BalanceUpdate,
+                missing_guard: GuardKind::TxLock,
+                witness_path: vec![TraceHop {
+                    file: "src/routes/checkout.ts".into(),
+                    symbol: "withdraw".into(),
+                    line: 8,
+                }],
+                remediation: "Use SELECT ... FOR UPDATE".into(),
+                proof_reasons: Vec::new(),
+            }],
+        };
+        let verified = vec![VerifiedFinding {
+            finding_id: "SMG-RACE-002".into(),
+            rule_id: "SMG-RACE-001".into(),
+            entry_route: "POST /api/v1/checkout/withdraw".into(),
+            status: VerificationStatus::Proven,
+            evidence: "2/2 concurrent overdraft succeeded".into(),
+            replay_cmd: "smg replay SMG-RACE-002".into(),
+        }];
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("fixtures")
+            .join("vuln-payment-node");
+        let mut state = TuiState::new(&root, graph, verified, 25);
+
+        for (w, h) in [(100, 24), (120, 36)] {
+            for ws in WorkspaceTab::ALL {
+                state.workspace = ws;
+                let backend = TestBackend::new(w, h);
+                let mut terminal = Terminal::new(backend).unwrap();
+                terminal.draw(|f| render_ui(f, &mut state)).unwrap();
+                let buf = terminal.backend().buffer();
+                let text: String = (0..h)
+                    .flat_map(|y| (0..w).map(move |x| buf[(x, y)].symbol()))
+                    .collect();
+                assert!(text.contains("SMG"));
+            }
+
+            state.workspace = WorkspaceTab::Findings;
+            for dt in [
+                DetailTab::TraceSource,
+                DetailTab::ProofDiff,
+                DetailTab::RuleDocs,
+            ] {
+                state.detail_tab = dt;
+                let backend = TestBackend::new(w, h);
+                let mut terminal = Terminal::new(backend).unwrap();
+                terminal.draw(|f| render_ui(f, &mut state)).unwrap();
+            }
+
+            state.palette_mode = true;
+            state.palette_input = "/re".into();
+            let backend = TestBackend::new(w, h);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|f| render_ui(f, &mut state)).unwrap();
+            let buf = terminal.backend().buffer();
+            let text: String = (0..h)
+                .flat_map(|y| (0..w).map(move |x| buf[(x, y)].symbol()))
+                .collect();
+            assert!(text.contains("/replay"));
+            assert!(text.contains("smg>"));
+            state.palette_mode = false;
+        }
+    }
+
+    #[test]
+    fn test_tui_baseline_cache_and_vim_stepping() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let tmp = std::env::temp_dir().join(format!("smg_tui_base_{}", nanos));
+        fs::create_dir_all(&tmp).unwrap();
+
+        let f1 = LatticeFinding {
+            id: "SMG-AUTH-001".into(),
+            rule_id: "SMG-AUTH-001".into(),
+            severity: "HIGH".into(),
+            title: "Unauth endpoint".into(),
+            file: "a.ts".into(),
+            line: 5,
+            status: "SUSPECT".into(),
+            confidence: Confidence::Confirmed,
+            entry_route: "POST /a".into(),
+            sink_kind: SinkKind::PaymentMutation,
+            missing_guard: GuardKind::Auth,
+            witness_path: vec![TraceHop {
+                file: "a.ts".into(),
+                symbol: "handleA".into(),
+                line: 5,
+            }],
+            remediation: "Auth".into(),
+            proof_reasons: Vec::new(),
+        };
+        let f2 = LatticeFinding {
+            id: "SMG-SQLI-001".into(),
+            rule_id: "SMG-SQLI-001".into(),
+            severity: "CRITICAL".into(),
+            title: "SQLi".into(),
+            file: "b.ts".into(),
+            line: 9,
+            status: "SUSPECT".into(),
+            confidence: Confidence::Confirmed,
+            entry_route: "GET /b".into(),
+            sink_kind: SinkKind::SqlInjection,
+            missing_guard: GuardKind::SqlSanitizer,
+            witness_path: vec![TraceHop {
+                file: "b.ts".into(),
+                symbol: "handleB".into(),
+                line: 9,
+            }],
+            remediation: "Bind".into(),
+            proof_reasons: Vec::new(),
+        };
+        let graph = GraphAnalysisResult {
+            parsed_files: 2,
+            symbol_count: 2,
+            edge_count: 1,
+            route_entries: 2,
+            active_domains: vec!["web".into()],
+            route_schemas: Vec::new(),
+            findings: vec![f1.clone(), f2],
+        };
+        let mut state = TuiState::new(&tmp, graph, Vec::new(), 5);
+        assert_eq!(state.filtered_len_mut(), 2);
+
+        // Baseline only f1 -> Net-New mode must leave only f2
+        assert_eq!(write_baseline_file(&tmp, &[f1]).unwrap(), 1);
+        state.baseline_keys = load_baseline_keys(&tmp);
+        state.hide_baselined = true;
+        state.invalidate_filter_cache();
+        assert_eq!(state.filtered_len_mut(), 1);
+        assert_eq!(state.filtered_findings()[0].id, "SMG-SQLI-001");
+
+        // Toggle off -> both back
+        state.hide_baselined = false;
+        assert_eq!(state.filtered_len_mut(), 2);
+
+        // Vim navigation across workspaces
+        state.workspace = WorkspaceTab::Findings;
+        step_workspace_selection(&mut state, 0, Some(true));
+        assert_eq!(state.selected_idx, 1);
+        step_workspace_selection(&mut state, 0, Some(false));
+        assert_eq!(state.selected_idx, 0);
+
+        state.workspace = WorkspaceTab::Rules;
+        step_workspace_selection(&mut state, 1, None);
+        assert_eq!(state.rules_selected, 1);
+        step_workspace_selection(&mut state, 0, Some(true));
+        assert_eq!(state.rules_selected, RULE_CATALOG.len() - 1);
+
+        let diff = "--- a/app.ts\n+++ b/app.ts\n@@ -1,3 +1,3 @@\n const a = 1;\n-db.query(`SELECT * FROM u WHERE id = ${id}`);\n+db.query('SELECT * FROM u WHERE id = $1', [id]);\n return true;";
+        let rows = build_side_by_side_diff_rows(diff);
+        let mod_row = rows
+            .iter()
+            .find(|r| r.tag == '~')
+            .expect("Side-by-side diff must align -/+ replacement row");
+        assert!(mod_row.left.as_deref().unwrap().contains("${id}"));
+        assert!(mod_row.right.as_deref().unwrap().contains("$1"));
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

@@ -734,6 +734,36 @@ mod imp {
         Ok(parsed)
     }
 
+    /// Boots `boot_cmd` once inside an isolated `--unshare-all` Bubblewrap / Seatbelt sandbox and verifies
+    /// a batch of dynamic findings sequentially against the single warm server (`--mode verify-batch`).
+    pub fn run_findings_batch_in_isolated_netns_with_config(
+        project_root: &Path,
+        boot_cmd: &str,
+        port: u16,
+        findings: &[LatticeFinding],
+        concurrency: usize,
+        probe_cfg: &SandboxProbeConfig,
+    ) -> Result<Vec<VerifiedFinding>> {
+        let batch_json = serde_json::to_string(findings)?;
+        let stdout_str = execute_in_isolated_netns(
+            project_root,
+            boot_cmd,
+            port,
+            "verify-batch",
+            concurrency,
+            Some(&batch_json),
+            probe_cfg,
+        )?;
+        let parsed: Vec<VerifiedFinding> =
+            serde_json::from_str(stdout_str.trim()).with_context(|| {
+                format!(
+                    "Failed to parse __probe-netns verify-batch output: {}",
+                    stdout_str.chars().take(200).collect::<String>()
+                )
+            })?;
+        Ok(parsed)
+    }
+
     /// Boots `boot_cmd` once inside an isolated `--unshare-all` Bubblewrap namespace and executes
     /// deep route-schema fuzz probes (`--mode fuzz`), returning discovered `FuzzProbeHit` items.
     pub fn run_deep_fuzz_in_isolated_netns(
@@ -1205,6 +1235,28 @@ mod imp {
             probe_cfg,
         )?;
         serde_json::from_str(out.trim()).context("Failed to parse WSL2 bwrap __probe-netns output")
+    }
+
+    pub fn run_findings_batch_in_isolated_netns_with_config(
+        project_root: &Path,
+        boot_cmd: &str,
+        port: u16,
+        findings: &[LatticeFinding],
+        concurrency: usize,
+        probe_cfg: &SandboxProbeConfig,
+    ) -> Result<Vec<VerifiedFinding>> {
+        let batch_json = serde_json::to_string(findings)?;
+        let out = run_wsl_bwrap_netns(
+            project_root,
+            boot_cmd,
+            port,
+            "verify-batch",
+            concurrency,
+            Some(&batch_json),
+            probe_cfg,
+        )?;
+        serde_json::from_str(out.trim())
+            .context("Failed to parse WSL2 bwrap __probe-netns verify-batch output")
     }
 
     pub fn run_deep_fuzz_in_isolated_netns(

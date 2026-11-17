@@ -214,10 +214,11 @@ smg scan /path/to/your/repo
 # Machine-readable or PR-ready reports (text | compact | table | markdown | json | sarif)
 smg scan /path/to/your/repo --format table
 smg scan /path/to/your/repo --format markdown --output security-report.md
-smg scan /path/to/your/repo --format sarif
+smg scan /path/to/your/repo --format sarif --cyclonedx bom-vex.cdx.json
+smg scan /path/to/your/repo --changed-since origin/main --ci
 
-# Filter layers, exclude noisy rules, snapshot baseline debt, or fail only on net-new issues
-smg scan /path/to/your/repo --layers secrets,sqli,xss,csrf,idor,race --min-confidence confirmed
+# Filter layers (including Wave 2-3: cicd,k8s,dos,zip,crypto,queue,api,ai,oauth,smuggle,state), exclude noisy rules, or baseline debt
+smg scan /path/to/your/repo --layers secrets,sqli,xss,csrf,idor,race,ai,api,k8s --min-confidence confirmed
 smg scan /path/to/your/repo --write-baseline .smg-baseline.json
 smg scan /path/to/your/repo --baseline .smg-baseline.json --exclude-rule SMG-CFG-001 --ci
 
@@ -411,9 +412,13 @@ ShellMind-Guard/
 │   │                              # Phase 9/10 cross-file field/closure taint, OpenAPI schemas & O(V+E) Lattice
 │   ├── smg-sandbox/                # Linux Bubblewrap (--unshare-all) + macOS/Windows sandbox helpers,
 │   │                              # RLIMIT_AS/cgroups v2, rustls TLS loopback, mock shims & `--deep` fuzz prover
-│   ├── smg-report/                 # SARIF 2.1.0 & self-contained Carbon-Slate HTML/SVG graph exporter
-│   ├── smg-tui/                    # Panic-safe 60fps ratatui 3-pane workspace + ring-buffer log drawer
-│   └── smg-ai/                     # Opt-in minimal-context (<= 2 KB) HTTP/TLS patcher & safe diff applier
+│   ├── smg-report/                 # SARIF 2.1.0, CycloneDX VEX & Carbon-Slate HTML/SVG graph exporter
+│   ├── smg-tui/                    # Panic-safe 60fps 4-workspace `/` ratatui UI + Side-by-Side Diff modal
+│   ├── smg-ai/                     # Deterministic AST codemods, 3-iter CEGIS loop & opt-in TLS patcher
+│   ├── smg-hw/                     # Isolated `--features hw` Firmware/MMIO/tnum/Octagon/IRQ/Boot verifier
+│   ├── smg-web3/                   # Isolated `--features web3` Solidity/Move/Solana AST + in-process `revm` EVM oracle
+│   ├── smg-pqc/                    # Opt-in `--features pqc` (`--compliance pqc` / `--cbom`) Shor/Grover/Mosca HNDL + static CBOM
+│   └── smg-enterprise/             # Isolated `--features enterprise` Ed25519 signed licensing & Remote TEE PCR0 attestation client
 └── fixtures/
     ├── vuln-payment-node/         # Runnable multi-file Node/TS double-spend race, SQLi & auth fixture
     └── vuln-auth-rust/            # Multi-file Rust Axum unauthenticated role-mutation fixture

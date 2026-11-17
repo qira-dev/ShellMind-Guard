@@ -1,4 +1,10 @@
+pub mod codemods;
+
 use anyhow::{Context, Result, bail};
+pub use codemods::{
+    CegisOutcome, GeneratedRegressionTest, export_regression_tests, generate_regression_test,
+    run_cegis_patch_loop, synthesize_deterministic_codemod_diff, verify_diff_syntax_before_sandbox,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use smg_core::{ShellMindGuardConfig, scan_repository};
@@ -1043,6 +1049,7 @@ mod tests {
                 line: 8,
             }],
             remediation: String::new(),
+            proof_reasons: vec![],
         }
     }
 
