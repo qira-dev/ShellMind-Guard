@@ -4,7 +4,7 @@
 >
 > **Non-Negotiable Rule:** **Never sacrifice accuracy or depth for artificial micro-speed.** Keep scans insanely fast by eliminating redundant work (delta caching, bounded parallelism, tiered execution), never by downgrading checks into shallow guesses.
 >
-> **Codebase Anchor:** Workspace v`0.1.0` (commit `d21223c`, Rust 2024 edition, ~13.3k lines across 7 workspace members).
+> **Codebase Anchor:** Workspace v`0.1.0` (Rust 2024 edition, **11 workspace members**: unified `smg`/`shellmind-guard` root binary + 10 specialized crates including 4 isolated Frontier Domain crates `smg-hw`, `smg-web3`, `smg-pqc`, and `smg-enterprise`).
 
 ---
 
@@ -44,6 +44,11 @@ The current repository (`d21223c`) already delivers a complete, tested determini
 |    modular `langs/`: PHP, Java, C#, Kotlin, Swift, Dart, C, C++, Ruby, Bash, HCL/Terraform|
 |  Deep scanners: .sql migrations, Dockerfile/.env/TLS/JWT/XXE/Proto, lockfiles & manifests|
 |  Domain Routing (web, system_engine, mobile) + AndroidManifest.xml / Info.plist          |
+|  Frontier Domain Crates (default feature-gated, 0ms overhead when domain absent):        |
+|   - smg-hw         : CMSIS-SVD, GNU .ld, Tnum/WrappedInterval/SparseOctagon, IRQ/MMIO/Boot|
+|   - smg-web3       : Solidity/Foundry/Hardhat, revm v43.0.3 EVM oracle, Solana & Move    |
+|   - smg-pqc        : Shor/Grover/BHT, Mosca HNDL, hybrid KDF, CycloneDX 1.5 Static CBOM  |
+|   - smg-enterprise : Fail-closed Ed25519 licensing + Nitro/TDX/SEV-SNP remote TEE client |
 |                                                                                          |
 |  GuardKind Lattice + Cross-File BFS Witness Extractor (trace hops):                      |
 |   - SMG-AUTH-001 (Auth)         - SMG-RACE-001 (TxLock)     - SMG-IDOR-001 (OwnershipCheck) |

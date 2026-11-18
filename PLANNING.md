@@ -20,6 +20,7 @@
 | `crates/smg-sandbox/src/{lib.rs,bwrap.rs,verifier.rs}` | Linux `bwrap` (`--unshare-all --unshare-net`), PGID reaper, HTTP/1.1 `Auth` & `TxLock` tests | **EXTEND (Phase 6 & 10)** | Keep existing `Auth` + Last-Byte Sync intact; wire `[sandbox]` profiles + `IDOR` two-user swapper (Phase 6), then TLS/cross-OS/mock shims & `RLIMIT_AS` (Phase 10) |
 | `crates/smg-ai/src/lib.rs` | `2048`-byte witness prompt builder + disabled provider stub (no HTTP crate yet) | **COMPLETE IN PHASE 6** | Add minimal HTTP client (e.g., `ureq` + `rustls`) to `smg-ai/Cargo.toml` & closed-loop `tmpfs` diff verification |
 | `crates/smg-tui`, `smg-report`, `src/{main.rs,mcp.rs}` | Panic-safe TUI, SARIF/HTML, CLI, hooks, MCP server | **PROTECTED / WIRE FLAGS** | Keep 12 existing `--layers` tokens intact; add confidence badges, `xss`/`csrf` layer filters, `has_dynamic_targets` IDOR trigger (`main.rs:304`), MCP schema sync, and `deps sync` subcommand |
+| `crates/smg-hw`, `smg-web3`, `smg-pqc`, `smg-enterprise` | Isolated Frontier Domain crates (`default` feature-gated) | **EXTEND / ISOLATED** | Zero-overhead on non-domain repos; `smg-hw` (SVD/Tnum/Octagon), `smg-web3` (`revm`/Solana/Move), `smg-pqc` (CBOM/HNDL), `smg-enterprise` (Ed25519/TEE) |
 
 ---
 
