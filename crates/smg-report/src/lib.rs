@@ -242,11 +242,28 @@ pub fn to_cyclonedx_vex_json(
             } else {
                 ("in_triage", "requires_environment", "Package imported or referenced in codebase")
             };
+            let root_ref = format!("pkg:generic/{project_name}");
+            let matched_comp_ref = deps
+                .iter()
+                .find(|d| f.title.contains(&d.name))
+                .map(|d| {
+                    let eco_low = d.ecosystem.to_ascii_lowercase();
+                    let purl_eco = match eco_low.as_str() {
+                        "npm" => "npm",
+                        "crates.io" | "cargo" => "cargo",
+                        "go" | "golang" => "golang",
+                        "pypi" => "pypi",
+                        other => other,
+                    };
+                    format!("pkg:{}/{}@{}", purl_eco, d.name, d.version)
+                })
+                .unwrap_or(root_ref);
             json!({
                 "id": f.id,
                 "source": { "name": "ShellMind Guard", "url": "https://github.com/qira-dev/ShellMind-Guard" },
                 "description": f.title,
                 "ratings": [{ "severity": f.severity.to_ascii_lowercase(), "method": "other" }],
+                "affects": [{ "ref": matched_comp_ref }],
                 "analysis": {
                     "state": state,
                     "justification": justification,
@@ -269,6 +286,7 @@ pub fn to_cyclonedx_vex_json(
         "metadata": {
             "component": {
                 "type": "application",
+                "bom-ref": format!("pkg:generic/{project_name}"),
                 "name": project_name
             },
             "tools": [{

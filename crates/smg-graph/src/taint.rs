@@ -281,14 +281,17 @@ pub fn strip_comments_simple(src: &str) -> String {
                 i += 2;
                 continue;
             }
-            if bytes[i] == str_delim {
+            if bytes[i] == str_delim || (str_delim != b'`' && bytes[i] == b'\n') {
                 str_delim = 0;
             }
             out.push(bytes[i]);
             i += 1;
             continue;
         }
-        if matches!(bytes[i], b'"' | b'\'' | b'`') {
+        if bytes[i] == b'"'
+            || bytes[i] == b'`'
+            || (bytes[i] == b'\'' && is_closed_single_quote_literal(bytes, i))
+        {
             str_delim = bytes[i];
             out.push(bytes[i]);
             i += 1;
@@ -331,6 +334,43 @@ pub fn strip_comments_simple(src: &str) -> String {
         i += 1;
     }
     String::from_utf8(out).unwrap_or_else(|_| src.to_string())
+}
+
+fn is_closed_single_quote_literal(bytes: &[u8], quote_idx: usize) -> bool {
+    if quote_idx + 1 < bytes.len()
+        && (bytes[quote_idx + 1].is_ascii_alphabetic() || bytes[quote_idx + 1] == b'_')
+        && bytes.get(quote_idx + 2) != Some(&b'\'')
+    {
+        if quote_idx > 0 && matches!(bytes[quote_idx - 1], b'&' | b'<') {
+            return false;
+        }
+        let mut k = quote_idx + 1;
+        while k < bytes.len() && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_') {
+            k += 1;
+        }
+        if k < bytes.len() && matches!(bytes[k], b'>' | b':' | b'+' | b')' | b',') {
+            return false;
+        }
+    }
+    let mut j = quote_idx + 1;
+    while j < bytes.len() && bytes[j] != b'\n' {
+        if bytes[j] == b'\\' && j + 1 < bytes.len() {
+            j += 2;
+            continue;
+        }
+        if bytes[j] == b'\'' {
+            return true;
+        }
+        if j + 1 < bytes.len()
+            && bytes[j] == b'/'
+            && (bytes[j + 1] == b'/' || bytes[j + 1] == b'*')
+            && (j == 0 || bytes[j - 1] != b':')
+        {
+            return false;
+        }
+        j += 1;
+    }
+    false
 }
 
 /// Strips comments and plain prose string literals (`"..."`, `'...'`, `` `...` ``) while preserving

@@ -4,8 +4,22 @@ use ring::rand::SystemRandom;
 use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::hint::black_box;
 use std::io::Read;
 use std::path::Path;
+
+/// Constant-time byte-slice comparison without early-exit timing side channels.
+#[inline]
+pub fn ct_eq_bytes(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= black_box(x ^ y);
+    }
+    black_box(diff) == 0
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -77,6 +91,12 @@ pub fn encode_hex(bytes: &[u8]) -> String {
 
 /// Signs structured `LicenseClaims` with a PKCS#8 Ed25519 private key.
 pub fn sign_license_claims(pkcs8_key: &[u8], claims: &LicenseClaims) -> Result<SignedLicenseToken> {
+    if claims.issued_at_unix > claims.expires_at_unix {
+        bail!("invalid license claims: issued_at_unix exceeds expires_at_unix");
+    }
+    if claims.max_seats == 0 {
+        bail!("invalid license claims: max_seats must be > 0");
+    }
     let pair = Ed25519KeyPair::from_pkcs8(pkcs8_key)
         .map_err(|_| anyhow::anyhow!("invalid Ed25519 PKCS#8 signing key"))?;
     let claims_json = serde_json::to_vec(claims)?;
@@ -159,6 +179,20 @@ pub fn verify_license_fail_closed(
     if claims.license_id.trim().is_empty() || claims.organization.trim().is_empty() {
         bail!("fail-closed: license missing organization or license_id");
     }
+    if claims.max_seats == 0 {
+        bail!(
+            "fail-closed: license `{}` has invalid max_seats = 0",
+            claims.license_id
+        );
+    }
+    if claims.issued_at_unix > claims.expires_at_unix {
+        bail!(
+            "fail-closed: license `{}` has inverted validity window (issued_at {} > expires_at {})",
+            claims.license_id,
+            claims.issued_at_unix,
+            claims.expires_at_unix
+        );
+    }
     if now_unix > claims.expires_at_unix {
         bail!(
             "fail-closed: license `{}` expired at unix {} (now={})",
@@ -188,7 +222,9 @@ pub fn verify_license_fail_closed(
                 "fail-closed: license pins binary BLAKE3 `{expected_hash}` but binary digest unavailable"
             );
         };
-        if !actual.eq_ignore_ascii_case(expected_hash.trim()) {
+        let exp_norm = expected_hash.trim().to_ascii_lowercase();
+        let act_norm = actual.trim().to_ascii_lowercase();
+        if exp_norm.is_empty() || !ct_eq_bytes(act_norm.as_bytes(), exp_norm.as_bytes()) {
             bail!(
                 "fail-closed: binary integrity digest mismatch (expected {}, got {})",
                 expected_hash,
@@ -205,7 +241,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ed25519_license_verifies_valid_and_fails_closed_on_tamper_expiry_or_binary_mismatch() {
+    fn ed25519_license_verifies_valid_and_fails_closed_on_tamper_expiry_seats_or_binary_mismatch() {
         let (pkcs8, pubkey) = generate_ed25519_keypair().unwrap();
         let claims = LicenseClaims {
             license_id: "lic-2026-ent-01".into(),
@@ -224,10 +260,20 @@ mod tests {
             &pubkey,
             1_795_000_000,
             LicenseTier::EnterpriseTee,
-            Some("deadbeef"),
+            Some("DEADBEEF"),
         )
         .unwrap();
         assert_eq!(verified, claims);
+
+        // Zero seats rejected at sign and verify time
+        let mut zero_seat_claims = claims.clone();
+        zero_seat_claims.max_seats = 0;
+        assert!(sign_license_claims(&pkcs8, &zero_seat_claims).is_err());
+
+        // Inverted timestamps rejected
+        let mut inverted_claims = claims.clone();
+        inverted_claims.issued_at_unix = 1_800_000_100;
+        assert!(sign_license_claims(&pkcs8, &inverted_claims).is_err());
 
         // Wrong binary hash fails closed cleanly
         let err_bin = verify_license_fail_closed(

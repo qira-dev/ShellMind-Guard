@@ -20,6 +20,9 @@ jobs:
       - name: Check formatting (Ubuntu)
         if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
+      - name: Check minimal build without default features (Ubuntu)
+        if: runner.os == 'Linux'
+        run: cargo check -p shellmind-guard --all-targets --no-default-features --locked
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Run Workspace Tests

@@ -1,8 +1,11 @@
-use crate::context::{EvmSlotEntry, StateVarSpec, Web3Context, abi_selector, pack_storage_vars};
+use crate::context::{
+    EvmSlotEntry, StateVarSpec, Web3Context, abi_selector, pack_storage_vars_with_defs,
+};
 use crate::evm_oracle::{
     check_amm_spot_skew_bps, probe_compiled_reentrancy_in_revm, probe_compiled_selector_unauth,
     solve_erc4626_inflation_witness,
 };
+use revm::primitives::U256;
 use smg_graph::{Confidence, GuardKind, LocalStaticFinding, SinkKind};
 use std::collections::{HashMap, HashSet};
 use tree_sitter::{Node, Parser};
@@ -20,17 +23,30 @@ pub enum EffectOp {
     ReadState {
         var: String,
         line: usize,
+        byte_offset: usize,
+        branch_path: Vec<(usize, u8)>,
     },
     WriteState {
         var: String,
         is_accounting: bool,
         is_rhs_nominal_amount: bool,
         line: usize,
+        byte_offset: usize,
+        branch_path: Vec<(usize, u8)>,
     },
     ExternalCall {
         has_callback_risk: bool,
         kind: String,
         line: usize,
+        byte_offset: usize,
+        branch_path: Vec<(usize, u8)>,
+        in_returning_branch: bool,
+    },
+    InternalCall {
+        callee: String,
+        line: usize,
+        byte_offset: usize,
+        branch_path: Vec<(usize, u8)>,
     },
 }
 
@@ -159,7 +175,6 @@ fn classify_external_call(call_node: Node, src: &[u8]) -> Option<(bool, String)>
     {
         return Some((true, raw_fn.to_string()));
     }
-    // Generic external contract method call on an address/interface parameter or state contract handle
     if raw_fn.contains('.')
         && !raw_fn.starts_with("abi.")
         && !raw_fn.starts_with("Math.")
@@ -192,7 +207,6 @@ fn is_div_before_mul(node: Node, src: &[u8]) -> bool {
         return false;
     }
     let full = node_txt(node, src);
-    // Look strictly at `*` operator where one child is a `/` binary expression (including parens)
     let mut op_is_mul = false;
     let mut has_div_child = false;
     let mut cursor = node.walk();
@@ -207,7 +221,6 @@ fn is_div_before_mul(node: Node, src: &[u8]) -> bool {
     if !op_is_mul || !has_div_child {
         return false;
     }
-    // Ignore explicit safe time rounding like `(block.timestamp / 1 days) * 1 days`
     let low = full.to_ascii_lowercase();
     !(low.contains("days")
         || low.contains("hours")
@@ -241,6 +254,22 @@ fn contains_immediate_div_expr(node: Node, src: &[u8]) -> bool {
     false
 }
 
+fn block_ends_with_return_or_revert(node: Node, src: &[u8]) -> bool {
+    let txt = smg_graph::taint::strip_comments_simple(node_txt(node, src));
+    let trimmed = txt.trim().trim_end_matches('}').trim();
+    if let Some(last_stmt) = trimmed.rsplit(';').nth(1).or(Some(trimmed)) {
+        let low = last_stmt.trim().to_ascii_lowercase();
+        if low.starts_with("return")
+            || low.contains(" return")
+            || low.starts_with("revert")
+            || low.contains(" revert")
+        {
+            return true;
+        }
+    }
+    false
+}
+
 #[allow(clippy::too_many_arguments)]
 fn walk_fn_body(
     node: Node,
@@ -251,8 +280,56 @@ fn walk_fn_body(
     tx_origin: &mut Vec<usize>,
     unsafe_dcall: &mut Vec<(usize, String)>,
     has_auth_guard_in_fn: bool,
+    branch_path: &[(usize, u8)],
+    in_returning_branch: bool,
 ) {
     let line = node.start_position().row + 1;
+    let byte_offset = node.start_byte();
+
+    if node.kind() == "if_statement" {
+        let if_id = node.start_byte();
+        // Walk condition
+        if let Some(cond) = node.child_by_field_name("condition") {
+            walk_fn_body(
+                cond,
+                src,
+                state_names,
+                ops,
+                div_mul,
+                tx_origin,
+                unsafe_dcall,
+                has_auth_guard_in_fn,
+                branch_path,
+                in_returning_branch,
+            );
+        }
+        // Walk consequence (then-branch = 0) and alternative (else-branch = 1)
+        let mut c = node.walk();
+        let mut branch_idx = 0u8;
+        for ch in node.named_children(&mut c) {
+            if Some(ch.id()) == node.child_by_field_name("condition").map(|n| n.id()) {
+                continue;
+            }
+            let mut next_path = branch_path.to_vec();
+            next_path.push((if_id, branch_idx));
+            let branch_rets = in_returning_branch || block_ends_with_return_or_revert(ch, src);
+            walk_fn_body(
+                ch,
+                src,
+                state_names,
+                ops,
+                div_mul,
+                tx_origin,
+                unsafe_dcall,
+                has_auth_guard_in_fn,
+                &next_path,
+                branch_rets,
+            );
+            branch_idx = branch_idx.saturating_add(1);
+        }
+        return;
+    }
+
     match node.kind() {
         "assignment_expression" | "augmented_assignment_expression" => {
             if let Some(left) = node.child_by_field_name("left")
@@ -260,10 +337,28 @@ fn walk_fn_body(
                 && state_names.contains(&root)
                 && let Some(right) = node.child_by_field_name("right")
             {
+                // Recurse into RHS first so nested calls / division-before-multiplication on RHS are captured
+                walk_fn_body(
+                    right,
+                    src,
+                    state_names,
+                    ops,
+                    div_mul,
+                    tx_origin,
+                    unsafe_dcall,
+                    has_auth_guard_in_fn,
+                    branch_path,
+                    in_returning_branch,
+                );
                 let mut reads = HashSet::new();
                 collect_identifiers(right, src, state_names, &mut reads);
                 for r in reads {
-                    ops.push(EffectOp::ReadState { var: r, line });
+                    ops.push(EffectOp::ReadState {
+                        var: r,
+                        line,
+                        byte_offset,
+                        branch_path: branch_path.to_vec(),
+                    });
                 }
                 let rhs_txt = node_txt(right, src);
                 let rhs_nom = node_txt(node, src).contains("+=")
@@ -273,6 +368,8 @@ fn walk_fn_body(
                     is_rhs_nominal_amount: rhs_nom,
                     var: root,
                     line,
+                    byte_offset,
+                    branch_path: branch_path.to_vec(),
                 });
                 return;
             }
@@ -289,9 +386,27 @@ fn walk_fn_body(
                     has_callback_risk: callback_risk,
                     kind,
                     line,
+                    byte_offset,
+                    branch_path: branch_path.to_vec(),
+                    in_returning_branch,
                 });
+            } else if let Some(fn_node) = node.child_by_field_name("function") {
+                let raw_fn = node_txt(fn_node, src).trim();
+                if !raw_fn.is_empty()
+                    && !raw_fn.contains('.')
+                    && !matches!(
+                        raw_fn,
+                        "require" | "assert" | "revert" | "keccak256" | "ecrecover"
+                    )
+                {
+                    ops.push(EffectOp::InternalCall {
+                        callee: raw_fn.to_string(),
+                        line,
+                        byte_offset,
+                        branch_path: branch_path.to_vec(),
+                    });
+                }
             }
-            // Also scan arguments for nested reads
             let mut c = node.walk();
             for ch in node.named_children(&mut c) {
                 walk_fn_body(
@@ -303,6 +418,8 @@ fn walk_fn_body(
                     tx_origin,
                     unsafe_dcall,
                     has_auth_guard_in_fn,
+                    branch_path,
+                    in_returning_branch,
                 );
             }
             return;
@@ -321,6 +438,8 @@ fn walk_fn_body(
                 ops.push(EffectOp::ReadState {
                     var: txt.to_string(),
                     line,
+                    byte_offset,
+                    branch_path: branch_path.to_vec(),
                 });
             }
             return;
@@ -339,21 +458,60 @@ fn walk_fn_body(
             tx_origin,
             unsafe_dcall,
             has_auth_guard_in_fn,
+            branch_path,
+            in_returning_branch,
         );
     }
 }
 
+fn branches_are_mutually_exclusive(a: &[(usize, u8)], b: &[(usize, u8)]) -> bool {
+    for &(if_a, br_a) in a {
+        for &(if_b, br_b) in b {
+            if if_a == if_b && br_a != br_b {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn has_caller_auth_tokens(text: &str) -> bool {
-    let low = text.to_ascii_lowercase();
-    low.contains("msg.sender")
-        || low.contains("_msgsender()")
-        || low.contains("_checkowner")
+    let stripped = smg_graph::taint::strip_comments_simple(text);
+    let low = stripped.to_ascii_lowercase();
+    if low.contains("_checkowner")
         || low.contains("_checkrole")
         || low.contains("hasrole(")
-        || low.contains("owner == ")
-        || low.contains("== owner")
-        || low.contains("admin == ")
-        || low.contains("== admin")
+        || low.contains("onlyowner")
+        || low.contains("onlyrole")
+        || low.contains("isauthorized(")
+    {
+        return true;
+    }
+    for stmt in low.split(';') {
+        let s = stmt.trim();
+        let has_sender = s.contains("msg.sender") || s.contains("_msgsender()");
+        if !has_sender {
+            continue;
+        }
+        // Require `msg.sender` to participate in a condition, comparison, or access mapping check
+        if s.contains("==")
+            || s.contains("!=")
+            || s.contains("require(")
+            || s.contains("require ")
+            || s.contains("if (")
+            || s.contains("if(")
+            || s.contains("revert")
+            || s.contains("assert(")
+            || s.contains("wards[")
+            || s.contains("admins[")
+            || s.contains("authorized[")
+            || s.contains("operators[")
+            || s.contains("whitelist[")
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn modifier_is_auth_name(name: &str, custom_auth: &HashSet<String>) -> bool {
@@ -388,7 +546,7 @@ fn modifier_is_lock_name(name: &str, custom_locks: &HashSet<String>) -> bool {
         || low == "noreenter"
 }
 
-/// Parses a Solidity file into contract metadata, packed storage layout, and function effect summaries.
+/// Parses a Solidity file into contract metadata, linearized packed storage layout, and function effect summaries.
 pub fn parse_solidity_file(rel_path: &str, source: &str) -> Vec<ParsedContract> {
     let mut parser = Parser::new();
     if parser
@@ -403,6 +561,25 @@ pub fn parse_solidity_file(rel_path: &str, source: &str) -> Vec<ParsedContract> 
     let root = tree.root_node();
     let src = source.as_bytes();
     let mut contracts = Vec::new();
+    let mut file_enums: HashSet<String> = HashSet::new();
+    let mut file_contract_types: HashSet<String> = HashSet::new();
+
+    let mut cur0 = root.walk();
+    for ch in root.named_children(&mut cur0) {
+        match ch.kind() {
+            "enum_declaration" => {
+                if let Some(n) = ch.child_by_field_name("name") {
+                    file_enums.insert(node_txt(n, src).to_string());
+                }
+            }
+            "contract_declaration" | "interface_declaration" => {
+                if let Some(n) = ch.child_by_field_name("name") {
+                    file_contract_types.insert(node_txt(n, src).to_string());
+                }
+            }
+            _ => {}
+        }
+    }
 
     let mut cur = root.walk();
     for ch in root.named_children(&mut cur) {
@@ -419,19 +596,77 @@ pub fn parse_solidity_file(rel_path: &str, source: &str) -> Vec<ParsedContract> 
             "library_declaration" => ContractKind::Library,
             _ => continue,
         };
-        contracts.push(extract_contract(ch, src, rel_path, kind));
+        contracts.push(extract_contract(
+            ch,
+            src,
+            rel_path,
+            kind,
+            &file_enums,
+            &file_contract_types,
+        ));
     }
+
+    // Linearize inherited base contracts' state variables, auth modifiers, and lock modifiers
+    let by_name: HashMap<String, ParsedContract> = contracts
+        .iter()
+        .map(|c| (c.name.clone(), c.clone()))
+        .collect();
+
+    for c in &mut contracts {
+        if c.bases.is_empty() {
+            continue;
+        }
+        let mut linearized_vars = Vec::new();
+        for base_name in &c.bases {
+            if let Some(base_c) = by_name.get(base_name) {
+                for sv in &base_c.state_vars {
+                    if !linearized_vars
+                        .iter()
+                        .any(|v: &StateVarSpec| v.name == sv.name)
+                    {
+                        linearized_vars.push(sv.clone());
+                    }
+                }
+                c.custom_auth_modifiers
+                    .extend(base_c.custom_auth_modifiers.iter().cloned());
+                c.custom_lock_modifiers
+                    .extend(base_c.custom_lock_modifiers.iter().cloned());
+            }
+        }
+        for sv in &c.state_vars {
+            if !linearized_vars.iter().any(|v| v.name == sv.name) {
+                linearized_vars.push(sv.clone());
+            }
+        }
+        c.state_vars = linearized_vars;
+        c.packed_slots = pack_storage_vars_with_defs(
+            &c.name,
+            rel_path,
+            &c.state_vars,
+            0,
+            &file_enums,
+            &file_contract_types,
+        );
+    }
+
     contracts
 }
 
-fn extract_contract(node: Node, src: &[u8], rel_path: &str, kind: ContractKind) -> ParsedContract {
+fn extract_contract(
+    node: Node,
+    src: &[u8],
+    rel_path: &str,
+    kind: ContractKind,
+    file_enums: &HashSet<String>,
+    file_contract_types: &HashSet<String>,
+) -> ParsedContract {
     let name = node
         .child_by_field_name("name")
         .map(|n| node_txt(n, src).to_string())
         .unwrap_or_else(|| "Contract".into());
     let start_line = node.start_position().row + 1;
     let full_txt = node_txt(node, src);
-    let has_erc7201_namespace = full_txt.contains("erc7201:");
+    let stripped_contract = smg_graph::taint::strip_comments_simple(full_txt);
 
     let mut bases = Vec::new();
     let mut c0 = node.walk();
@@ -449,17 +684,36 @@ fn extract_contract(node: Node, src: &[u8], rel_path: &str, kind: ContractKind) 
         }
     }
 
+    let mut local_enums = file_enums.clone();
     let mut state_vars = Vec::new();
     let mut custom_auth_modifiers = HashSet::new();
     let mut custom_lock_modifiers = HashSet::new();
     let mut fn_nodes = Vec::new();
+    let mut has_erc7201_struct = false;
 
     if let Some(body) = node.child_by_field_name("body") {
         let mut bc = body.walk();
         for item in body.named_children(&mut bc) {
             match item.kind() {
+                "enum_declaration" => {
+                    if let Some(en) = item.child_by_field_name("name") {
+                        local_enums.insert(node_txt(en, src).to_string());
+                    }
+                }
+                "struct_declaration" => {
+                    // Check preceding NatSpec comment for `@custom:storage-location erc7201:`
+                    let item_start = item.start_byte();
+                    let lookback_start = item_start.saturating_sub(240);
+                    let preceding =
+                        std::str::from_utf8(&src[lookback_start..item_start]).unwrap_or("");
+                    if preceding.contains("@custom:storage-location")
+                        && preceding.contains("erc7201:")
+                    {
+                        has_erc7201_struct = true;
+                    }
+                }
                 "state_variable_declaration" => {
-                    let raw = node_txt(item, src);
+                    let raw = smg_graph::taint::strip_comments_simple(node_txt(item, src));
                     let is_const = raw.contains(" constant ") || raw.contains(" immutable ");
                     if let (Some(ty_n), Some(nm_n)) = (
                         item.child_by_field_name("type"),
@@ -478,8 +732,8 @@ fn extract_contract(node: Node, src: &[u8], rel_path: &str, kind: ContractKind) 
                         .child_by_field_name("name")
                         .map(|n| node_txt(n, src).to_string())
                         .unwrap_or_default();
-                    let mod_txt = node_txt(item, src);
-                    if has_caller_auth_tokens(mod_txt) {
+                    let mod_txt = smg_graph::taint::strip_comments_simple(node_txt(item, src));
+                    if has_caller_auth_tokens(&mod_txt) {
                         custom_auth_modifiers.insert(mod_name.clone());
                     }
                     let mod_low = mod_txt.to_ascii_lowercase();
@@ -504,7 +758,14 @@ fn extract_contract(node: Node, src: &[u8], rel_path: &str, kind: ContractKind) 
     }
 
     let state_names: HashSet<String> = state_vars.iter().map(|v| v.name.clone()).collect();
-    let packed_slots = pack_storage_vars(&name, rel_path, &state_vars, 0);
+    let packed_slots = pack_storage_vars_with_defs(
+        &name,
+        rel_path,
+        &state_vars,
+        0,
+        &local_enums,
+        file_contract_types,
+    );
 
     let mut functions = Vec::new();
     for fnode in fn_nodes {
@@ -541,9 +802,10 @@ fn extract_contract(node: Node, src: &[u8], rel_path: &str, kind: ContractKind) 
         }
 
         let body_node = fnode.child_by_field_name("body");
-        let body_text = body_node
+        let raw_body = body_node
             .map(|b| node_txt(b, src).to_string())
             .unwrap_or_default();
+        let body_text = smg_graph::taint::strip_comments_simple(&raw_body);
         let has_auth_guard = modifiers
             .iter()
             .any(|m| modifier_is_auth_name(m, &custom_auth_modifiers))
@@ -563,6 +825,8 @@ fn extract_contract(node: Node, src: &[u8], rel_path: &str, kind: ContractKind) 
                 &mut tx_origin,
                 &mut unsafe_dcall,
                 has_auth_guard,
+                &[],
+                false,
             );
         }
 
@@ -582,9 +846,82 @@ fn extract_contract(node: Node, src: &[u8], rel_path: &str, kind: ContractKind) 
         });
     }
 
-    let is_proxy_like = (full_txt.contains("delegatecall") && kind == ContractKind::Contract)
+    // 1-hop intra-contract internal/private helper call EffectOp expansion
+    let helper_ops: HashMap<String, Vec<EffectOp>> = functions
+        .iter()
+        .map(|f| (f.name.clone(), f.ops.clone()))
+        .collect();
+    for f in &mut functions {
+        let mut expanded = Vec::with_capacity(f.ops.len());
+        for op in &f.ops {
+            if let EffectOp::InternalCall {
+                callee,
+                line,
+                byte_offset,
+                branch_path,
+            } = op
+            {
+                if callee != &f.name
+                    && let Some(callee_ops) = helper_ops.get(callee)
+                {
+                    for (idx, cop) in callee_ops.iter().enumerate() {
+                        match cop {
+                            EffectOp::ReadState { var, .. } => {
+                                expanded.push(EffectOp::ReadState {
+                                    var: var.clone(),
+                                    line: *line,
+                                    byte_offset: byte_offset.saturating_add(idx),
+                                    branch_path: branch_path.clone(),
+                                });
+                            }
+                            EffectOp::WriteState {
+                                var,
+                                is_accounting,
+                                is_rhs_nominal_amount,
+                                ..
+                            } => {
+                                expanded.push(EffectOp::WriteState {
+                                    var: var.clone(),
+                                    is_accounting: *is_accounting,
+                                    is_rhs_nominal_amount: *is_rhs_nominal_amount,
+                                    line: *line,
+                                    byte_offset: byte_offset.saturating_add(idx),
+                                    branch_path: branch_path.clone(),
+                                });
+                            }
+                            EffectOp::ExternalCall {
+                                has_callback_risk,
+                                kind,
+                                in_returning_branch,
+                                ..
+                            } => {
+                                expanded.push(EffectOp::ExternalCall {
+                                    has_callback_risk: *has_callback_risk,
+                                    kind: kind.clone(),
+                                    line: *line,
+                                    byte_offset: byte_offset.saturating_add(idx),
+                                    branch_path: branch_path.clone(),
+                                    in_returning_branch: *in_returning_branch,
+                                });
+                            }
+                            EffectOp::InternalCall { .. } => {}
+                        }
+                    }
+                }
+            } else {
+                expanded.push(op.clone());
+            }
+        }
+        f.ops = expanded;
+    }
+
+    let is_proxy_like = (stripped_contract.contains("delegatecall")
+        && kind == ContractKind::Contract)
         || name.contains("Proxy")
         || bases.iter().any(|b| b.contains("Proxy"));
+
+    // Only treat the contract as fully ERC-7201 namespaced if it declares an ERC-7201 struct and is not a raw slot-0 proxy
+    let has_erc7201_namespace = has_erc7201_struct && !is_proxy_like;
 
     ParsedContract {
         name,
@@ -602,16 +939,42 @@ fn extract_contract(node: Node, src: &[u8], rel_path: &str, kind: ContractKind) 
 }
 
 fn has_inline_reentrancy_mutex(body: &str) -> bool {
-    let low = body.to_ascii_lowercase();
+    let low = smg_graph::taint::strip_comments_simple(body).to_ascii_lowercase();
     (low.contains("_locked =") || low.contains("locked =") || low.contains("_entered ="))
         && (low.contains("require(") || low.contains("revert"))
 }
 
 fn view_fn_checks_reentrancy_lock(body: &str) -> bool {
-    let low = body.to_ascii_lowercase();
+    let low = smg_graph::taint::strip_comments_simple(body).to_ascii_lowercase();
     low.contains("_reentrancyguardentered")
         || low.contains("_locked")
         || low.contains("require(!locked")
+}
+
+fn build_withdraw_probe_calldata(
+    fn_name: &str,
+    params_text: &str,
+    art: &crate::context::CompiledContractArtifact,
+) -> Vec<u8> {
+    let zero_arg_sig = format!("{fn_name}()");
+    if art.abi_functions.iter().any(|s| s == &zero_arg_sig) || params_text.trim().is_empty() {
+        return abi_selector(&zero_arg_sig).to_vec();
+    }
+    let one_eth_bytes = U256::from(1_000_000_000_000_000_000u128).to_be_bytes::<32>();
+    if let Some(sig) = art
+        .abi_functions
+        .iter()
+        .find(|s| s.starts_with(&format!("{fn_name}(")))
+    {
+        let mut cd = abi_selector(sig).to_vec();
+        if sig.contains("uint") {
+            cd.extend_from_slice(&one_eth_bytes);
+        }
+        return cd;
+    }
+    let mut cd = abi_selector(&format!("{fn_name}(uint256)")).to_vec();
+    cd.extend_from_slice(&one_eth_bytes);
+    cd
 }
 
 /// Runs all EVM/Solidity security passes on a parsed file and attaches `revm` witness proofs when available.
@@ -627,6 +990,9 @@ pub fn analyze_solidity_file(
         return (contracts, findings);
     }
 
+    let stripped_source = smg_graph::taint::strip_comments_simple(source);
+    let source_lines: Vec<&str> = stripped_source.lines().collect();
+
     for c in &contracts {
         if matches!(c.kind, ContractKind::Interface) {
             continue;
@@ -636,7 +1002,7 @@ pub fn analyze_solidity_file(
 
         for f in &c.functions {
             if f.is_constructor || matches!(f.visibility.as_str(), "internal" | "private") {
-                check_math_and_oracle_inside_fn(c, f, rel_path, &mut findings);
+                check_math_and_oracle_inside_fn(c, f, &source_lines, rel_path, &mut findings);
                 continue;
             }
 
@@ -654,27 +1020,53 @@ pub fn analyze_solidity_file(
 
             // 1. CEI / Reentrancy Effect Graph Sigma(f)
             if !is_view_or_pure && !has_lock {
-                let mut first_callback_line: Option<usize> = None;
+                struct ActiveCallSite {
+                    line: usize,
+                    byte_offset: usize,
+                    branch_path: Vec<(usize, u8)>,
+                    in_returning_branch: bool,
+                }
+                let mut active_calls: Vec<ActiveCallSite> = Vec::new();
+                let mut reported_reentrancy = false;
                 for op in &f.ops {
+                    if reported_reentrancy {
+                        break;
+                    }
                     match op {
                         EffectOp::ExternalCall {
                             has_callback_risk: true,
                             line,
+                            byte_offset,
+                            branch_path,
+                            in_returning_branch,
                             ..
                         } => {
-                            if first_callback_line.is_none() {
-                                first_callback_line = Some(*line);
-                            }
+                            active_calls.push(ActiveCallSite {
+                                line: *line,
+                                byte_offset: *byte_offset,
+                                branch_path: branch_path.clone(),
+                                in_returning_branch: *in_returning_branch,
+                            });
                         }
                         EffectOp::WriteState {
                             var,
                             is_accounting: true,
                             line,
+                            byte_offset,
+                            branch_path,
                             ..
                         } => {
-                            if let Some(call_line) = first_callback_line
-                                && *line > call_line
-                            {
+                            if let Some(call_site) = active_calls.iter().find(|cs| {
+                                *byte_offset > cs.byte_offset
+                                    && !branches_are_mutually_exclusive(
+                                        &cs.branch_path,
+                                        branch_path,
+                                    )
+                                    && (!cs.in_returning_branch
+                                        || &cs.branch_path == branch_path
+                                        || *line == cs.line)
+                            }) {
+                                let call_line = call_site.line;
                                 stale_vars_exposed_after_call
                                     .entry(var.clone())
                                     .or_insert(call_line);
@@ -683,7 +1075,8 @@ pub fn analyze_solidity_file(
                                 if let Some(art) = artifact
                                     && !art.deployed_bytecode.is_empty()
                                 {
-                                    let w_sel = abi_selector(&format!("{}()", f.name));
+                                    let w_cd =
+                                        build_withdraw_probe_calldata(&f.name, &f.params_text, art);
                                     let d_sel = art
                                         .abi_functions
                                         .iter()
@@ -692,7 +1085,7 @@ pub fn analyze_solidity_file(
                                     let wres = probe_compiled_reentrancy_in_revm(
                                         &art.deployed_bytecode,
                                         d_sel,
-                                        &w_sel,
+                                        &w_cd,
                                     );
                                     if wres.proven {
                                         conf = Confidence::Proven;
@@ -714,7 +1107,7 @@ pub fn analyze_solidity_file(
                                     confidence: conf,
                                     remediation: "Update accounting state before external calls (Checks-Effects-Interactions) and add `nonReentrant` guard.".into(),
                                 });
-                                break;
+                                reported_reentrancy = true;
                             }
                         }
                         _ => {}
@@ -744,21 +1137,23 @@ pub fn analyze_solidity_file(
                 }
 
                 for (ln, expr) in &f.unsafe_delegatecall_lines {
-                    findings.push(LocalStaticFinding {
-                        rule_id: "SMG-WEB3-ACCESS".into(),
-                        severity: "CRITICAL".into(),
-                        title: format!(
-                            "Unprotected `delegatecall` `{}` without caller authorization in `{}.{}`",
-                            expr, c.name, f.name
-                        ),
-                        rel_path: rel_path.into(),
-                        line: *ln,
-                        symbol: format!("{}.{}", c.name, f.name),
-                        sink_kind: SinkKind::AuthMutation,
-                        missing_guard: GuardKind::Auth,
-                        confidence: Confidence::Confirmed,
-                        remediation: "Restrict proxy/delegatecall upgrades strictly to owner/governance and trusted implementation slots.".into(),
-                    });
+                    if !has_auth {
+                        findings.push(LocalStaticFinding {
+                            rule_id: "SMG-WEB3-ACCESS".into(),
+                            severity: "CRITICAL".into(),
+                            title: format!(
+                                "Unprotected `delegatecall` `{}` without caller authorization in `{}.{}`",
+                                expr, c.name, f.name
+                            ),
+                            rel_path: rel_path.into(),
+                            line: *ln,
+                            symbol: format!("{}.{}", c.name, f.name),
+                            sink_kind: SinkKind::AuthMutation,
+                            missing_guard: GuardKind::Auth,
+                            confidence: Confidence::Confirmed,
+                            remediation: "Restrict proxy/delegatecall upgrades strictly to owner/governance and trusted implementation slots.".into(),
+                        });
+                    }
                 }
 
                 check_initializer_and_admin_access(
@@ -776,7 +1171,7 @@ pub fn analyze_solidity_file(
             check_signature_replay(c, f, rel_path, &mut findings);
 
             // 4. Rounding Math & Oracle Feeds
-            check_math_and_oracle_inside_fn(c, f, rel_path, &mut findings);
+            check_math_and_oracle_inside_fn(c, f, &source_lines, rel_path, &mut findings);
         }
 
         // 5. Read-Only View Reentrancy across Sigma(view_fn) reading stale accounting state
@@ -848,10 +1243,22 @@ fn check_initializer_and_admin_access(
             if let Some(art) = artifact
                 && !art.deployed_bytecode.is_empty()
             {
-                let sig = format!("{}(address)", f.name);
+                let sig = art
+                    .abi_functions
+                    .iter()
+                    .find(|s| s.starts_with(&format!("{}(", f.name)))
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        if f.params_text.trim().is_empty() {
+                            format!("{}()", f.name)
+                        } else {
+                            format!("{}(address)", f.name)
+                        }
+                    });
                 let sel = abi_selector(&sig);
+                let arg = (!sig.ends_with("()")).then_some([0xBB; 32]);
                 if let Ok((ok, writes, gas)) =
-                    probe_compiled_selector_unauth(&art.deployed_bytecode, sel, Some([0xBB; 32]))
+                    probe_compiled_selector_unauth(&art.deployed_bytecode, sel, arg)
                     && ok
                     && writes > 0
                 {
@@ -973,6 +1380,7 @@ fn check_signature_replay(
 fn check_math_and_oracle_inside_fn(
     c: &ParsedContract,
     f: &ParsedFunction,
+    source_lines: &[&str],
     rel_path: &str,
     findings: &mut Vec<LocalStaticFinding>,
 ) {
@@ -1017,9 +1425,13 @@ fn check_math_and_oracle_inside_fn(
         }
     }
 
-    // B. AST Division before Multiplication precision loss
+    // B. AST Division before Multiplication precision loss (checked per line rather than whole-function suppression)
     for ln in &f.div_before_mul_lines {
-        if !body.contains("mulDiv") {
+        let line_txt = source_lines
+            .get(ln.saturating_sub(1))
+            .copied()
+            .unwrap_or("");
+        if !line_txt.contains("mulDiv") {
             findings.push(LocalStaticFinding {
                 rule_id: "SMG-WEB3-ROUNDING".into(),
                 severity: "MEDIUM".into(),
@@ -1098,14 +1510,17 @@ fn check_math_and_oracle_inside_fn(
         || fn_low.contains("liquidat")
         || fn_low.contains("collateral")
         || fn_low.contains("value");
+    let has_pricing_math = body.contains('*') || body.contains('/');
     if is_valuation_fn
+        && has_pricing_math
         && low.contains("getreserves(")
         && !low.contains("twap")
         && !low.contains("observe(")
         && !low.contains("consult(")
         && !low.contains("latestrounddata")
     {
-        let skew = check_amm_spot_skew_bps(1_000_000, 1_000_000, 500_000);
+        let r_18dec = 1_000_000_000_000_000_000_000_000u128;
+        let skew = check_amm_spot_skew_bps(r_18dec, r_18dec, r_18dec / 2);
         findings.push(LocalStaticFinding {
             rule_id: "SMG-WEB3-ORACLE".into(),
             severity: "CRITICAL".into(),

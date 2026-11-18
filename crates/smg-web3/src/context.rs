@@ -96,11 +96,27 @@ pub struct Web3Context {
 
 /// Returns EVM byte width for common Solidity primitive/reference storage types.
 pub fn solidity_type_byte_width(raw_type: &str) -> u8 {
+    solidity_type_byte_width_with_defs(raw_type, &HashSet::new(), &HashSet::new())
+}
+
+pub fn solidity_type_byte_width_with_defs(
+    raw_type: &str,
+    enums: &HashSet<String>,
+    contracts_and_interfaces: &HashSet<String>,
+) -> u8 {
     let t = raw_type.trim();
-    if t == "bool" || t == "uint8" || t == "int8" {
+    if t == "bool" || t == "uint8" || t == "int8" || enums.contains(t) {
         return 1;
     }
-    if t == "address" || t == "address payable" {
+    if t == "address"
+        || t == "address payable"
+        || contracts_and_interfaces.contains(t)
+        || (t.starts_with('I')
+            && t.len() >= 2
+            && t.as_bytes()[1].is_ascii_uppercase()
+            && !t.contains('[')
+            && !t.contains(' '))
+    {
         return 20;
     }
     if let Some(rest) = t.strip_prefix("uint").or_else(|| t.strip_prefix("int"))
@@ -128,6 +144,24 @@ pub fn pack_storage_vars(
     vars: &[StateVarSpec],
     start_slot: u64,
 ) -> Vec<EvmSlotEntry> {
+    pack_storage_vars_with_defs(
+        contract,
+        rel_path,
+        vars,
+        start_slot,
+        &HashSet::new(),
+        &HashSet::new(),
+    )
+}
+
+pub fn pack_storage_vars_with_defs(
+    contract: &str,
+    rel_path: &str,
+    vars: &[StateVarSpec],
+    start_slot: u64,
+    enums: &HashSet<String>,
+    contracts_and_interfaces: &HashSet<String>,
+) -> Vec<EvmSlotEntry> {
     let mut entries = Vec::new();
     let mut cur_slot = start_slot;
     let mut cur_off: u8 = 0;
@@ -137,8 +171,32 @@ pub fn pack_storage_vars(
             continue;
         }
         let clean_ty = v.var_type.trim();
-        // Fixed static arrays `T[N]` reserve N slots (or packed slots)
-        let width = solidity_type_byte_width(clean_ty);
+        // Fixed static arrays `T[N]` or `T[M][N]` always start on a new 32-byte slot boundary
+        if let Some(slots_consumed) =
+            parse_fixed_array_slots_with_defs(clean_ty, enums, contracts_and_interfaces)
+        {
+            if cur_off > 0 {
+                cur_slot += 1;
+                cur_off = 0;
+            }
+            let span = slots_consumed.max(1);
+            for s in 0..span.min(64) {
+                entries.push(EvmSlotEntry {
+                    contract: contract.to_string(),
+                    var_name: v.name.clone(),
+                    var_type: clean_ty.to_string(),
+                    slot: U256::from(cur_slot + s),
+                    byte_offset: 0,
+                    byte_len: 32,
+                    rel_path: rel_path.to_string(),
+                    line: v.line,
+                });
+            }
+            cur_slot += span;
+            continue;
+        }
+
+        let width = solidity_type_byte_width_with_defs(clean_ty, enums, contracts_and_interfaces);
         if width == 32 {
             if cur_off > 0 {
                 cur_slot += 1;
@@ -154,8 +212,7 @@ pub fn pack_storage_vars(
                 rel_path: rel_path.to_string(),
                 line: v.line,
             });
-            let slots_consumed = parse_fixed_array_slots(clean_ty).unwrap_or(1);
-            cur_slot += slots_consumed;
+            cur_slot += 1;
         } else {
             if cur_off + width > 32 {
                 cur_slot += 1;
@@ -181,20 +238,38 @@ pub fn pack_storage_vars(
     entries
 }
 
-fn parse_fixed_array_slots(ty: &str) -> Option<u64> {
-    let lb = ty.rfind('[')?;
-    let rb = ty.rfind(']')?;
-    if rb <= lb + 1 {
+pub fn parse_fixed_array_slots(ty: &str) -> Option<u64> {
+    parse_fixed_array_slots_with_defs(ty, &HashSet::new(), &HashSet::new())
+}
+
+fn parse_fixed_array_slots_with_defs(
+    ty: &str,
+    enums: &HashSet<String>,
+    contracts_and_interfaces: &HashSet<String>,
+) -> Option<u64> {
+    let trimmed = ty.trim();
+    if !trimmed.ends_with(']') {
         return None;
     }
-    let count = ty[lb + 1..rb].trim().parse::<u64>().ok()?;
-    let elem = ty[..lb].trim();
-    let w = solidity_type_byte_width(elem) as u64;
+    let lb = trimmed.rfind('[')?;
+    let rb = trimmed.len() - 1;
+    if rb <= lb + 1 {
+        // Dynamic array `T[]` occupies 1 base length slot
+        return None;
+    }
+    let count = trimmed[lb + 1..rb].trim().parse::<u64>().ok()?;
+    let elem = trimmed[..lb].trim();
+    if let Some(inner_slots) =
+        parse_fixed_array_slots_with_defs(elem, enums, contracts_and_interfaces)
+    {
+        return Some(count.saturating_mul(inner_slots.max(1)).max(1));
+    }
+    let w = solidity_type_byte_width_with_defs(elem, enums, contracts_and_interfaces) as u64;
     if w == 0 || count == 0 {
         return Some(1);
     }
-    let per_slot = 32 / w;
-    Some(count.div_ceil(per_slot.max(1)))
+    let per_slot = (32 / w).max(1);
+    Some(count.div_ceil(per_slot))
 }
 
 fn is_canonical_upgrade_slot(slot: U256) -> bool {
@@ -203,7 +278,49 @@ fn is_canonical_upgrade_slot(slot: U256) -> bool {
         || slot == eip1967_beacon_slot()
 }
 
-/// Checks slot-level storage disjointness between delegatecall proxies and implementation contracts.
+fn contract_family_stem(name: &str) -> String {
+    let mut s = name.to_ascii_lowercase();
+    for token in [
+        "transparentupgradeableproxy",
+        "upgradeableproxy",
+        "uupsproxy",
+        "proxy",
+        "implementation",
+        "impl",
+        "logic",
+        "v1",
+        "v2",
+        "v3",
+    ] {
+        s = s.replace(token, "");
+    }
+    s.trim_matches('_').to_string()
+}
+
+fn are_proxy_and_impl_paired(
+    proxy_name: &str,
+    proxy_path: &str,
+    impl_name: &str,
+    impl_path: &str,
+    total_proxies: usize,
+) -> bool {
+    if proxy_path == impl_path {
+        return true;
+    }
+    let p_stem = contract_family_stem(proxy_name);
+    let i_stem = contract_family_stem(impl_name);
+    if !p_stem.is_empty() && !i_stem.is_empty() {
+        if p_stem == i_stem || p_stem.contains(&i_stem) || i_stem.contains(&p_stem) {
+            return true;
+        }
+        // Distinct explicit family stems across different files (e.g., `TokenAProxy` vs `TokenBImpl`)
+        return false;
+    }
+    // Generic proxy name (`Proxy`) pairs when it is the single proxy in the scan
+    total_proxies == 1
+}
+
+/// Checks slot-level storage disjointness between paired delegatecall proxies and implementation contracts.
 pub fn detect_proxy_storage_collisions(
     proxies: &[(String, String, Vec<EvmSlotEntry>)],
     implementations: &[(String, String, Vec<EvmSlotEntry>)],
@@ -212,8 +329,16 @@ pub fn detect_proxy_storage_collisions(
     let mut seen: HashSet<(String, usize)> = HashSet::new();
 
     for (proxy_name, proxy_path, proxy_slots) in proxies {
-        for (impl_name, _impl_path, impl_slots) in implementations {
-            if proxy_name == impl_name {
+        for (impl_name, impl_path, impl_slots) in implementations {
+            if proxy_name == impl_name
+                || !are_proxy_and_impl_paired(
+                    proxy_name,
+                    proxy_path,
+                    impl_name,
+                    impl_path,
+                    proxies.len(),
+                )
+            {
                 continue;
             }
             for ps in proxy_slots {
@@ -300,10 +425,15 @@ fn collect_json_artifacts(
     if depth > 4 || out.len() >= 128 {
         return;
     }
-    let Ok(entries) = fs::read_dir(dir) else {
+    let Ok(rd) = fs::read_dir(dir) else {
         return;
     };
-    for ent in entries.flatten() {
+    let mut entries: Vec<_> = rd.flatten().collect();
+    entries.sort_by_key(|e| e.file_name());
+    for ent in entries {
+        if out.len() >= 128 {
+            break;
+        }
         let p = ent.path();
         if p.is_dir() {
             collect_json_artifacts(&p, root, out, depth + 1);
@@ -312,12 +442,15 @@ fn collect_json_artifacts(
         if p.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
+        let Ok(meta) = ent.metadata() else {
+            continue;
+        };
+        if !meta.is_file() || meta.len() > 4 * 1024 * 1024 {
+            continue;
+        }
         let Ok(raw) = fs::read_to_string(&p) else {
             continue;
         };
-        if raw.len() > 4 * 1024 * 1024 {
-            continue;
-        }
         let Ok(val) = serde_json::from_str::<Value>(&raw) else {
             continue;
         };
@@ -327,9 +460,13 @@ fn collect_json_artifacts(
     }
 }
 
-fn decode_hex_bytecode(hex_str: &str) -> Vec<u8> {
-    let clean = hex_str.trim().strip_prefix("0x").unwrap_or(hex_str.trim());
-    if clean.is_empty() || !clean.len().is_multiple_of(2) {
+pub fn decode_hex_bytecode(hex_str: &str) -> Vec<u8> {
+    let trimmed = hex_str.trim();
+    let clean = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed);
+    if clean.is_empty() || !clean.is_ascii() || !clean.len().is_multiple_of(2) {
         return Vec::new();
     }
     let mut out = Vec::with_capacity(clean.len() / 2);
@@ -419,25 +556,44 @@ fn parse_foundry_or_hardhat_artifact(
                 .get("type")
                 .and_then(|v| v.as_str())
                 .unwrap_or("t_uint256");
-            let byte_len = val
+            let total_bytes = val
                 .pointer(&format!("/storageLayout/types/{ty_id}/numberOfBytes"))
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse::<u8>().ok())
+                .and_then(|v| {
+                    v.as_str()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .or_else(|| v.as_u64())
+                })
                 .unwrap_or(32);
             let ty_label = val
                 .pointer(&format!("/storageLayout/types/{ty_id}/label"))
                 .and_then(|v| v.as_str())
                 .unwrap_or(ty_id);
-            storage_slots.push(EvmSlotEntry {
-                contract: contract_name.clone(),
-                var_name: label.to_string(),
-                var_type: ty_label.to_string(),
-                slot,
-                byte_offset: offset,
-                byte_len,
-                rel_path: rel_path.clone(),
-                line: 1,
-            });
+            if total_bytes <= 32 {
+                storage_slots.push(EvmSlotEntry {
+                    contract: contract_name.clone(),
+                    var_name: label.to_string(),
+                    var_type: ty_label.to_string(),
+                    slot,
+                    byte_offset: offset,
+                    byte_len: total_bytes.max(1) as u8,
+                    rel_path: rel_path.clone(),
+                    line: 1,
+                });
+            } else {
+                let num_slots = total_bytes.div_ceil(32).min(64);
+                for s in 0..num_slots {
+                    storage_slots.push(EvmSlotEntry {
+                        contract: contract_name.clone(),
+                        var_name: label.to_string(),
+                        var_type: ty_label.to_string(),
+                        slot: slot.wrapping_add(U256::from(s)),
+                        byte_offset: 0,
+                        byte_len: 32,
+                        rel_path: rel_path.clone(),
+                        line: 1,
+                    });
+                }
+            }
         }
     }
 
@@ -465,6 +621,18 @@ mod tests {
         );
         let ns = erc7201_namespace_slot("openzeppelin.storage.Ownable");
         assert_eq!(ns.to_be_bytes::<32>()[31], 0);
+        // Official EIP-7201 specification test vectors:
+        assert_eq!(
+            format!("{:#066x}", erc7201_namespace_slot("example.main")),
+            "0x183a6125c38840424c4a85fa12bab2ab606c4b6d0e7cc73c0c06ba5300eab500"
+        );
+        assert_eq!(
+            format!(
+                "{:#066x}",
+                erc7201_namespace_slot("openzeppelin.storage.ERC20")
+            ),
+            "0x52c63247e1f47db19d5ce0460030c497f067ca4cebf71ba98eeadabe20bace00"
+        );
 
         let key = [0xAA; 32];
         let s1 = mapping_storage_slot(key, U256::ZERO);
@@ -477,7 +645,7 @@ mod tests {
     }
 
     #[test]
-    fn packs_slots_and_detects_proxy_collision_while_sparing_identical_layout() {
+    fn packs_slots_multidim_arrays_and_pairs_proxies_without_cross_contract_fp() {
         let proxy_vars = vec![
             StateVarSpec {
                 name: "implementation".into(),
@@ -500,15 +668,51 @@ mod tests {
         }];
         let p_slots = pack_storage_vars("BadProxy", "contracts/Proxy.sol", &proxy_vars, 0);
         let i_slots = pack_storage_vars("ImplBad", "contracts/Impl.sol", &impl_bad, 0);
-        // `implementation` (20B) + `paused` (1B) pack into slot 0, colliding with Impl.owner at slot 0.
         assert_eq!(p_slots[0].slot, U256::ZERO);
         assert_eq!(p_slots[1].slot, U256::ZERO);
         assert_eq!(p_slots[1].byte_offset, 20);
         let hits = detect_proxy_storage_collisions(
-            &[("BadProxy".into(), "contracts/Proxy.sol".into(), p_slots)],
-            &[("ImplBad".into(), "contracts/Impl.sol".into(), i_slots)],
+            &[(
+                "BadProxy".into(),
+                "contracts/Proxy.sol".into(),
+                p_slots.clone(),
+            )],
+            &[(
+                "ImplBad".into(),
+                "contracts/Impl.sol".into(),
+                i_slots.clone(),
+            )],
         );
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].rule_id, "SMG-WEB3-STORAGE");
+
+        // Unrelated proxy/impl stems in separate files (`TokenAProxy` vs `StakingRewardsImpl`) must not collide
+        let unrelated = detect_proxy_storage_collisions(
+            &[
+                (
+                    "TokenAProxy".into(),
+                    "contracts/TokenAProxy.sol".into(),
+                    p_slots.clone(),
+                ),
+                (
+                    "TokenBProxy".into(),
+                    "contracts/TokenBProxy.sol".into(),
+                    p_slots,
+                ),
+            ],
+            &[(
+                "StakingRewardsImpl".into(),
+                "contracts/StakingRewardsImpl.sol".into(),
+                i_slots,
+            )],
+        );
+        assert!(unrelated.is_empty());
+
+        // Multi-dimensional fixed array `uint256[2][3]` consumes 2 * 3 = 6 slots
+        assert_eq!(parse_fixed_array_slots("uint256[2][3]"), Some(6));
+        assert_eq!(parse_fixed_array_slots("uint128[4]"), Some(2));
+
+        // Non-ASCII hex string in decode_hex_bytecode must not panic on UTF-8 boundary
+        assert!(decode_hex_bytecode("0x€a").is_empty());
     }
 }

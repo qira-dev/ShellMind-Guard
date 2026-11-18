@@ -1667,7 +1667,7 @@ fn insert_shorter(best: &mut HashMap<(String, String), LatticeFinding>, cand: La
     }
 }
 
-fn proof_reasons_for_static_rule(rule_id: &str) -> Vec<String> {
+fn proof_reasons_for_static_rule(rule_id: &str, confidence: Confidence) -> Vec<String> {
     if rule_id.starts_with("SMG-CICD-") {
         vec!["YamlStructuralAudit".into(), "ExpressionInjection".into()]
     } else if rule_id.starts_with("SMG-K8S-") || rule_id == "SMG-CFG-DOCKER" {
@@ -1686,10 +1686,14 @@ fn proof_reasons_for_static_rule(rule_id: &str) -> Vec<String> {
             "ReducedProductInterval".into(),
         ]
     } else if rule_id.starts_with("SMG-WEB3-") {
-        vec![
-            "Web3StorageEffectGraph".into(),
-            "RevmConcreteExecutionOracle".into(),
-        ]
+        if matches!(confidence, Confidence::Proven) {
+            vec![
+                "Web3StorageEffectGraph".into(),
+                "RevmConcreteExecutionOracle".into(),
+            ]
+        } else {
+            vec!["Web3StorageEffectGraph".into()]
+        }
     } else if rule_id.starts_with("SMG-PQC-") {
         vec![
             "PostQuantumBitReductionLattice".into(),
@@ -1714,10 +1718,30 @@ pub fn append_local_static_findings(
     let mut seq = findings.len();
     for sf in extra {
         let entry_route = format!("{}:{}", sf.rel_path, sf.line);
-        if findings
-            .iter()
-            .any(|f| f.rule_id == sf.rule_id && f.entry_route == entry_route)
-        {
+        if let Some(existing) = findings.iter_mut().find(|f| {
+            f.entry_route == entry_route
+                && (f.rule_id == sf.rule_id
+                    || (f.rule_id == "SMG-MEM-BOUNDS" && sf.rule_id == "SMG-HW-BOUNDS")
+                    || (f.rule_id == "SMG-HW-BOUNDS" && sf.rule_id == "SMG-MEM-BOUNDS"))
+        }) {
+            let should_replace = (existing.rule_id == "SMG-MEM-BOUNDS"
+                && sf.rule_id == "SMG-HW-BOUNDS")
+                || (matches!(sf.confidence, Confidence::Proven)
+                    && !matches!(existing.confidence, Confidence::Proven))
+                || (sf.severity == "CRITICAL" && existing.severity != "CRITICAL");
+            if should_replace {
+                existing.rule_id = sf.rule_id.clone();
+                existing.severity = sf.severity.clone();
+                existing.title = sf.title.clone();
+                existing.confidence = sf.confidence;
+                existing.status = if matches!(sf.confidence, Confidence::Proven) {
+                    "PROVEN".into()
+                } else {
+                    "SUSPECT_UNGUARDED".into()
+                };
+                existing.remediation = sf.remediation.clone();
+                existing.proof_reasons = proof_reasons_for_static_rule(&sf.rule_id, sf.confidence);
+            }
             continue;
         }
         seq += 1;
@@ -1743,7 +1767,7 @@ pub fn append_local_static_findings(
                 line: sf.line,
             }],
             remediation: sf.remediation.clone(),
-            proof_reasons: proof_reasons_for_static_rule(&sf.rule_id),
+            proof_reasons: proof_reasons_for_static_rule(&sf.rule_id, sf.confidence),
         });
     }
 }
@@ -1783,7 +1807,7 @@ fn insert_static_finding(
             line: sf.line,
         }],
         remediation: sf.remediation.clone(),
-        proof_reasons: proof_reasons_for_static_rule(&sf.rule_id),
+        proof_reasons: proof_reasons_for_static_rule(&sf.rule_id, sf.confidence),
     });
 }
 

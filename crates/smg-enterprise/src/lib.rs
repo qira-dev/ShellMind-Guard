@@ -80,8 +80,9 @@ mod tests {
             authority_pubkey_32: pubkey,
         };
 
+        // Also verify subpath preservation (`/tee-gw` -> `/tee-gw/v1/attest-and-scan`)
         let (session, resp) = execute_remote_tee_scan(
-            &format!("http://127.0.0.1:{port}"),
+            &format!("http://127.0.0.1:{port}/tee-gw"),
             &files,
             None,
             &policy,
@@ -92,5 +93,29 @@ mod tests {
         assert_eq!(session.pcr0_verified, pcr0);
         assert_eq!(resp.scan_elapsed_ms, 12);
         handle.join().unwrap();
+
+        // Counterexample ENT-03: > 256 files must fail closed instead of silently truncating
+        let mut too_many_files = Vec::new();
+        for idx in 0..257 {
+            too_many_files.push(IndexedFile {
+                rel_path: format!("src/f_{idx}.ts"),
+                abs_path: Path::new("src/app.ts").to_path_buf(),
+                language: Language::TypeScript,
+                blake3_hash: "0".into(),
+                mtime_ns: 0,
+                size_bytes: 2,
+                cached_bytes: Some(b"1;".to_vec()),
+            });
+        }
+        let err_many = execute_remote_tee_scan(
+            &format!("http://127.0.0.1:{port}"),
+            &too_many_files,
+            None,
+            &policy,
+            now,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err_many.contains("exceeds 256-file enclave payload limit"));
     }
 }

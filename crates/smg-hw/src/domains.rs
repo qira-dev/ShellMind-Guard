@@ -10,6 +10,15 @@ pub struct Tnum {
 }
 
 impl Tnum {
+    #[inline]
+    pub const fn width_mask(width_bits: u32) -> u64 {
+        if width_bits == 0 || width_bits >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << width_bits) - 1
+        }
+    }
+
     pub const fn constant(v: u64) -> Self {
         Self { value: v, mask: 0 }
     }
@@ -19,6 +28,21 @@ impl Tnum {
             value: 0,
             mask: u64::MAX,
         }
+    }
+
+    pub const fn unknown_with_width(width_bits: u32) -> Self {
+        Self {
+            value: 0,
+            mask: Self::width_mask(width_bits),
+        }
+    }
+
+    #[inline]
+    pub const fn masked(self, width_bits: u32) -> Self {
+        let wm = Self::width_mask(width_bits);
+        let m = self.mask & wm;
+        let v = (self.value & wm) & !m;
+        Self { value: v, mask: m }
     }
 
     pub fn from_range(umin: u64, umax: u64) -> Self {
@@ -95,6 +119,12 @@ impl Tnum {
         }
     }
 
+    pub fn tnum_add_width(self, other: Self, width_bits: u32) -> Self {
+        self.masked(width_bits)
+            .tnum_add(other.masked(width_bits))
+            .masked(width_bits)
+    }
+
     pub fn min_u64(self) -> u64 {
         self.value
     }
@@ -118,52 +148,58 @@ pub struct WrappedInterval {
 
 impl WrappedInterval {
     pub fn constant_signed(val: i64, width_bits: u32) -> Self {
-        let uval = if width_bits == 32 {
-            (val as i32 as u32) as u64
+        let (sval, uval) = if width_bits == 32 {
+            let v32 = val as i32;
+            (v32 as i64, (v32 as u32) as u64)
         } else {
-            val as u64
+            (val, val as u64 & Tnum::width_mask(width_bits))
         };
         Self {
-            smin: val,
-            smax: val,
+            smin: sval,
+            smax: sval,
             umin: uval,
             umax: uval,
-            tnum: Tnum::constant(uval),
+            tnum: Tnum::constant(uval).masked(width_bits),
             signed_wrap: false,
             width_bits,
         }
     }
 
     pub fn signed_range(smin: i64, smax: i64, width_bits: u32) -> Self {
+        let (mut smin, mut smax) = if smin <= smax {
+            (smin, smax)
+        } else {
+            (smax, smin)
+        };
+        if width_bits == 32 {
+            smin = smin.clamp(i32::MIN as i64, i32::MAX as i64);
+            smax = smax.clamp(i32::MIN as i64, i32::MAX as i64);
+        }
+        let max_w = Tnum::width_mask(width_bits);
         let mut out = if smin >= 0 {
-            let umin = smin as u64;
-            let umax = smax as u64;
+            let umin = (smin as u64) & max_w;
+            let umax = (smax as u64) & max_w;
             Self {
                 smin,
                 smax,
                 umin,
                 umax,
-                tnum: Tnum::from_range(umin, umax),
+                tnum: Tnum::from_range(umin, umax).masked(width_bits),
                 signed_wrap: false,
                 width_bits,
             }
         } else {
-            let max_w = if width_bits == 32 {
-                u32::MAX as u64
-            } else {
-                u64::MAX
-            };
             let min_neg_u = if width_bits == 32 {
                 (smin as i32 as u32) as u64
             } else {
-                smin as u64
+                (smin as u64) & max_w
             };
             let umax = if smax >= 0 {
                 max_w
             } else if width_bits == 32 {
                 (smax as i32 as u32) as u64
             } else {
-                smax as u64
+                (smax as u64) & max_w
             };
             Self {
                 smin,
@@ -171,9 +207,9 @@ impl WrappedInterval {
                 umin: if smax >= 0 { 0 } else { min_neg_u },
                 umax,
                 tnum: if smax >= 0 {
-                    Tnum::unknown()
+                    Tnum::unknown_with_width(width_bits)
                 } else {
-                    Tnum::from_range(min_neg_u, umax)
+                    Tnum::from_range(min_neg_u, umax).masked(width_bits)
                 },
                 signed_wrap: false,
                 width_bits,
@@ -184,37 +220,79 @@ impl WrappedInterval {
     }
 
     pub fn from_u64_bounds(umin: u64, umax: u64, width_bits: u32) -> Self {
+        let wmask = Tnum::width_mask(width_bits);
+        let umin = umin & wmask;
+        let umax = (umax & wmask).max(umin);
+        let sign_bit = if width_bits == 32 {
+            1u64 << 31
+        } else if width_bits > 0 && width_bits < 64 {
+            1u64 << (width_bits - 1)
+        } else {
+            1u64 << 63
+        };
+        let (smin, smax) = if umax < sign_bit {
+            (umin as i64, umax as i64)
+        } else if umin >= sign_bit {
+            if width_bits == 32 {
+                ((umin as u32 as i32) as i64, (umax as u32 as i32) as i64)
+            } else {
+                (umin as i64, umax as i64)
+            }
+        } else if width_bits == 32 {
+            (i32::MIN as i64, i32::MAX as i64)
+        } else {
+            (i64::MIN, i64::MAX)
+        };
         let mut s = Self {
-            smin: 0,
-            smax: i64::MAX,
+            smin,
+            smax,
             umin,
             umax,
-            tnum: Tnum::from_range(umin, umax),
+            tnum: Tnum::from_range(umin, umax).masked(width_bits),
             signed_wrap: false,
             width_bits,
         };
-        if umax <= i64::MAX as u64 {
-            s.smin = umin as i64;
-            s.smax = umax as i64;
-        }
         s.reduce();
         s
     }
 
     /// Reduced-product refinement `I_w ⋈ T_w` until fixed point.
     pub fn reduce(&mut self) {
+        let wmask = Tnum::width_mask(self.width_bits);
+        self.tnum = self.tnum.masked(self.width_bits);
+        self.umin &= wmask;
+        self.umax &= wmask;
+
         for _ in 0..4 {
             let prev = (self.umin, self.umax, self.tnum);
-            self.umin = self.umin.max(self.tnum.min_u64());
-            self.umax = self.umax.min(self.tnum.max_u64());
+            let tmin = self.tnum.min_u64();
+            let tmax = self.tnum.max_u64();
+            if tmin > self.umax || tmax < self.umin {
+                // Disjoint interval and tnum: clamp to single witness point to preserve `umin <= umax`.
+                let witness = tmin.clamp(self.umin, self.umax);
+                self.umin = witness;
+                self.umax = witness;
+                self.tnum = Tnum::constant(witness).masked(self.width_bits);
+                break;
+            }
+            self.umin = self.umin.max(tmin);
+            self.umax = self.umax.min(tmax);
             if self.umin <= self.umax {
-                let prefix_tnum = Tnum::from_range(self.umin, self.umax);
+                let prefix_tnum = Tnum::from_range(self.umin, self.umax).masked(self.width_bits);
+                let conflict =
+                    (self.tnum.value ^ prefix_tnum.value) & !(self.tnum.mask | prefix_tnum.mask);
+                if conflict != 0 {
+                    // Known bits conflict between interval prefix and tnum; preserve valid range prefix.
+                    self.tnum = prefix_tnum;
+                    break;
+                }
                 let combined_mask = self.tnum.mask & prefix_tnum.mask;
                 let combined_val = (self.tnum.value | prefix_tnum.value) & !combined_mask;
                 self.tnum = Tnum {
                     value: combined_val,
                     mask: combined_mask,
-                };
+                }
+                .masked(self.width_bits);
             }
             if (self.umin, self.umax, self.tnum) == prev {
                 break;
@@ -232,7 +310,8 @@ impl WrappedInterval {
     }
 
     pub fn signed_add(self, rhs: Self) -> Self {
-        let (min_limit, max_limit) = if self.width_bits == 32 {
+        let width_bits = self.width_bits;
+        let (min_limit, max_limit) = if width_bits == 32 {
             (i32::MIN as i128, i32::MAX as i128)
         } else {
             (i64::MIN as i128, i64::MAX as i128)
@@ -240,24 +319,23 @@ impl WrappedInterval {
         let lo = self.smin as i128 + rhs.smin as i128;
         let hi = self.smax as i128 + rhs.smax as i128;
         let wrapped = lo < min_limit || hi > max_limit;
+        let sum_tnum = self.tnum.tnum_add_width(rhs.tnum, width_bits);
         if wrapped {
-            let max_u = if self.width_bits == 32 {
-                u32::MAX as u64
-            } else {
-                u64::MAX
-            };
-            Self {
+            let max_u = Tnum::width_mask(width_bits);
+            let mut res = Self {
                 smin: min_limit as i64,
                 smax: max_limit as i64,
                 umin: 0,
                 umax: max_u,
-                tnum: self.tnum.tnum_add(rhs.tnum),
+                tnum: sum_tnum,
                 signed_wrap: true,
-                width_bits: self.width_bits,
-            }
+                width_bits,
+            };
+            res.reduce();
+            res
         } else {
-            let mut res = Self::signed_range(lo as i64, hi as i64, self.width_bits);
-            res.tnum = self.tnum.tnum_add(rhs.tnum);
+            let mut res = Self::signed_range(lo as i64, hi as i64, width_bits);
+            res.tnum = sum_tnum;
             res.reduce();
             res
         }
@@ -306,12 +384,10 @@ impl SparseOctagon {
         node ^ 1
     }
 
-    /// Adds relational difference constraint `node_a - node_b <= c` while keeping coherent involution `M[b^][a^]`.
-    pub fn add_diff(&mut self, node_a: usize, node_b: usize, c: i64) {
+    fn add_diff_i128(&mut self, node_a: usize, node_b: usize, ci: i128) {
         if self.overflowed_pack_cap || node_a >= self.num_vars * 2 || node_b >= self.num_vars * 2 {
             return;
         }
-        let ci = c as i128;
         let p1 = self.idx(node_a, node_b);
         let p2 = self.idx(Self::bar(node_b), Self::bar(node_a));
         if ci < self.dbm[p1] {
@@ -322,22 +398,27 @@ impl SparseOctagon {
         }
     }
 
+    /// Adds relational difference constraint `node_a - node_b <= c` while keeping coherent involution `M[b^][a^]`.
+    pub fn add_diff(&mut self, node_a: usize, node_b: usize, c: i64) {
+        self.add_diff_i128(node_a, node_b, c as i128);
+    }
+
     /// Constrains `var_a + var_b <= c` (i.e. `v_a^+ - v_b^- <= c`).
     pub fn add_sum_le(&mut self, var_a: usize, var_b: usize, c: i64) {
-        self.add_diff(var_a * 2, var_b * 2 + 1, c);
+        self.add_diff_i128(var_a * 2, var_b * 2 + 1, c as i128);
     }
 
-    /// Constrains `var <= c` (`v^+ - v^- <= 2*c`).
+    /// Constrains `var <= c` (`v^+ - v^- <= 2*c`) using wide `i128` scaling so `c > i64::MAX / 2` never saturates.
     pub fn add_upper_bound(&mut self, var: usize, c: i64) {
-        self.add_diff(var * 2, var * 2 + 1, c.saturating_mul(2));
+        self.add_diff_i128(var * 2, var * 2 + 1, (c as i128) * 2);
     }
 
-    /// Constrains `var >= c` (`v^- - v^+ <= -2*c`).
+    /// Constrains `var >= c` (`v^- - v^+ <= -2*c`) using wide `i128` negation & scaling so `i64::MIN` never saturates.
     pub fn add_lower_bound(&mut self, var: usize, c: i64) {
-        self.add_diff(var * 2 + 1, var * 2, c.saturating_neg().saturating_mul(2));
+        self.add_diff_i128(var * 2 + 1, var * 2, -(c as i128) * 2);
     }
 
-    /// Floyd-Warshall + Miné strong closure returning `false` on unsatisfiable negative cycle.
+    /// Floyd-Warshall + Miné strong integer closure returning `false` on unsatisfiable negative cycle.
     pub fn close(&mut self) -> bool {
         if self.overflowed_pack_cap {
             return true;
@@ -362,19 +443,36 @@ impl SparseOctagon {
                 }
             }
         }
-        // Miné tightening: M[i][j] = min(M[i][j], floor((M[i][i^] + M[j^][j]) / 2))
+        // Step 1: Miné unary integer tightening: 2*v_i <= M[i][i^] ==> M[i][i^] = 2 * floor(M[i][i^] / 2)
         for i in 0..dim {
-            if self.dbm[self.idx(i, i)] < 0 {
-                return false;
+            let ii_bar = self.idx(i, Self::bar(i));
+            if self.dbm[ii_bar] < Self::INF {
+                self.dbm[ii_bar] = self.dbm[ii_bar].div_euclid(2) * 2;
             }
+        }
+        // Step 2: Miné binary tightening: M[i][j] = min(M[i][j], floor(M[i][i^]/2) + floor(M[j^][j]/2))
+        for i in 0..dim {
+            let m_ii_bar = self.dbm[self.idx(i, Self::bar(i))];
+            if m_ii_bar >= Self::INF {
+                continue;
+            }
+            let half_i = m_ii_bar.div_euclid(2);
             for j in 0..dim {
-                let c_half = (self.dbm[self.idx(i, Self::bar(i))]
-                    .saturating_add(self.dbm[self.idx(Self::bar(j), j)]))
-                    / 2;
+                let m_jbar_j = self.dbm[self.idx(Self::bar(j), j)];
+                if m_jbar_j >= Self::INF {
+                    continue;
+                }
+                let c_half = half_i.saturating_add(m_jbar_j.div_euclid(2));
                 let ij = self.idx(i, j);
                 if c_half < self.dbm[ij] {
                     self.dbm[ij] = c_half;
                 }
+            }
+        }
+        // Step 3: Check negative self-cycles after integer tightening (catches Z-unsatisfiable 2x <= 1 && -2x <= -1)
+        for i in 0..dim {
+            if self.dbm[self.idx(i, i)] < 0 {
+                return false;
             }
         }
         true
@@ -388,7 +486,7 @@ impl SparseOctagon {
         if raw >= Self::INF / 2 {
             None
         } else {
-            Some((raw / 2) as i64)
+            i64::try_from(raw.div_euclid(2)).ok()
         }
     }
 
@@ -424,7 +522,31 @@ mod tests {
     }
 
     #[test]
-    fn sparse_octagon_proves_dma_bounds_under_cap() {
+    fn wrapped_interval_32bit_signed_add_and_sign_boundaries_are_sound() {
+        // Counterexample HW-01a: (-1) + 1 in 32-bit width must wrap tnum to 0, never umin = 2^32 > umax = 0
+        let neg_one = WrappedInterval::constant_signed(-1, 32);
+        let pos_one = WrappedInterval::constant_signed(1, 32);
+        let zero = neg_one.signed_add(pos_one);
+        assert_eq!(zero.smin, 0);
+        assert_eq!(zero.smax, 0);
+        assert_eq!(zero.umin, 0);
+        assert_eq!(zero.umax, 0);
+        assert_eq!(zero.tnum, Tnum::constant(0));
+
+        // Counterexample HW-01b: 32-bit unsigned range [0x8000_0000, 0xFFFF_FFFF] is negative in i32
+        let high_u32 = WrappedInterval::from_u64_bounds(0x8000_0000, 0xFFFF_FFFF, 32);
+        assert_eq!(high_u32.smin, i32::MIN as i64);
+        assert_eq!(high_u32.smax, -1);
+        assert!(high_u32.can_wrap_negative_to_large_size());
+
+        // Counterexample HW-01c: 64-bit full unsigned range [0, u64::MAX] spans i64::MIN..=i64::MAX
+        let full_u64 = WrappedInterval::from_u64_bounds(0, u64::MAX, 64);
+        assert_eq!(full_u64.smin, i64::MIN);
+        assert_eq!(full_u64.smax, i64::MAX);
+    }
+
+    #[test]
+    fn sparse_octagon_proves_dma_bounds_and_tightens_integers_without_overflow() {
         // off (0) <= 64, len (1) <= 128 -> off + len <= 192 <= cap (256)
         let mut oct = SparseOctagon::new(2);
         oct.add_upper_bound(0, 64);
@@ -432,6 +554,20 @@ mod tests {
         assert!(oct.close());
         assert!(oct.proves_sum_le(0, 1, 256));
         assert!(!oct.proves_sum_le(0, 1, 160));
+
+        // Counterexample HW-02a: large bound x <= 2^62 must not saturate i64::MAX and falsely prove 2x <= i64::MAX
+        let mut large_oct = SparseOctagon::new(1);
+        let big = 1i64 << 62;
+        large_oct.add_upper_bound(0, big);
+        assert!(large_oct.close());
+        assert_eq!(large_oct.upper_bound(0), Some(big));
+        assert!(!large_oct.proves_sum_le(0, 0, i64::MAX));
+
+        // Counterexample HW-02b: Z-unsatisfiable system 2x <= 1 && -2x <= -1 (x in [0.5, 0.5]) must return false on close()
+        let mut z_unsat = SparseOctagon::new(1);
+        z_unsat.add_diff(0, 1, 1); // 2x <= 1
+        z_unsat.add_diff(1, 0, -1); // -2x <= -1
+        assert!(!z_unsat.close());
 
         // Beyond MAX_OCTAGON_VARS=12 degrades safely without blowup
         let capped = SparseOctagon::new(MAX_OCTAGON_VARS + 1);

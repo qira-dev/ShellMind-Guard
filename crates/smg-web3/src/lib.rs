@@ -7,10 +7,20 @@ use context::{EvmSlotEntry, detect_proxy_storage_collisions, ingest_web3_context
 use smg_core::{IndexedFile, Language};
 use smg_graph::LocalStaticFinding;
 use solidity::{ContractKind, analyze_solidity_file};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use svm_move::{analyze_move_file, analyze_solana_rust_file, is_solana_rust_source};
+
+fn severity_rank(sev: &str) -> u8 {
+    match sev {
+        "CRITICAL" => 4,
+        "HIGH" => 3,
+        "MEDIUM" => 2,
+        "LOW" => 1,
+        _ => 0,
+    }
+}
 
 /// Returns `true` only when a repository contains Solidity, Move, Solana/Anchor, or EVM Foundry/Hardhat
 /// indicators — guaranteeing zero latency overhead on pure Web2/AppSec repositories.
@@ -28,10 +38,11 @@ pub fn repo_has_web3_indicators(project_root: &Path, files: &[IndexedFile]) -> b
         match f.language {
             Language::Solidity | Language::Move => return true,
             Language::Rust => {
-                if let Some(text) = read_indexed_text(f)
-                    && is_solana_rust_source(&text)
-                {
-                    return true;
+                if let Some(text) = read_indexed_text(f) {
+                    let stripped = smg_graph::taint::strip_comments_simple(&text);
+                    if is_solana_rust_source(&stripped) {
+                        return true;
+                    }
                 }
             }
             _ => {}
@@ -112,10 +123,21 @@ pub fn scan_web3_repo(
 
     all_findings.extend(detect_proxy_storage_collisions(&proxies, &impls));
 
-    // Deterministic deduplication by (rule_id, rel_path, line)
-    let mut seen: HashSet<(String, String, usize)> = HashSet::new();
-    all_findings.retain(|f| seen.insert((f.rule_id.clone(), f.rel_path.clone(), f.line)));
-    all_findings
+    // Deterministic deduplication by (rule_id, rel_path, line) retaining highest severity
+    let mut best_by_key: HashMap<(String, String, usize), usize> = HashMap::new();
+    let mut deduped: Vec<LocalStaticFinding> = Vec::new();
+    for f in all_findings {
+        let key = (f.rule_id.clone(), f.rel_path.clone(), f.line);
+        if let Some(&idx) = best_by_key.get(&key) {
+            if severity_rank(&f.severity) > severity_rank(&deduped[idx].severity) {
+                deduped[idx] = f;
+            }
+        } else {
+            best_by_key.insert(key, deduped.len());
+            deduped.push(f);
+        }
+    }
+    deduped
 }
 
 #[cfg(test)]
@@ -159,9 +181,6 @@ mod tests {
         let root = std::env::temp_dir().join(format!("smg_web3_matrix_{nanos}"));
         fs::create_dir_all(root.join("out")).unwrap();
 
-        // Real vulnerable vault compiled runtime bytecode supporting:
-        // - deposit() when CALLVALUE > 0: SSTORE(0, CALLVALUE)
-        // - withdraw() when CALLVALUE == 0: SLOAD(0) -> CALL caller -> SSTORE(0, 0) (CEI violation)
         let vuln_vault_bytecode_hex = "0x3415600a5734600055005b6000548015602a57600060006000600084336207a120f150506000600055005b5000";
         fs::write(
             root.join("out/VulnVault.json"),
@@ -388,5 +407,199 @@ module vault::safe_core {
         );
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn web3_audit_counterexamples_zero_false_positives_and_strict_detection() {
+        let dir = Path::new("/tmp");
+
+        // 1. Benign counterexamples that MUST produce 0 false positives:
+        // - Mutually exclusive if/else call vs state write
+        // - Early-return call branch before state write
+        // - Inherited custom auth/lock modifiers from base contract
+        // - Anchor `#[account(has_one=authority)]` without space + CPI with `Program<'info, Token>` in `Context<SafeCpi>`
+        // - Move `coin::split` guarded by `>= 1` and helper `public fun init(val: u64)` without `TxContext`
+        let benign_sol = r#"
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+abstract contract BaseGuards {
+    address public gov;
+    uint256 private _entered;
+    modifier checkGov() {
+        require(msg.sender == gov, "not gov");
+        _;
+    }
+    modifier guardEntered() {
+        require(_entered == 0, "busy");
+        _entered = 1;
+        _;
+        _entered = 0;
+    }
+}
+
+contract SafePatterns is BaseGuards {
+    mapping(address => uint256) public balances;
+
+    function setAdmin(address nextGov) external checkGov {
+        gov = nextGov;
+    }
+
+    function branchDisjoint(bool payDirect, uint256 amt) external {
+        if (payDirect) {
+            (bool ok, ) = msg.sender.call{value: amt}("");
+            require(ok);
+        } else {
+            balances[msg.sender] = 0;
+        }
+    }
+
+    function guardedByInheritedLock(uint256 amt) external guardEntered {
+        (bool ok, ) = msg.sender.call{value: amt}("");
+        require(ok);
+        balances[msg.sender] = 0;
+    }
+}
+"#;
+        let benign_anchor = r#"
+use anchor_lang::prelude::*;
+
+#[derive(Accounts)]
+pub struct SafeCpi<'info> {
+    pub authority: Signer<'info>,
+    #[account(mut, has_one=authority)]
+    pub vault: UncheckedAccount<'info>,
+    pub token_program: Program<'info, Token>,
+}
+
+pub fn run_safe_cpi(ctx: Context<SafeCpi>) -> ProgramResult {
+    solana_program::program::invoke(&ix, &[ctx.accounts.token_program.to_account_info()])
+}
+"#;
+        let benign_move = r#"
+module vault::benign_move {
+    public fun init(default_val: u64): u64 {
+        default_val
+    }
+    public entry fun admin_set(_cap: &AdminCap, amount: u64, ctx: &mut TxContext) {
+        assert!(amount >= 1, 0);
+        coin::split(&mut coin_obj, amount, ctx);
+    }
+}
+"#;
+        let benign_files = vec![
+            mem_indexed("contracts/SafePatterns.sol", Language::Solidity, benign_sol),
+            mem_indexed("programs/benign.rs", Language::Rust, benign_anchor),
+            mem_indexed("sources/benign.move", Language::Move, benign_move),
+        ];
+        let benign_hits = scan_web3_repo(dir, &benign_files, true);
+        assert!(
+            benign_hits.is_empty(),
+            "Audited benign Web3 counterexamples must produce 0 false positives, got: {benign_hits:#?}"
+        );
+
+        // 2. Subtle true-positive counterexamples that MUST be caught:
+        // - Commented-out `// require(msg.sender == owner);` and dead `address s = msg.sender;` in `setOwner`
+        // - Same-line CEI violation `(bool ok,) = msg.sender.call{value: b}(""); balances[msg.sender] = 0;`
+        // - Intra-contract internal helper call `_sendEth(b)` before `balances[msg.sender] = 0;`
+        // - Move `set_capacity(vault: &mut Vault, capacity: u64)` where parameter name contains "cap" but type is `u64`
+        // - Solana file with both a safe instruction checking `authority.is_signer` and an unsafe `UncheckedAccount` struct
+        let subtle_sol = r#"
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+contract SubtleVuln {
+    address public owner;
+    mapping(address => uint256) public balances;
+
+    function setOwner(address newOwner) external {
+        // require(msg.sender == owner);
+        address caller = msg.sender;
+        owner = newOwner;
+    }
+
+    function sameLineWithdraw(uint256 b) external {
+        (bool ok, ) = msg.sender.call{value: b}(""); balances[msg.sender] = 0;
+    }
+
+    function _doSend(uint256 b) internal {
+        (bool ok, ) = msg.sender.call{value: b}("");
+        require(ok);
+    }
+
+    function helperWithdraw(uint256 b) external {
+        _doSend(b);
+        balances[msg.sender] = 0;
+    }
+}
+"#;
+        let subtle_anchor = r#"
+use anchor_lang::prelude::*;
+
+#[derive(Accounts)]
+pub struct CheckedCtx<'info> {
+    pub authority: AccountInfo<'info>,
+}
+
+#[derive(Accounts)]
+pub struct UncheckedCtx<'info> {
+    pub authority: AccountInfo<'info>,
+}
+
+pub fn checked_ix(ctx: Context<CheckedCtx>) -> ProgramResult {
+    if !ctx.accounts.authority.is_signer { return Err(ProgramError::MissingRequiredSignature); }
+    Ok(())
+}
+
+pub fn unchecked_ix(_ctx: Context<UncheckedCtx>) -> ProgramResult {
+    Ok(())
+}
+"#;
+        let subtle_move = r#"
+module vault::subtle_move {
+    public entry fun set_capacity(capacity: u64) {
+        let _ = capacity;
+    }
+}
+"#;
+        let subtle_files = vec![
+            mem_indexed("contracts/SubtleVuln.sol", Language::Solidity, subtle_sol),
+            mem_indexed("programs/subtle.rs", Language::Rust, subtle_anchor),
+            mem_indexed("sources/subtle.move", Language::Move, subtle_move),
+        ];
+        let subtle_hits = scan_web3_repo(dir, &subtle_files, true);
+
+        assert!(
+            subtle_hits
+                .iter()
+                .any(|h| h.rule_id == "SMG-WEB3-ACCESS" && h.symbol == "SubtleVuln.setOwner"),
+            "Must catch setOwner with commented-out msg.sender and dead caller = msg.sender: {subtle_hits:#?}"
+        );
+        assert!(
+            subtle_hits
+                .iter()
+                .any(|h| h.rule_id == "SMG-WEB3-REENTRANCY"
+                    && h.symbol == "SubtleVuln.sameLineWithdraw"),
+            "Must catch same-line CEI reentrancy: {subtle_hits:#?}"
+        );
+        assert!(
+            subtle_hits
+                .iter()
+                .any(|h| h.rule_id == "SMG-WEB3-REENTRANCY"
+                    && h.symbol == "SubtleVuln.helperWithdraw"),
+            "Must catch internal helper CEI reentrancy: {subtle_hits:#?}"
+        );
+        assert!(
+            subtle_hits
+                .iter()
+                .any(|h| h.rule_id == "SMG-WEB3-SOLANA" && h.symbol == "UncheckedCtx.authority"),
+            "Must catch UncheckedCtx.authority even when CheckedCtx.authority is verified in another instruction: {subtle_hits:#?}"
+        );
+        assert!(
+            subtle_hits
+                .iter()
+                .any(|h| h.rule_id == "SMG-WEB3-MOVE" && h.symbol == "set_capacity"),
+            "Must catch Move set_capacity(capacity: u64) without capability type: {subtle_hits:#?}"
+        );
     }
 }

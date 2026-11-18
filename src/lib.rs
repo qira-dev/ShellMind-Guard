@@ -605,8 +605,9 @@ fn handle_enterprise_command(action: EnterpriseAction) -> Result<()> {
             let raw = fs::read_to_string(&license)?;
             let tok: smg_enterprise::SignedLicenseToken = serde_json::from_str(&raw)?;
             let req_tier = smg_enterprise::LicenseTier::parse(&tier)?;
-            let actual_digest = match binary {
-                Some(ref p) => Some(smg_enterprise::compute_binary_blake3(p)?),
+            let fallback_exe = binary.or_else(|| std::env::current_exe().ok());
+            let actual_digest = match fallback_exe {
+                Some(ref p) => smg_enterprise::compute_binary_blake3(p).ok(),
                 None => None,
             };
             let claims = smg_enterprise::verify_license_fail_closed(
@@ -658,7 +659,21 @@ fn handle_enterprise_command(action: EnterpriseAction) -> Result<()> {
             let cfg = ShellMindGuardConfig::load_from_dir(&path)?;
             let summary = scan_repository(&path, &cfg)?;
             let lic_raw = match license {
-                Some(p) => Some(fs::read_to_string(p)?),
+                Some(p) => {
+                    let s = fs::read_to_string(p)?;
+                    let tok: smg_enterprise::SignedLicenseToken = serde_json::from_str(&s)?;
+                    let exe_digest = std::env::current_exe()
+                        .ok()
+                        .and_then(|e| smg_enterprise::compute_binary_blake3(&e).ok());
+                    smg_enterprise::verify_license_fail_closed(
+                        &tok,
+                        &pk,
+                        now_unix,
+                        smg_enterprise::LicenseTier::EnterpriseTee,
+                        exe_digest.as_deref(),
+                    )?;
+                    Some(s)
+                }
                 None => None,
             };
             let nonce_hex = smg_enterprise::generate_challenge_nonce_hex()?;
@@ -800,18 +815,25 @@ fn finding_fingerprint(f: &LatticeFinding) -> BaselineEntry {
     }
 }
 
+fn has_unquoted_comment_before(prefix: &str) -> bool {
+    let quote_count = prefix.bytes().filter(|&b| b == b'"').count();
+    if !quote_count.is_multiple_of(2) {
+        return false;
+    }
+    prefix.contains("//")
+        || prefix.contains('#')
+        || prefix.contains("/*")
+        || prefix.contains("--")
+        || prefix.contains("<!--")
+}
+
 fn line_suppresses_finding(raw_line: &str, rule_id: &str, finding_id: &str) -> bool {
     let lower = raw_line.to_ascii_lowercase();
     let Some(idx) = lower.find("smg-ignore") else {
         return false;
     };
     let before = &raw_line[..idx];
-    let in_comment = before.contains("//")
-        || before.contains('#')
-        || before.contains("/*")
-        || before.contains("--")
-        || before.contains("<!--");
-    if !in_comment {
+    if !has_unquoted_comment_before(before) {
         return false;
     }
     let after = raw_line[idx + "smg-ignore".len()..].trim();
@@ -902,15 +924,14 @@ fn count_stale_smg_ignores(root: &Path, pre_findings: &[LatticeFinding]) -> usiz
         }
         let candidates = active_by_file.get(&file.rel_path);
         for (idx, line) in txt.lines().enumerate() {
-            if !line.to_ascii_lowercase().contains("smg-ignore") {
-                continue;
+            if line.trim().starts_with("#[cfg(test)]") {
+                break;
             }
-            if !line.contains("//")
-                && !line.contains('#')
-                && !line.contains("/*")
-                && !line.contains("--")
-                && !line.contains("<!--")
-            {
+            let lower = line.to_ascii_lowercase();
+            let Some(ig_idx) = lower.find("smg-ignore") else {
+                continue;
+            };
+            if !has_unquoted_comment_before(&line[..ig_idx]) {
                 continue;
             }
             let comment_ln = idx + 1;
@@ -1286,7 +1307,11 @@ pub(crate) fn execute_scan_pipeline_full(
     }
     #[cfg(not(feature = "pqc"))]
     {
-        let _ = (pqc_compliance, cbom_path);
+        if pqc_compliance || cbom_path.is_some() {
+            anyhow::bail!(
+                "This binary was built without `--features pqc`. Recompile with `--features pqc` to use `--compliance pqc` or `--cbom`."
+            );
+        }
     }
     let mut all_findings = graph_res.findings.clone();
 
@@ -1651,12 +1676,15 @@ pub fn run_cli() -> Result<ExitCode> {
             } = *boxed_scan;
             let effective_format = if json { OutputFormat::Json } else { format };
             let min_conf = min_confidence.map(|m| m.to_confidence());
-            let run_pqc = compliance.as_deref().is_some_and(|c| {
-                matches!(
-                    c.trim().to_ascii_lowercase().as_str(),
-                    "pqc" | "quantum" | "post-quantum"
-                )
-            });
+            let run_pqc = match compliance.as_deref().map(|s| s.trim().to_ascii_lowercase()) {
+                None => false,
+                Some(ref s) if matches!(s.as_str(), "pqc" | "quantum" | "post-quantum") => true,
+                Some(other) => {
+                    anyhow::bail!(
+                        "Unsupported `--compliance {other}` profile (supported: `pqc` / `post-quantum`)"
+                    );
+                }
+            };
             if boot_cmd.is_some() && std::io::stderr().is_terminal() {
                 eprintln!(
                     "[SMG] Scanning {} with live sandbox exploit verification...",
@@ -1839,21 +1867,27 @@ pub fn run_cli() -> Result<ExitCode> {
                     };
                     if cur_sig != prev_sig {
                         prev_sig = cur_sig;
-                        let mut next_outcome = match execute_scan_pipeline(ScanRunOptions {
-                            path: &path,
-                            layers: &layers,
-                            min_confidence: min_conf,
-                            boot_cmd: boot_cmd.clone(),
-                            port,
-                            sync_race,
-                            unsafe_host_fallback,
-                            trust_repo_config,
-                            deep,
-                            sandbox_mem_mb,
-                            sandbox_tls,
-                            mock_shims,
-                            cgroup_v2,
-                        }) {
+                        let mut next_outcome = match execute_scan_pipeline_full(
+                            ScanRunOptions {
+                                path: &path,
+                                layers: &layers,
+                                min_confidence: min_conf,
+                                boot_cmd: boot_cmd.clone(),
+                                port,
+                                sync_race,
+                                unsafe_host_fallback,
+                                trust_repo_config,
+                                deep,
+                                sandbox_mem_mb,
+                                sandbox_tls,
+                                mock_shims,
+                                cgroup_v2,
+                            },
+                            changed_since.as_deref(),
+                            include_generated,
+                            run_pqc,
+                            cbom.as_deref(),
+                        ) {
                             Ok(o) => o,
                             Err(e) => {
                                 eprintln!("[SMG watch] scan error: {}", e);

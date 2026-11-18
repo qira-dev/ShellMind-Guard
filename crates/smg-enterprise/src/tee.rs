@@ -1,3 +1,4 @@
+use crate::license::ct_eq_bytes;
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use reqwest::Url;
@@ -6,7 +7,10 @@ use serde::{Deserialize, Serialize};
 use smg_core::IndexedFile;
 use smg_graph::LatticeFinding;
 use std::collections::HashMap;
+use std::io::Read;
+use std::net::{IpAddr, ToSocketAddrs};
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -38,6 +42,10 @@ pub struct TeeAttestationQuote {
     pub issued_at_unix: u64,
     pub enclave_session_id: String,
     pub signature_b64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_blake3_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub findings_blake3_hex: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -78,21 +86,69 @@ pub fn probe_local_tee_hardware() -> EnclaveHostProbe {
     }
 }
 
+fn is_strict_even_hex(s: &str, min_len: usize) -> bool {
+    let t = s.trim();
+    t.len() >= min_len && t.len().is_multiple_of(2) && t.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn validate_quote_fields(q: &TeeAttestationQuote) -> Result<()> {
+    if !is_strict_even_hex(&q.pcr0_or_mrtd_hex, 32) {
+        bail!(
+            "fail-closed TEE attestation: pcr0_or_mrtd_hex must be valid even-length ASCII hex (>= 32 chars)"
+        );
+    }
+    if !is_strict_even_hex(&q.nonce_hex, 8) {
+        bail!(
+            "fail-closed TEE attestation: nonce_hex must be valid even-length ASCII hex (>= 8 chars)"
+        );
+    }
+    let sess = q.enclave_session_id.trim();
+    if sess.is_empty()
+        || sess.len() > 128
+        || sess.contains('|')
+        || sess.chars().any(|c| c.is_control())
+    {
+        bail!(
+            "fail-closed TEE attestation: invalid enclave_session_id (must be 1..=128 chars without `|` or control chars)"
+        );
+    }
+    if let Some(ref req_h) = q.request_blake3_hex
+        && !is_strict_even_hex(req_h, 64)
+    {
+        bail!("fail-closed TEE attestation: invalid request_blake3_hex");
+    }
+    if let Some(ref fin_h) = q.findings_blake3_hex
+        && !is_strict_even_hex(fin_h, 64)
+    {
+        bail!("fail-closed TEE attestation: invalid findings_blake3_hex");
+    }
+    Ok(())
+}
+
 fn canonical_quote_signing_bytes(q: &TeeAttestationQuote) -> Vec<u8> {
     let plat = match q.platform {
         TeePlatform::AwsNitro => "aws-nitro",
         TeePlatform::IntelTdx => "intel-tdx",
         TeePlatform::AmdSevSnp => "amd-sev-snp",
     };
-    format!(
+    let base = format!(
         "smg-tee-v1|{}|{}|{}|{}|{}",
         plat,
         q.pcr0_or_mrtd_hex.trim().to_ascii_lowercase(),
         q.nonce_hex.trim().to_ascii_lowercase(),
         q.issued_at_unix,
         q.enclave_session_id.trim(),
-    )
-    .into_bytes()
+    );
+    match (&q.request_blake3_hex, &q.findings_blake3_hex) {
+        (None, None) => base.into_bytes(),
+        (req_opt, fin_opt) => format!(
+            "{}|{}|{}",
+            base,
+            req_opt.as_deref().unwrap_or("").trim().to_ascii_lowercase(),
+            fin_opt.as_deref().unwrap_or("").trim().to_ascii_lowercase()
+        )
+        .into_bytes(),
+    }
 }
 
 /// Signs a TEE attestation quote payload with a PKCS#8 Ed25519 enclave authority key (for CI/enclave issuer use).
@@ -113,7 +169,10 @@ pub fn sign_tee_quote(
         issued_at_unix,
         enclave_session_id: enclave_session_id.trim().to_string(),
         signature_b64: String::new(),
+        request_blake3_hex: None,
+        findings_blake3_hex: None,
     };
+    validate_quote_fields(&q)?;
     let msg = canonical_quote_signing_bytes(&q);
     q.signature_b64 = URL_SAFE_NO_PAD.encode(pair.sign(&msg).as_ref());
     Ok(q)
@@ -125,6 +184,7 @@ pub fn verify_tee_attestation_quote(
     policy: &AttestationPolicy,
     now_unix: u64,
 ) -> Result<VerifiedEnclaveSession> {
+    validate_quote_fields(quote)?;
     if quote.platform != policy.expected_platform {
         bail!(
             "fail-closed TEE attestation: platform mismatch (expected {:?}, got {:?})",
@@ -132,12 +192,9 @@ pub fn verify_tee_attestation_quote(
             quote.platform
         );
     }
-    if quote.nonce_hex.trim().is_empty()
-        || !quote
-            .nonce_hex
-            .trim()
-            .eq_ignore_ascii_case(policy.expected_nonce_hex.trim())
-    {
+    let quote_nonce = quote.nonce_hex.trim().to_ascii_lowercase();
+    let expected_nonce = policy.expected_nonce_hex.trim().to_ascii_lowercase();
+    if quote_nonce.is_empty() || !ct_eq_bytes(quote_nonce.as_bytes(), expected_nonce.as_bytes()) {
         bail!("fail-closed TEE attestation: nonce challenge mismatch (possible replay)");
     }
     if quote.issued_at_unix > now_unix.saturating_add(60) {
@@ -152,12 +209,12 @@ pub fn verify_tee_attestation_quote(
     }
 
     let measured = quote.pcr0_or_mrtd_hex.trim().to_ascii_lowercase();
-    if measured.is_empty()
-        || !policy
-            .allowed_pcr0_hex
-            .iter()
-            .any(|p| p.trim().eq_ignore_ascii_case(&measured))
-    {
+    let is_allowed_pcr = !measured.is_empty()
+        && policy.allowed_pcr0_hex.iter().any(|p| {
+            let p_norm = p.trim().to_ascii_lowercase();
+            ct_eq_bytes(measured.as_bytes(), p_norm.as_bytes())
+        });
+    if !is_allowed_pcr {
         bail!(
             "fail-closed TEE attestation: unpinned PCR0/MRTD measurement `{}`",
             measured
@@ -181,16 +238,33 @@ pub fn verify_tee_attestation_quote(
     })
 }
 
-/// Validates that `--remote-tee` enforces HTTPS on remote endpoints (allowing plain HTTP only on loopback).
+fn is_url_strictly_loopback(url: &Url) -> bool {
+    let Some(raw_host) = url.host_str() else {
+        return false;
+    };
+    let clean_host = raw_host.trim_matches(['[', ']']);
+    if let Ok(ip) = clean_host.parse::<IpAddr>() {
+        return ip.is_loopback();
+    }
+    if clean_host.eq_ignore_ascii_case("localhost") {
+        let port = url.port_or_known_default().unwrap_or(80);
+        if let Ok(addrs) = (clean_host, port).to_socket_addrs() {
+            let vec: Vec<_> = addrs.collect();
+            return !vec.is_empty() && vec.iter().all(|a| a.ip().is_loopback());
+        }
+        return true;
+    }
+    false
+}
+
+/// Validates that `--remote-tee` enforces HTTPS on remote endpoints (allowing plain HTTP only on verified loopback).
 pub fn validate_tee_endpoint(raw_url: &str) -> Result<Url> {
     let url = Url::parse(raw_url.trim())
         .with_context(|| format!("invalid remote TEE URL `{raw_url}`"))?;
     if !url.username().is_empty() || url.password().is_some() {
         bail!("refusing remote TEE URL with embedded credentials");
     }
-    let host = url.host_str().unwrap_or("");
-    let is_loopback =
-        host == "127.0.0.1" || host == "localhost" || host == "::1" || host == "[::1]";
+    let is_loopback = is_url_strictly_loopback(&url);
     match url.scheme() {
         "https" => Ok(url),
         "http" if is_loopback => Ok(url),
@@ -213,6 +287,22 @@ pub struct RemoteTeeScanResponse {
     pub scan_elapsed_ms: u128,
 }
 
+fn compute_request_blake3_hex(nonce_hex: &str, files: &HashMap<String, String>) -> String {
+    let mut keys: Vec<&String> = files.keys().collect();
+    keys.sort();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(nonce_hex.trim().to_ascii_lowercase().as_bytes());
+    for k in keys {
+        hasher.update(k.as_bytes());
+        hasher.update(&[0u8]);
+        if let Some(v) = files.get(k) {
+            hasher.update(v.as_bytes());
+        }
+        hasher.update(&[0u8]);
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
 /// Submits bounded source files over HTTPS/loopback to a remote TEE enclave worker and verifies its
 /// cryptographic PCR0/MRTD quote before returning findings.
 pub fn execute_remote_tee_scan(
@@ -222,19 +312,62 @@ pub fn execute_remote_tee_scan(
     policy: &AttestationPolicy,
     now_unix: u64,
 ) -> Result<(VerifiedEnclaveSession, RemoteTeeScanResponse)> {
-    let validated = validate_tee_endpoint(endpoint_url)?;
-    let scan_url = validated.join("v1/attest-and-scan")?;
-
-    let mut payload_files = HashMap::new();
-    for f in files.iter().take(256) {
-        if let Some(bytes) = f.cached_bytes.as_deref()
-            && let Ok(text) = std::str::from_utf8(bytes)
-        {
-            payload_files.insert(f.rel_path.clone(), text.to_string());
-        } else if let Ok(text) = std::fs::read_to_string(&f.abs_path) {
-            payload_files.insert(f.rel_path.clone(), text);
-        }
+    if files.len() > 256 {
+        bail!(
+            "fail-closed remote TEE scan: repository file count ({}) exceeds 256-file enclave payload limit",
+            files.len()
+        );
     }
+
+    let mut base_url = validate_tee_endpoint(endpoint_url)?;
+    if !base_url.path().ends_with('/') {
+        let with_slash = format!("{}/", base_url.path());
+        base_url.set_path(&with_slash);
+    }
+    let scan_url = base_url.join("v1/attest-and-scan")?;
+
+    let mut payload_files = HashMap::with_capacity(files.len());
+    for f in files {
+        let text = if let Some(bytes) = f.cached_bytes.as_deref() {
+            std::str::from_utf8(bytes)
+                .with_context(|| format!("file `{}` is not valid UTF-8", f.rel_path))?
+                .to_string()
+        } else {
+            let meta = std::fs::symlink_metadata(&f.abs_path).with_context(|| {
+                format!(
+                    "failed to stat `{}` for remote TEE scan",
+                    f.abs_path.display()
+                )
+            })?;
+            if meta.file_type().is_symlink() {
+                bail!(
+                    "fail-closed remote TEE scan: refusing symlink `{}`",
+                    f.rel_path
+                );
+            }
+            if !meta.is_file() || meta.len() > 4 * 1024 * 1024 {
+                bail!(
+                    "fail-closed remote TEE scan: file `{}` exceeds 4 MiB limit or is not a regular file",
+                    f.rel_path
+                );
+            }
+            let s = std::fs::read_to_string(&f.abs_path)
+                .with_context(|| format!("failed to read `{}`", f.rel_path))?;
+            if !f.blake3_hash.is_empty() && f.blake3_hash != "0" {
+                let actual_hash = blake3::hash(s.as_bytes()).to_hex().to_string();
+                if actual_hash != f.blake3_hash {
+                    bail!(
+                        "fail-closed remote TEE scan: TOCTOU digest mismatch on `{}`",
+                        f.rel_path
+                    );
+                }
+            }
+            s
+        };
+        payload_files.insert(f.rel_path.clone(), text);
+    }
+
+    let expected_req_hash = compute_request_blake3_hex(&policy.expected_nonce_hex, &payload_files);
 
     let req_body = RemoteTeeScanRequest {
         nonce_hex: policy.expected_nonce_hex.clone(),
@@ -244,6 +377,7 @@ pub fn execute_remote_tee_scan(
 
     let _ = rustls::crypto::ring::default_provider().install_default();
     let client = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
     let resp = client
@@ -254,8 +388,51 @@ pub fn execute_remote_tee_scan(
     if !resp.status().is_success() {
         bail!("remote TEE endpoint returned HTTP {}", resp.status());
     }
-    let body: RemoteTeeScanResponse = resp.json().context("invalid remote TEE response JSON")?;
-    let session = verify_tee_attestation_quote(&body.quote, policy, now_unix)?;
+
+    const MAX_RESP_BYTES: usize = 16 * 1024 * 1024;
+    let mut raw_bytes = Vec::new();
+    resp.take((MAX_RESP_BYTES + 1) as u64)
+        .read_to_end(&mut raw_bytes)
+        .context("failed to read remote TEE response stream")?;
+    if raw_bytes.len() > MAX_RESP_BYTES {
+        bail!("fail-closed remote TEE scan: response exceeds 16 MiB limit");
+    }
+
+    let body: RemoteTeeScanResponse =
+        serde_json::from_slice(&raw_bytes).context("invalid remote TEE response JSON")?;
+
+    if let Some(ref quoted_req_hash) = body.quote.request_blake3_hex
+        && !quoted_req_hash
+            .trim()
+            .eq_ignore_ascii_case(&expected_req_hash)
+    {
+        bail!(
+            "fail-closed TEE attestation: request transcript BLAKE3 mismatch (expected {}, got {})",
+            expected_req_hash,
+            quoted_req_hash
+        );
+    }
+    if let Some(ref quoted_fin_hash) = body.quote.findings_blake3_hex {
+        let findings_json = serde_json::to_vec(&body.findings).unwrap_or_default();
+        let expected_fin_hash = blake3::hash(&findings_json).to_hex().to_string();
+        if !quoted_fin_hash
+            .trim()
+            .eq_ignore_ascii_case(&expected_fin_hash)
+        {
+            bail!(
+                "fail-closed TEE attestation: findings transcript BLAKE3 mismatch (expected {}, got {})",
+                expected_fin_hash,
+                quoted_fin_hash
+            );
+        }
+    }
+
+    let verify_now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(now_unix)
+        .max(now_unix);
+    let session = verify_tee_attestation_quote(&body.quote, policy, verify_now)?;
     Ok((session, body))
 }
 
@@ -265,7 +442,7 @@ mod tests {
     use crate::license::generate_ed25519_keypair;
 
     #[test]
-    fn tee_quote_pins_pcr0_nonce_platform_and_rejects_tampering() {
+    fn tee_quote_pins_pcr0_nonce_platform_and_rejects_delimiter_injection_or_tampering() {
         let (pkcs8, pubkey) = generate_ed25519_keypair().unwrap();
         let pcr0 = "a".repeat(96);
         let nonce = "deadbeef01020304";
@@ -291,6 +468,30 @@ mod tests {
         assert_eq!(verified.pcr0_verified, pcr0);
         assert_eq!(verified.session_id, "enclave-sess-99");
 
+        // Pipe delimiter injection in session_id or non-hex in PCR0/nonce must fail closed
+        assert!(
+            sign_tee_quote(
+                &pkcs8,
+                TeePlatform::AwsNitro,
+                &pcr0,
+                nonce,
+                1_795_000_000,
+                "sess|injected",
+            )
+            .is_err()
+        );
+        assert!(
+            sign_tee_quote(
+                &pkcs8,
+                TeePlatform::AwsNitro,
+                "not-hex-at-all",
+                nonce,
+                1_795_000_000,
+                "enclave-sess-99",
+            )
+            .is_err()
+        );
+
         // Wrong PCR0 rejected
         let mut bad_pcr = quote.clone();
         bad_pcr.pcr0_or_mrtd_hex = "b".repeat(96);
@@ -298,12 +499,13 @@ mod tests {
 
         // Nonce replay rejected
         let mut bad_nonce = quote.clone();
-        bad_nonce.nonce_hex = "cafebabe".into();
+        bad_nonce.nonce_hex = "cafebabe01020304".into();
         assert!(verify_tee_attestation_quote(&bad_nonce, &policy, 1_795_000_060).is_err());
 
         // Remote non-HTTPS endpoint refused
         assert!(validate_tee_endpoint("http://tee.example.com").is_err());
         assert!(validate_tee_endpoint("https://tee.example.com").is_ok());
         assert!(validate_tee_endpoint("http://127.0.0.1:8443").is_ok());
+        assert!(validate_tee_endpoint("http://127.0.0.2:8443").is_ok());
     }
 }

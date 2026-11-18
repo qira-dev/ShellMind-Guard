@@ -1,5 +1,5 @@
 use smg_graph::{Confidence, GuardKind, LocalStaticFinding, SinkKind};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use tree_sitter::{Node, Parser};
 
 fn node_txt<'a>(node: Node, src: &'a [u8]) -> &'a str {
@@ -24,6 +24,27 @@ fn has_test_attr(node: Node, src: &[u8]) -> bool {
     false
 }
 
+fn extract_ctx_struct_name(text: &str) -> Option<String> {
+    let idx = text.find("Context")?;
+    let rest = text[idx + "Context".len()..].trim_start();
+    let inner = rest.strip_prefix('<')?.split_once('>')?.0;
+    let struct_tok = inner.rsplit(',').next()?.trim();
+    let ident: String = struct_tok
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    (!ident.is_empty()).then_some(ident)
+}
+
+fn has_anchor_owner_attr(attrs_low: &str) -> bool {
+    let no_ws: String = attrs_low.chars().filter(|c| !c.is_whitespace()).collect();
+    no_ws.contains("owner=")
+        || no_ws.contains("address=")
+        || no_ws.contains("constraint=")
+        || no_ws.contains("has_one=")
+        || no_ws.contains("seeds=")
+}
+
 /// Checks if a Rust file belongs to Solana / Anchor smart contracts.
 pub fn is_solana_rust_source(source: &str) -> bool {
     source.contains("anchor_lang")
@@ -33,11 +54,22 @@ pub fn is_solana_rust_source(source: &str) -> bool {
         || source.contains("ProgramResult")
 }
 
+#[derive(Default)]
+struct SolanaFileContext {
+    /// Per `Context<StructName>` fields verified with `.is_signer` inside instructions using that `StructName`
+    struct_signers: HashMap<String, HashSet<String>>,
+    /// Per `Context<StructName>` fields verified with `.owner ==` inside instructions using that `StructName`
+    struct_owners: HashMap<String, HashSet<String>>,
+    /// `#[derive(Accounts)]` structs that validate a program account via `Program<'info, ...>` or `address = ...`
+    structs_with_validated_program: HashSet<String>,
+}
+
 /// Analyzes Solana Anchor & native Rust SVM programs via Tree-sitter Rust AST.
 pub fn analyze_solana_rust_file(rel_path: &str, source: &str) -> Vec<LocalStaticFinding> {
     if smg_core::is_test_source_path(rel_path) || !is_solana_rust_source(source) {
         return Vec::new();
     }
+    let stripped = smg_graph::taint::strip_comments_simple(source);
     let mut parser = Parser::new();
     if parser
         .set_language(&tree_sitter_rust::LANGUAGE.into())
@@ -45,42 +77,42 @@ pub fn analyze_solana_rust_file(rel_path: &str, source: &str) -> Vec<LocalStatic
     {
         return Vec::new();
     }
-    let Some(tree) = parser.parse(source, None) else {
+    let Some(tree) = parser.parse(&stripped, None) else {
         return Vec::new();
     };
-    let src = source.as_bytes();
+    let src = stripped.as_bytes();
     let mut findings = Vec::new();
 
-    // Collect instruction-wide `is_signer` and `owner ==` checks per file/function
-    let mut fn_is_signer_checks: HashSet<String> = HashSet::new();
-    let mut fn_owner_checks: HashSet<String> = HashSet::new();
-    collect_native_svm_checks(
-        tree.root_node(),
-        src,
-        &mut fn_is_signer_checks,
-        &mut fn_owner_checks,
-    );
+    let mut sctx = SolanaFileContext::default();
+    collect_solana_file_context(tree.root_node(), src, &mut sctx);
 
-    walk_rust_solana(
-        tree.root_node(),
-        src,
-        rel_path,
-        &fn_is_signer_checks,
-        &fn_owner_checks,
-        &mut findings,
-    );
+    walk_rust_solana(tree.root_node(), src, rel_path, &sctx, &mut findings);
     findings
 }
 
-fn collect_native_svm_checks(
-    node: Node,
-    src: &[u8],
-    signers: &mut HashSet<String>,
-    owners: &mut HashSet<String>,
-) {
-    if node.kind() == "function_item" && !has_test_attr(node, src) {
-        let body = node_txt(node, src);
-        for line in body.lines() {
+fn collect_solana_file_context(node: Node, src: &[u8], sctx: &mut SolanaFileContext) {
+    if has_test_attr(node, src) {
+        return;
+    }
+    if node.kind() == "struct_item" && has_derive_accounts_attr(node, src) {
+        let struct_name = node
+            .child_by_field_name("name")
+            .map(|n| node_txt(n, src).to_string())
+            .unwrap_or_default();
+        let body_txt = node_txt(node, src);
+        if body_txt.contains("Program<")
+            || body_txt.contains("Interface<")
+            || has_anchor_owner_attr(&body_txt.to_ascii_lowercase())
+        {
+            sctx.structs_with_validated_program.insert(struct_name);
+        }
+        return;
+    }
+    if node.kind() == "function_item" {
+        let fn_txt = node_txt(node, src);
+        let ctx_struct =
+            extract_ctx_struct_name(fn_txt).unwrap_or_else(|| "__native__".to_string());
+        for line in fn_txt.lines() {
             let low = line.to_ascii_lowercase();
             if low.contains(".is_signer")
                 && let Some(ident) = line.split(".is_signer").next()
@@ -89,7 +121,10 @@ fn collect_native_svm_checks(
                     .next_back()
                 && !word.is_empty()
             {
-                signers.insert(word.to_string());
+                sctx.struct_signers
+                    .entry(ctx_struct.clone())
+                    .or_default()
+                    .insert(word.to_string());
             }
             if low.contains(".owner")
                 && (low.contains("==") || low.contains("!="))
@@ -99,13 +134,16 @@ fn collect_native_svm_checks(
                     .next_back()
                 && !word.is_empty()
             {
-                owners.insert(word.to_string());
+                sctx.struct_owners
+                    .entry(ctx_struct.clone())
+                    .or_default()
+                    .insert(word.to_string());
             }
         }
     }
     let mut c = node.walk();
     for ch in node.children(&mut c) {
-        collect_native_svm_checks(ch, src, signers, owners);
+        collect_solana_file_context(ch, src, sctx);
     }
 }
 
@@ -131,8 +169,7 @@ fn walk_rust_solana(
     node: Node,
     src: &[u8],
     rel_path: &str,
-    fn_signers: &HashSet<String>,
-    fn_owners: &HashSet<String>,
+    sctx: &SolanaFileContext,
     findings: &mut Vec<LocalStaticFinding>,
 ) {
     if has_test_attr(node, src) {
@@ -140,17 +177,17 @@ fn walk_rust_solana(
     }
     match node.kind() {
         "struct_item" if has_derive_accounts_attr(node, src) => {
-            inspect_anchor_accounts_struct(node, src, rel_path, fn_signers, fn_owners, findings);
+            inspect_anchor_accounts_struct(node, src, rel_path, sctx, findings);
             return;
         }
         "function_item" => {
-            inspect_solana_instruction_fn(node, src, rel_path, findings);
+            inspect_solana_instruction_fn(node, src, rel_path, sctx, findings);
         }
         _ => {}
     }
     let mut c = node.walk();
     for ch in node.children(&mut c) {
-        walk_rust_solana(ch, src, rel_path, fn_signers, fn_owners, findings);
+        walk_rust_solana(ch, src, rel_path, sctx, findings);
     }
 }
 
@@ -158,8 +195,7 @@ fn inspect_anchor_accounts_struct(
     struct_node: Node,
     src: &[u8],
     rel_path: &str,
-    fn_signers: &HashSet<String>,
-    fn_owners: &HashSet<String>,
+    sctx: &SolanaFileContext,
     findings: &mut Vec<LocalStaticFinding>,
 ) {
     let struct_name = struct_node
@@ -169,6 +205,9 @@ fn inspect_anchor_accounts_struct(
     let Some(body) = struct_node.child_by_field_name("body") else {
         return;
     };
+
+    let fn_signers = sctx.struct_signers.get(&struct_name);
+    let fn_owners = sctx.struct_owners.get(&struct_name);
 
     let mut pending_attrs = String::new();
     let mut bc = body.walk();
@@ -215,13 +254,10 @@ fn inspect_anchor_accounts_struct(
             .iter()
             .any(|kw| fname_low.contains(kw));
 
-        let attr_checks_signer = attrs_low.contains("signer") || fn_signers.contains(&field_name);
-        let attr_checks_owner = attrs_low.contains("owner =")
-            || attrs_low.contains("address =")
-            || attrs_low.contains("constraint =")
-            || attrs_low.contains("has_one =")
-            || attrs_low.contains("seeds =")
-            || fn_owners.contains(&field_name);
+        let attr_checks_signer =
+            attrs_low.contains("signer") || fn_signers.is_some_and(|s| s.contains(&field_name));
+        let attr_checks_owner =
+            has_anchor_owner_attr(&attrs_low) || fn_owners.is_some_and(|s| s.contains(&field_name));
 
         if is_authority_name && !attr_checks_signer {
             findings.push(LocalStaticFinding {
@@ -261,6 +297,7 @@ fn inspect_solana_instruction_fn(
     fn_node: Node,
     src: &[u8],
     rel_path: &str,
+    sctx: &SolanaFileContext,
     findings: &mut Vec<LocalStaticFinding>,
 ) {
     let fn_name = fn_node
@@ -269,6 +306,8 @@ fn inspect_solana_instruction_fn(
         .unwrap_or_else(|| "instruction".into());
     let body = node_txt(fn_node, src);
     let base_line = fn_node.start_position().row + 1;
+    let ctx_has_validated_program = extract_ctx_struct_name(body)
+        .is_some_and(|st| sctx.structs_with_validated_program.contains(&st));
 
     for (idx, line) in body.lines().enumerate() {
         let ln = base_line + idx;
@@ -292,6 +331,7 @@ fn inspect_solana_instruction_fn(
             });
         }
         if (line.contains("invoke(") || line.contains("invoke_signed("))
+            && !ctx_has_validated_program
             && !body.contains("Program<'info")
             && !body.contains("check_program_account")
             && !body.contains("::ID")
@@ -316,18 +356,41 @@ fn inspect_solana_instruction_fn(
     }
 }
 
+fn has_move_capability_param(params: &str) -> bool {
+    for part in params.split(',') {
+        let Some((_, raw_ty)) = part.split_once(':') else {
+            continue;
+        };
+        let ty = raw_ty.trim();
+        let ty_low = ty.to_ascii_lowercase();
+        if ty_low.contains("signer")
+            || ty_low.contains("capability")
+            || ty_low.contains("treasury_cap")
+            || ty_low.contains("admin_cap")
+            || ty.ends_with("Cap")
+            || ty.contains("Cap<")
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Analyzes Sui / Aptos Move source modules cleanly above VM linear resource guarantees.
 pub fn analyze_move_file(rel_path: &str, source: &str) -> Vec<LocalStaticFinding> {
     if smg_core::is_test_source_path(rel_path) {
         return Vec::new();
     }
+    let stripped = smg_graph::taint::strip_comments_simple(source);
     let mut findings = Vec::new();
-    let lines: Vec<&str> = source.lines().collect();
+    let lines: Vec<&str> = stripped.lines().collect();
     let mut i = 0usize;
 
     while i < lines.len() {
         let trimmed = lines[i].trim();
-        let is_test_fn = i > 0 && lines[i - 1].contains("#[test");
+        let is_test_fn = (i > 0 && lines[i - 1].contains("#[test"))
+            || (i > 1 && lines[i - 2].contains("#[test"))
+            || trimmed.starts_with("#[test");
         if is_test_fn {
             i += 1;
             continue;
@@ -395,8 +458,8 @@ pub fn analyze_move_file(rel_path: &str, source: &str) -> Vec<LocalStaticFinding
         let params_low = params.to_ascii_lowercase();
         let body_low = body.to_ascii_lowercase();
 
-        // 1. Public `init` exposure
-        if fn_low == "init" {
+        // 1. Public Sui `init(ctx: &mut TxContext)` exposure
+        if fn_low == "init" && params_low.contains("txcontext") {
             findings.push(LocalStaticFinding {
                 rule_id: "SMG-WEB3-MOVE".into(),
                 severity: "CRITICAL".into(),
@@ -418,10 +481,9 @@ pub fn analyze_move_file(rel_path: &str, source: &str) -> Vec<LocalStaticFinding
                 fn_low.as_str(),
                 "mint" | "burn" | "withdraw" | "emergency_withdraw" | "pause" | "upgrade"
             );
-        let has_cap_or_sender_auth = params_low.contains("cap")
+        let has_cap_or_sender_auth = has_move_capability_param(&params)
             || body_low.contains("tx_context::sender")
-            || body_low.contains("signer::address_of")
-            || params_low.contains("treasury_cap");
+            || body_low.contains("signer::address_of");
         if is_privileged && !has_cap_or_sender_auth {
             findings.push(LocalStaticFinding {
                 rule_id: "SMG-WEB3-MOVE".into(),
@@ -444,6 +506,9 @@ pub fn analyze_move_file(rel_path: &str, source: &str) -> Vec<LocalStaticFinding
             && !body_low.contains("> 0")
             && !body_low.contains("!= 0")
             && !body_low.contains("== 0")
+            && !body_low.contains(">= 1")
+            && !body_low.contains(">= min")
+            && !body_low.contains("< 1")
         {
             findings.push(LocalStaticFinding {
                 rule_id: "SMG-WEB3-MOVE".into(),

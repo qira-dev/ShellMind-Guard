@@ -40,11 +40,6 @@ const EOA_ADDR: Address = Address::new([
 /// Builds runtime EVM bytecode for an attacker relay contract that calls/re-enters `VICTIM_ADDR` (0x2000)
 /// up to `max_calls` times tracked in storage slot `0`.
 fn build_reentrant_attacker_bytecode(max_calls: u8) -> Vec<u8> {
-    // Byte offsets:
-    // 00: PUSH1 0x00; SLOAD; DUP1; PUSH1 max_calls; GT; ISZERO; PUSH1 0x23; JUMPI
-    // 11: PUSH1 0x01; ADD; PUSH1 0x00; SSTORE
-    // 17: PUSH1 0 (retSz, retOff, argSz, argOff, val); PUSH2 0x2000; PUSH3 500000; CALL; POP
-    // 35 (0x23): JUMPDEST; STOP
     vec![
         0x60, 0x00, 0x54, // 0..3: PUSH1 0, SLOAD
         0x80, // 3: DUP1
@@ -62,14 +57,13 @@ fn build_reentrant_attacker_bytecode(max_calls: u8) -> Vec<u8> {
         0x60, 0x00, // 25..27: value
         0x61, 0x20, 0x00, // 27..30: PUSH2 0x2000 (Victim)
         0x62, 0x07, 0xa1, 0x20, // 30..34: PUSH3 500_000 gas
-        0xf1, // 34? Wait: recount! 30,31,32,33 are PUSH3 500_000! 34 is CALL! 35 is POP! 36 is 0x24!
+        0xf1, // 34: CALL
         0x50, 0x5b, 0x00,
     ]
 }
 
 fn patched_reentrant_attacker_bytecode(max_calls: u8) -> Vec<u8> {
     let mut code = build_reentrant_attacker_bytecode(max_calls);
-    // JUMPDEST (`0x5b`) is the second-to-last byte (`len - 2`).
     let jd_pc = (code.len() - 2) as u8;
     code[9] = jd_pc;
     code
@@ -80,20 +74,12 @@ fn patched_reentrant_attacker_bytecode(max_calls: u8) -> Vec<u8> {
 /// - `cei_safe == true`: updates `SSTORE(0, 0)` BEFORE `CALL` (CEI hardened).
 fn build_vault_bytecode(cei_safe: bool) -> Vec<u8> {
     if !cei_safe {
-        // 0..8: PUSH1 0, SLOAD, DUP1, ISZERO, PUSH1 0x1f, JUMPI
-        // 8..25: PUSH1 0 x4, DUP5, CALLER, PUSH3 500000, CALL, POP, POP
-        // 25..31: PUSH1 0, PUSH1 0, SSTORE, STOP
-        // 31 (0x1f): JUMPDEST, POP, STOP
         vec![
             0x60, 0x00, 0x54, 0x80, 0x15, 0x60, 0x1f, 0x57, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00,
             0x60, 0x00, 0x84, 0x33, 0x62, 0x07, 0xa1, 0x20, 0xf1, 0x50, 0x50, 0x60, 0x00, 0x60,
             0x00, 0x55, 0x00, 0x5b, 0x50, 0x00,
         ]
     } else {
-        // 0..8: PUSH1 0, SLOAD, DUP1, ISZERO, PUSH1 0x1f, JUMPI
-        // 8..13: PUSH1 0, PUSH1 0, SSTORE  (CEI fix FIRST!)
-        // 13..31: PUSH1 0 x4, DUP5, CALLER, PUSH3 500000, CALL, POP, POP, STOP
-        // 31 (0x1f): JUMPDEST, POP, STOP
         vec![
             0x60, 0x00, 0x54, 0x80, 0x15, 0x60, 0x1f, 0x57, 0x60, 0x00, 0x60, 0x00, 0x55, 0x60,
             0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x84, 0x33, 0x62, 0x07, 0xa1, 0x20, 0xf1,
@@ -234,7 +220,7 @@ pub fn verify_reentrancy_in_revm(has_cei_or_mutex: bool) -> RevmWitnessResult {
 fn build_forwarding_reentrant_attacker(max_calls: u8, reenter_calldata: &[u8]) -> Vec<u8> {
     let mut code = Vec::new();
     // If CALLDATASIZE > 0, jump to forwarder (`fwd_pc` placeholder at idx 5)
-    code.extend_from_slice(&[0x36, 0x15, 0x15, 0x61, 0x00, 0x00, 0x57]); // CALLDATASIZE, ISZERO, ISZERO, PUSH2 fwd_pc, JUMPI
+    code.extend_from_slice(&[0x36, 0x15, 0x15, 0x61, 0x00, 0x00, 0x57]);
 
     // Callback / direct re-entry path: check slot[0] < max_calls
     let stop_placeholder_idx = code.len() + 9;
@@ -419,11 +405,18 @@ pub fn probe_compiled_selector_unauth(
         .transact_commit(tx)
         .map_err(|e| format!("revm selector probe error: {e:?}"))?;
     let db = evm.ctx.journaled_state.database;
+    // Count only storage slots whose committed value actually changed from initial 0 (ignoring SLOAD or no-op SSTORE(k, 0))
     let storage_writes = db
         .cache
         .accounts
         .get(&target)
-        .map(|a| a.storage.len())
+        .map(|a| {
+            let mut changed = a.storage.values().filter(|&&v| v != U256::ZERO).count();
+            if a.info.balance != one_eth {
+                changed += 1;
+            }
+            changed
+        })
         .unwrap_or(0);
     match res {
         ExecutionResult::Success { gas, .. } => Ok((true, storage_writes, gas.tx_gas_used())),
@@ -483,22 +476,32 @@ pub fn solve_erc4626_inflation_witness(deposit_wei: u128) -> Option<u128> {
     None
 }
 
-/// Bounded 2-step AMM constant-product x*y=k spot-price skew check (`k <= 2` swaps):
-/// Models how flash-swapping `dx` shifts spot ratio `R1/R0` beyond a manipulation threshold `max_bps`.
+/// Bounded 2-step AMM constant-product x*y=k spot-price skew check (`k <= 2` swaps) using 256-bit `U256` arithmetic
+/// so 18-decimal ERC-20 reserves (`10^24` wei) never saturate `u128::MAX`.
 pub fn check_amm_spot_skew_bps(r0: u128, r1: u128, flash_dx: u128) -> u128 {
     if r0 == 0 || r1 == 0 || flash_dx == 0 {
         return 0;
     }
-    let k = r0.saturating_mul(r1);
-    let new_r0 = r0.saturating_add(flash_dx);
-    let new_r1 = k / new_r0;
-    // Spot price of token0 in token1 dropped from (r1/r0) to (new_r1/new_r0): skew = 1 - (new_r1*r0)/(r1*new_r0)
-    let orig_cross = r1.saturating_mul(new_r0);
-    let new_cross = new_r1.saturating_mul(r0);
-    if orig_cross == 0 || new_cross >= orig_cross {
+    let r0_u = U256::from(r0);
+    let r1_u = U256::from(r1);
+    let dx_u = U256::from(flash_dx);
+    let k = r0_u.saturating_mul(r1_u);
+    let new_r0 = r0_u.saturating_add(dx_u);
+    if new_r0.is_zero() {
         return 0;
     }
-    orig_cross.saturating_sub(new_cross).saturating_mul(10_000) / orig_cross
+    let new_r1 = k / new_r0;
+    // Spot price of token0 in token1 dropped from (r1/r0) to (new_r1/new_r0): skew = 1 - (new_r1*r0)/(r1*new_r0)
+    let orig_cross = r1_u.saturating_mul(new_r0);
+    let new_cross = new_r1.saturating_mul(r0_u);
+    if orig_cross.is_zero() || new_cross >= orig_cross {
+        return 0;
+    }
+    let bps = orig_cross
+        .saturating_sub(new_cross)
+        .saturating_mul(U256::from(10_000u64))
+        / orig_cross;
+    u128::try_from(bps).unwrap_or(10_000)
 }
 
 #[cfg(test)]
@@ -526,13 +529,21 @@ mod tests {
     }
 
     #[test]
-    fn revm_unauth_selector_probe_detects_mutating_unprotected_entrypoint() {
+    fn revm_unauth_selector_probe_detects_mutating_unprotected_entrypoint_and_ignores_sload() {
         // Deployed bytecode: PUSH1 0x42, PUSH1 0x00, SSTORE, STOP
         let vuln_code = vec![0x60, 0x42, 0x60, 0x00, 0x55, 0x00];
         let (ok, writes, _) =
             probe_compiled_selector_unauth(&vuln_code, [0xc4, 0xd6, 0x6d, 0xe8], None).unwrap();
         assert!(ok);
         assert_eq!(writes, 1);
+
+        // Read-only SLOAD bytecode: PUSH1 0x00, SLOAD, POP, STOP (must report 0 storage writes!)
+        let sload_only_code = vec![0x60, 0x00, 0x54, 0x50, 0x00];
+        let (ok_ro, writes_ro, _) =
+            probe_compiled_selector_unauth(&sload_only_code, [0xc4, 0xd6, 0x6d, 0xe8], None)
+                .unwrap();
+        assert!(ok_ro);
+        assert_eq!(writes_ro, 0);
 
         // Guarded bytecode: CALLER, ISZERO, REVERT (immediately reverts for unauth caller)
         let guarded_code = vec![0x33, 0x60, 0x00, 0x60, 0x00, 0xfd];
@@ -543,10 +554,15 @@ mod tests {
     }
 
     #[test]
-    fn erc4626_and_amm_witness_solvers_find_concrete_bounds() {
+    fn erc4626_and_amm_witness_solvers_handle_18_decimal_reserves_without_overflow() {
         let donation = solve_erc4626_inflation_witness(100_000_000_000_000_000).unwrap();
         assert!(donation >= 100_000_000_000_000_000);
         let skew = check_amm_spot_skew_bps(1_000_000, 1_000_000, 500_000);
         assert!(skew > 5_000);
+
+        // Counterexample WEB3-07: 18-decimal reserves (10^24 wei) where r0 * r1 = 10^48 > u128::MAX
+        let r_18dec = 1_000_000_000_000_000_000_000_000u128; // 10^24 wei
+        let skew_18dec = check_amm_spot_skew_bps(r_18dec, r_18dec, r_18dec / 2);
+        assert_eq!(skew_18dec, 5_555);
     }
 }

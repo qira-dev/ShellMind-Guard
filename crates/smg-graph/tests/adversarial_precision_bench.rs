@@ -1575,6 +1575,20 @@ fn test_adversarial_precision_recall_and_latency_benchmark() {
     }
 
     // Permanent precision, recall, and latency non-regression gates:
+    let strict_gate = std::env::var("SMG_ENFORCE_PRECISION_GATE")
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    if strict_gate {
+        assert_eq!(
+            fp, 0,
+            "SMG_ENFORCE_PRECISION_GATE=1 requires 0 false positives! Misses: {:?}",
+            misses
+        );
+        assert_eq!(
+            fn_count, 0,
+            "SMG_ENFORCE_PRECISION_GATE=1 requires 0 false negatives! Misses: {:?}",
+            misses
+        );
+    }
     assert!(scale_p99.is_finite() && scale_p99 > 0.0);
     assert!(
         tp >= 20,
