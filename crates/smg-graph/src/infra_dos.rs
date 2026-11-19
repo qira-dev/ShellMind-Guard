@@ -119,23 +119,7 @@ fn unpinned_uses_re() -> &'static Regex {
 }
 
 fn strip_yaml_comment(line: &str) -> &str {
-    let mut in_single = false;
-    let mut in_double = false;
-    let bytes = line.as_bytes();
-    for (i, &b) in bytes.iter().enumerate() {
-        if b == b'\'' && !in_double {
-            in_single = !in_single;
-        } else if b == b'"' && !in_single && (i == 0 || bytes[i - 1] != b'\\') {
-            in_double = !in_double;
-        } else if b == b'#'
-            && !in_single
-            && !in_double
-            && (i == 0 || bytes[i - 1].is_ascii_whitespace())
-        {
-            return &line[..i];
-        }
-    }
-    line
+    smg_core::yaml::strip_yaml_comment_quoted(line)
 }
 
 fn has_untrusted_pr_trigger(lines: &[&str]) -> bool {

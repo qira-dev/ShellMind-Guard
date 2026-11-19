@@ -16,8 +16,11 @@ pub struct FileScopeTable {
     /// Import alias -> source module specifier (`runSql -> ./barrel`).
     pub import_aliases: HashMap<String, String>,
     /// Variables proven to hold XSS-sanitized HTML values (`clean = DOMPurify.sanitize(...)`),
-    /// revoked automatically if reassigned from an unsanitized/tainted expression.
+    /// revoked automatically if reassigned or shadowed by an unsanitized parameter/assignment anywhere in the file.
     pub xss_sanitized_vars: HashSet<String>,
+    /// Variables that have at least one unsanitized assignment or parameter binding in the file,
+    /// preventing cross-function sanitizer leakage when two functions share a variable name.
+    pub unsanitized_or_shadowed_vars: HashSet<String>,
 }
 
 /// Extracts per-file scope bindings and sanitizer provenance in a single bounded AST walk.
@@ -56,6 +59,15 @@ fn walk_scope(node: Node, src: &[u8], lang: Language, table: &mut FileScopeTable
         }
     }
 
+    // Track function parameter names so a parameter `html` in function B is never treated as
+    // sanitized just because function A had `const html = DOMPurify.sanitize(...)`.
+    if matches!(
+        kind,
+        "formal_parameters" | "parameters" | "parameter_list" | "function_parameters"
+    ) {
+        record_param_shadowing(node, src, table);
+    }
+
     if matches!(
         kind,
         "variable_declarator" | "assignment_expression" | "assignment" | "short_var_declaration"
@@ -88,6 +100,30 @@ fn walk_scope(node: Node, src: &[u8], lang: Language, table: &mut FileScopeTable
     }
 }
 
+fn record_param_shadowing(node: Node, src: &[u8], table: &mut FileScopeTable) {
+    if matches!(
+        node.kind(),
+        "identifier" | "shorthand_property_identifier_pattern"
+    ) {
+        let name = node_text(node, src).trim();
+        if !name.is_empty() && name != "_" {
+            table.unsanitized_or_shadowed_vars.insert(name.to_string());
+            table.xss_sanitized_vars.remove(name);
+        }
+        return;
+    }
+    if matches!(
+        node.kind(),
+        "type_annotation" | "generic_type" | "pointer_type" | "qualified_type" | "type"
+    ) {
+        return;
+    }
+    let mut c = node.walk();
+    for ch in node.children(&mut c) {
+        record_param_shadowing(ch, src, table);
+    }
+}
+
 fn update_binding_from_rhs(
     var_name: &str,
     rhs: Node,
@@ -103,13 +139,35 @@ fn update_binding_from_rhs(
         if !cname.is_empty() {
             table.var_receivers.insert(var_name.to_string(), cname);
         }
+    } else if matches!(
+        rhs.kind(),
+        "call_expression" | "call" | "composite_literal" | "struct_expression" | "unary_expression"
+    ) {
+        // Also recognize Rust `ClassName::new()`, Go `&ClassName{}` / `NewClassName()`, and Python `ClassName()`
+        let candidate = rhs_txt
+            .trim_start_matches('&')
+            .split(['(', '{', ':'])
+            .next()
+            .unwrap_or("")
+            .trim();
+        if !candidate.is_empty() && table.local_classes.contains(candidate) {
+            table
+                .var_receivers
+                .insert(var_name.to_string(), candidate.to_string());
+        }
     }
 
     let is_direct_xss_san = contains_xss_sanitizer_call(rhs, src)
         || (table.xss_sanitized_vars.contains(rhs_txt) && !has_taint_source_expr(rhs_txt));
-    if is_direct_xss_san && !has_direct_tainted_unsanitized_wrap(rhs_txt) {
+    if is_direct_xss_san
+        && !has_direct_tainted_unsanitized_wrap(rhs_txt)
+        && !table.unsanitized_or_shadowed_vars.contains(var_name)
+    {
         table.xss_sanitized_vars.insert(var_name.to_string());
     } else if rhs_txt.is_empty() || !table.xss_sanitized_vars.contains(rhs_txt) {
+        table
+            .unsanitized_or_shadowed_vars
+            .insert(var_name.to_string());
         table.xss_sanitized_vars.remove(var_name);
     }
 }
@@ -242,5 +300,24 @@ runner.query('cpu');
         let scope = parse_ts_scope(code);
         assert!(scope.local_classes.contains("LocalMetricsRunner"));
         assert!(is_benign_local_receiver("runner.query", &scope));
+    }
+
+    #[test]
+    fn test_scope_prevents_cross_function_parameter_shadowing_leak() {
+        let code = r#"
+import DOMPurify from 'dompurify';
+function safeView(raw: string) {
+    const html = DOMPurify.sanitize(raw);
+    return html;
+}
+function unsafeView(html: string) {
+    return html;
+}
+"#;
+        let scope = parse_ts_scope(code);
+        assert!(
+            !scope.xss_sanitized_vars.contains("html"),
+            "Parameter `html` in unsafeView must revoke file-global xss_sanitized_vars entry"
+        );
     }
 }

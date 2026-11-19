@@ -626,7 +626,7 @@ fn parse_openapi_yaml_lite(rel_path: &str, source: &str) -> Vec<RouteSchema> {
 
     for (idx, raw) in source.lines().enumerate() {
         let ln = idx + 1;
-        let without_comment = raw.split('#').next().unwrap_or("");
+        let without_comment = smg_core::yaml::strip_yaml_comment_quoted(raw);
         if without_comment.trim().is_empty() {
             continue;
         }

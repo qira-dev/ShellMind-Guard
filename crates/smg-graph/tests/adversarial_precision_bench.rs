@@ -1876,6 +1876,57 @@ export async function syncData(id: string) {
                 code: "#!/usr/bin/env bash\necho \"PR_TITLE=$1\" >> $GITHUB_ENV\n",
             }],
         },
+        // ------------------------------------------------------------------
+        // Phase 11 (Sprint 1): CFG Else-Abort, Closure Isolation, Multi-Hop Alias & Switch Join
+        // ------------------------------------------------------------------
+        AdversarialCase {
+            id: "sprint1_inverted_if_else_abort_auth_safe",
+            family: "AUTH",
+            expected_prefix: "SMG-AUTH",
+            expect_finding: false,
+            trap_kind: TrapKind::DominatorGuardTrap,
+            files: vec![BenchFile {
+                rel_path: "src/pay_else_abort.ts",
+                lang: Language::TypeScript,
+                code: "function doCharge(req: any) { balance -= req.body.amount; }\napp.post('/api/pay-inv', (req, res) => {\n  if (verifyJwt(req)) {\n    doCharge(req);\n  } else {\n    return res.status(401).end();\n  }\n});\n",
+            }],
+        },
+        AdversarialCase {
+            id: "sprint1_uninvoked_closure_auth_leak_vuln",
+            family: "AUTH",
+            expected_prefix: "SMG-AUTH",
+            expect_finding: true,
+            trap_kind: TrapKind::ScopeCollisionTrap,
+            files: vec![BenchFile {
+                rel_path: "src/pay_uninvoked_closure.ts",
+                lang: Language::TypeScript,
+                code: "app.post('/api/pay-closure', (req, res) => {\n  const deadGuard = () => { requireAuth(req); return res.status(401).end(); };\n  balance -= req.body.amount;\n});\n",
+            }],
+        },
+        AdversarialCase {
+            id: "sprint1_multihop_object_alias_cmdi_vuln",
+            family: "CMDI",
+            expected_prefix: "SMG-CMDI",
+            expect_finding: true,
+            trap_kind: TrapKind::OneHopWrapperTrap,
+            files: vec![BenchFile {
+                rel_path: "src/alias_cmd.ts",
+                lang: Language::TypeScript,
+                code: "import child_process from 'child_process';\napp.post('/api/alias-exec', (req, res) => {\n  const ctx: any = { cmd: 'echo safe' };\n  const a = ctx;\n  const b = a;\n  b.cmd = req.body.userCmd;\n  child_process.execSync(ctx.cmd);\n});\n",
+            }],
+        },
+        AdversarialCase {
+            id: "sprint1_switch_sibling_arm_sanitizer_leak_vuln",
+            family: "PATH",
+            expected_prefix: "SMG-PATH",
+            expect_finding: true,
+            trap_kind: TrapKind::DominatorGuardTrap,
+            files: vec![BenchFile {
+                rel_path: "src/switch_path.ts",
+                lang: Language::TypeScript,
+                code: "import fs from 'fs';\nimport path from 'path';\napp.get('/api/switch-file', (req, res) => {\n  let p = req.query.file;\n  switch (req.query.mode) {\n    case 'safe':\n      p = path.basename(p);\n      break;\n    case 'raw':\n      fs.readFileSync(p);\n      break;\n  }\n});\n",
+            }],
+        },
     ]
 }
 

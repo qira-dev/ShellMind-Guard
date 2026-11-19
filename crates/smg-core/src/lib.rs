@@ -2,6 +2,7 @@ pub mod advisories;
 pub mod config;
 pub mod scanner;
 pub mod store;
+pub mod yaml;
 
 pub use advisories::{
     AdvisoryRecord, AdvisoryStore, advisories_db_stamp, default_advisories_db_path,

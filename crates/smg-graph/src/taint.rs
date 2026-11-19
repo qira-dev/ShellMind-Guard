@@ -63,9 +63,26 @@ struct TaintEnv {
     handler_maps: HashMap<String, Vec<String>>,
     /// Wave 3A: local callable alias bound from a handler map (`const fn = handlers[k]`).
     handler_aliases: HashMap<String, Vec<String>>,
+    /// Phase 11: Multi-hop object points-to alias graph (`alias_var -> parent_obj_var`).
+    object_aliases: HashMap<String, String>,
 }
 
 impl TaintEnv {
+    /// Resolves a variable through up to 4 object alias hops (`r2 -> r1 -> payload`) to its canonical root.
+    fn resolve_obj_root(&self, var: &str) -> String {
+        let mut cur = var;
+        for _ in 0..4 {
+            if let Some(next) = self.object_aliases.get(cur)
+                && next != cur
+            {
+                cur = next.as_str();
+            } else {
+                break;
+            }
+        }
+        cur.to_string()
+    }
+
     fn join(&mut self, other: &Self) {
         for (k, v) in &other.direct {
             *self.direct.entry(k.clone()).or_insert(0) |= *v;
@@ -133,6 +150,11 @@ impl TaintEnv {
                 }
             }
         }
+        for (alias, target) in &other.object_aliases {
+            self.object_aliases
+                .entry(alias.clone())
+                .or_insert_with(|| target.clone());
+        }
         self.var_cleared_masks.retain(|k, prev| {
             if let Some(ov) = other.var_cleared_masks.get(k) {
                 *prev &= *ov;
@@ -159,23 +181,26 @@ impl TaintEnv {
 
     fn clear_bits_for_vars(&mut self, vars: &HashSet<String>, clear_mask: u8) {
         for v in vars {
-            if let Some(m) = self.direct.get_mut(v) {
-                *m &= !clear_mask;
-                if *m == 0 {
-                    self.direct.remove(v);
+            let root_v = self.resolve_obj_root(v);
+            for target_v in [v.as_str(), root_v.as_str()] {
+                if let Some(m) = self.direct.get_mut(target_v) {
+                    *m &= !clear_mask;
+                    if *m == 0 {
+                        self.direct.remove(target_v);
+                    }
                 }
-            }
-            if let Some(m) = self.params.get_mut(v) {
-                *m &= !clear_mask;
-                if *m == 0 {
-                    self.params.remove(v);
+                if let Some(m) = self.params.get_mut(target_v) {
+                    *m &= !clear_mask;
+                    if *m == 0 {
+                        self.params.remove(target_v);
+                    }
                 }
             }
             let keys: Vec<(String, String)> = self
                 .field_direct
                 .keys()
                 .chain(self.field_params.keys())
-                .filter(|(obj, fld)| obj == v || fld == v)
+                .filter(|(obj, fld)| obj == v || obj == &root_v || fld == v)
                 .cloned()
                 .collect();
             for k in keys {
@@ -1106,7 +1131,18 @@ fn collect_param_idents(node: Node, src: &[u8], out: &mut HashSet<String>) {
         return;
     }
     if k == "parameter_declaration" {
-        if let Some(name_node) = node.child_by_field_name("name") {
+        let mut found_any = false;
+        let mut c = node.walk();
+        for ch in node.children(&mut c) {
+            if ch.kind() == "identifier" {
+                let name = node_text(ch, src).trim();
+                if !name.is_empty() && name != "_" {
+                    out.insert(name.to_string());
+                    found_any = true;
+                }
+            }
+        }
+        if !found_any && let Some(name_node) = node.child_by_field_name("name") {
             let name = node_text(name_node, src).trim();
             if !name.is_empty() && name != "_" {
                 out.insert(name.to_string());
@@ -1615,17 +1651,20 @@ fn ast_eval_masks(node: Node, src: &[u8], env: &TaintEnv) -> (u8, u8) {
                 return (0, 0);
             }
         }
-        if let Some((base, field)) = extract_member_base_field(node, src) {
+        if let Some((raw_base, field)) = extract_member_base_field(node, src) {
             if matches!(field.as_str(), "length" | "len" | "size" | "count") {
                 return (0, 0);
             }
+            let base = env.resolve_obj_root(&raw_base);
             let f_direct = env
                 .field_direct
                 .get(&(base.clone(), field.clone()))
+                .or_else(|| env.field_direct.get(&(raw_base.clone(), field.clone())))
                 .copied();
             let f_param = env
                 .field_params
                 .get(&(base.clone(), field.clone()))
+                .or_else(|| env.field_params.get(&(raw_base.clone(), field.clone())))
                 .copied();
             if f_direct.is_some() || f_param.is_some() {
                 return (f_direct.unwrap_or(0), f_param.unwrap_or(0));
@@ -1633,10 +1672,13 @@ fn ast_eval_masks(node: Node, src: &[u8], env: &TaintEnv) -> (u8, u8) {
             if env
                 .sanitized_fields
                 .contains(&(base.clone(), field.clone()))
+                || env
+                    .sanitized_fields
+                    .contains(&(raw_base.clone(), field.clone()))
             {
                 return (0, 0);
             }
-            if env.object_vars.contains(&base) {
+            if env.object_vars.contains(&base) || env.object_vars.contains(&raw_base) {
                 return (0, 0);
             }
         }
@@ -2557,16 +2599,17 @@ fn check_call_taint_sinks(
             let mut ac2 = an.walk();
             for arg in an.children(&mut ac2) {
                 if arg.kind() == "identifier" {
-                    let aname = node_text(arg, src).trim();
-                    if env.object_vars.contains(aname) {
+                    let raw_aname = node_text(arg, src).trim();
+                    let aname = env.resolve_obj_root(raw_aname);
+                    if env.object_vars.contains(raw_aname) || env.object_vars.contains(&aname) {
                         let mut field_pairs: Vec<(String, u8)> = Vec::new();
                         for ((obj, fld), m) in &env.field_direct {
-                            if obj == aname && *m != 0 {
+                            if (obj == &aname || obj == raw_aname) && *m != 0 {
                                 field_pairs.push((fld.clone(), *m));
                             }
                         }
                         for ((obj, fld), m) in &env.field_params {
-                            if obj == aname && *m != 0 {
+                            if (obj == &aname || obj == raw_aname) && *m != 0 {
                                 if let Some(ex) = field_pairs.iter_mut().find(|(f, _)| f == fld) {
                                     ex.1 |= *m;
                                 } else {
@@ -3350,17 +3393,39 @@ fn collect_return_clears_rec(
 
 fn stmt_unconditionally_exits(stmt: Node) -> bool {
     let k = stmt.kind();
+    if crate::cfg::is_nested_fn_or_closure_kind(k) {
+        return false;
+    }
     if matches!(
         k,
         "return_statement" | "throw_statement" | "raise_statement" | "return_expression"
     ) {
         return true;
     }
-    if matches!(k, "statement_block" | "block") {
+    if matches!(
+        k,
+        "statement_block"
+            | "block"
+            | "compound_statement"
+            | "else_clause"
+            | "switch_case"
+            | "switch_default"
+            | "expression_case"
+            | "default_case"
+            | "match_arm"
+    ) {
         let mut c = stmt.walk();
         return stmt
             .children(&mut c)
             .any(|ch| stmt_unconditionally_exits(ch));
+    }
+    if matches!(k, "if_statement" | "if_expression" | "elif_clause") {
+        let cons = stmt
+            .child_by_field_name("consequence")
+            .or_else(|| stmt.child_by_field_name("body"));
+        let alt = stmt.child_by_field_name("alternative");
+        return cons.is_some_and(stmt_unconditionally_exits)
+            && alt.is_some_and(stmt_unconditionally_exits);
     }
     false
 }
@@ -3435,6 +3500,9 @@ fn analyze_statement_block_depth(
                 | "for_statement"
                 | "for_in_statement"
                 | "while_statement"
+                | "for_expression"
+                | "while_expression"
+                | "loop_expression"
                 | "with_statement"
                 | "match_expression"
                 | "switch_statement"
@@ -3627,14 +3695,17 @@ fn analyze_statement_block_depth(
                 }
             } else if !is_aug
                 && lhs_raws.len() == 1
-                && let Some((base, field)) = split_simple_member(&lhs_raws[0])
+                && let Some((raw_base, field)) = split_simple_member(&lhs_raws[0])
             {
+                let base = env.resolve_obj_root(&raw_base);
+                env.object_vars.insert(raw_base.clone());
                 env.object_vars.insert(base.clone());
                 if rhs_direct_mask != 0 {
                     env.field_direct
                         .insert((base.clone(), field.clone()), rhs_direct_mask);
                     env.sanitized_fields.remove(&(base.clone(), field.clone()));
                     *env.direct.entry(base.clone()).or_insert(0) |= rhs_direct_mask;
+                    *env.direct.entry(raw_base.clone()).or_insert(0) |= rhs_direct_mask;
                 } else {
                     env.field_direct.remove(&(base.clone(), field.clone()));
                 }
@@ -3643,6 +3714,7 @@ fn analyze_statement_block_depth(
                         .insert((base.clone(), field.clone()), rhs_param_mask);
                     env.sanitized_fields.remove(&(base.clone(), field.clone()));
                     *env.params.entry(base.clone()).or_insert(0) |= rhs_param_mask;
+                    *env.params.entry(raw_base.clone()).or_insert(0) |= rhs_param_mask;
                 } else {
                     env.field_params.remove(&(base.clone(), field.clone()));
                 }
@@ -3698,15 +3770,22 @@ fn analyze_statement_block_depth(
                             env.destructured_param_fields
                                 .insert(local_var.clone(), orig_k.clone());
                         }
-                        if env.object_vars.contains(rhs_id) {
+                        let rhs_root = env.resolve_obj_root(rhs_id);
+                        if env.object_vars.contains(rhs_id) || env.object_vars.contains(&rhs_root) {
                             let fd = env
                                 .field_direct
-                                .get(&(rhs_id.to_string(), orig_k.clone()))
+                                .get(&(rhs_root.clone(), orig_k.clone()))
+                                .or_else(|| {
+                                    env.field_direct.get(&(rhs_id.to_string(), orig_k.clone()))
+                                })
                                 .copied()
                                 .unwrap_or(0);
                             let fp = env
                                 .field_params
-                                .get(&(rhs_id.to_string(), orig_k.clone()))
+                                .get(&(rhs_root, orig_k.clone()))
+                                .or_else(|| {
+                                    env.field_params.get(&(rhs_id.to_string(), orig_k.clone()))
+                                })
                                 .copied()
                                 .unwrap_or(0);
                             if fd != 0 {
@@ -3773,6 +3852,19 @@ fn analyze_statement_block_depth(
                                 env.var_wrappers.insert(n.clone(), w.clone());
                             } else {
                                 env.var_wrappers.remove(&n);
+                            }
+                            // Track object points-to alias `const alias = payload`
+                            let rhs_trim = rhs_txt.trim();
+                            if rhs_node.kind() == "identifier"
+                                && rhs_trim != n
+                                && (env.object_vars.contains(rhs_trim)
+                                    || env.object_aliases.contains_key(rhs_trim))
+                            {
+                                let root_obj = env.resolve_obj_root(rhs_trim);
+                                env.object_aliases.insert(n.clone(), root_obj);
+                                env.object_vars.insert(n.clone());
+                            } else {
+                                env.object_aliases.remove(&n);
                             }
                             // Track alias `const fn = handlers[action]` or `handlers.get(action)`
                             if matches!(
@@ -3862,17 +3954,26 @@ fn analyze_statement_block_depth(
             let alt_node = stmt.child_by_field_name("alternative");
             let mut env_then = env.clone();
             let then_exits = cons_node.is_some_and(stmt_unconditionally_exits);
-            if let Some(cn) = cond_node
-                && !then_exits
-            {
+            let cond_meta = cond_node.map(|cn| {
                 let cond_txt = strip_comments_simple(node_text(cn, src));
                 let trimmed = cond_txt.trim_start().trim_start_matches('(').trim_start();
-                if !trimmed.starts_with('!') && !trimmed.starts_with("not ") {
-                    let narrow_mask = condition_narrow_mask(&cond_txt);
-                    if narrow_mask != 0 {
-                        let c_vars = collect_cond_idents(&cond_txt);
-                        env_then.clear_bits_for_vars(&c_vars, narrow_mask);
-                    }
+                let is_neg = trimmed.starts_with('!')
+                    || trimmed.starts_with("not ")
+                    || trimmed.contains("== false")
+                    || trimmed.contains("=== false");
+                let has_or = cond_txt.contains("||") || cond_txt.contains(" or ");
+                let has_and = cond_txt.contains("&&") || cond_txt.contains(" and ");
+                (cond_txt, is_neg, has_or, has_and)
+            });
+            if let Some((ref cond_txt, is_neg, has_or, _)) = cond_meta
+                && !then_exits
+                && !is_neg
+                && !has_or
+            {
+                let narrow_mask = condition_narrow_mask(cond_txt);
+                if narrow_mask != 0 {
+                    let c_vars = collect_cond_idents(cond_txt);
+                    env_then.clear_bits_for_vars(&c_vars, narrow_mask);
                 }
             }
             if let Some(cons) = cons_node {
@@ -3890,6 +3991,17 @@ fn analyze_statement_block_depth(
 
             if let Some(alt) = alt_node {
                 let mut env_else = env.clone();
+                // Negated guard on `if (!isAllowedPath(p)) { ... } else { readFile(p); }` narrows `env_else`
+                if let Some((ref cond_txt, is_neg, _, has_and)) = cond_meta
+                    && is_neg
+                    && !has_and
+                {
+                    let narrow_mask = condition_narrow_mask(cond_txt);
+                    if narrow_mask != 0 {
+                        let c_vars = collect_cond_idents(cond_txt);
+                        env_else.clear_bits_for_vars(&c_vars, narrow_mask);
+                    }
+                }
                 analyze_statement_block_depth(
                     alt,
                     src,
@@ -3908,17 +4020,224 @@ fn analyze_statement_block_depth(
                     (true, true) => {}
                 }
             } else if then_exits {
-                // Early-return validation narrowing on fall-through path (only for vars checked AFTER the guard)
-                if let Some(cn) = cond_node {
-                    let cond_txt = strip_comments_simple(node_text(cn, src));
-                    let narrow_mask = condition_narrow_mask(&cond_txt);
+                // Early-return validation narrowing on fall-through path (only when De Morgan guarantees guard holds)
+                if let Some((ref cond_txt, is_neg, _, has_and)) = cond_meta
+                    && !(is_neg && has_and)
+                {
+                    let narrow_mask = condition_narrow_mask(cond_txt);
                     if narrow_mask != 0 {
-                        let c_vars = collect_cond_idents(&cond_txt);
+                        let c_vars = collect_cond_idents(cond_txt);
                         env.clear_bits_for_vars(&c_vars, narrow_mask);
                     }
                 }
             } else {
                 env.join(&env_then);
+            }
+        } else if matches!(
+            sk,
+            "switch_statement"
+                | "expression_switch_statement"
+                | "type_switch_statement"
+                | "match_expression"
+        ) {
+            let mut arms = Vec::new();
+            let mut has_default = false;
+            let mut sub = stmt.walk();
+            for ch in stmt.children(&mut sub) {
+                let ck = ch.kind();
+                if matches!(
+                    ck,
+                    "switch_case"
+                        | "switch_default"
+                        | "expression_case"
+                        | "default_case"
+                        | "match_arm"
+                ) {
+                    if ck == "switch_default"
+                        || ck == "default_case"
+                        || (ck == "match_arm" && node_text(ch, src).trim_start().starts_with('_'))
+                    {
+                        has_default = true;
+                    }
+                    arms.push(ch);
+                } else if matches!(ck, "switch_body" | "match_block") {
+                    let mut sc = ch.walk();
+                    for s in ch.children(&mut sc) {
+                        let sk2 = s.kind();
+                        if matches!(
+                            sk2,
+                            "switch_case"
+                                | "switch_default"
+                                | "expression_case"
+                                | "default_case"
+                                | "match_arm"
+                        ) {
+                            if sk2 == "switch_default"
+                                || sk2 == "default_case"
+                                || (sk2 == "match_arm"
+                                    && node_text(s, src).trim_start().starts_with('_'))
+                            {
+                                has_default = true;
+                            }
+                            arms.push(s);
+                        }
+                    }
+                }
+            }
+            if !arms.is_empty() {
+                let base_env = env.clone();
+                let mut joined_opt: Option<TaintEnv> = if has_default {
+                    None
+                } else {
+                    Some(base_env.clone())
+                };
+                for arm in arms {
+                    let mut arm_env = base_env.clone();
+                    analyze_statement_block_depth(
+                        arm,
+                        src,
+                        rel_path,
+                        lang,
+                        symbol_name,
+                        &mut arm_env,
+                        summary,
+                        depth + 1,
+                    );
+                    if !stmt_unconditionally_exits(arm) {
+                        if let Some(ref mut j) = joined_opt {
+                            j.join(&arm_env);
+                        } else {
+                            joined_opt = Some(arm_env);
+                        }
+                    }
+                }
+                if let Some(j) = joined_opt {
+                    *env = j;
+                }
+            }
+        } else if sk == "try_statement" {
+            let base_env = env.clone();
+            let mut try_env = base_env.clone();
+            let mut try_exits = false;
+            let mut catch_nodes = Vec::new();
+            let mut finally_node: Option<Node> = None;
+
+            let mut sub = stmt.walk();
+            for ch in stmt.children(&mut sub) {
+                match ch.kind() {
+                    "statement_block" | "block" => {
+                        analyze_statement_block_depth(
+                            ch,
+                            src,
+                            rel_path,
+                            lang,
+                            symbol_name,
+                            &mut try_env,
+                            summary,
+                            depth + 1,
+                        );
+                        try_exits = stmt_unconditionally_exits(ch);
+                    }
+                    "catch_clause" | "except_clause" => catch_nodes.push(ch),
+                    "finally_clause" => finally_node = Some(ch),
+                    _ => {}
+                }
+            }
+
+            let mut joined_opt: Option<TaintEnv> = if try_exits {
+                None
+            } else {
+                Some(try_env.clone())
+            };
+            for cn in catch_nodes {
+                let mut catch_env = base_env.clone();
+                catch_env.join(&try_env);
+                analyze_statement_block_depth(
+                    cn,
+                    src,
+                    rel_path,
+                    lang,
+                    symbol_name,
+                    &mut catch_env,
+                    summary,
+                    depth + 1,
+                );
+                if !stmt_unconditionally_exits(cn) {
+                    if let Some(ref mut j) = joined_opt {
+                        j.join(&catch_env);
+                    } else {
+                        joined_opt = Some(catch_env);
+                    }
+                }
+            }
+            if let Some(j) = joined_opt {
+                *env = j;
+            }
+            if let Some(fin) = finally_node {
+                analyze_statement_block_depth(
+                    fin,
+                    src,
+                    rel_path,
+                    lang,
+                    symbol_name,
+                    env,
+                    summary,
+                    depth + 1,
+                );
+            }
+        } else if matches!(
+            sk,
+            "for_statement"
+                | "for_in_statement"
+                | "while_statement"
+                | "for_expression"
+                | "while_expression"
+                | "loop_expression"
+        ) {
+            let pre_direct = env.direct.clone();
+            let pre_params = env.params.clone();
+            let pre_fd = env.field_direct.clone();
+            let pre_fp = env.field_params.clone();
+            let mut loop_env = env.clone();
+            let mut sub = stmt.walk();
+            for ch in stmt.children(&mut sub) {
+                if matches!(ch.kind(), "statement_block" | "block") {
+                    analyze_statement_block_depth(
+                        ch,
+                        src,
+                        rel_path,
+                        lang,
+                        symbol_name,
+                        &mut loop_env,
+                        summary,
+                        depth + 1,
+                    );
+                }
+            }
+            env.join(&loop_env);
+            // Bounded 2-pass fixpoint: if loop body introduced new loop-carried taint, run a second pass
+            if env.direct != pre_direct
+                || env.params != pre_params
+                || env.field_direct != pre_fd
+                || env.field_params != pre_fp
+            {
+                let mut pass2_env = env.clone();
+                let mut sub2 = stmt.walk();
+                for ch in stmt.children(&mut sub2) {
+                    if matches!(ch.kind(), "statement_block" | "block") {
+                        analyze_statement_block_depth(
+                            ch,
+                            src,
+                            rel_path,
+                            lang,
+                            symbol_name,
+                            &mut pass2_env,
+                            summary,
+                            depth + 1,
+                        );
+                    }
+                }
+                env.join(&pass2_env);
             }
         } else if is_compound {
             let mut sub = stmt.walk();
@@ -4393,5 +4712,108 @@ pub fn extract_frontend_calls_and_bugs(
     let mut cursor = node.walk();
     for ch in node.children(&mut cursor) {
         extract_frontend_calls_and_bugs(ch, src, rel_path, lang, calls_out, bugs_out);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn run_ts_taint(code: &str) -> FunctionTaintSummary {
+        let mut p = Parser::new();
+        p.set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+            .unwrap();
+        let tree = p.parse(code, None).unwrap();
+        let root = tree.root_node();
+        let mut c = root.walk();
+        let fn_node = root
+            .children(&mut c)
+            .find(|n| n.kind() == "function_declaration")
+            .unwrap();
+        analyze_function_taint(
+            fn_node,
+            code.as_bytes(),
+            "src/handler.ts",
+            Language::TypeScript,
+            "handler",
+            Some("/api/run"),
+        )
+    }
+
+    #[test]
+    fn test_sprint1_multihop_object_alias_switch_isolation_and_go_grouped_params() {
+        // 1. Multi-hop object points-to alias (`r1 = obj; r2 = r1; r2.cmd = req.body.x; execSync(obj.cmd)`)
+        let alias_sum = run_ts_taint(
+            r#"function handler(req: any) {
+                const obj: any = { cmd: "echo ok" };
+                const r1 = obj;
+                const r2 = r1;
+                r2.cmd = req.body.userCmd;
+                child_process.execSync(obj.cmd);
+            }"#,
+        );
+        assert!(
+            alias_sum
+                .local_taint_hits
+                .iter()
+                .any(|f| f.rule_id == "SMG-CMDI-001"),
+            "Multi-hop object alias write `r2.cmd = req.body...` must taint `obj.cmd`"
+        );
+
+        // 2. Switch case sanitizer must NOT leak into sibling switch case
+        let switch_sum = run_ts_taint(
+            r#"function handler(req: any) {
+                let p = req.query.file;
+                switch (req.query.mode) {
+                    case 'clean':
+                        p = path.basename(p);
+                        break;
+                    case 'raw':
+                        fs.readFileSync(p);
+                        break;
+                }
+            }"#,
+        );
+        assert!(
+            switch_sum
+                .local_taint_hits
+                .iter()
+                .any(|f| f.rule_id == "SMG-PATH-001"),
+            "Sanitizer in case 'clean' must not suppress unsanitized sink in sibling case 'raw'"
+        );
+
+        // 3. Grouped Go parameters `func run(a, b string)` must taint secondary param `b`
+        let go_code = r#"
+package main
+import "os/exec"
+func run(a, b string) {
+    exec.Command("sh", "-c", b).Run()
+}
+"#;
+        let mut gp = Parser::new();
+        gp.set_language(&tree_sitter_go::LANGUAGE.into()).unwrap();
+        let gtree = gp.parse(go_code, None).unwrap();
+        let groot = gtree.root_node();
+        let mut gc = groot.walk();
+        let gfn = groot
+            .children(&mut gc)
+            .find(|n| n.kind() == "function_declaration")
+            .unwrap();
+        let go_sum = analyze_function_taint(
+            gfn,
+            go_code.as_bytes(),
+            "pkg/exec.go",
+            Language::Go,
+            "run",
+            None,
+        );
+        assert!(
+            go_sum
+                .param_sinks
+                .iter()
+                .any(|f| f.rule_id == "SMG-CMDI-001"),
+            "Secondary grouped Go parameter `b` in `func run(a, b string)` must be tracked as param taint"
+        );
     }
 }

@@ -744,11 +744,20 @@ fn collect_call_names_shallow_depth(node: Node, src: &[u8], out: &mut Vec<String
     if matches!(
         k,
         "if_statement"
+            | "if_expression"
             | "switch_statement"
-            | "function_declaration"
-            | "arrow_function"
-            | "function_expression"
-    ) {
+            | "expression_switch_statement"
+            | "type_switch_statement"
+            | "match_expression"
+            | "try_statement"
+            | "for_statement"
+            | "for_in_statement"
+            | "while_statement"
+            | "for_expression"
+            | "while_expression"
+            | "loop_expression"
+    ) || crate::cfg::is_nested_fn_or_closure_kind(k)
+    {
         return;
     }
     if (k == "call_expression" || k == "call")

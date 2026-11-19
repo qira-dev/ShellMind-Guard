@@ -24,8 +24,86 @@ pub struct CfgBlock {
     pub is_abort_exit: bool,
 }
 
+/// Fast $O(N)$ AST text pre-filter: returns `false` for pure helper functions that contain
+/// no control-flow branching, guard calls, sanitizers, locks, or state-mutating sinks,
+/// avoiding unnecessary CFG/dominator allocations on trivial functions.
+fn has_cfg_candidate_signal(body: Node, src: &[u8]) -> bool {
+    let raw = node_text(body, src);
+    if raw.len() > 64 {
+        return true;
+    }
+    let low = raw.to_ascii_lowercase();
+    low.contains('(')
+        || low.contains("if")
+        || low.contains("match")
+        || low.contains("switch")
+        || low.contains("try")
+        || low.contains("for")
+        || low.contains("while")
+        || low.contains("auth")
+        || low.contains("lock")
+        || low.contains("select ")
+        || low.contains("update ")
+        || low.contains("insert ")
+        || low.contains("delete ")
+        || low.contains("balance")
+        || low.contains("debit")
+        || low.contains("withdraw")
+}
+
+/// Returns `true` when `stmt` is a variable declaration or assignment whose RHS is an uninvoked
+/// closure/function definition (`const f = () => { ... };`), so its body does not pollute outer CFG.
+fn is_uninvoked_closure_binding(stmt: Node) -> bool {
+    if is_nested_fn_or_closure_kind(stmt.kind()) {
+        return true;
+    }
+    if matches!(
+        stmt.kind(),
+        "lexical_declaration"
+            | "variable_declaration"
+            | "short_var_declaration"
+            | "assignment_expression"
+            | "assignment"
+            | "let_declaration"
+    ) {
+        let mut c = stmt.walk();
+        for ch in stmt.named_children(&mut c) {
+            if is_nested_fn_or_closure_kind(ch.kind()) {
+                return true;
+            }
+            if matches!(ch.kind(), "variable_declarator" | "init_declarator")
+                && let Some(val) = ch.child_by_field_name("value")
+                && is_nested_fn_or_closure_kind(val.kind())
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+/// Returns `true` if `kind` is an inner function or closure boundary whose control flow
+/// (`return`, `throw`, inner statements) must not leak into the enclosing function's CFG.
+#[inline]
+pub(crate) fn is_nested_fn_or_closure_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "function_declaration"
+            | "function_item"
+            | "function_definition"
+            | "method_declaration"
+            | "method_definition"
+            | "arrow_function"
+            | "closure_expression"
+            | "func_literal"
+            | "function_expression"
+            | "lambda"
+            | "anonymous_function"
+    )
+}
+
 /// Evaluates whether guards strictly dominate every reachable sink (or exit block if sinkless
-/// wrapper) in `fn_node` across linear, early-return, conditional diamond, and post-sink paths.
+/// wrapper) in `fn_node` across linear, early-return, conditional diamond, switch/match,
+/// try/catch/finally, loop, and post-sink paths.
 pub fn compute_cfg_guard_dominance(
     fn_node: Node,
     src: &[u8],
@@ -35,6 +113,9 @@ pub fn compute_cfg_guard_dominance(
     let Some(body) = fn_node.child_by_field_name("body") else {
         return entry_guards.to_set();
     };
+    if !has_cfg_candidate_signal(body, src) {
+        return entry_guards.to_set();
+    }
 
     let mut builder = CfgBuilder::new(src, cfg, entry_guards);
     let exit_bb = builder.lower_block(body, 0, 0);
@@ -244,16 +325,39 @@ impl<'a> CfgBuilder<'a> {
                     continue;
                 }
             }
-            // Ignore nested inner function declarations (analyzed as their own symbols)
-            if matches!(
-                sk,
-                "function_declaration" | "function_item" | "function_definition"
-            ) {
+            // Ignore nested inner function/closure declarations (analyzed as their own symbols)
+            if is_uninvoked_closure_binding(stmt) {
                 continue;
             }
 
             if matches!(sk, "if_statement" | "if_expression" | "elif_clause") {
                 cur_bb = self.lower_if(stmt, cur_bb, depth + 1)?;
+                continue;
+            }
+            if matches!(
+                sk,
+                "switch_statement"
+                    | "expression_switch_statement"
+                    | "type_switch_statement"
+                    | "match_expression"
+            ) {
+                cur_bb = self.lower_switch_or_match(stmt, cur_bb, depth + 1)?;
+                continue;
+            }
+            if sk == "try_statement" {
+                cur_bb = self.lower_try(stmt, cur_bb, depth + 1)?;
+                continue;
+            }
+            if matches!(
+                sk,
+                "for_statement"
+                    | "for_in_statement"
+                    | "while_statement"
+                    | "for_expression"
+                    | "while_expression"
+                    | "loop_expression"
+            ) {
+                cur_bb = self.lower_loop(stmt, cur_bb, depth + 1)?;
                 continue;
             }
             if matches!(
@@ -299,13 +403,24 @@ impl<'a> CfgBuilder<'a> {
     }
 
     fn lower_if(&mut self, if_node: Node, pre_bb: usize, depth: usize) -> Option<usize> {
-        let cond_guards = if_node
-            .child_by_field_name("condition")
+        let cond_node = if_node.child_by_field_name("condition");
+        let (cond_guards, cond_is_negated) = cond_node
             .map(|c| {
-                self.stmt_direct_guards(c)
-                    .union(self.early_cond_text_guards(if_node))
+                let g = self
+                    .stmt_direct_guards(c)
+                    .union(self.early_cond_text_guards(if_node));
+                let c_txt = crate::ast::strip_comments(node_text(c, self.src));
+                let t = c_txt.trim_start().trim_start_matches('(').trim_start();
+                let neg = t.starts_with('!')
+                    || t.starts_with("not ")
+                    || t.contains("!= nil")
+                    || t.contains("== nil")
+                    || t.contains("== null")
+                    || t.contains("== false")
+                    || t.contains("=== false");
+                (g, neg)
             })
-            .unwrap_or_else(|| self.early_cond_text_guards(if_node));
+            .unwrap_or_else(|| (self.early_cond_text_guards(if_node), false));
 
         let consequence = if_node
             .child_by_field_name("consequence")
@@ -314,6 +429,15 @@ impl<'a> CfgBuilder<'a> {
 
         let then_start = self.new_block()?;
         self.link(pre_bb, then_start);
+        // Positive branch condition (`if (verifyJwt(req)) { sink(); }`, `if (idx < cap) { ... }`)
+        // grants condition guards inside `then_start` even when `else` does not abort.
+        if !cond_is_negated
+            && !cond_guards.is_empty()
+            && let Some(tb) = self.blocks.get_mut(then_start)
+        {
+            tb.pre_sink_guards = tb.pre_sink_guards.union(cond_guards);
+            tb.post_guards = tb.post_guards.union(cond_guards);
+        }
         let then_end = if let Some(cons) = consequence {
             self.lower_block(cons, then_start, depth)
         } else {
@@ -321,37 +445,52 @@ impl<'a> CfgBuilder<'a> {
         };
 
         let then_terminated = then_end.is_none();
+        if then_terminated {
+            for b in &mut self.blocks[then_start..] {
+                if b.succs.is_empty() {
+                    b.is_abort_exit = true;
+                }
+            }
+        }
 
+        let mut else_start_idx: Option<usize> = None;
         let else_end = if let Some(alt) = alternative {
             let else_start = self.new_block()?;
+            else_start_idx = Some(else_start);
             self.link(pre_bb, else_start);
+            // Negated condition (`if (!verifyJwt(req)) { ... } else { sink(); }`) grants guard on `else_start`.
+            if cond_is_negated
+                && !cond_guards.is_empty()
+                && let Some(eb) = self.blocks.get_mut(else_start)
+            {
+                eb.pre_sink_guards = eb.pre_sink_guards.union(cond_guards);
+                eb.post_guards = eb.post_guards.union(cond_guards);
+            }
             self.lower_block(alt, else_start, depth)
         } else {
-            // Fallthrough edge (condition false / early-return guard passed).
-            if then_terminated && !cond_guards.is_empty() {
-                for b in &mut self.blocks[then_start..] {
+            let fall_bb = self.new_block()?;
+            self.link(pre_bb, fall_bb);
+            if then_terminated && let Some(b) = self.blocks.get_mut(fall_bb) {
+                // Passing a terminating auth/lock/bounds guard condition grants that guard along the surviving path.
+                b.pre_sink_guards = b.pre_sink_guards.union(cond_guards);
+                b.post_guards = b.post_guards.union(cond_guards);
+            }
+            Some(fall_bb)
+        };
+
+        // Mark abort exits on `if (ok) { ... } else { return 401; }` and propagate guard onto `then_start`.
+        if else_end.is_none() {
+            if let Some(es) = else_start_idx {
+                for b in &mut self.blocks[es..] {
                     if b.succs.is_empty() {
                         b.is_abort_exit = true;
                     }
                 }
             }
-            let fall_bb = self.new_block()?;
-            self.link(pre_bb, fall_bb);
-            if then_terminated && let Some(b) = self.blocks.get_mut(fall_bb) {
-                // Passing a terminating auth/lock guard condition grants that guard along the surviving path.
-                b.pre_sink_guards = cond_guards;
-                b.post_guards = cond_guards;
+            if !then_terminated && let Some(tb) = self.blocks.get_mut(then_start) {
+                tb.pre_sink_guards = tb.pre_sink_guards.union(cond_guards);
+                tb.post_guards = tb.post_guards.union(cond_guards);
             }
-            Some(fall_bb)
-        };
-
-        // Also propagate guard on `if (ok) { ... } else { return 401; }` pattern!
-        if !then_terminated
-            && else_end.is_none()
-            && let Some(tb) = self.blocks.get_mut(then_start)
-        {
-            tb.pre_sink_guards = tb.pre_sink_guards.union(cond_guards);
-            tb.post_guards = tb.post_guards.union(cond_guards);
         }
 
         match (then_end, else_end) {
@@ -364,6 +503,170 @@ impl<'a> CfgBuilder<'a> {
             (Some(surviving), None) | (None, Some(surviving)) => Some(surviving),
             (None, None) => None,
         }
+    }
+
+    fn lower_switch_or_match(
+        &mut self,
+        sw_node: Node,
+        pre_bb: usize,
+        depth: usize,
+    ) -> Option<usize> {
+        let mut arm_nodes = Vec::new();
+        let mut has_default_arm = false;
+        let mut c = sw_node.walk();
+        for ch in sw_node.children(&mut c) {
+            let ck = ch.kind();
+            if matches!(
+                ck,
+                "switch_case" | "switch_default" | "expression_case" | "default_case" | "match_arm"
+            ) {
+                if ck == "switch_default"
+                    || ck == "default_case"
+                    || (ck == "match_arm" && node_text(ch, self.src).trim_start().starts_with('_'))
+                {
+                    has_default_arm = true;
+                }
+                arm_nodes.push(ch);
+            } else if matches!(ck, "switch_body" | "match_block") {
+                let mut sc = ch.walk();
+                for sub in ch.children(&mut sc) {
+                    let sk = sub.kind();
+                    if matches!(
+                        sk,
+                        "switch_case"
+                            | "switch_default"
+                            | "expression_case"
+                            | "default_case"
+                            | "match_arm"
+                    ) {
+                        if sk == "switch_default"
+                            || sk == "default_case"
+                            || (sk == "match_arm"
+                                && node_text(sub, self.src).trim_start().starts_with('_'))
+                        {
+                            has_default_arm = true;
+                        }
+                        arm_nodes.push(sub);
+                    }
+                }
+            }
+        }
+        if arm_nodes.is_empty() {
+            return Some(pre_bb);
+        }
+
+        let mut surviving_ends = Vec::new();
+        for arm in arm_nodes {
+            let arm_start = self.new_block()?;
+            self.link(pre_bb, arm_start);
+            if let Some(end_bb) = self.lower_block(arm, arm_start, depth + 1) {
+                surviving_ends.push(end_bb);
+            } else {
+                for b in &mut self.blocks[arm_start..] {
+                    if b.succs.is_empty() {
+                        b.is_abort_exit = true;
+                    }
+                }
+            }
+        }
+        // If switch/match has no default/wildcard arm, an unmatched value bypasses all cases.
+        if !has_default_arm {
+            let bypass_bb = self.new_block()?;
+            self.link(pre_bb, bypass_bb);
+            surviving_ends.push(bypass_bb);
+        }
+        if surviving_ends.is_empty() {
+            return None;
+        }
+        let join = self.new_block()?;
+        for end_bb in surviving_ends {
+            self.link(end_bb, join);
+        }
+        Some(join)
+    }
+
+    fn lower_try(&mut self, try_node: Node, pre_bb: usize, depth: usize) -> Option<usize> {
+        let mut try_body: Option<Node> = try_node.child_by_field_name("body");
+        let mut catch_nodes = Vec::new();
+        let mut finally_node: Option<Node> = None;
+
+        let mut c = try_node.walk();
+        for ch in try_node.children(&mut c) {
+            match ch.kind() {
+                "statement_block" | "block" | "compound_statement" if try_body.is_none() => {
+                    try_body = Some(ch);
+                }
+                "catch_clause" | "except_clause" => catch_nodes.push(ch),
+                "finally_clause" => finally_node = Some(ch),
+                _ => {}
+            }
+        }
+
+        let try_start = self.new_block()?;
+        self.link(pre_bb, try_start);
+        let try_end = if let Some(tb) = try_body {
+            self.lower_block(tb, try_start, depth + 1)
+        } else {
+            Some(try_start)
+        };
+        if try_end.is_none() {
+            for b in &mut self.blocks[try_start..] {
+                if b.succs.is_empty() {
+                    b.is_abort_exit = true;
+                }
+            }
+        }
+
+        let mut surviving = Vec::new();
+        if let Some(te) = try_end {
+            surviving.push(te);
+        }
+        for cn in catch_nodes {
+            let catch_start = self.new_block()?;
+            // Exception may occur before try-block guards complete, so link from `pre_bb`.
+            self.link(pre_bb, catch_start);
+            if let Some(ce) = self.lower_block(cn, catch_start, depth + 1) {
+                surviving.push(ce);
+            } else {
+                for b in &mut self.blocks[catch_start..] {
+                    if b.succs.is_empty() {
+                        b.is_abort_exit = true;
+                    }
+                }
+            }
+        }
+
+        if surviving.is_empty() {
+            return None;
+        }
+        let join = self.new_block()?;
+        for s in surviving {
+            self.link(s, join);
+        }
+        if let Some(fin) = finally_node {
+            self.lower_block(fin, join, depth + 1)
+        } else {
+            Some(join)
+        }
+    }
+
+    fn lower_loop(&mut self, loop_node: Node, pre_bb: usize, depth: usize) -> Option<usize> {
+        let is_unconditional_loop = loop_node.kind() == "loop_expression";
+        let body_start = self.new_block()?;
+        self.link(pre_bb, body_start);
+        let body_end = self.lower_block(loop_node, body_start, depth + 1);
+        let join = self.new_block()?;
+        if let Some(be) = body_end {
+            self.link(be, join);
+        }
+        // Conditional `for`/`while` loops may execute 0 iterations, so guards inside the loop
+        // body do not dominate statements after the loop unless verified before the loop.
+        if !is_unconditional_loop {
+            self.link(pre_bb, join);
+        } else if body_end.is_none() {
+            return None;
+        }
+        Some(join)
     }
 
     fn early_cond_text_guards(&self, if_node: Node) -> GuardBitset {
@@ -403,12 +706,55 @@ impl<'a> CfgBuilder<'a> {
             if is_user_forbidden || is_unauth_early_exit {
                 bits.insert(GuardKind::Auth);
             }
+            // Relational / ownership / bounds / path / SSRF / CSRF guard predicates in conditions
+            if (cond_head.contains("owner_id")
+                || cond_head.contains("ownerid")
+                || cond_head.contains("user_id")
+                || cond_head.contains("userid")
+                || cond_head.contains("tenant_id")
+                || cond_head.contains("org_id"))
+                && (cond_head.contains("==")
+                    || cond_head.contains("===")
+                    || cond_head.contains("!=")
+                    || cond_head.contains("!=="))
+            {
+                bits.insert(GuardKind::OwnershipCheck);
+            }
+            if cond_head.contains("csrf") {
+                bits.insert(GuardKind::CsrfProtection);
+            }
+            if cond_head.contains("startswith(")
+                || cond_head.contains("starts_with(")
+                || cond_head.contains("hasprefix(")
+                || cond_head.contains("isallowedpath")
+            {
+                bits.insert(GuardKind::PathSanitizer);
+            }
+            if cond_head.contains("allowed_hosts")
+                || cond_head.contains("allowedhosts")
+                || cond_head.contains("is_private")
+                || cond_head.contains("is_loopback")
+            {
+                bits.insert(GuardKind::SsrfSanitizer);
+            }
+            if cond_head.contains("< sizeof(")
+                || cond_head.contains("<= sizeof(")
+                || cond_head.contains(".len()")
+                || cond_head.contains(".length")
+                || cond_head.contains("checked_add")
+                || cond_head.contains("checked_mul")
+            {
+                bits.insert(GuardKind::MemoryBounds);
+            }
         }
         bits
     }
 
     fn stmt_direct_guards(&self, stmt: Node) -> GuardBitset {
         let mut bits = GuardBitset::EMPTY;
+        if is_uninvoked_closure_binding(stmt) {
+            return bits;
+        }
         let mut calls = Vec::new();
         collect_call_names_shallow(stmt, self.src, &mut calls);
         for c in &calls {
@@ -418,9 +764,25 @@ impl<'a> CfgBuilder<'a> {
             if is_lock_guard_ident(c, self.cfg) {
                 bits.insert(GuardKind::TxLock);
             }
+            let c_low = c.to_ascii_lowercase();
+            if c_low.contains(" verifycsrf")
+                || c_low == "verifycsrf"
+                || c_low == "verify_csrf"
+                || c_low == "csurf"
+            {
+                bits.insert(GuardKind::CsrfProtection);
+            }
+            if c_low.contains("checkownership")
+                || c_low.contains("check_ownership")
+                || c_low.contains("verifyowner")
+                || c_low.contains("verify_owner")
+            {
+                bits.insert(GuardKind::OwnershipCheck);
+            }
         }
 
-        let stmt_code = crate::ast::strip_comments(node_text(stmt, self.src)).to_ascii_lowercase();
+        let stmt_raw = crate::ast::strip_comments(node_text(stmt, self.src));
+        let stmt_code = stmt_raw.to_ascii_lowercase();
         if (stmt_code.contains("select ") && stmt_code.contains("for update"))
             || (stmt.kind() == "with_statement"
                 && self
@@ -432,24 +794,47 @@ impl<'a> CfgBuilder<'a> {
         {
             bits.insert(GuardKind::TxLock);
         }
+        if crate::taint::has_csrf_guard_expr(&stmt_raw) {
+            bits.insert(GuardKind::CsrfProtection);
+        }
+        if stmt_code.contains(".parse(")
+            || stmt_code.contains(".safeparse(")
+            || stmt_code.contains("validate(")
+        {
+            bits.insert(GuardKind::InputValidation);
+        }
         bits
     }
 }
 
 fn stmt_unconditionally_exits(stmt: Node, src: &[u8]) -> bool {
     let k = stmt.kind();
+    if is_uninvoked_closure_binding(stmt) {
+        return false;
+    }
     if matches!(
         k,
-        "return_statement" | "throw_statement" | "raise_statement"
+        "return_statement" | "throw_statement" | "raise_statement" | "return_expression"
     ) {
         return true;
+    }
+    if matches!(
+        k,
+        "statement_block" | "block" | "compound_statement" | "else_clause"
+    ) {
+        let mut c = stmt.walk();
+        return stmt
+            .children(&mut c)
+            .any(|ch| stmt_unconditionally_exits(ch, src));
     }
     let code = crate::ast::strip_comments(node_text(stmt, src)).to_ascii_lowercase();
     code.starts_with("return ")
         || code == "return;"
+        || code == "return"
         || code.starts_with("throw ")
         || code.starts_with("raise ")
         || code.contains("bail!(")
+        || code.contains("panic!(")
         || code.contains("abort(")
         || code.contains("abortwithstatus")
         || code.contains("http.error(")
@@ -532,5 +917,93 @@ func customGate(w http.ResponseWriter, r *http.Request) {
         let go_guards =
             compute_cfg_guard_dominance(gfn, go_code.as_bytes(), &ShellMindGuardConfig::default());
         assert!(go_guards.contains(&GuardKind::Auth));
+    }
+
+    #[test]
+    fn test_sprint1_else_abort_closure_isolation_switch_try_and_loops() {
+        // 1. Inverted `if (ok) { ... } else { return 401; }` wrapper (no direct sink) must keep Auth
+        let inverted_wrapper = eval_ts_fn_guards(
+            r#"function authMiddleware(req: any, res: any) {
+                if (verifyJwt(req)) {
+                    doNext();
+                } else {
+                    return res.status(401).end();
+                }
+            }"#,
+        );
+        assert!(
+            inverted_wrapper.contains(&GuardKind::Auth),
+            "Inverted if/else abort must preserve Auth dominance on normal exit"
+        );
+
+        // 2. Uninvoked closure binding must NOT leak Auth or early return to enclosing handler
+        let uninvoked_closure = eval_ts_fn_guards(
+            r#"function pay(req: any, res: any) {
+                const helper = () => {
+                    requireAuth(req);
+                    return res.status(401).end();
+                };
+                balance -= req.body.amount;
+            }"#,
+        );
+        assert!(
+            !uninvoked_closure.contains(&GuardKind::Auth),
+            "Uninvoked closure must not grant Auth to enclosing function"
+        );
+
+        // 3. Exhaustive switch where all surviving arms have Auth vs non-exhaustive switch
+        let sw_exhaustive = eval_ts_fn_guards(
+            r#"function pay(req: any, res: any) {
+                switch (req.mode) {
+                    case 'a':
+                        requireAuth(req);
+                        break;
+                    default:
+                        return res.status(401).end();
+                }
+                balance -= req.body.amount;
+            }"#,
+        );
+        assert!(sw_exhaustive.contains(&GuardKind::Auth));
+
+        let sw_non_exhaustive = eval_ts_fn_guards(
+            r#"function pay(req: any) {
+                switch (req.mode) {
+                    case 'a':
+                        requireAuth(req);
+                        break;
+                }
+                balance -= req.body.amount;
+            }"#,
+        );
+        assert!(
+            !sw_non_exhaustive.contains(&GuardKind::Auth),
+            "Non-exhaustive switch without default must not dominate post-switch sink"
+        );
+
+        // 4. try/catch: non-aborting catch prevents dominance; aborting catch preserves dominance
+        let try_swallowed = eval_ts_fn_guards(
+            r#"function pay(req: any) {
+                try {
+                    requireAuth(req);
+                } catch (e) {
+                    logErr(e);
+                }
+                balance -= req.body.amount;
+            }"#,
+        );
+        assert!(!try_swallowed.contains(&GuardKind::Auth));
+
+        let try_abort_catch = eval_ts_fn_guards(
+            r#"function pay(req: any, res: any) {
+                try {
+                    requireAuth(req);
+                } catch (e) {
+                    return res.status(401).end();
+                }
+                balance -= req.body.amount;
+            }"#,
+        );
+        assert!(try_abort_catch.contains(&GuardKind::Auth));
     }
 }
