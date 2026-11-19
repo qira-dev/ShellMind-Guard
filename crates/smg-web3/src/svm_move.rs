@@ -126,9 +126,12 @@ fn collect_solana_file_context(node: Node, src: &[u8], sctx: &mut SolanaFileCont
                     .or_default()
                     .insert(word.to_string());
             }
-            if low.contains(".owner")
+            if (low.contains(".owner") || low.contains(".key()"))
                 && (low.contains("==") || low.contains("!="))
-                && let Some(ident) = line.split(".owner").next()
+                && let Some(ident) = line
+                    .split(".owner")
+                    .next()
+                    .and_then(|s| s.split(".key()").next())
                 && let Some(word) = ident
                     .split(|c: char| !c.is_alphanumeric() && c != '_')
                     .next_back()
@@ -138,6 +141,22 @@ fn collect_solana_file_context(node: Node, src: &[u8], sctx: &mut SolanaFileCont
                     .entry(ctx_struct.clone())
                     .or_default()
                     .insert(word.to_string());
+            }
+            if low.contains("assert_keys_eq!")
+                && let Some(inner) = low.split("assert_keys_eq!(").nth(1)
+            {
+                for tok in inner.split([',', ')']).take(2) {
+                    if let Some(word) = tok
+                        .split(|c: char| !c.is_alphanumeric() && c != '_')
+                        .next_back()
+                        && !word.is_empty()
+                    {
+                        sctx.struct_owners
+                            .entry(ctx_struct.clone())
+                            .or_default()
+                            .insert(word.to_string());
+                    }
+                }
             }
         }
     }
@@ -239,20 +258,28 @@ fn inspect_anchor_accounts_struct(
             continue;
         }
 
-        let is_authority_name = [
-            "authority",
-            "admin",
-            "owner",
-            "signer",
-            "payer",
-            "governance",
-            "sender",
-        ]
-        .iter()
-        .any(|kw| fname_low.contains(kw));
-        let is_state_or_program_name = ["vault", "state", "config", "pool", "escrow", "program"]
+        let is_non_signing_dest = fname_low.starts_with("new_")
+            || fname_low.starts_with("recipient")
+            || fname_low.starts_with("dest")
+            || fname_low.starts_with("old_")
+            || fname_low.starts_with("previous_")
+            || fname_low.ends_with("_ata");
+        let is_authority_name = !is_non_signing_dest
+            && [
+                "authority",
+                "admin",
+                "owner",
+                "signer",
+                "payer",
+                "governance",
+                "sender",
+            ]
             .iter()
             .any(|kw| fname_low.contains(kw));
+        let is_state_or_program_name = ["vault", "state", "config", "pool", "escrow", "program"]
+            .iter()
+            .any(|kw| fname_low.contains(kw))
+            && fname_low != "program_data";
 
         let attr_checks_signer =
             attrs_low.contains("signer") || fn_signers.is_some_and(|s| s.contains(&field_name));
@@ -309,6 +336,46 @@ fn inspect_solana_instruction_fn(
     let ctx_has_validated_program = extract_ctx_struct_name(body)
         .is_some_and(|st| sctx.structs_with_validated_program.contains(&st));
 
+    let body_low = body.to_ascii_lowercase();
+    let has_lamport_zero = body_low.contains("try_borrow_mut_lamports") && body_low.contains("= 0");
+    if has_lamport_zero
+        && !body_low.contains(".fill(0)")
+        && !body_low.contains("closed_account_discriminator")
+    {
+        findings.push(LocalStaticFinding {
+            rule_id: "SMG-WEB3-SOLANA".into(),
+            severity: "HIGH".into(),
+            title: format!("Solana account close zeroes lamports without clearing data/discriminator in `{fn_name}` (account resurrection risk)"),
+            rel_path: rel_path.into(),
+            line: base_line,
+            symbol: fn_name.clone(),
+            sink_kind: SinkKind::Misconfiguration,
+            missing_guard: GuardKind::InputValidation,
+            confidence: Confidence::Confirmed,
+            remediation: "Use Anchor `#[account(mut, close = recipient)]` or zero account data and write `CLOSED_ACCOUNT_DISCRIMINATOR`.".into(),
+        });
+    }
+    if (body_low.contains("token::transfer(")
+        || body_low.contains("invoke(")
+        || body_low.contains("invoke_signed("))
+        && body_low.contains("remaining_accounts")
+        && !body_low.contains(".owner ==")
+        && !body_low.contains("try_deserialize")
+    {
+        findings.push(LocalStaticFinding {
+            rule_id: "SMG-WEB3-SOLANA".into(),
+            severity: "HIGH".into(),
+            title: format!("Unvalidated `ctx.remaining_accounts` used near CPI/account access in `{fn_name}`"),
+            rel_path: rel_path.into(),
+            line: base_line,
+            symbol: fn_name.clone(),
+            sink_kind: SinkKind::IdorDbAccess,
+            missing_guard: GuardKind::OwnershipCheck,
+            confidence: Confidence::Heuristic,
+            remediation: "Validate `acc.owner == program_id`, expected keys, and account discriminators for every entry in `remaining_accounts`.".into(),
+        });
+    }
+
     for (idx, line) in body.lines().enumerate() {
         let ln = base_line + idx;
         if line.contains("create_program_address(")
@@ -330,7 +397,9 @@ fn inspect_solana_instruction_fn(
                 remediation: "Use `Pubkey::find_program_address` or Anchor canonical `bump` seed constraint to prevent non-canonical bump spoofing.".into(),
             });
         }
-        if (line.contains("invoke(") || line.contains("invoke_signed("))
+        if (line.contains("invoke(")
+            || line.contains("invoke_signed(")
+            || line.contains("CpiContext::new("))
             && !ctx_has_validated_program
             && !body.contains("Program<'info")
             && !body.contains("check_program_account")
@@ -378,7 +447,7 @@ fn has_move_capability_param(params: &str) -> bool {
 
 /// Analyzes Sui / Aptos Move source modules cleanly above VM linear resource guarantees.
 pub fn analyze_move_file(rel_path: &str, source: &str) -> Vec<LocalStaticFinding> {
-    if smg_core::is_test_source_path(rel_path) {
+    if smg_core::is_test_source_path(rel_path) || source.contains("#[test_only]") {
         return Vec::new();
     }
     let stripped = smg_graph::taint::strip_comments_simple(source);
@@ -388,8 +457,10 @@ pub fn analyze_move_file(rel_path: &str, source: &str) -> Vec<LocalStaticFinding
 
     while i < lines.len() {
         let trimmed = lines[i].trim();
-        let is_test_fn = (i > 0 && lines[i - 1].contains("#[test"))
-            || (i > 1 && lines[i - 2].contains("#[test"))
+        let is_test_fn = (i > 0
+            && (lines[i - 1].contains("#[test") || lines[i - 1].contains("#[test_only]")))
+            || (i > 1
+                && (lines[i - 2].contains("#[test") || lines[i - 2].contains("#[test_only]")))
             || trimmed.starts_with("#[test");
         if is_test_fn {
             i += 1;
@@ -474,13 +545,23 @@ pub fn analyze_move_file(rel_path: &str, source: &str) -> Vec<LocalStaticFinding
             });
         }
 
-        // 2. Missing `&AdminCap` / signer check on privileged Move entrypoints
-        let is_privileged = fn_low.starts_with("admin_")
-            || fn_low.starts_with("set_")
-            || matches!(
-                fn_low.as_str(),
-                "mint" | "burn" | "withdraw" | "emergency_withdraw" | "pause" | "upgrade"
-            );
+        // 2. Missing `&AdminCap` / signer check on privileged Move entrypoints (exempt benign user self-setters)
+        let is_user_self_setter = matches!(
+            fn_low.as_str(),
+            "set_profile"
+                | "set_referrer"
+                | "set_username"
+                | "set_avatar"
+                | "set_bio"
+                | "set_nickname"
+        );
+        let is_privileged = !is_user_self_setter
+            && (fn_low.starts_with("admin_")
+                || fn_low.starts_with("set_")
+                || matches!(
+                    fn_low.as_str(),
+                    "mint" | "burn" | "withdraw" | "emergency_withdraw" | "pause" | "upgrade"
+                ));
         let has_cap_or_sender_auth = has_move_capability_param(&params)
             || body_low.contains("tx_context::sender")
             || body_low.contains("signer::address_of");
@@ -501,14 +582,43 @@ pub fn analyze_move_file(rel_path: &str, source: &str) -> Vec<LocalStaticFinding
             });
         }
 
-        // 3. Unchecked zero-value coin/balance split
+        // 2b. Unconstrained generic `Coin<T>` / `Balance<T>` missing `type_name::get<T>()` check
+        if (params.contains("Coin<T>") || params.contains("Balance<T>"))
+            && (body_low.contains("deposit")
+                || body_low.contains("repay")
+                || body_low.contains("mint"))
+            && !body_low.contains("type_name::get")
+            && !body_low.contains("type_of<")
+        {
+            findings.push(LocalStaticFinding {
+                rule_id: "SMG-WEB3-MOVE".into(),
+                severity: "HIGH".into(),
+                title: format!(
+                    "Move generic `Coin<T>`/`Balance<T>` entrypoint `{fn_name}` omits runtime `type_name::get<T>()` verification"
+                ),
+                rel_path: rel_path.into(),
+                line: start_line,
+                symbol: fn_name.clone(),
+                sink_kind: SinkKind::AuthMutation,
+                missing_guard: GuardKind::InputValidation,
+                confidence: Confidence::Heuristic,
+                remediation: "Validate generic coin type `T` against pool type witness via `type_name::get<T>() == pool.coin_type`.".into(),
+            });
+        }
+
+        // 3. Unchecked zero-value coin/balance split (also honor `>= MIN_` / `> MIN_` assertions)
+        let has_non_zero_bound = body_low.contains("> 0")
+            || body_low.contains("!= 0")
+            || body_low.contains("== 0")
+            || body_low.contains(">= 1")
+            || body_low.contains(">= 2")
+            || body_low.contains(">= min")
+            || body_low.contains("> min")
+            || body_low.contains("< 1")
+            || body_low.contains("assert!(amount >")
+            || body_low.contains("assert!(amount >=");
         if (body_low.contains("coin::split(") || body_low.contains("balance::split("))
-            && !body_low.contains("> 0")
-            && !body_low.contains("!= 0")
-            && !body_low.contains("== 0")
-            && !body_low.contains(">= 1")
-            && !body_low.contains(">= min")
-            && !body_low.contains("< 1")
+            && !has_non_zero_bound
         {
             findings.push(LocalStaticFinding {
                 rule_id: "SMG-WEB3-MOVE".into(),

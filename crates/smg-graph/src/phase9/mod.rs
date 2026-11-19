@@ -118,12 +118,9 @@ pub fn detect_domain_hints(
         || low_src.contains("import package:flutter/")
         || low_src.contains("package:shared_preferences/")
         || low_src.contains("package:flutter_secure_storage/")
-        || low_src.contains("sharedpreferences")
         || low_src.contains("encryptedsharedpreferences")
         || low_src.contains("userdefaults")
         || low_src.contains("secitemadd")
-        || low_src.contains("registerreceiver(")
-        || low_src.contains("x509trustmanager")
         || low_src.contains("badcertificatecallback");
 
     let system_engine = matches!(lang, Language::C | Language::Cpp | Language::Rust)

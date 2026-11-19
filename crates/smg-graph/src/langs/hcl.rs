@@ -64,7 +64,11 @@ fn collect_body_attrs(body: Node, src: &[u8]) -> HashMap<String, String> {
                         key = Some(node_text(part, src).trim().to_ascii_lowercase());
                     }
                     "expression" => {
-                        val = Some(node_text(part, src).trim().to_string());
+                        val = Some(
+                            crate::ast::strip_comments(node_text(part, src))
+                                .trim()
+                                .to_string(),
+                        );
                     }
                     _ => {}
                 }
@@ -161,13 +165,13 @@ fn analyze_top_block(block: Node, ctx: &mut ExtractContext<'_>) {
     });
 
     // 1. Public Storage / Database Exposure (`SMG-CFG-IAC-PUBLIC`)
-    check_public_exposure(ctx, &res_type, &sym_name, line, &attrs);
+    check_public_exposure(ctx, &res_type, &sym_name, line, body, &attrs);
 
     // 2. Public Network Ingress (`SMG-CFG-IAC-NET`)
     check_network_exposure(ctx, &res_type, &sym_name, line, body, &attrs);
 
     // 3. Encryption & TLS Posture (`SMG-CFG-IAC-CRYPTO`)
-    check_crypto_posture(ctx, &res_type, &sym_name, line, &attrs);
+    check_crypto_posture(ctx, &res_type, &sym_name, line, body, &attrs);
 
     // 4. Over-permissive IAM Policies (`SMG-CFG-IAC-IAM`)
     check_iam_wildcards(ctx, &res_type, &sym_name, line, body, &attrs);
@@ -181,6 +185,26 @@ fn push_iac_finding(
     line: usize,
     remediation: &str,
 ) {
+    push_iac_finding_conf(
+        ctx,
+        rule_id,
+        severity,
+        title,
+        line,
+        Confidence::Confirmed,
+        remediation,
+    );
+}
+
+fn push_iac_finding_conf(
+    ctx: &mut ExtractContext<'_>,
+    rule_id: &str,
+    severity: &str,
+    title: String,
+    line: usize,
+    confidence: Confidence,
+    remediation: &str,
+) {
     ctx.static_findings.push(LocalStaticFinding {
         rule_id: rule_id.to_string(),
         severity: severity.to_string(),
@@ -190,7 +214,7 @@ fn push_iac_finding(
         symbol: format!("{}:{}", ctx.rel_path, line),
         sink_kind: SinkKind::Misconfiguration,
         missing_guard: GuardKind::ConfigPolicy,
-        confidence: Confidence::Confirmed,
+        confidence,
         remediation: remediation.to_string(),
     });
 }
@@ -207,8 +231,126 @@ fn check_public_exposure(
     res_type: &str,
     sym_name: &str,
     line: usize,
+    body: Node,
     attrs: &HashMap<String, String>,
 ) {
+    if res_type == "aws_lambda_function_url"
+        && attrs
+            .get("authorization_type")
+            .is_some_and(|v| strip_quotes(v).eq_ignore_ascii_case("NONE"))
+    {
+        push_iac_finding(
+            ctx,
+            "SMG-CFG-IAC-PUBLIC",
+            "HIGH",
+            format!(
+                "AWS Lambda Function URL `{}` allows unauthenticated invocation (`NONE`)",
+                sym_name
+            ),
+            line,
+            "Require IAM authorization (`authorization_type = \"AWS_IAM\"`) or front behind authenticated API Gateway.",
+        );
+    }
+
+    if matches!(
+        res_type,
+        "aws_instance" | "aws_launch_template" | "aws_launch_configuration"
+    ) {
+        for nested in collect_nested_blocks(body) {
+            let (nt, _) = block_header(nested, ctx.src);
+            if nt == "metadata_options"
+                && let Some(nb) = find_block_body(nested)
+            {
+                let nattrs = collect_body_attrs(nb, ctx.src);
+                if nattrs
+                    .get("http_tokens")
+                    .is_some_and(|v| strip_quotes(v).eq_ignore_ascii_case("optional"))
+                {
+                    push_iac_finding(
+                        ctx,
+                        "SMG-CFG-IAC-NET",
+                        "HIGH",
+                        format!(
+                            "EC2 metadata allows IMDSv1 (`http_tokens = \"optional\"`) on `{}`",
+                            sym_name
+                        ),
+                        nested.start_position().row + 1,
+                        "Enforce IMDSv2 by setting `http_tokens = \"required\"` in `metadata_options`.",
+                    );
+                }
+            }
+        }
+    }
+
+    if res_type == "google_sql_database_instance" {
+        for settings in collect_nested_blocks(body) {
+            if block_header(settings, ctx.src).0 == "settings"
+                && let Some(sb) = find_block_body(settings)
+            {
+                for ipc in collect_nested_blocks(sb) {
+                    if block_header(ipc, ctx.src).0 == "ip_configuration"
+                        && let Some(ib) = find_block_body(ipc)
+                    {
+                        for auth_net in collect_nested_blocks(ib) {
+                            if block_header(auth_net, ctx.src).0 == "authorized_networks"
+                                && let Some(ab) = find_block_body(auth_net)
+                            {
+                                let aattrs = collect_body_attrs(ab, ctx.src);
+                                if aattrs
+                                    .get("value")
+                                    .is_some_and(|v| v.contains("0.0.0.0/0") || v.contains("::/0"))
+                                {
+                                    push_iac_finding(
+                                        ctx,
+                                        "SMG-CFG-IAC-PUBLIC",
+                                        "CRITICAL",
+                                        format!(
+                                            "CloudSQL instance `{}` authorizes public `0.0.0.0/0` network access",
+                                            sym_name
+                                        ),
+                                        auth_net.start_position().row + 1,
+                                        "Remove `0.0.0.0/0` from `authorized_networks` and use Private Service Connect / Cloud SQL Proxy.",
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if matches!(
+        res_type,
+        "aws_s3_bucket_policy" | "aws_sqs_queue_policy" | "aws_sns_topic_policy" | "aws_kms_key"
+    ) && let Some(pol) = attrs.get("policy")
+    {
+        let compact: String = pol
+            .replace("\\\"", "\"")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+            .to_ascii_lowercase();
+        let has_wildcard_principal = compact.contains("\"principal\":\"*\"")
+            || compact.contains("\"principal\":{\"aws\":\"*\"}")
+            || compact.contains("\"principal\":{\"aws\":[\"*\"]}");
+        if has_wildcard_principal
+            && !compact.contains("\"condition\"")
+            && !compact.contains("\"effect\":\"deny\"")
+        {
+            push_iac_finding(
+                ctx,
+                "SMG-CFG-IAC-PUBLIC",
+                "CRITICAL",
+                format!(
+                    "Resource policy `{}` grants `Principal: \"*\"` without restricting `Condition`",
+                    sym_name
+                ),
+                line,
+                "Scope `Principal` to explicit IAM roles/accounts or enforce an `aws:PrincipalOrgID`/`aws:SourceArn` `Condition`.",
+            );
+        }
+    }
     if matches!(res_type, "aws_s3_bucket" | "aws_s3_bucket_acl")
         && let Some(acl) = attrs.get("acl")
     {
@@ -328,28 +470,37 @@ fn check_network_exposure(
     {
         check_ingress_attrs(ctx, sym_name, block_line, top_attrs);
     } else if res_type == "google_compute_firewall" {
+        let is_egress = top_attrs
+            .get("direction")
+            .is_some_and(|d| strip_quotes(d).eq_ignore_ascii_case("EGRESS"));
         let has_world_cidr = top_attrs
             .get("source_ranges")
             .is_some_and(|v| v.contains("0.0.0.0/0") || v.contains("::/0"));
-        if has_world_cidr {
-            let mut allow_http_only = false;
+        if !is_egress && has_world_cidr {
+            let mut has_allow_block = false;
+            let mut allow_non_http_port = false;
             for nested in collect_nested_blocks(body) {
                 let (nt, _) = block_header(nested, ctx.src);
                 if nt == "allow"
                     && let Some(nb) = find_block_body(nested)
                 {
+                    has_allow_block = true;
                     let nattrs = collect_body_attrs(nb, ctx.src);
-                    if let Some(ports) = nattrs.get("ports")
-                        && (ports == "[\"80\"]"
-                            || ports == "[\"443\"]"
-                            || ports == "[\"80\", \"443\"]"
-                            || ports == "[\"443\", \"80\"]")
-                    {
-                        allow_http_only = true;
+                    let only_http_ports = nattrs.get("ports").is_some_and(|ports| {
+                        let inner: Vec<String> = ports
+                            .trim_matches(['[', ']', ' ', '\n', '\r', '\t'])
+                            .split(',')
+                            .map(|p| strip_quotes(p).trim().to_string())
+                            .filter(|p| !p.is_empty())
+                            .collect();
+                        !inner.is_empty() && inner.iter().all(|p| p == "80" || p == "443")
+                    });
+                    if !only_http_ports {
+                        allow_non_http_port = true;
                     }
                 }
             }
-            if !allow_http_only {
+            if has_allow_block && allow_non_http_port {
                 push_iac_finding(
                     ctx,
                     "SMG-CFG-IAC-NET",
@@ -464,8 +615,65 @@ fn check_crypto_posture(
     res_type: &str,
     sym_name: &str,
     line: usize,
+    body: Node,
     attrs: &HashMap<String, String>,
 ) {
+    if matches!(
+        res_type,
+        "aws_db_instance" | "aws_rds_cluster" | "aws_ebs_volume"
+    ) && !attrs.contains_key("storage_encrypted")
+        && !attrs.contains_key("encrypted")
+        && !attrs.contains_key("kms_key_id")
+        && !attrs.contains_key("replicate_source_db")
+        && !attrs.contains_key("snapshot_identifier")
+    {
+        push_iac_finding_conf(
+            ctx,
+            "SMG-CFG-IAC-CRYPTO",
+            "HIGH",
+            format!(
+                "Resource `{}` omits `storage_encrypted = true`/`encrypted = true` (Terraform defaults encryption off)",
+                sym_name
+            ),
+            line,
+            Confidence::Heuristic,
+            "Explicitly set `storage_encrypted = true` (or `encrypted = true`) with a KMS key.",
+        );
+    }
+
+    if matches!(res_type, "aws_lb_listener" | "aws_alb_listener")
+        && attrs
+            .get("protocol")
+            .is_some_and(|p| strip_quotes(p).eq_ignore_ascii_case("HTTP"))
+    {
+        let mut is_https_redirect = false;
+        for nested in collect_nested_blocks(body) {
+            if block_header(nested, ctx.src).0 == "default_action"
+                && let Some(nb) = find_block_body(nested)
+            {
+                let nattrs = collect_body_attrs(nb, ctx.src);
+                if nattrs
+                    .get("type")
+                    .is_some_and(|t| strip_quotes(t).eq_ignore_ascii_case("redirect"))
+                {
+                    is_https_redirect = true;
+                }
+            }
+        }
+        if !is_https_redirect {
+            push_iac_finding(
+                ctx,
+                "SMG-CFG-IAC-CRYPTO",
+                "HIGH",
+                format!(
+                    "Load balancer listener `{}` forwards plaintext `HTTP` without HTTPS redirect",
+                    sym_name
+                ),
+                line,
+                "Use `protocol = \"HTTPS\"` or configure `default_action { type = \"redirect\" }` to port 443.",
+            );
+        }
+    }
     if attr_is_bool(attrs, "storage_encrypted", false)
         || attr_is_bool(attrs, "encrypted", false)
         || attr_is_bool(attrs, "encryption_at_rest_enabled", false)
@@ -597,12 +805,8 @@ fn check_iam_wildcards(
                 chunk.contains("\"effect\":\"deny\"") || chunk.contains("effect=\"deny\"");
             has_star_action && has_star_res && !is_deny
         };
-        // Split multi-statement arrays `},{` when present so an Allow-scoped + Deny-* policy does not false-positive
-        let chunks: Vec<&str> = if low.contains("},{") {
-            low.split("},{").collect()
-        } else {
-            vec![low.as_str()]
-        };
+        // Split top-level JSON objects inside `"Statement":[{...},{...}]` respecting nested braces (fixes `Condition` split FPs)
+        let chunks = split_json_statement_objects(&low);
         if chunks.into_iter().any(check_stmt_chunk) {
             push_iac_finding(
                 ctx,
@@ -617,6 +821,56 @@ fn check_iam_wildcards(
             );
         }
     }
+}
+
+fn split_json_statement_objects(compact_low: &str) -> Vec<&str> {
+    if let Some(pos) = compact_low.find("\"statement\":[") {
+        let arr = &compact_low[pos + "\"statement\":[".len()..];
+        let mut out = Vec::new();
+        let mut depth = 0usize;
+        let mut obj_start: Option<usize> = None;
+        let mut in_str = false;
+        let mut esc = false;
+        for (i, ch) in arr.char_indices() {
+            if esc {
+                esc = false;
+                continue;
+            }
+            if ch == '\\' && in_str {
+                esc = true;
+                continue;
+            }
+            if ch == '"' {
+                in_str = !in_str;
+                continue;
+            }
+            if in_str {
+                continue;
+            }
+            match ch {
+                '{' => {
+                    if depth == 0 {
+                        obj_start = Some(i);
+                    }
+                    depth += 1;
+                }
+                '}' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0
+                        && let Some(s) = obj_start.take()
+                    {
+                        out.push(&arr[s..=i]);
+                    }
+                }
+                ']' if depth == 0 => break,
+                _ => {}
+            }
+        }
+        if !out.is_empty() {
+            return out;
+        }
+    }
+    vec![compact_low]
 }
 
 fn contains_exact_wildcard_token(expr: &str) -> bool {

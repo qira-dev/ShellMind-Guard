@@ -31,6 +31,7 @@ pub(crate) const PROFILE: LangProfile = LangProfile {
         ".executeupdate(",
         ".execute(",
         "createnativequery(",
+        "createquery(",
         "jdbctemplate.query(",
         "jdbctemplate.execute(",
         "createsqlquery(",
@@ -43,7 +44,7 @@ pub(crate) const PROFILE: LangProfile = LangProfile {
         ".setlong(",
         ".setint(",
     ],
-    cmd_sinks: &["getruntime().exec(", ".exec(", "new processbuilder("],
+    cmd_sinks: &["getruntime().exec(", "new processbuilder("],
     cmd_sanitizers: &["commandallowlist", "allowedcommands"],
     path_sinks: &[
         "files.readstring(",
@@ -52,6 +53,7 @@ pub(crate) const PROFILE: LangProfile = LangProfile {
         "new file(",
         "new fileinputstream(",
         "paths.get(",
+        "path.of(",
     ],
     path_sanitizers: &[
         ".normalize().startswith(",

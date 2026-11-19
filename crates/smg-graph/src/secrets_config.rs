@@ -185,6 +185,162 @@ fn secret_token_pack() -> &'static (RegexSet, Vec<(SecretTokenSpec, Regex)>) {
                 r"\b(SK[0-9a-f]{32})\b",
                 SecretTokenSpec { provider: "Twilio API Secret", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 2, min_entropy: 2.9, requires_keyword: Some("twilio") },
             ),
+            (
+                r"\b(sk-or-v1-[0-9a-f]{48,})\b",
+                SecretTokenSpec { provider: "OpenRouter API Key", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 9, min_entropy: 3.1, requires_keyword: None },
+            ),
+            (
+                r"\b(fw_[0-9A-Za-z]{24,})\b",
+                SecretTokenSpec { provider: "Fireworks AI Key", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 3, min_entropy: 3.1, requires_keyword: None },
+            ),
+            (
+                r"\b(re_[0-9A-Za-z]{24,})\b",
+                SecretTokenSpec { provider: "Resend API Key", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 3, min_entropy: 3.1, requires_keyword: Some("resend") },
+            ),
+            (
+                r"\b(dckr_pat_[0-9A-Za-z_-]{20,})\b",
+                SecretTokenSpec { provider: "Docker Hub PAT", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 9, min_entropy: 3.1, requires_keyword: None },
+            ),
+            (
+                r"\b(oy2[a-z0-9]{43})\b",
+                SecretTokenSpec { provider: "NuGet API Key", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 3, min_entropy: 3.1, requires_keyword: Some("nuget") },
+            ),
+            (
+                r"\b(cio[0-9A-Za-z]{28,})\b",
+                SecretTokenSpec { provider: "Crates.io API Token", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 3, min_entropy: 3.2, requires_keyword: None },
+            ),
+            (
+                r"\b(fo1_[0-9A-Za-z_-]{24,})\b",
+                SecretTokenSpec { provider: "Fly.io Deploy Token", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 4, min_entropy: 3.1, requires_keyword: None },
+            ),
+            (
+                r"\b(napi_[0-9A-Za-z]{40,})\b",
+                SecretTokenSpec { provider: "Neon API Key", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 5, min_entropy: 3.1, requires_keyword: None },
+            ),
+            (
+                r"\b(nfp_[0-9A-Za-z]{32,})\b",
+                SecretTokenSpec { provider: "Netlify Access Token", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 4, min_entropy: 3.1, requires_keyword: None },
+            ),
+            (
+                r"\b(rnd_[0-9A-Za-z]{24,})\b",
+                SecretTokenSpec { provider: "Render API Key", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 4, min_entropy: 3.1, requires_keyword: None },
+            ),
+            (
+                r"\b(NRAK-[0-9A-Z]{27})\b",
+                SecretTokenSpec { provider: "New Relic User Key", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 5, min_entropy: 3.1, requires_keyword: None },
+            ),
+            (
+                r"\b([0-9a-f]{32}-us[0-9]{1,2})\b",
+                SecretTokenSpec { provider: "Mailchimp API Key", rule_id: "SMG-SEC-APIKEY", severity: "HIGH", prefix_skip: 0, min_entropy: 2.9, requires_keyword: Some("mailchimp") },
+            ),
+            (
+                r"\b(xoxe\.xoxp-[0-9A-Za-z-]{24,}|xoxe-[0-9]-[0-9A-Za-z]{30,})\b",
+                SecretTokenSpec { provider: "Slack Refresh Token", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 5, min_entropy: 3.1, requires_keyword: None },
+            ),
+            (
+                r"\b([0-9]{8,12}:AA[0-9A-Za-z_-]{33})\b",
+                SecretTokenSpec { provider: "Telegram Bot Token", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 12, min_entropy: 3.2, requires_keyword: None },
+            ),
+            (
+                r"\b(pat[A-Za-z0-9]{14}\.[a-f0-9]{64})\b",
+                SecretTokenSpec { provider: "Airtable Personal Token", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 3, min_entropy: 3.1, requires_keyword: None },
+            ),
+            (
+                r"\b(sk\.eyJ[0-9A-Za-z_-]{30,}\.[0-9A-Za-z_-]{15,})\b",
+                SecretTokenSpec { provider: "Mapbox Secret Token", rule_id: "SMG-SEC-APIKEY", severity: "HIGH", prefix_skip: 6, min_entropy: 3.2, requires_keyword: None },
+            ),
+            (
+                r"\b(sq[pau]_[0-9a-f]{40})\b",
+                SecretTokenSpec { provider: "SonarQube / SonarCloud Token", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 4, min_entropy: 2.9, requires_keyword: None },
+            ),
+            (
+                r"\b(dt0c01\.[0-9A-Z]{24}\.[0-9A-Z]{64})\b",
+                SecretTokenSpec { provider: "Dynatrace API Token", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 7, min_entropy: 3.1, requires_keyword: None },
+            ),
+            (
+                r"\b(bkua_[0-9a-f]{40})\b",
+                SecretTokenSpec { provider: "Buildkite Agent Token", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 5, min_entropy: 2.9, requires_keyword: None },
+            ),
+            (
+                r"\b(rdme_[0-9a-f]{64})\b",
+                SecretTokenSpec { provider: "ReadMe API Key", rule_id: "SMG-SEC-APIKEY", severity: "HIGH", prefix_skip: 5, min_entropy: 2.9, requires_keyword: None },
+            ),
+            (
+                r"\b(ATBB[0-9A-Za-z]{28,})\b",
+                SecretTokenSpec { provider: "Bitbucket App Password", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 4, min_entropy: 3.1, requires_keyword: None },
+            ),
+            (
+                r"\b(ATATT3xFfGF0[0-9A-Za-z_-]{40,})\b",
+                SecretTokenSpec { provider: "Atlassian API Token", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 12, min_entropy: 3.2, requires_keyword: None },
+            ),
+            (
+                r"\b(LTAI[0-9A-Za-z]{16,})\b",
+                SecretTokenSpec { provider: "Alibaba Cloud AccessKey ID", rule_id: "SMG-SEC-AWS", severity: "HIGH", prefix_skip: 4, min_entropy: 3.0, requires_keyword: Some("alibaba") },
+            ),
+            (
+                r"\b(AccountKey=[0-9A-Za-z+/=]{60,}==)\b",
+                SecretTokenSpec { provider: "Azure Storage Account Key", rule_id: "SMG-SEC-KEY", severity: "CRITICAL", prefix_skip: 11, min_entropy: 3.4, requires_keyword: None },
+            ),
+            (
+                r"(sv=20[0-9]{2}-[0-9]{2}-[0-9]{2}&[^&\s]*sig=[0-9A-Za-z%+/=]{24,})",
+                SecretTokenSpec { provider: "Azure SAS Signature URL", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 18, min_entropy: 3.2, requires_keyword: None },
+            ),
+            (
+                r"\b(key-[0-9a-f]{32})\b",
+                SecretTokenSpec { provider: "Mailgun API Key", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 4, min_entropy: 2.9, requires_keyword: Some("mailgun") },
+            ),
+            (
+                r"\b(secret_[0-9A-Za-z]{40,})\b",
+                SecretTokenSpec { provider: "Notion / Service Integration Secret", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 7, min_entropy: 3.1, requires_keyword: Some("notion") },
+            ),
+            (
+                r"\b(sdk-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b",
+                SecretTokenSpec { provider: "LaunchDarkly SDK Key", rule_id: "SMG-SEC-APIKEY", severity: "HIGH", prefix_skip: 4, min_entropy: 2.9, requires_keyword: Some("launchdarkly") },
+            ),
+            (
+                r"\b(access_token\$production\$[0-9a-z]{12,}\$[0-9a-f]{32})\b",
+                SecretTokenSpec { provider: "PayPal Production Token", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 24, min_entropy: 3.0, requires_keyword: None },
+            ),
+            (
+                r"\b(sk_[0-9a-f]{48})\b",
+                SecretTokenSpec { provider: "ElevenLabs API Key", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 3, min_entropy: 3.0, requires_keyword: Some("eleven") },
+            ),
+            (
+                r"\b(sk-[0-9a-f]{32})\b",
+                SecretTokenSpec { provider: "DeepSeek API Key", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 3, min_entropy: 2.9, requires_keyword: Some("deepseek") },
+            ),
+            (
+                r"\b(00[0-9A-Za-z_-]{40})\b",
+                SecretTokenSpec { provider: "Okta API Token", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 2, min_entropy: 3.2, requires_keyword: Some("okta") },
+            ),
+            (
+                r"\b(dop_v1_[0-9a-f]{64}|doo_v1_[0-9a-f]{64}|dor_v1_[0-9a-f]{64})\b",
+                SecretTokenSpec { provider: "DigitalOcean v1 Token", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 7, min_entropy: 3.0, requires_keyword: None },
+            ),
+            (
+                r"\b(ya29\.[0-9A-Za-z_-]{50,})\b",
+                SecretTokenSpec { provider: "Google OAuth2 Access Token", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 5, min_entropy: 3.4, requires_keyword: None },
+            ),
+            (
+                r"\b(r_live_[0-9A-Za-z]{20,})\b",
+                SecretTokenSpec { provider: "Razorpay / Live Payment Key", rule_id: "SMG-SEC-STRIPE", severity: "CRITICAL", prefix_skip: 7, min_entropy: 3.1, requires_keyword: None },
+            ),
+            (
+                r"\b(rzp_live_[0-9A-Za-z]{14,})\b",
+                SecretTokenSpec { provider: "Razorpay Live Key", rule_id: "SMG-SEC-STRIPE", severity: "CRITICAL", prefix_skip: 9, min_entropy: 3.0, requires_keyword: None },
+            ),
+            (
+                r"\b(gph_[0-9A-Za-z]{36,})\b",
+                SecretTokenSpec { provider: "GitHub Enterprise Token", rule_id: "SMG-SEC-GITHUB", severity: "CRITICAL", prefix_skip: 4, min_entropy: 3.1, requires_keyword: None },
+            ),
+            (
+                r"\b(sbp_v0_[0-9A-Za-z]{32,})\b",
+                SecretTokenSpec { provider: "Supabase Management Token", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 7, min_entropy: 3.1, requires_keyword: None },
+            ),
+            (
+                r"\b(cfat_[0-9A-Za-z_-]{32,}|v1\.0-[0-9a-f]{24}-[0-9a-f]{120,})\b",
+                SecretTokenSpec { provider: "Cloudflare / Cloud API Token", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 5, min_entropy: 3.1, requires_keyword: None },
+            ),
         ];
 
         let patterns: Vec<&str> = defs.iter().map(|(p, _)| *p).collect();
@@ -810,11 +966,15 @@ pub fn scan_secrets_and_config(rel_path: &str, content: &str) -> Vec<LocalStatic
             continue;
         }
 
-        // Skip regex pattern literals in rule/analyzer definitions themselves
+        // Skip regex pattern literals & Rust rule-catalog documentation examples
         if trimmed.contains("Regex::new(")
             || trimmed.contains("RegexSet::new(")
             || trimmed.starts_with("r\"")
             || trimmed.starts_with("r#\"")
+            || (is_rust
+                && (trimmed.starts_with("vulnerable_example:")
+                    || trimmed.starts_with("fixed_example:")
+                    || trimmed.starts_with("remediation:")))
         {
             continue;
         }
@@ -1019,8 +1179,10 @@ pub fn scan_secrets_and_config(rel_path: &str, content: &str) -> Vec<LocalStatic
             }
         }
 
-        // Skip comment lines for configuration/misconfiguration checks
-        if is_comment_line(trimmed) {
+        // Skip comment lines and Rust catalog metadata descriptions for misconfiguration checks
+        if is_comment_line(trimmed)
+            || (is_rust && (trimmed.starts_with("title:") || trimmed.starts_with("description:")))
+        {
             continue;
         }
 

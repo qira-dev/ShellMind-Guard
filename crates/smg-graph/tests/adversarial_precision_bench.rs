@@ -1705,6 +1705,177 @@ export async function syncData(id: string) {
                 code: "package netpkg\nfunc insecureTLS() any {\n    return &tls.Config{MinVersion: tls.VersionTLS10}\n}\n",
             }],
         },
+        // ------------------------------------------------------------------
+        // Phase 2: Multi-Domain Maximum Depth & Adversarial FP Regression Pack
+        // ------------------------------------------------------------------
+        AdversarialCase {
+            id: "phase2_pg_positional_bind_arithmetic_safe",
+            family: "SQLI",
+            expected_prefix: "SMG-SQLI",
+            expect_finding: false,
+            trap_kind: TrapKind::CheckedBoundsTrap,
+            files: vec![BenchFile {
+                rel_path: "src/repo/orders.ts",
+                lang: Language::TypeScript,
+                code: "export async function pageOrders(db: any, orgId: string, limit: number, skip: number) {\n  return db.query('SELECT id FROM orders WHERE org_id = $1 AND rank > $2', [orgId, limit + skip]);\n}\n",
+            }],
+        },
+        AdversarialCase {
+            id: "phase2_dart_request_read_as_string_safe",
+            family: "PATH",
+            expected_prefix: "SMG-PATH",
+            expect_finding: false,
+            trap_kind: TrapKind::ScopeCollisionTrap,
+            files: vec![BenchFile {
+                rel_path: "lib/handlers/webhook.dart",
+                lang: Language::Dart,
+                code: "Future<Response> handleHook(Request request) async {\n  final body = await request.readAsString();\n  return Response.ok('received:' + body.length.toString());\n}\n",
+            }],
+        },
+        AdversarialCase {
+            id: "phase2_ml_torch_load_unsafe_vuln",
+            family: "CMDI",
+            expected_prefix: "SMG-CMDI",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "ml/infer.py",
+                lang: Language::Python,
+                code: "import torch\ndef load_model(p: str):\n    return torch.load(p)\n",
+            }],
+        },
+        AdversarialCase {
+            id: "phase2_ml_torch_load_weights_only_safe",
+            family: "CMDI",
+            expected_prefix: "SMG-CMDI",
+            expect_finding: false,
+            trap_kind: TrapKind::DominatorGuardTrap,
+            files: vec![BenchFile {
+                rel_path: "ml/safe_infer.py",
+                lang: Language::Python,
+                code: "import torch\ndef load_model(p: str):\n    return torch.load(p, weights_only=True)\n",
+            }],
+        },
+        AdversarialCase {
+            id: "phase2_hf_trust_remote_code_vuln",
+            family: "AI",
+            expected_prefix: "SMG-AI",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "ml/tokenizer.py",
+                lang: Language::Python,
+                code: "def load_hf():\n    return AutoModel.from_pretrained('org/model', trust_remote_code=True)\n",
+            }],
+        },
+        AdversarialCase {
+            id: "phase2_electron_node_integration_vuln",
+            family: "CMDI",
+            expected_prefix: "SMG-CMDI",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "electron/main.ts",
+                lang: Language::TypeScript,
+                code: "export function createWindow() {\n  return new BrowserWindow({ webPreferences: { nodeIntegration: true } });\n}\n",
+            }],
+        },
+        AdversarialCase {
+            id: "phase2_nextjs_allow_svg_vuln",
+            family: "XSS",
+            expected_prefix: "SMG-XSS",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "next.config.ts",
+                lang: Language::TypeScript,
+                code: "export default { images: { dangerouslyAllowSVG: true } };\n",
+            }],
+        },
+        AdversarialCase {
+            id: "phase2_csharp_json_typename_all_vuln",
+            family: "CMDI",
+            expected_prefix: "SMG-CMDI",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "Services/Serializer.cs",
+                lang: Language::CSharp,
+                code: "public class Serializer {\n  public JsonSerializerSettings Opts() => new JsonSerializerSettings { TypeNameHandling = TypeNameHandling.All };\n}\n",
+            }],
+        },
+        AdversarialCase {
+            id: "phase2_terraform_imdsv1_optional_vuln",
+            family: "CFG",
+            expected_prefix: "SMG-CFG-IAC",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "infra/ec2.tf",
+                lang: Language::Hcl,
+                code: "resource \"aws_instance\" \"app\" {\n  metadata_options {\n    http_tokens = \"optional\"\n  }\n}\n",
+            }],
+        },
+        AdversarialCase {
+            id: "phase2_iam_nested_condition_deny_safe",
+            family: "CFG",
+            expected_prefix: "SMG-CFG",
+            expect_finding: false,
+            trap_kind: TrapKind::ScopeCollisionTrap,
+            files: vec![BenchFile {
+                rel_path: "infra/policy.tf",
+                lang: Language::Hcl,
+                code: "resource \"aws_iam_policy\" \"guard\" {\n  policy = jsonencode({\n    Statement = [{\n      Effect = \"Deny\",\n      Action = \"*\",\n      Resource = \"*\",\n      Condition = { Bool = { \"aws:SecureTransport\" = \"false\" } }\n    }]\n  })\n}\n",
+            }],
+        },
+        AdversarialCase {
+            id: "phase2_c_malloc_sizeof_safe",
+            family: "MEM",
+            expected_prefix: "SMG-MEM",
+            expect_finding: false,
+            trap_kind: TrapKind::CheckedBoundsTrap,
+            files: vec![BenchFile {
+                rel_path: "native/alloc.c",
+                lang: Language::C,
+                code: "#include <stdlib.h>\nint *alloc_ints(void) {\n    int *p = (int *)malloc(sizeof(int) * 4);\n    return p;\n}\n",
+            }],
+        },
+        AdversarialCase {
+            id: "phase2_stream_read_not_mutex_safe",
+            family: "RACE",
+            expected_prefix: "SMG-RACE",
+            expect_finding: false,
+            trap_kind: TrapKind::ScopeCollisionTrap,
+            files: vec![BenchFile {
+                rel_path: "app/stream.py",
+                lang: Language::Python,
+                code: "def load_cfg(fp):\n    data = fp.read()\n    return len(data)\n",
+            }],
+        },
+        AdversarialCase {
+            id: "phase2_bash_heredoc_body_safe",
+            family: "CMDI",
+            expected_prefix: "SMG-CMDI",
+            expect_finding: false,
+            trap_kind: TrapKind::ScopeCollisionTrap,
+            files: vec![BenchFile {
+                rel_path: "scripts/gen.sh",
+                lang: Language::Bash,
+                code: "#!/usr/bin/env bash\ncat << 'EOF' > /tmp/note.txt\neval \"$1\"\nEOF\n",
+            }],
+        },
+        AdversarialCase {
+            id: "phase2_bash_github_env_injection_vuln",
+            family: "CMDI",
+            expected_prefix: "SMG-CMDI",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "scripts/ci.sh",
+                lang: Language::Bash,
+                code: "#!/usr/bin/env bash\necho \"PR_TITLE=$1\" >> $GITHUB_ENV\n",
+            }],
+        },
     ]
 }
 

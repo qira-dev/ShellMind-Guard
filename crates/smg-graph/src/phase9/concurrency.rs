@@ -69,6 +69,24 @@ fn method_lock_re() -> &'static Regex {
     })
 }
 
+fn is_plausible_lock_method(method: &str, raw_recv: &str, file_uses_rwlock: bool) -> bool {
+    match method {
+        "read" | "write" => {
+            let rl = raw_recv.to_ascii_lowercase();
+            file_uses_rwlock
+                || rl.contains("lock")
+                || rl.contains("rw")
+                || rl.contains("mtx")
+                || rl.ends_with("mu")
+        }
+        "acquire" => {
+            let rl = raw_recv.to_ascii_lowercase();
+            rl.contains("lock") || rl.contains("mutex") || rl.contains("mtx")
+        }
+        _ => true,
+    }
+}
+
 fn method_unlock_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -105,7 +123,7 @@ fn go_handle_assign_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r#"\b([A-Za-z_][A-Za-z0-9_]*)\s*(?:,\s*[A-Za-z_][A-Za-z0-9_]*\s*)?:?=\s*(?:os\.Open(?:File)?|sql\.Open|net\.Dial|http\.(?:Get|Post))\s*\("#,
+            r#"\b([A-Za-z_][A-Za-z0-9_]*)\s*(?:,\s*[A-Za-z_][A-Za-z0-9_]*\s*)?:?=\s*(?:os\.Open(?:File)?|sql\.Open|net\.Dial|db\.Query(?:Context)?|http\.(?:Get|Post))\s*\("#,
         )
         .expect("valid go handle regex")
     })
@@ -291,14 +309,14 @@ pub fn analyze_concurrency_and_leaks(
     static_findings: &mut Vec<LocalStaticFinding>,
 ) {
     let full_src = std::str::from_utf8(src).unwrap_or("");
-    let file_uses_async_mutex = full_src.contains("tokio::sync::Mutex")
-        || full_src.contains("tokio::sync::RwLock")
-        || full_src.contains("futures::lock::Mutex")
-        || full_src.contains("async_std::sync::Mutex");
-    let file_uses_sync_mutex = full_src.contains("std::sync::Mutex")
-        || full_src.contains("std::sync::RwLock")
-        || full_src.contains("parking_lot::Mutex")
-        || full_src.contains("parking_lot::RwLock");
+    let file_uses_async_mutex = full_src.contains("tokio::sync::")
+        && (full_src.contains("Mutex") || full_src.contains("RwLock"))
+        || full_src.contains("futures::lock::")
+        || full_src.contains("async_std::sync::");
+    let file_uses_sync_mutex = (full_src.contains("std::sync::")
+        || full_src.contains("parking_lot::"))
+        && (full_src.contains("Mutex") || full_src.contains("RwLock"));
+    let file_uses_rwlock = full_src.contains("RwLock");
 
     let mut spans = Vec::new();
     collect_functions(root, src, lang, &mut spans);
@@ -311,6 +329,7 @@ pub fn analyze_concurrency_and_leaks(
             &f,
             file_uses_async_mutex,
             file_uses_sync_mutex,
+            file_uses_rwlock,
             sym_idx.map(|i| &mut symbols[i]),
             static_findings,
         );
@@ -318,12 +337,14 @@ pub fn analyze_concurrency_and_leaks(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn analyze_function_locks(
     rel_path: &str,
     lang: Language,
     f: &FnSpan,
     file_uses_async_mutex: bool,
     file_uses_sync_mutex: bool,
+    file_uses_rwlock: bool,
     mut sym_opt: Option<&mut SymbolInfo>,
     out: &mut Vec<LocalStaticFinding>,
 ) {
@@ -368,6 +389,57 @@ fn analyze_function_locks(
             || trimmed.contains("sleep_for(")
             || trimmed.contains("usleep(");
 
+        // Rust `std::mem::forget(guard)` while holding lock -> permanent deadlock
+        if lang == Language::Rust && trimmed.contains("mem::forget(") {
+            for g in &guards {
+                if let Some(gv) = &g.guard_var
+                    && trimmed.contains(&format!("forget({})", gv))
+                {
+                    out.push(make_phase9_finding(
+                        "SMG-ENG-DEADLOCK",
+                        "CRITICAL",
+                        format!(
+                            "`mem::forget({})` leaks mutex guard `{}` permanently in `{}`",
+                            gv, g.norm_name, f.fn_name
+                        ),
+                        rel_path,
+                        ln,
+                        &f.fn_name,
+                        SinkKind::ConcurrencyHazard,
+                        GuardKind::LockOrdering,
+                        Confidence::Confirmed,
+                        "Drop the mutex guard instead of calling `std::mem::forget` on it.",
+                    ));
+                }
+            }
+        }
+
+        // Python blocking HTTP/sleep calls inside `async def` stall the event loop
+        if lang == Language::Python
+            && f.code.trim_start().starts_with("async def ")
+            && (trimmed.contains("time.sleep(")
+                || trimmed.contains("requests.get(")
+                || trimmed.contains("requests.post(")
+                || trimmed.contains("urllib.request.urlopen("))
+        {
+            out.push(make_phase9_finding(
+                "SMG-ENG-DEADLOCK",
+                "MEDIUM",
+                format!(
+                    "Blocking call `{}` inside Python `async def {}` stalls asyncio event loop",
+                    trimmed.split('(').next().unwrap_or(trimmed),
+                    f.fn_name
+                ),
+                rel_path,
+                ln,
+                &f.fn_name,
+                SinkKind::ConcurrencyHazard,
+                GuardKind::LockOrdering,
+                Confidence::Heuristic,
+                "Use non-blocking async equivalents (`await asyncio.sleep(...)` or `httpx.AsyncClient`).",
+            ));
+        }
+
         if (has_await_kw && !is_lock_acq_await) || is_blocking_sleep {
             let sync_mutex_hazard =
                 !file_uses_async_mutex || file_uses_sync_mutex || is_blocking_sleep;
@@ -376,6 +448,8 @@ fn analyze_function_locks(
                 && !(has_await_kw && matches!(lang, Language::C | Language::Cpp))
             {
                 let held_names: Vec<&str> = guards.iter().map(|g| g.norm_name.as_str()).collect();
+                let sync_confirmed =
+                    (!file_uses_async_mutex && file_uses_sync_mutex) || is_blocking_sleep;
                 out.push(make_phase9_finding(
                     "SMG-ENG-DEADLOCK",
                     "HIGH",
@@ -390,7 +464,7 @@ fn analyze_function_locks(
                     &f.fn_name,
                     SinkKind::ConcurrencyHazard,
                     GuardKind::LockOrdering,
-                    if file_uses_sync_mutex || !file_uses_async_mutex || is_blocking_sleep {
+                    if sync_confirmed || !file_uses_async_mutex {
                         Confidence::Confirmed
                     } else {
                         Confidence::Heuristic
@@ -504,9 +578,12 @@ fn analyze_function_locks(
                     }
                     continue;
                 }
-                // Avoid matching unlock/deadlock/block calls accidentally
+                // Avoid matching unlock/deadlock/block calls or non-lock stream `.read()`/`.write()` accidentally
                 let raw_recv = &cap[2];
-                if raw_recv.ends_with(".unlock") {
+                let method_name = &cap[3];
+                if raw_recv.ends_with(".unlock")
+                    || !is_plausible_lock_method(method_name, raw_recv, file_uses_rwlock)
+                {
                     continue;
                 }
                 let norm = norm_lock_name(raw_recv);
@@ -564,9 +641,18 @@ fn analyze_function_locks(
             }
         }
 
-        // 7. Pop RAII/block-scoped guards whose brace scope exited on this line
+        // 7. Pop RAII/block-scoped guards whose brace scope exited on this line (or single-line `{ ... }` blocks)
+        let single_line_block = opens > 0 && opens == closes && stmt_depth == depth_after;
         depth = depth_after;
-        guards.retain(|g| g.is_manual_unlock || g.scope_depth <= depth);
+        guards.retain(|g| {
+            if g.is_manual_unlock {
+                !(is_return_stmt && g.scope_depth > depth)
+            } else if single_line_block {
+                g.scope_depth < depth
+            } else {
+                g.scope_depth <= depth
+            }
+        });
     }
 }
 
@@ -907,7 +993,16 @@ fn analyze_function_leaks(
         }
 
         // Language-specific RAII / guaranteed cleanup guards -> SAFE
-        if lang == Language::Go && rest_low.contains(&format!("defer {}.close(", var_low)) {
+        if lang == Language::Go
+            && (rest_low.contains(&format!("defer {}.close(", var_low))
+                || rest_low.contains(&format!("defer {}.body.close(", var_low)))
+        {
+            continue;
+        }
+        if matches!(lang, Language::C | Language::Cpp)
+            && (rest_low.contains("unique_ptr<") || rest_low.contains("shared_ptr<"))
+            && rest_low.contains(&format!("({}", var_low))
+        {
             continue;
         }
         if matches!(
@@ -919,6 +1014,7 @@ fn analyze_function_leaks(
                 | Language::JavaScript
         ) && (rest_low.contains("finally:") || rest_low.contains("finally {"))
             && (rest_low.contains(&format!("{}.close(", var_low))
+                || rest_low.contains(&format!("{}.body.close(", var_low))
                 || rest_low.contains("release(")
                 || rest_low.contains("closesync("))
         {
@@ -937,6 +1033,7 @@ fn analyze_function_leaks(
                 || ll.contains(&format!("pqfinish({})", var_low))
                 || ll.contains(&format!("free({})", var_low))
                 || ll.contains(&format!("{}.close(", var_low))
+                || ll.contains(&format!("{}.body.close(", var_low))
                 || ll.contains(&format!("{}.release(", var_low))
                 || ll.contains(&format!("fs.closesync({})", var_low)))
                 && !ll.trim_start().starts_with("if ")
@@ -973,11 +1070,21 @@ fn analyze_function_leaks(
                     || r_low.starts_with("throw ")
                     || r_low.starts_with("raise ")
                     || (r_low.contains(") return ") && !is_handle_null_err_guard(rt, var));
-                let closed_on_same_line = r_low.contains("close(")
-                    || r_low.contains("fclose(")
-                    || r_low.contains("free(")
-                    || r_low.contains(".close(");
-                if returns_early && !closed_on_same_line {
+                let prev_non_empty = rest_lines[..r_off]
+                    .iter()
+                    .rev()
+                    .find(|l| !l.trim().is_empty())
+                    .map(|l| l.to_ascii_lowercase())
+                    .unwrap_or_default();
+                let has_close_in_str = |s: &str| {
+                    s.contains(&format!("close({})", var_low))
+                        || s.contains(&format!("fclose({})", var_low))
+                        || s.contains(&format!("free({})", var_low))
+                        || s.contains(&format!("{}.close(", var_low))
+                };
+                let closed_right_before =
+                    has_close_in_str(&r_low) || has_close_in_str(&prev_non_empty);
+                if returns_early && !closed_right_before {
                     out.push(make_phase9_finding(
                         "SMG-ENG-LEAK",
                         "HIGH",

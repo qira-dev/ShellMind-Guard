@@ -70,7 +70,13 @@ fn has_ident_word(haystack: &str, needle: &str) -> bool {
 
 fn token_candidates_in_line(line: &str) -> Vec<&'static str> {
     let mut masked = line.to_ascii_lowercase();
-    if masked.contains("= false") || masked.contains(": false") {
+    if let Some((lhs, rhs)) = masked.split_once('=')
+        && rhs.trim_start().starts_with("false")
+        && (lhs.contains("fallback")
+            || lhs.contains("allow_")
+            || lhs.contains("enable_")
+            || lhs.contains("use_"))
+    {
         return Vec::new();
     }
     const FAST_STEMS: &[&str] = &[
@@ -82,8 +88,10 @@ fn token_candidates_in_line(line: &str) -> Vec<&'static str> {
         "ecdh",
         "25519",
         "ecdsa",
-        "secp256",
-        "prime256",
+        "secp",
+        "prime",
+        "ssh-dss",
+        "diffie-hellman",
         "rsa",
         "rs256",
         "rs384",
@@ -152,6 +160,16 @@ fn token_candidates_in_line(line: &str) -> Vec<&'static str> {
         ("secp256k1", "secp256k1"),
         ("prime256v1", "prime256v1"),
         ("secp256r1", "secp256r1"),
+        ("secp192r1", "secp192r1"),
+        ("prime192v1", "prime192v1"),
+        ("secp224r1", "secp224r1"),
+        ("secp384r1", "secp384r1"),
+        ("secp521r1", "secp521r1"),
+        ("ssh-dss", "ssh-dss"),
+        ("diffie-hellman-group1-sha1", "diffie-hellman-group1-sha1"),
+        ("rsa-512", "RSA-512"),
+        ("rsa-1024", "RSA-1024"),
+        ("rsa1024", "RSA-1024"),
         ("rsa-oaep", "RSA-OAEP"),
         ("rsa_oaep", "RSA-OAEP"),
         ("rsa-pss", "RSA-PSS"),
@@ -361,7 +379,14 @@ pub fn analyze_pqc_inventory(
     let mut seen_assets: HashSet<(String, String, usize)> = HashSet::new();
 
     for f in files {
-        if smg_core::is_test_source_path(&f.rel_path) || f.rel_path.ends_with(".lock") {
+        let low_path = f.rel_path.to_ascii_lowercase();
+        if smg_core::is_test_source_path(&f.rel_path)
+            || f.rel_path.ends_with(".lock")
+            || low_path.ends_with("package-lock.json")
+            || low_path.ends_with("pnpm-lock.yaml")
+            || low_path.ends_with("go.sum")
+            || low_path.contains("sbom")
+        {
             continue;
         }
         let Some(raw_text) = read_text(f) else {
@@ -475,48 +500,56 @@ pub fn analyze_pqc_inventory(
                         confidence: Confidence::Confirmed,
                         remediation: "Migrate key exchange to FIPS 203 hybrid `X25519MLKEM768` / `ML-KEM-768` and signatures to FIPS 204 `ML-DSA-65`.".into(),
                     });
-                } else if strength.quantum_bits < 128
-                    && !(strength.family == CryptoFamily::HashFunction && line_low.contains("hmac"))
-                {
-                    // Gate 2: Grover symmetric halving / BHT collision reduction below 128-bit quantum security
-                    raw_findings.push(LocalStaticFinding {
-                        rule_id: "SMG-PQC-GROVER".into(),
-                        severity: "MEDIUM".into(),
-                        title: format!(
-                            "Grover/BHT security reduction: `{}` drops to {} quantum bits (< 128-bit PQC floor)",
-                            strength.algorithm, strength.quantum_bits
-                        ),
-                        rel_path: f.rel_path.clone(),
-                        line: line_no,
-                        symbol: strength.algorithm.into(),
-                        sink_kind: SinkKind::Misconfiguration,
-                        missing_guard: GuardKind::ConfigPolicy,
-                        confidence: Confidence::Confirmed,
-                        remediation: "Upgrade symmetric ciphers to AES-256 / ChaCha20-Poly1305 and hashes to SHA-384+.".into(),
-                    });
-                } else if min_pq_category >= 3
-                    && matches!(
-                        strength.family,
-                        CryptoFamily::PostQuantumKem | CryptoFamily::PostQuantumSig
-                    )
-                    && strength.nist_category < min_pq_category
-                {
-                    // Gate 3: Sub-threshold FIPS PQC parameter set (`ML-KEM-512` / `ML-DSA-44` / `SLH-DSA-128` under Category 3+ policy)
-                    raw_findings.push(LocalStaticFinding {
-                        rule_id: "SMG-PQC-PARAMS".into(),
-                        severity: "MEDIUM".into(),
-                        title: format!(
-                            "Sub-threshold PQC parameter set `{}` (NIST Cat {}) under Category {}+ policy",
-                            strength.algorithm, strength.nist_category, min_pq_category
-                        ),
-                        rel_path: f.rel_path.clone(),
-                        line: line_no,
-                        symbol: strength.algorithm.into(),
-                        sink_kind: SinkKind::Misconfiguration,
-                        missing_guard: GuardKind::ConfigPolicy,
-                        confidence: Confidence::Confirmed,
-                        remediation: "Select `ML-KEM-768` / `ML-KEM-1024` or `ML-DSA-65` / `ML-DSA-87` for NIST Category 3+ assurance.".into(),
-                    });
+                } else {
+                    let is_sha256_prf_or_digest = strength.algorithm == "SHA-256"
+                        && (line_low.contains("hmac")
+                            || line_low.contains("hkdf")
+                            || line_low.contains("pbkdf2")
+                            || line_low.contains("tls_aes_")
+                            || line_low.contains("chacha20_poly1305_sha256")
+                            || line_low.contains("sha256:")
+                            || line_low.contains("sha256-"));
+                    if strength.quantum_bits < 128 && !is_sha256_prf_or_digest {
+                        // Gate 2: Grover symmetric halving / BHT collision reduction below 128-bit quantum security
+                        raw_findings.push(LocalStaticFinding {
+                            rule_id: "SMG-PQC-GROVER".into(),
+                            severity: "MEDIUM".into(),
+                            title: format!(
+                                "Grover/BHT security reduction: `{}` drops to {} quantum bits (< 128-bit PQC floor)",
+                                strength.algorithm, strength.quantum_bits
+                            ),
+                            rel_path: f.rel_path.clone(),
+                            line: line_no,
+                            symbol: strength.algorithm.into(),
+                            sink_kind: SinkKind::Misconfiguration,
+                            missing_guard: GuardKind::ConfigPolicy,
+                            confidence: Confidence::Confirmed,
+                            remediation: "Upgrade symmetric ciphers to AES-256 / ChaCha20-Poly1305 and hashes to SHA-384+.".into(),
+                        });
+                    } else if min_pq_category >= 3
+                        && matches!(
+                            strength.family,
+                            CryptoFamily::PostQuantumKem | CryptoFamily::PostQuantumSig
+                        )
+                        && strength.nist_category < min_pq_category
+                    {
+                        // Gate 3: Sub-threshold FIPS PQC parameter set (`ML-KEM-512` / `ML-DSA-44` / `SLH-DSA-128` under Category 3+ policy)
+                        raw_findings.push(LocalStaticFinding {
+                            rule_id: "SMG-PQC-PARAMS".into(),
+                            severity: "MEDIUM".into(),
+                            title: format!(
+                                "Sub-threshold PQC parameter set `{}` (NIST Cat {}) under Category {}+ policy",
+                                strength.algorithm, strength.nist_category, min_pq_category
+                            ),
+                            rel_path: f.rel_path.clone(),
+                            line: line_no,
+                            symbol: strength.algorithm.into(),
+                            sink_kind: SinkKind::Misconfiguration,
+                            missing_guard: GuardKind::ConfigPolicy,
+                            confidence: Confidence::Confirmed,
+                            remediation: "Select `ML-KEM-768` / `ML-KEM-1024` or `ML-DSA-65` / `ML-DSA-87` for NIST Category 3+ assurance.".into(),
+                        });
+                    }
                 }
             }
         }

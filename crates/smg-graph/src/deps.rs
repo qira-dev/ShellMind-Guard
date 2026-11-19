@@ -13,6 +13,10 @@ pub enum Ecosystem {
     Cargo,
     Go,
     PyPi,
+    Maven,
+    Packagist,
+    RubyGems,
+    Pub,
 }
 
 impl Ecosystem {
@@ -22,6 +26,10 @@ impl Ecosystem {
             Ecosystem::Cargo => "crates.io",
             Ecosystem::Go => "Go",
             Ecosystem::PyPi => "PyPI",
+            Ecosystem::Maven => "Maven",
+            Ecosystem::Packagist => "Packagist",
+            Ecosystem::RubyGems => "RubyGems",
+            Ecosystem::Pub => "Pub",
         }
     }
 }
@@ -46,7 +54,13 @@ fn norm_pkg_key(raw: &str) -> String {
 }
 
 fn expand_pkg_aliases(raw: &str, out: &mut HashSet<String>) {
-    let trimmed = raw.trim().trim_matches(['"', '\'', '`']);
+    let raw_trimmed = raw.trim().trim_matches(['"', '\'', '`']);
+    let trimmed = if let Some((_, rest)) = raw_trimmed.split_once("::") {
+        // Handle Phase-8 prefixed imports (`java::org/apache/...`, `rb::rack`, `php::vendor/...`)
+        rest
+    } else {
+        raw_trimmed
+    };
     if trimmed.is_empty() || trimmed.starts_with('.') || trimmed.starts_with('/') {
         return;
     }
@@ -154,23 +168,6 @@ pub fn assess_dependency_reachability(
             }
         } else if in_tick {
             buf.push(ch);
-        }
-    }
-    if !matched_pkg {
-        for tok in title.split_whitespace() {
-            let clean = tok
-                .trim_matches([':', ',', ';', '(', ')', '[', ']', '\'', '`', '"'])
-                .split('@')
-                .next()
-                .unwrap_or("");
-            let norm = norm_pkg_key(clean);
-            let low = clean.to_ascii_lowercase();
-            if (!norm.is_empty() && reachable_pkgs.contains(&norm))
-                || (!low.is_empty() && reachable_pkgs.contains(&low))
-            {
-                matched_pkg = true;
-                break;
-            }
         }
     }
     Some(if matched_pkg {
@@ -376,6 +373,66 @@ const OFFLINE_ADVISORIES: &[Advisory] = &[
         severity: "HIGH",
         reason: "Known OpenSSL binding security advisories (< 0.10.55)",
     },
+    // Maven / JVM
+    Advisory {
+        ecosystem: Ecosystem::Maven,
+        package: "log4j-core",
+        fixed_below: Some((2, 17, 1)),
+        severity: "CRITICAL",
+        reason: "Log4Shell JNDI remote code execution (< 2.17.1)",
+    },
+    Advisory {
+        ecosystem: Ecosystem::Maven,
+        package: "spring-beans",
+        fixed_below: Some((5, 3, 18)),
+        severity: "CRITICAL",
+        reason: "Spring4Shell data binding RCE (< 5.3.18)",
+    },
+    Advisory {
+        ecosystem: Ecosystem::Maven,
+        package: "jackson-databind",
+        fixed_below: Some((2, 13, 4)),
+        severity: "HIGH",
+        reason: "Polymorphic deserialization / DoS advisories (< 2.13.4)",
+    },
+    // Packagist / PHP
+    Advisory {
+        ecosystem: Ecosystem::Packagist,
+        package: "symfony/http-kernel",
+        fixed_below: Some((5, 4, 20)),
+        severity: "HIGH",
+        reason: "Known cache/request smuggling advisories (< 5.4.20)",
+    },
+    Advisory {
+        ecosystem: Ecosystem::Packagist,
+        package: "laravel/framework",
+        fixed_below: Some((9, 52, 16)),
+        severity: "HIGH",
+        reason: "Known validation/XSS advisories (< 9.52.16)",
+    },
+    // RubyGems
+    Advisory {
+        ecosystem: Ecosystem::RubyGems,
+        package: "rack",
+        fixed_below: Some((2, 2, 8)),
+        severity: "HIGH",
+        reason: "HTTP request smuggling / ReDoS advisories (< 2.2.8)",
+    },
+    Advisory {
+        ecosystem: Ecosystem::RubyGems,
+        package: "nokogiri",
+        fixed_below: Some((1, 15, 6)),
+        severity: "HIGH",
+        reason: "Bundled libxml2 memory safety advisories (< 1.15.6)",
+    },
+    // Pub / Dart
+    Advisory {
+        ecosystem: Ecosystem::Pub,
+        package: "http",
+        fixed_below: Some((0, 13, 6)),
+        severity: "MEDIUM",
+        reason: "Header injection risk on legacy `http` package (< 0.13.6)",
+    },
 ];
 
 fn has_explicit_patch(raw: &str) -> bool {
@@ -436,12 +493,54 @@ fn make_dep_finding(
 }
 
 fn find_line_for_needle(lines: &[&str], needle: &str) -> usize {
+    if needle.is_empty() {
+        return 1;
+    }
+    let nb = needle.as_bytes();
+    let is_word_needle = nb
+        .first()
+        .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+        && nb
+            .last()
+            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_');
     for (i, line) in lines.iter().enumerate() {
-        if line.contains(needle) {
-            return i + 1;
+        let mut off = 0usize;
+        while let Some(rel) = line[off..].find(needle) {
+            let pos = off + rel;
+            if !is_word_needle {
+                return i + 1;
+            }
+            let bytes = line.as_bytes();
+            let prev_ok = pos == 0
+                || (!bytes[pos - 1].is_ascii_alphanumeric()
+                    && bytes[pos - 1] != b'_'
+                    && bytes[pos - 1] != b'-');
+            let end = pos + needle.len();
+            let next_ok = end >= bytes.len()
+                || (!bytes[end].is_ascii_alphanumeric()
+                    && bytes[end] != b'_'
+                    && bytes[end] != b'-');
+            if prev_ok && next_ok {
+                return i + 1;
+            }
+            off = pos + 1;
         }
     }
     1
+}
+
+fn is_flexible_range_spec(version_str: &str) -> bool {
+    let t = version_str.trim();
+    t.starts_with('^')
+        || t.starts_with('~')
+        || t.starts_with(">=")
+        || t.starts_with("<=")
+        || t.starts_with('>')
+}
+
+fn is_commit_sha_40(raw: &str) -> bool {
+    let t = raw.trim();
+    t.len() == 40 && t.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 fn is_go_pseudo_version(ver: &str) -> bool {
@@ -504,7 +603,11 @@ fn check_single_offline_advisory(
                     line,
                     fix_hint,
                 );
-                hit.confidence = Confidence::Confirmed;
+                hit.confidence = if is_flexible_range_spec(version_str) {
+                    Confidence::Heuristic
+                } else {
+                    Confidence::Confirmed
+                };
                 out.push(hit);
             }
         }
@@ -568,7 +671,11 @@ fn check_single_offline_advisory(
                 line,
                 fix_hint,
             );
-            finding.confidence = Confidence::Confirmed;
+            finding.confidence = if is_flexible_range_spec(version_str) {
+                Confidence::Heuristic
+            } else {
+                Confidence::Confirmed
+            };
             out.push(finding);
         }
     }
@@ -631,6 +738,33 @@ fn audit_package_json(
     let mut out = Vec::new();
     let mut adv_entries = Vec::new();
 
+    if let Some(scripts) = val.get("scripts").and_then(|v| v.as_object()) {
+        for hook in ["preinstall", "install", "postinstall", "prepare"] {
+            if let Some(cmd) = scripts.get(hook).and_then(|v| v.as_str()) {
+                let low = cmd.to_ascii_lowercase();
+                if low.contains("curl ")
+                    || low.contains("wget ")
+                    || low.contains("powershell")
+                    || low.contains("base64")
+                    || low.contains("bash -c")
+                    || low.contains("sh -c")
+                    || low.contains("node -e")
+                {
+                    let ln = find_line_for_needle(&lines, &format!("\"{}\"", hook));
+                    let mut hit = make_dep_finding(
+                        "HIGH",
+                        format!("Suspicious npm lifecycle hook `{}` executes download/shell payload: `{}`", hook, cmd),
+                        rel_path,
+                        ln,
+                        "Remove arbitrary download/eval commands from npm install lifecycle hooks and inspect lockfile scripts.".into(),
+                    );
+                    hit.confidence = Confidence::Confirmed;
+                    out.push(hit);
+                }
+            }
+        }
+    }
+
     for section in [
         "dependencies",
         "devDependencies",
@@ -667,6 +801,18 @@ fn audit_package_json(
                     ln,
                     format!("Use an `https://` registry or tarball URL for `{}`.", pkg),
                 ));
+            } else if (ver.starts_with("git+https://")
+                || ver.starts_with("github:")
+                || ver.starts_with("git+ssh://"))
+                && !ver.split('#').nth(1).is_some_and(is_commit_sha_40)
+            {
+                out.push(make_dep_finding(
+                    "HIGH",
+                    format!("Git npm dependency `{}` (`{}`) is not pinned to an immutable 40-char commit SHA", pkg, ver),
+                    rel_path,
+                    ln,
+                    format!("Pin `{}` with `#<40-char-commit-sha>`.", pkg),
+                ));
             }
             adv_entries.push((pkg.clone(), ver.to_string(), ln));
         }
@@ -692,7 +838,8 @@ fn audit_package_lock(
     };
     let lines: Vec<&str> = content.lines().collect();
     let mut out = Vec::new();
-    let mut checked: HashMap<String, String> = HashMap::new();
+    let mut seen_pairs: HashSet<(String, String)> = HashSet::new();
+    let mut checked: Vec<(String, String)> = Vec::new();
 
     if let Some(pkgs) = val.get("packages").and_then(|v| v.as_object()) {
         for (pkg_path, info) in pkgs {
@@ -700,22 +847,36 @@ fn audit_package_lock(
                 continue;
             }
             let name = pkg_path.rsplit("node_modules/").next().unwrap_or(pkg_path);
-            if let Some(resolved) = info.get("resolved").and_then(|v| v.as_str())
-                && is_insecure_http_url(resolved)
-            {
-                let ln = find_line_for_needle(&lines, resolved);
-                out.push(make_dep_finding(
-                    "HIGH",
-                    format!("Insecure `http://` tarball URL in lockfile for `{}`", name),
-                    rel_path,
-                    ln,
-                    "Regenerate lockfile using `https://` registry URLs only.".into(),
-                ));
+            if let Some(resolved) = info.get("resolved").and_then(|v| v.as_str()) {
+                if is_insecure_http_url(resolved) {
+                    let ln = find_line_for_needle(&lines, resolved);
+                    out.push(make_dep_finding(
+                        "HIGH",
+                        format!("Insecure `http://` tarball URL in lockfile for `{}`", name),
+                        rel_path,
+                        ln,
+                        "Regenerate lockfile using `https://` registry URLs only.".into(),
+                    ));
+                } else if resolved.starts_with("https://")
+                    && info
+                        .get("integrity")
+                        .and_then(|v| v.as_str())
+                        .is_none_or(|s| s.trim().is_empty())
+                {
+                    let ln = find_line_for_needle(&lines, resolved);
+                    out.push(make_dep_finding(
+                        "MEDIUM",
+                        format!("Remote tarball for `{}` lacks cryptographic `integrity` hash in lockfile", name),
+                        rel_path,
+                        ln,
+                        "Regenerate lockfile with modern npm/yarn/pnpm to record SHA-512 integrity digests.".into(),
+                    ));
+                }
             }
-            if let Some(ver) = info.get("version").and_then(|v| v.as_str()) {
-                checked
-                    .entry(name.to_string())
-                    .or_insert_with(|| ver.to_string());
+            if let Some(ver) = info.get("version").and_then(|v| v.as_str())
+                && seen_pairs.insert((name.to_string(), ver.to_string()))
+            {
+                checked.push((name.to_string(), ver.to_string()));
             }
         }
     }
@@ -734,26 +895,22 @@ fn audit_package_lock(
                     "Regenerate lockfile using `https://` registry URLs only.".into(),
                 ));
             }
-            if let Some(ver) = info.get("version").and_then(|v| v.as_str()) {
-                checked
-                    .entry(name.to_string())
-                    .or_insert_with(|| ver.to_string());
+            if let Some(ver) = info.get("version").and_then(|v| v.as_str())
+                && seen_pairs.insert((name.to_string(), ver.to_string()))
+            {
+                checked.push((name.to_string(), ver.to_string()));
             }
         }
     }
 
     let entries: Vec<(String, String, usize)> = checked
         .into_iter()
-        .map(|(name, ver)| (name, ver, 1))
+        .map(|(name, ver)| {
+            let ln = find_line_for_needle(&lines, &format!("\"{}\"", name));
+            (name, ver, ln)
+        })
         .collect();
-    check_advisories_batch(
-        Ecosystem::Npm,
-        &entries,
-        rel_path,
-        Some((&lines, "plain")),
-        store,
-        &mut out,
-    );
+    check_advisories_batch(Ecosystem::Npm, &entries, rel_path, None, store, &mut out);
 
     out
 }
@@ -819,16 +976,28 @@ fn audit_cargo_toml(
                         }
                         adv_entries.push((pkg.clone(), ver.to_string(), ln));
                     }
-                    if let Some(git_url) = dep_tbl.get("git").and_then(|v| v.as_str())
-                        && is_insecure_http_url(git_url)
-                    {
-                        out.push(make_dep_finding(
-                            "HIGH",
-                            format!("Insecure `http://` git dependency URL for `{}`", pkg),
-                            rel_path,
-                            ln,
-                            "Use `https://` for git crate sources.".into(),
-                        ));
+                    if let Some(git_url) = dep_tbl.get("git").and_then(|v| v.as_str()) {
+                        if is_insecure_http_url(git_url) {
+                            out.push(make_dep_finding(
+                                "HIGH",
+                                format!("Insecure `http://` git dependency URL for `{}`", pkg),
+                                rel_path,
+                                ln,
+                                "Use `https://` for git crate sources.".into(),
+                            ));
+                        } else if !dep_tbl
+                            .get("rev")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(is_commit_sha_40)
+                        {
+                            out.push(make_dep_finding(
+                                "HIGH",
+                                format!("Cargo git dependency `{}` lacks immutable 40-char `rev = \"...\"` commit SHA", pkg),
+                                rel_path,
+                                ln,
+                                format!("Pin git crate `{}` with `rev = \"<40-char-sha>\"`.", pkg),
+                            ));
+                        }
                     }
                 }
                 _ => {}
@@ -1028,6 +1197,36 @@ fn audit_requirements_txt(
                 ln,
                 "Use `https://` for all package URLs and `--index-url` directives.".into(),
             ));
+            continue;
+        }
+        if code.starts_with("--extra-index-url") {
+            out.push(make_dep_finding(
+                "MEDIUM",
+                format!("PyPI `--extra-index-url` (`{}`) introduces dependency-confusion risk if private package names are unregistered publicly", code),
+                rel_path,
+                ln,
+                "Avoid `--extra-index-url`; mirror PyPI into a single private index using `--index-url`.".into(),
+            ));
+            continue;
+        }
+        if code.starts_with("git+https://") || code.contains(" @ git+https://") {
+            let pinned = code
+                .rsplit('@')
+                .next()
+                .is_some_and(|r| is_commit_sha_40(r.split('#').next().unwrap_or("")));
+            if !pinned {
+                out.push(make_dep_finding(
+                    "HIGH",
+                    format!(
+                        "Unpinned Python git dependency `{}` lacks immutable 40-char commit SHA",
+                        code
+                    ),
+                    rel_path,
+                    ln,
+                    "Pin git dependencies with `@<40-char-commit-sha>` and `--require-hashes`."
+                        .into(),
+                ));
+            }
             continue;
         }
         if code.starts_with('-') {
@@ -1419,6 +1618,167 @@ pub fn scan_dependencies(rel_path: &str, content: &str) -> Vec<LocalStaticFindin
     scan_dependencies_with_store(rel_path, content, store.as_ref())
 }
 
+fn audit_generic_ecosystem_manifest(
+    rel_path: &str,
+    content: &str,
+    store: Option<&AdvisoryStore>,
+) -> Vec<LocalStaticFinding> {
+    let fname = Path::new(rel_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    let mut out = Vec::new();
+    let lines: Vec<&str> = content.lines().collect();
+
+    if fname == ".npmrc" {
+        for (idx, raw) in lines.iter().enumerate() {
+            let trimmed = raw.trim();
+            if trimmed.starts_with('#') || trimmed.starts_with(';') || trimmed.is_empty() {
+                continue;
+            }
+            if is_insecure_http_url(trimmed) {
+                out.push(make_dep_finding(
+                    "HIGH",
+                    format!("Insecure `http://` npm registry URL in `.npmrc`: `{}`", trimmed),
+                    rel_path,
+                    idx + 1,
+                    "Use `https://` registries in `.npmrc` and scope private registries (`@org:registry=...`).".into(),
+                ));
+            } else if trimmed.starts_with("registry=") && !trimmed.contains("registry.npmjs.org") {
+                out.push(make_dep_finding(
+                    "MEDIUM",
+                    format!("Global `.npmrc` overrides default npm registry globally (`{}`); prefer scoped `@org:registry`", trimmed),
+                    rel_path,
+                    idx + 1,
+                    "Scope internal registries to `@your-org:registry=https://...` to prevent dependency confusion.".into(),
+                ));
+            }
+        }
+        return out;
+    }
+
+    for (idx, raw) in lines.iter().enumerate() {
+        let trimmed = raw.trim();
+        if trimmed.starts_with('#') || trimmed.starts_with("//") {
+            continue;
+        }
+        if is_insecure_http_url(trimmed)
+            && !trimmed.contains("xmlns")
+            && !trimmed.contains("w3.org")
+        {
+            out.push(make_dep_finding(
+                "HIGH",
+                format!(
+                    "Insecure `http://` repository or dependency URL in `{}`",
+                    fname
+                ),
+                rel_path,
+                idx + 1,
+                "Switch repository and dependency URLs to HTTPS (`https://`).".into(),
+            ));
+        }
+    }
+
+    // Ecosystem-specific quick advisory extraction for Maven (`pom.xml`/`build.gradle*`), PHP (`composer.lock`), Ruby (`Gemfile.lock`), Dart (`pubspec.*`)
+    if matches!(fname, "pom.xml" | "build.gradle" | "build.gradle.kts") {
+        let mut entries = Vec::new();
+        for (idx, raw) in lines.iter().enumerate() {
+            let low = raw.to_ascii_lowercase();
+            for (pkg, marker) in [
+                ("log4j-core", "log4j-core"),
+                ("spring-beans", "spring-beans"),
+                ("jackson-databind", "jackson-databind"),
+            ] {
+                if low.contains(marker) {
+                    let window = lines[idx..(idx + 3).min(lines.len())].join(" ");
+                    if let Some(ver) = extract_first_semver_token(&window) {
+                        entries.push((pkg.to_string(), ver, idx + 1));
+                    }
+                }
+            }
+        }
+        check_advisories_batch(Ecosystem::Maven, &entries, rel_path, None, store, &mut out);
+    } else if fname == "composer.lock"
+        && let Ok(val) = serde_json::from_str::<serde_json::Value>(content)
+    {
+        let mut entries = Vec::new();
+        for key in ["packages", "packages-dev"] {
+            if let Some(arr) = val.get(key).and_then(|v| v.as_array()) {
+                for item in arr {
+                    if let (Some(n), Some(v)) = (
+                        item.get("name").and_then(|s| s.as_str()),
+                        item.get("version").and_then(|s| s.as_str()),
+                    ) {
+                        let ln = find_line_for_needle(&lines, &format!("\"{}\"", n));
+                        entries.push((n.to_string(), v.trim_start_matches('v').to_string(), ln));
+                    }
+                }
+            }
+        }
+        check_advisories_batch(
+            Ecosystem::Packagist,
+            &entries,
+            rel_path,
+            None,
+            store,
+            &mut out,
+        );
+    } else if fname == "Gemfile.lock" {
+        let mut entries = Vec::new();
+        for (idx, raw) in lines.iter().enumerate() {
+            let t = raw.trim();
+            if let Some((pkg, rest)) = t.split_once(" (")
+                && let Some(ver) = rest.strip_suffix(')')
+                && ver.chars().next().is_some_and(|c| c.is_ascii_digit())
+            {
+                entries.push((pkg.trim().to_string(), ver.to_string(), idx + 1));
+            }
+        }
+        check_advisories_batch(
+            Ecosystem::RubyGems,
+            &entries,
+            rel_path,
+            None,
+            store,
+            &mut out,
+        );
+    } else if matches!(fname, "yarn.lock" | "pnpm-lock.yaml") {
+        let mut entries = Vec::new();
+        for (idx, raw) in lines.iter().enumerate() {
+            let trimmed = raw.trim();
+            if trimmed.contains("@npm:") || trimmed.contains("version:") {
+                for adv_pkg in OFFLINE_ADVISORIES
+                    .iter()
+                    .filter(|a| a.ecosystem == Ecosystem::Npm)
+                    .map(|a| a.package)
+                {
+                    if trimmed.contains(adv_pkg) {
+                        let window = lines[idx..(idx + 4).min(lines.len())].join(" ");
+                        if let Some(ver) = extract_first_semver_token(&window) {
+                            entries.push((adv_pkg.to_string(), ver, idx + 1));
+                        }
+                    }
+                }
+            }
+        }
+        check_advisories_batch(Ecosystem::Npm, &entries, rel_path, None, store, &mut out);
+    }
+
+    out
+}
+
+fn extract_first_semver_token(text: &str) -> Option<String> {
+    for tok in text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '-')) {
+        let clean = tok.trim_start_matches(['v', 'V']);
+        if clean.chars().next().is_some_and(|c| c.is_ascii_digit())
+            && clean.matches('.').count() >= 2
+        {
+            return Some(clean.to_string());
+        }
+    }
+    None
+}
+
 pub fn scan_dependencies_with_store(
     rel_path: &str,
     content: &str,
@@ -1437,6 +1797,12 @@ pub fn scan_dependencies_with_store(
         "requirements.txt" => audit_requirements_txt(rel_path, content, store),
         "pyproject.toml" => audit_pyproject_toml(rel_path, content, store),
         "poetry.lock" | "uv.lock" => audit_python_toml_lock(rel_path, content, store),
+        "yarn.lock" | "pnpm-lock.yaml" | "bun.lock" | "go.sum" | "pom.xml" | "build.gradle"
+        | "build.gradle.kts" | "gradle.lockfile" | "packages.lock.json" | "composer.json"
+        | "composer.lock" | "Gemfile" | "Gemfile.lock" | "Package.resolved" | "pubspec.yaml"
+        | "pubspec.lock" | ".npmrc" | "Pipfile.lock" => {
+            audit_generic_ecosystem_manifest(rel_path, content, store)
+        }
         _ => Vec::new(),
     }
 }

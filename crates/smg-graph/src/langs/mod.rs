@@ -384,6 +384,21 @@ fn contains_any_ci(haystack_low: &str, needles: &[&str]) -> bool {
         .any(|n| haystack_low.contains(&n.to_ascii_lowercase()))
 }
 
+fn contains_sink_ci(haystack_low: &str, sinks: &[&str]) -> bool {
+    sinks.iter().any(|s| {
+        let sl = s.to_ascii_lowercase();
+        let starts_word = sl
+            .as_bytes()
+            .first()
+            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_');
+        if starts_word {
+            contains_word_call(haystack_low, &sl)
+        } else {
+            haystack_low.contains(&sl)
+        }
+    })
+}
+
 fn contains_word_call(haystack_low: &str, call_marker: &str) -> bool {
     let bytes = haystack_low.as_bytes();
     let mut off = 0usize;
@@ -475,7 +490,8 @@ fn has_quoted_dollar_interp(stmt: &str) -> bool {
     let mut escaped = false;
     let mut prev = '\0';
     let mut prev2 = '\0';
-    for ch in stmt.chars() {
+    let mut chars = stmt.chars().peekable();
+    while let Some(ch) = chars.next() {
         if escaped {
             escaped = false;
             prev2 = prev;
@@ -492,7 +508,12 @@ fn has_quoted_dollar_interp(stmt: &str) -> bool {
             if ch == q {
                 in_quote = None;
             } else if ch == '$' && (q == '"' || q == '\'') {
-                return true;
+                // Skip PostgreSQL positional placeholders (`$1`, `$2`, `$10`, ...)
+                if let Some(&next) = chars.peek()
+                    && (next == '{' || next.is_ascii_alphabetic() || next == '_' || next == '$')
+                {
+                    return true;
+                }
             }
         } else if ch == '"' || ch == '\'' {
             if prev == '$' || (prev2 == '$' && prev == '@') {
@@ -506,9 +527,31 @@ fn has_quoted_dollar_interp(stmt: &str) -> bool {
     false
 }
 
+fn has_string_concat_plus(stmt: &str) -> bool {
+    let bytes = stmt.as_bytes();
+    for (idx, &b) in bytes.iter().enumerate() {
+        if b != b'+' {
+            continue;
+        }
+        let left_quote = bytes[..idx]
+            .iter()
+            .rev()
+            .find(|c| !c.is_ascii_whitespace())
+            .is_some_and(|c| matches!(*c, b'"' | b'\''));
+        let right_quote = bytes[idx + 1..]
+            .iter()
+            .find(|c| !c.is_ascii_whitespace())
+            .is_some_and(|c| matches!(*c, b'"' | b'\''));
+        if left_quote || right_quote {
+            return true;
+        }
+    }
+    false
+}
+
 fn is_dynamic_sql_stmt(stmt: &str, has_sql_var_taint: bool, has_dyn_sql_var: bool) -> bool {
-    let has_concat_or_interp = stmt.contains('+')
-        || stmt.contains(" . ")
+    let has_quoted_dollar = has_quoted_dollar_interp(stmt);
+    let has_non_plus_interp = stmt.contains(" . ")
         || stmt.contains(".$")
         || stmt.contains("\\(")
         || stmt.contains("#{")
@@ -516,15 +559,21 @@ fn is_dynamic_sql_stmt(stmt: &str, has_sql_var_taint: bool, has_dyn_sql_var: boo
         || stmt.contains("snprintf")
         || stmt.contains("string.format")
         || stmt.contains("fmt::format")
-        || has_quoted_dollar_interp(stmt);
-    let has_param_placeholder = stmt.contains("?")
+        || has_quoted_dollar;
+    let has_param_placeholder = stmt.contains('?')
         || stmt.contains("@p0")
         || stmt.contains("@id")
         || stmt.contains(":id")
-        || stmt.contains("$1");
-    if has_param_placeholder && !has_concat_or_interp && !has_dyn_sql_var {
+        || stmt.contains("$1")
+        || stmt.contains("$2");
+    if has_param_placeholder
+        && !has_non_plus_interp
+        && !has_string_concat_plus(stmt)
+        && !has_dyn_sql_var
+    {
         return false;
     }
+    let has_concat_or_interp = stmt.contains('+') || has_non_plus_interp;
     ((sql_verb_re().is_match(stmt) || has_sql_var_taint) && has_concat_or_interp) || has_dyn_sql_var
 }
 
@@ -637,15 +686,22 @@ pub(crate) fn build_analyzed_symbol(
     let mut dynamic_sql_vars: HashSet<String> = HashSet::new();
     let mut param_vars: HashSet<String> = param_names.iter().cloned().collect();
 
-    // Seed parameters annotated with explicit HTTP input attributes/extractors
-    let params_low = params_text.to_ascii_lowercase();
-    for p in param_names {
+    // Seed parameters annotated with explicit HTTP input attributes/extractors (per-parameter segment)
+    let param_segments: Vec<String> = params_text
+        .split(',')
+        .map(|s| s.to_ascii_lowercase())
+        .collect();
+    for (idx_p, p) in param_names.iter().enumerate() {
         let p_low = p.to_ascii_lowercase();
+        let seg_low = param_segments
+            .iter()
+            .find(|seg| ident_re().find_iter(seg).any(|m| m.as_str() == p))
+            .or_else(|| param_segments.get(idx_p))
+            .map(String::as_str)
+            .unwrap_or("");
         let explicit_tainted = profile.tainted_param_markers.iter().any(|mk| {
             let mkl = mk.to_ascii_lowercase();
-            params_low.contains(&format!("{} {}", mkl, p_low))
-                || params_low.contains(&format!("{}\n{}", mkl, p_low))
-                || params_low.contains(&mkl) && route_path.is_some()
+            seg_low.contains(&mkl)
         });
         if explicit_tainted
             || p_low == "argv"
@@ -789,7 +845,7 @@ pub(crate) fn build_analyzed_symbol(
         ];
 
         for &(bit, sinks, rule_id, sev, skind, mguard, rem) in checks {
-            if !contains_any_ci(&stmt_low, sinks) {
+            if !contains_sink_ci(&stmt_low, sinks) {
                 continue;
             }
             if (stmt_san & bit) != 0 {

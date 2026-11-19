@@ -36,6 +36,7 @@ const PROFILE: LangProfile = LangProfile {
         ".joins(",
         ".from(",
         ".exec(",
+        "arel.sql(",
     ],
     sql_sanitizers: &["sanitize_sql", ".quote(", ".to_i", "integer(", "float("],
     cmd_sinks: &[
@@ -43,6 +44,8 @@ const PROFILE: LangProfile = LangProfile {
         "system ",
         "exec(",
         "exec ",
+        "eval(",
+        "instance_eval(",
         "open3.",
         "io.popen",
         "process.spawn",
@@ -160,13 +163,16 @@ impl ControllerFilters {
         if self.skip_auth_global || self.skip_auth_only.contains(method_name) {
             return false;
         }
+        if self.auth_global {
+            return !self.auth_except.contains(method_name);
+        }
         if !self.auth_only.is_empty() {
             return self.auth_only.contains(method_name);
         }
         if !self.auth_except.is_empty() {
             return !self.auth_except.contains(method_name);
         }
-        self.auth_global
+        false
     }
 
     fn is_csrf_exempt_for(&self, method_name: &str) -> bool {

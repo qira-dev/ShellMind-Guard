@@ -262,15 +262,25 @@ fn analyze_shell_unit(
         });
     }
 
+    let mut heredoc_end: Option<String> = None;
     for (abs_line, stmt) in lines {
         let abs_line = *abs_line;
+        if let Some(ref end_delim) = heredoc_end {
+            if stmt.trim() == end_delim {
+                heredoc_end = None;
+            }
+            continue;
+        }
+        if let Some(delim) = extract_heredoc_delim(stmt) {
+            heredoc_end = Some(delim);
+        }
         if stmt.is_empty() {
             continue;
         }
         let low = stmt.to_ascii_lowercase();
 
-        // Allowlist / strict regex guard clears variable taint for subsequent lines.
-        if (low.contains("[[") || low.contains("=~")) && low.contains("^[") {
+        // Allowlist / strictly anchored (`^...$`) regex guard clears variable taint
+        if (low.contains("[[") || low.contains("=~")) && stmt.contains('^') && stmt.contains('$') {
             for cap in shell_var_re().captures_iter(stmt) {
                 tainted_vars.remove(&cap[1]);
                 guards.insert(GuardKind::CmdSanitizer);
@@ -345,7 +355,7 @@ fn analyze_shell_unit(
         let active_taint = explicit | var_taint | top_positional;
         let uses_fn_param = is_function && (positional || references_any_param(stmt, &param_vars));
 
-        // 1. Command Injection: `eval ...` or `sh -c` / `bash -c` with untrusted expansion
+        // 1. Command Injection: `eval ...` or `sh -c` / `bash -c` or `$GITHUB_ENV`/`source $var`
         if is_eval_or_shell_c_sink(&low) {
             if (active_taint & TAINT_CMD) != 0 {
                 push_shell_finding(
@@ -361,6 +371,7 @@ fn analyze_shell_unit(
                     name,
                     SinkKind::CommandInjection,
                     GuardKind::CmdSanitizer,
+                    Confidence::Confirmed,
                     "Avoid `eval` and `sh -c`/`bash -c` with dynamic variables; invoke commands directly with quoted array elements.",
                 );
             } else if uses_fn_param {
@@ -377,9 +388,27 @@ fn analyze_shell_unit(
                     name,
                     SinkKind::CommandInjection,
                     GuardKind::CmdSanitizer,
+                    Confidence::Heuristic,
                     "Validate parameters against an allowlist and avoid `eval` / `sh -c`.",
                 );
             }
+        } else if is_github_env_or_dynamic_source(stmt, &low) && (active_taint & TAINT_CMD) != 0 {
+            push_shell_finding(
+                &mut local_taint_hits,
+                "SMG-CMDI-001",
+                "CRITICAL",
+                &format!(
+                    "SMG-CMDI-001 (bash) untrusted variable written to GITHUB_ENV/GITHUB_PATH or sourced dynamically in `{}`",
+                    name
+                ),
+                ctx.rel_path,
+                abs_line,
+                name,
+                SinkKind::CommandInjection,
+                GuardKind::CmdSanitizer,
+                Confidence::Confirmed,
+                "Sanitize multiline newlines/values before writing to `$GITHUB_ENV` / `$GITHUB_PATH`, and never `source` dynamic user-controlled file paths.",
+            );
         }
 
         // 2. SQL Injection via CLI database clients (`psql -c`, `mysql -e`, `sqlite3`)
@@ -398,6 +427,7 @@ fn analyze_shell_unit(
                     name,
                     SinkKind::SqlInjection,
                     GuardKind::SqlSanitizer,
+                    Confidence::Confirmed,
                     "Use `psql -v var=...` bound variables (`:'var'`) instead of interpolating variables into `-c`/`-e` SQL strings.",
                 );
             } else if uses_fn_param {
@@ -414,6 +444,7 @@ fn analyze_shell_unit(
                     name,
                     SinkKind::SqlInjection,
                     GuardKind::SqlSanitizer,
+                    Confidence::Heuristic,
                     "Bind parameters via CLI variable flags instead of string interpolation.",
                 );
             }
@@ -439,6 +470,7 @@ fn analyze_shell_unit(
                     name,
                     SinkKind::Ssrf,
                     GuardKind::SsrfSanitizer,
+                    Confidence::Confirmed,
                     "Anchor outbound requests to a hardcoded HTTPS scheme and allowlisted hostname.",
                 );
             } else if is_function
@@ -457,6 +489,7 @@ fn analyze_shell_unit(
                     name,
                     SinkKind::Ssrf,
                     GuardKind::SsrfSanitizer,
+                    Confidence::Heuristic,
                     "Anchor outbound URLs to an explicit host allowlist.",
                 );
             }
@@ -478,6 +511,7 @@ fn analyze_shell_unit(
                     name,
                     SinkKind::PathTraversal,
                     GuardKind::PathSanitizer,
+                    Confidence::Confirmed,
                     "Canonicalize paths (`realpath`) or sanitize filenames (`basename`) and verify a fixed base prefix.",
                 );
             } else if uses_fn_param {
@@ -494,6 +528,7 @@ fn analyze_shell_unit(
                     name,
                     SinkKind::PathTraversal,
                     GuardKind::PathSanitizer,
+                    Confidence::Heuristic,
                     "Canonicalize and prefix-check path parameters before recursive deletion.",
                 );
             }
@@ -553,6 +588,7 @@ fn push_shell_finding(
     symbol: &str,
     sink_kind: SinkKind,
     missing_guard: GuardKind,
+    confidence: Confidence,
     remediation: &str,
 ) {
     dst.push(LocalStaticFinding {
@@ -564,9 +600,43 @@ fn push_shell_finding(
         symbol: symbol.to_string(),
         sink_kind,
         missing_guard,
-        confidence: Confidence::Confirmed,
+        confidence,
         remediation: remediation.to_string(),
     });
+}
+
+fn extract_heredoc_delim(stmt: &str) -> Option<String> {
+    if let Some(pos) = stmt.find("<<") {
+        let mut rest = &stmt[pos + 2..];
+        if let Some(stripped) = rest.strip_prefix('-') {
+            rest = stripped;
+        }
+        // Ignore `<<<` here-string
+        if rest.starts_with('<') {
+            return None;
+        }
+        let tok = rest.split_whitespace().next().unwrap_or("");
+        let delim = tok.trim_matches(|c| c == '\'' || c == '"' || c == ';');
+        if !delim.is_empty()
+            && delim
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+        {
+            return Some(delim.to_string());
+        }
+    }
+    None
+}
+
+fn is_github_env_or_dynamic_source(stmt: &str, low: &str) -> bool {
+    if (low.contains(">>") || low.contains('>'))
+        && (low.contains("github_env") || low.contains("github_path"))
+        && stmt.contains('$')
+    {
+        return true;
+    }
+    let trimmed = stmt.trim();
+    (trimmed.starts_with("source ") || trimmed.starts_with(". ")) && trimmed.contains('$')
 }
 
 fn explicit_source_mask(expr: &str) -> u8 {

@@ -381,11 +381,17 @@ fn extract_function_lock_summary(
     fn_body: &str,
 ) -> Option<HardwareFunctionLockSummary> {
     let fn_low = fn_body.to_ascii_lowercase();
+    let fn_header_low = fn_body
+        .split('{')
+        .next()
+        .unwrap_or(fn_body)
+        .to_ascii_lowercase();
+    let fn_name_low = fn_name.to_ascii_lowercase();
     let fn_slice_start = fn_start.saturating_sub(2);
     let attr_ctx = lines[fn_slice_start.saturating_sub(1)..fn_start.min(lines.len())].join("\n");
-    let is_isr = fn_low.contains("irqhandler")
-        || fn_low.contains("_isr(")
-        || fn_low.contains("__attribute__((interrupt))")
+    let is_isr = fn_name_low.contains("irqhandler")
+        || fn_name_low.ends_with("_isr")
+        || fn_header_low.contains("__attribute__((interrupt))")
         || attr_ctx.contains("#[interrupt]")
         || attr_ctx.contains("ISR(");
 
@@ -673,10 +679,74 @@ fn resolve_bound_token(
     if let Some(&v) = local_caps.get(tok) {
         return i64::try_from(v).ok();
     }
-    if tok.eq_ignore_ascii_case("cap") || tok.starts_with("sizeof") || tok.starts_with("max_") {
-        return Some(256);
+    if let Some(inner) = tok
+        .strip_prefix("sizeof(")
+        .and_then(|s| s.strip_suffix(')'))
+        && let Some(&v) = local_caps.get(inner.trim())
+    {
+        return i64::try_from(v).ok();
     }
     None
+}
+
+fn line_derefs_ptr(trimmed: &str, ptr: &str) -> bool {
+    let bytes = trimmed.as_bytes();
+    let arrow = format!("{}->", ptr);
+    let mut off = 0usize;
+    while let Some(rel) = trimmed[off..].find(&arrow) {
+        let pos = off + rel;
+        let prev_ok =
+            pos == 0 || (!bytes[pos - 1].is_ascii_alphanumeric() && bytes[pos - 1] != b'_');
+        if prev_ok {
+            return true;
+        }
+        off = pos + 1;
+    }
+    let star = format!("*{}", ptr);
+    let mut soff = 0usize;
+    while let Some(rel) = trimmed[soff..].find(&star) {
+        let pos = soff + rel;
+        let end = pos + star.len();
+        let prev_is_expr_operand = pos > 0
+            && trimmed[..pos]
+                .trim_end()
+                .as_bytes()
+                .last()
+                .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b')');
+        let next_ok =
+            end >= bytes.len() || (!bytes[end].is_ascii_alphanumeric() && bytes[end] != b'_');
+        if !prev_is_expr_operand && next_ok {
+            return true;
+        }
+        soff = pos + 1;
+    }
+    false
+}
+
+fn region_applies_to_file(
+    rel_path: &str,
+    region: &crate::context::MemoryRegion,
+    all_regions: &[crate::context::MemoryRegion],
+) -> bool {
+    let distinct_boards: HashSet<&str> = all_regions
+        .iter()
+        .map(|r| {
+            r.source_file
+                .split('/')
+                .next()
+                .unwrap_or(r.source_file.as_str())
+        })
+        .collect();
+    if distinct_boards.len() <= 1 {
+        return true;
+    }
+    let reg_top = region
+        .source_file
+        .split('/')
+        .next()
+        .unwrap_or(region.source_file.as_str());
+    let file_top = rel_path.split('/').next().unwrap_or(rel_path);
+    reg_top == file_top || !distinct_boards.contains(file_top)
 }
 
 fn is_hex_preceded_by_mask_or_cmp(line: &str, byte_start: usize) -> bool {
@@ -805,15 +875,76 @@ fn analyze_single_hw_function(
     // Track DMA / __user pointers & Double-Fetch TOCTOU
     let mut ext_ptrs: HashSet<String> = HashSet::new();
     if fn_low.contains("__user") || fn_low.contains("dma") || fn_low.contains("shared_mmio") {
-        for cap in ident_re().captures_iter(fn_body) {
+        let header_section = fn_body.split('{').next().unwrap_or(fn_body);
+        for cap in ident_re().captures_iter(header_section) {
             let id = &cap[1];
             let id_low = id.to_ascii_lowercase();
-            if id_low.contains("user")
+            if (id_low.contains("user")
                 || id_low.contains("dma")
                 || id_low.contains("desc")
-                || id_low.contains("hdr")
+                || id_low.contains("hdr"))
+                && !id_low.starts_with("local_")
             {
                 ext_ptrs.insert(id.to_string());
+            }
+        }
+        for &(_, raw) in &fn_lines {
+            let rlow = raw.to_ascii_lowercase();
+            if rlow.contains("__user") || rlow.contains("volatile") || rlow.contains("dma") {
+                for cap in ident_re().captures_iter(raw) {
+                    let id = &cap[1];
+                    let id_low = id.to_ascii_lowercase();
+                    if (id_low.contains("user")
+                        || id_low.contains("dma")
+                        || id_low.contains("desc")
+                        || id_low.contains("hdr"))
+                        && !id_low.starts_with("local_")
+                    {
+                        ext_ptrs.insert(id.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // 0. Blocking/sleeping RTOS/kernel APIs called directly inside ISR context (`SMG-HW-IRQ`)
+    let fn_hdr_low = fn_body
+        .split('{')
+        .next()
+        .unwrap_or(fn_body)
+        .to_ascii_lowercase();
+    let fn_name_low_self = fn_name.to_ascii_lowercase();
+    let fn_is_isr = fn_name_low_self.contains("irqhandler")
+        || fn_name_low_self.ends_with("_isr")
+        || fn_hdr_low.contains("__attribute__((interrupt))");
+    if fn_is_isr {
+        for &(ln, raw) in &fn_lines {
+            let l = strip_string_literals_line(raw).to_ascii_lowercase();
+            let is_blocking_isr_api = l.contains("vtaskdelay(")
+                || l.contains("pvportmalloc(")
+                || l.contains("malloc(")
+                || l.contains("msleep(")
+                || l.contains("xsemaphoretake(")
+                || l.contains("mutex_lock(")
+                || (l.contains("kmalloc(") && l.contains("gfp_kernel"));
+            if is_blocking_isr_api
+                && let Some(hit) = mk_hw_finding(
+                    "SMG-HW-IRQ",
+                    "CRITICAL",
+                    SoundinessTier::Verified,
+                    format!(
+                        "Blocking/sleeping API called inside interrupt handler `{}` (ISR deadlock/crash risk)",
+                        fn_name
+                    ),
+                    rel_path,
+                    ln,
+                    fn_name,
+                    SinkKind::ConcurrencyHazard,
+                    GuardKind::LockOrdering,
+                    "Never block or sleep inside an ISR; defer work via RTOS `*FromISR` queue/semaphore APIs.",
+                )
+            {
+                findings.push(hit);
             }
         }
     }
@@ -874,7 +1005,12 @@ fn analyze_single_hw_function(
                 || low.contains("ed25519")
                 || low.contains("ecdsa")
                 || low.contains("rsa_verify")
-                || low.contains("crypto_verify");
+                || low.contains("crypto_verify")
+                || low.contains("mbedtls_pk_verify")
+                || low.contains("wc_")
+                || low.contains("mcuboot_")
+                || low.contains("bootutil_")
+                || low.contains("validate_ota");
             if has_sig_call {
                 let checked_inline = low.starts_with("if")
                     || low.contains("if (")
@@ -937,7 +1073,7 @@ fn analyze_single_hw_function(
                 if let Some(hit) = mk_hw_finding(
                     "SMG-HW-BOOT",
                     "CRITICAL",
-                    SoundinessTier::Proven,
+                    SoundinessTier::Likely,
                     format!(
                         "SecureBoot / OTA `{}` proceeds without {} before `{}`",
                         fn_name,
@@ -966,8 +1102,9 @@ fn analyze_single_hw_function(
         let trimmed = raw.trim();
         let low = trimmed.to_ascii_lowercase();
 
-        // Update typestate branch stack on `}` / `else` transitions before analyzing line
+        // Update typestate branch stack on `}` / `else if` / `else` transitions before analyzing line
         let starts_with_close = trimmed.starts_with('}');
+        let is_else_if = low.contains("else if");
         let has_else_transition = starts_with_close
             && (low.contains("else") || low.starts_with("} else"))
             || low.starts_with("else ")
@@ -977,12 +1114,20 @@ fn analyze_single_hw_function(
             if let Some(top) = branch_stack.last_mut()
                 && !top.in_else
             {
-                top.then_states = Some(typestates.clone());
-                top.then_nulls = Some(null_ptrs.clone());
-                top.then_returned = top.branch_returned;
+                let accum_then = match top.then_states.take() {
+                    Some(prev) => merge_typestate_maps(&prev, &typestates),
+                    None => typestates.clone(),
+                };
+                let accum_nulls = match top.then_nulls.take() {
+                    Some(prev) => prev.intersection(&null_ptrs).cloned().collect(),
+                    None => null_ptrs.clone(),
+                };
+                top.then_states = Some(accum_then);
+                top.then_nulls = Some(accum_nulls);
+                top.then_returned = top.then_returned && top.branch_returned;
                 typestates = top.pre_if_states.clone();
                 null_ptrs = top.pre_if_nulls.clone();
-                top.in_else = true;
+                top.in_else = !is_else_if;
                 top.branch_returned = false;
             }
         } else if starts_with_close
@@ -1123,12 +1268,17 @@ fn analyze_single_hw_function(
                     }
 
                     // Bind MMIO pointer variable `volatile uint32_t *flash = (volatile uint32_t *)0x08001000;`
+                    let mut bound_hex = false;
                     if l_trim.contains('*') && !r_trim.starts_with('*') {
                         for cap in hex_addr_re().captures_iter(r_trim) {
                             if let Some(addr) = parse_u64_hex(&cap[1]) {
                                 mmio_ptrs.insert(lv.clone(), addr);
+                                bound_hex = true;
                             }
                         }
+                    }
+                    if !bound_hex {
+                        mmio_ptrs.remove(&lv);
                     }
                 }
 
@@ -1250,7 +1400,7 @@ fn analyze_single_hw_function(
                 let bound_val = resolve_bound_token(bound_tok, ctx, &local_caps);
                 if let Some(iv) = intervals.get_mut(v) {
                     if (op == ">=" && bound_val == Some(0) && !is_early_reject)
-                        || (op == "<" && bound_val == Some(0) && is_early_reject)
+                        || ((op == "<" || op == "<=") && bound_val == Some(0) && is_early_reject)
                     {
                         iv.smin = iv.smin.max(0);
                         iv.umin = 0;
@@ -1331,38 +1481,35 @@ fn analyze_single_hw_function(
                 }
             }
         } else {
-            // Check dereference of a Freed pointer (`ptr->...` or `*ptr`)
+            // Check dereference of a Freed pointer (`ptr->...` or `*ptr`) with word boundaries
             for (ptr, (state, freed_ln)) in &typestates {
-                if matches!(state, HwTypestate::Freed | HwTypestate::Conflict) {
-                    let deref_arrow = format!("{}->", ptr);
-                    let deref_star = format!("*{}", ptr);
-                    if (trimmed.contains(&deref_arrow) || trimmed.contains(&deref_star))
-                        && !trimmed.starts_with("if")
-                        && !trimmed.contains("= NULL")
-                        && !trimmed.contains("= nullptr")
-                    {
-                        let tier = if *state == HwTypestate::Freed {
-                            SoundinessTier::Proven
-                        } else {
-                            SoundinessTier::Likely
-                        };
-                        if let Some(hit) = mk_hw_finding(
-                            "SMG-HW-TYPESTATE",
-                            "CRITICAL",
-                            tier,
-                            format!(
-                                "Use-After-Free dereference of `{}` (freed at line {}) in `{}`",
-                                ptr, freed_ln, fn_name
-                            ),
-                            rel_path,
-                            ln,
-                            fn_name,
-                            SinkKind::MemorySafety,
-                            GuardKind::MemoryBounds,
-                            "Do not dereference pointers after `free`/`kfree`; restructure cleanup onto a single exit path.",
-                        ) {
-                            findings.push(hit);
-                        }
+                if matches!(state, HwTypestate::Freed | HwTypestate::Conflict)
+                    && line_derefs_ptr(trimmed, ptr)
+                    && !trimmed.starts_with("if")
+                    && !trimmed.contains("= NULL")
+                    && !trimmed.contains("= nullptr")
+                {
+                    let tier = if *state == HwTypestate::Freed {
+                        SoundinessTier::Proven
+                    } else {
+                        SoundinessTier::Likely
+                    };
+                    if let Some(hit) = mk_hw_finding(
+                        "SMG-HW-TYPESTATE",
+                        "CRITICAL",
+                        tier,
+                        format!(
+                            "Use-After-Free dereference of `{}` (freed at line {}) in `{}`",
+                            ptr, freed_ln, fn_name
+                        ),
+                        rel_path,
+                        ln,
+                        fn_name,
+                        SinkKind::MemorySafety,
+                        GuardKind::MemoryBounds,
+                        "Do not dereference pointers after `free`/`kfree`; restructure cleanup onto a single exit path.",
+                    ) {
+                        findings.push(hit);
                     }
                 }
             }
@@ -1393,15 +1540,49 @@ fn analyze_single_hw_function(
             trimmed.contains("write_volatile")
         };
 
+        // Check stack-allocated buffer passed directly into async DMA TX/RX API (`SMG-HW-BOUNDS`)
+        if !local_caps.is_empty()
+            && (low.contains("_transmit_dma(")
+                || low.contains("_receive_dma(")
+                || low.contains("dma_map_single("))
+        {
+            for buf_name in local_caps.keys() {
+                if ident_re()
+                    .find_iter(trimmed)
+                    .any(|m| m.as_str() == buf_name)
+                {
+                    if let Some(hit) = mk_hw_finding(
+                        "SMG-HW-BOUNDS",
+                        "HIGH",
+                        SoundinessTier::Verified,
+                        format!(
+                            "Stack buffer `{}` passed directly to DMA API in `{}` (DMA lifetime/cache-alignment hazard)",
+                            buf_name, fn_name
+                        ),
+                        rel_path,
+                        ln,
+                        fn_name,
+                        SinkKind::MemorySafety,
+                        GuardKind::MemoryBounds,
+                        "Allocate DMA buffers in static DMA-capable SRAM (`__attribute__((aligned(32)))`) or heap DMA pools instead of stack frames.",
+                    ) {
+                        findings.push(hit);
+                    }
+                    break;
+                }
+            }
+        }
+
         // Check dereference writes through bound MMIO pointer variables (`*flash = 0x1;`)
         if is_direct_write_stmt && let Some((lhs, _)) = trimmed.split_once('=') {
             for cap in ident_re().captures_iter(lhs) {
                 let pvar = &cap[1];
                 if let Some(&addr) = mmio_ptrs.get(pvar)
-                    && ctx
-                        .memory_regions
-                        .iter()
-                        .any(|r| r.contains(addr) && !r.writable)
+                    && ctx.memory_regions.iter().any(|r| {
+                        r.contains(addr)
+                            && !r.writable
+                            && region_applies_to_file(rel_path, r, &ctx.memory_regions)
+                    })
                     && let Some(hit) = mk_hw_finding(
                         "SMG-HW-MMIO",
                         "HIGH",
@@ -1439,12 +1620,16 @@ fn analyze_single_hw_function(
                     continue;
                 }
                 if let Some(addr) = parse_u64_hex(m.as_str()) {
-                    let in_readonly_flash = ctx
-                        .memory_regions
-                        .iter()
-                        .any(|r| r.contains(addr) && !r.writable);
+                    let in_readonly_flash = ctx.memory_regions.iter().any(|r| {
+                        r.contains(addr)
+                            && !r.writable
+                            && region_applies_to_file(rel_path, r, &ctx.memory_regions)
+                    });
                     let unknown_unmapped = !ctx.memory_regions.is_empty()
-                        && !ctx.memory_regions.iter().any(|r| r.contains(addr))
+                        && !ctx.memory_regions.iter().any(|r| {
+                            r.contains(addr)
+                                && region_applies_to_file(rel_path, r, &ctx.memory_regions)
+                        })
                         && (has_svd || !(0x4000_0000..0x6000_0000).contains(&addr));
                     let has_mask_guard = trimmed.contains('&')
                         || trimmed.contains("in_bounds")
@@ -1621,10 +1806,11 @@ fn analyze_single_hw_function(
                         }
                     }
                 }
-                let dst_cap = local_caps
-                    .values()
-                    .copied()
+                let dst_cap = ident_re()
+                    .find_iter(trimmed)
+                    .filter_map(|m| local_caps.get(m.as_str()).copied())
                     .min()
+                    .or_else(|| local_caps.values().copied().min())
                     .and_then(|v| i64::try_from(v).ok())
                     .unwrap_or(256);
 

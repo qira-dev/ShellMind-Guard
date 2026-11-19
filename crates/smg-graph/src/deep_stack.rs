@@ -271,6 +271,8 @@ pub fn scan_ast_deep(
             | Language::CSharp
             | Language::Kotlin
             | Language::Ruby
+            | Language::Dart
+            | Language::Swift
     ) {
         return;
     }
@@ -390,7 +392,14 @@ fn scan_frontend_ast(
         }
 
         // 3b. `window.addEventListener("message", handler)` accessing `.data` without `.origin` verification
-        if (ftxt == "addEventListener" || ftxt.ends_with(".addEventListener"))
+        let is_port_or_channel = {
+            let f_low = ftxt.to_ascii_lowercase();
+            f_low.contains("port") || f_low.contains("channel") || f_low.contains("worker")
+        };
+        if (ftxt == "addEventListener"
+            || ftxt == "window.addEventListener"
+            || ftxt == "self.addEventListener")
+            && !is_port_or_channel
             && (args_low.contains("'message'") || args_low.contains("\"message\""))
             && args_low.contains(".data")
             && !args_low.contains(".origin")
@@ -432,43 +441,35 @@ fn scan_frontend_ast(
             ));
         }
 
-        // 3d. Client `window.open(untrusted)` / `eval(untrusted)` with DOM query source
-        if (ftxt == "eval" || ftxt == "window.open")
-            && has_dom_untrusted_source(args_txt)
-            && !has_url_scheme_guard(full_src)
-        {
-            let (rid, title) = if ftxt == "eval" {
-                (
-                    "SMG-XSS-001",
-                    "Client DOM XSS / arbitrary JS execution via `eval()` with URL parameters"
-                        .into(),
-                )
-            } else {
-                (
-                    "SMG-SSRF-REDIRECT",
-                    "Unsafe client navigation via `window.open()` with unvalidated URL parameters"
-                        .into(),
-                )
-            };
+        // 3d. Client `eval(untrusted)` (never exempted by URL scheme guard) & `window.open(untrusted)`
+        if ftxt == "eval" && has_dom_untrusted_source(args_txt) {
             out.push(make_deep_finding(
-                rid,
+                "SMG-XSS-001",
                 "HIGH",
-                title,
+                "Client DOM XSS / arbitrary JS execution via `eval()` with URL parameters".into(),
                 rel_path,
                 line,
                 ftxt,
-                if rid == "SMG-XSS-001" {
-                    SinkKind::Xss
-                } else {
-                    SinkKind::Ssrf
-                },
-                if rid == "SMG-XSS-001" {
-                    GuardKind::XssSanitizer
-                } else {
-                    GuardKind::SsrfSanitizer
-                },
+                SinkKind::Xss,
+                GuardKind::XssSanitizer,
                 Confidence::Confirmed,
-                "Validate scheme (`https:`/`http:` or relative `/`) and avoid `eval()` completely.",
+                "Remove `eval()` completely; parse structured JSON safely with `JSON.parse()`.",
+            ));
+        } else if ftxt == "window.open"
+            && has_dom_untrusted_source(args_txt)
+            && !has_url_scheme_guard(full_src)
+        {
+            out.push(make_deep_finding(
+                "SMG-SSRF-REDIRECT",
+                "HIGH",
+                "Unsafe client navigation via `window.open()` with unvalidated URL parameters".into(),
+                rel_path,
+                line,
+                ftxt,
+                SinkKind::Ssrf,
+                GuardKind::SsrfSanitizer,
+                Confidence::Confirmed,
+                "Validate scheme (`https:`/`http:` or relative `/`) and same-origin/allowlisted host before navigating.",
             ));
         }
     }
@@ -557,15 +558,21 @@ fn scan_backend_and_db_deep(
             || block_low.contains(".permit(")
             || block_low.contains("validatedata")
             || block_low.contains("pydantic");
-        let has_proto_guard = block_low.contains("__proto__")
-            || block_low.contains("object.hasown")
+        let has_proto_guard = block_low.contains("object.hasown")
             || block_low.contains("hasownproperty")
-            || block_low.contains("object.create(null)");
+            || block_low.contains("object.create(null)")
+            || (block_low.contains("__proto__")
+                && (block_low.contains("===")
+                    || block_low.contains("!==")
+                    || block_low.contains("includes(")
+                    || block_low.contains("continue")
+                    || block_low.contains("return")
+                    || block_low.contains("throw")));
         let has_redirect_guard = block_low.contains("allowed_hosts")
             || block_low.contains("allowedhosts")
             || block_low.contains("url_has_allowed_host_and_scheme")
-            || block_low.contains("startswith(\"/\")")
-            || block_low.contains("startswith('/')");
+            || ((block_low.contains("startswith(\"/\")") || block_low.contains("startswith('/')"))
+                && (block_low.contains("\"//\"") || block_low.contains("'//'")));
 
         let existing_hit_keys: HashSet<(String, usize)> = sym
             .local_taint_hits
@@ -639,7 +646,7 @@ fn scan_backend_and_db_deep(
             }
 
             // 3. Server-Side Template Injection (`SMG-CMDI-SSTI`)
-            if is_ssti_sink_line(lang, &trimmed, &low, &scalar_taint_vars) {
+            if is_ssti_sink_line(lang, &trimmed, &low, &scalar_taint_vars, &block_low) {
                 sym.local_taint_hits.push(make_deep_finding(
                     "SMG-CMDI-SSTI",
                     "CRITICAL",
@@ -727,7 +734,11 @@ fn check_file_xxe(
     if lang == Language::Java
         && (full_low.contains("documentbuilderfactory.newinstance")
             || full_low.contains("saxparserfactory.newinstance")
-            || full_low.contains("xmlinputfactory.newinstance"))
+            || full_low.contains("xmlinputfactory.newinstance")
+            || full_low.contains("transformerfactory.newinstance")
+            || full_low.contains("schemafactory.newinstance")
+            || full_low.contains("new saxbuilder(")
+            || full_low.contains("new saxreader("))
         && !(full_low.contains("disallow-doctype-decl")
             || full_low.contains("access_external_dtd")
             || full_low.contains("is_supporting_external_entities"))
@@ -737,6 +748,10 @@ fn check_file_xxe(
             if l.contains("documentbuilderfactory.newinstance")
                 || l.contains("saxparserfactory.newinstance")
                 || l.contains("xmlinputfactory.newinstance")
+                || l.contains("transformerfactory.newinstance")
+                || l.contains("schemafactory.newinstance")
+                || l.contains("new saxbuilder(")
+                || l.contains("new saxreader(")
             {
                 static_findings.push(make_deep_finding(
                     "SMG-CFG-XXE",
@@ -758,6 +773,7 @@ fn check_file_xxe(
 
     if lang == Language::Python
         && !full_low.contains("defusedxml")
+        && !full_low.contains("resolve_entities=false")
         && (full_low.contains("elementtree.fromstring(")
             || full_low.contains("et.fromstring(")
             || full_low.contains("lxml.etree.fromstring(")
@@ -765,7 +781,11 @@ fn check_file_xxe(
     {
         for (i, line) in lines.iter().enumerate() {
             let l = line.to_ascii_lowercase();
-            if l.contains("fromstring(") || l.contains("parsestring(") {
+            if l.contains("elementtree.fromstring(")
+                || l.contains("et.fromstring(")
+                || l.contains("lxml.etree.fromstring(")
+                || l.contains("minidom.parsestring(")
+            {
                 static_findings.push(make_deep_finding(
                     "SMG-CFG-XXE",
                     "HIGH",
@@ -778,6 +798,31 @@ fn check_file_xxe(
                     GuardKind::ConfigPolicy,
                     Confidence::Confirmed,
                     "Replace stdlib `xml.etree`/`minidom` with `defusedxml.ElementTree` when parsing untrusted XML.",
+                ));
+                break;
+            }
+        }
+    }
+
+    if lang == Language::CSharp
+        && (full_low.contains("dtdprocessing.parse")
+            || (full_low.contains("new xmldocument(") && !full_low.contains("xmlresolver = null")))
+        && !full_low.contains("dtdprocessing.prohibit")
+    {
+        for (i, line) in lines.iter().enumerate() {
+            let l = line.to_ascii_lowercase();
+            if l.contains("dtdprocessing.parse") || l.contains("new xmldocument(") {
+                static_findings.push(make_deep_finding(
+                    "SMG-CFG-XXE",
+                    "HIGH",
+                    ".NET XML parser allows DTD processing or external `XmlResolver` (XXE risk)".into(),
+                    rel_path,
+                    i + 1,
+                    &format!("{}:{}", rel_path, i + 1),
+                    SinkKind::Misconfiguration,
+                    GuardKind::ConfigPolicy,
+                    Confidence::Confirmed,
+                    "Set `DtdProcessing = DtdProcessing.Prohibit` on `XmlReaderSettings` and `XmlResolver = null` on `XmlDocument`.",
                 ));
                 break;
             }
@@ -818,6 +863,17 @@ fn is_static_dangerously_html(attr_txt: &str) -> bool {
 
 fn is_sensitive_storage_item(args_low: &str) -> bool {
     let first_arg = args_low.split(',').next().unwrap_or("");
+    let non_secret_meta = [
+        "provider", "theme", "expires", "expiry", "enabled", "flag", "hint", "count", "mode",
+        "locale", "redirect",
+    ];
+    if non_secret_meta.iter().any(|m| first_arg.contains(m))
+        && !first_arg.contains("secret")
+        && !first_arg.contains("apikey")
+        && !first_arg.contains("api_key")
+    {
+        return false;
+    }
     let auth_key = first_arg.contains("token")
         || first_arg.contains("jwt")
         || first_arg.contains("auth")
@@ -845,13 +901,15 @@ fn has_dom_untrusted_source(expr: &str) -> bool {
 
 fn has_url_scheme_guard(full_src: &str) -> bool {
     let low = full_src.to_ascii_lowercase();
-    low.contains("new url(")
+    let has_new_url_with_proto = low.contains("new url(")
+        && (low.contains(".protocol") || low.contains(".hostname") || low.contains(".origin"));
+    has_new_url_with_proto
         || low.contains(".protocol ===")
         || low.contains(".protocol===")
         || low.contains("startswith(\"https://\")")
         || low.contains("startswith('https://')")
-        || low.contains("startswith(\"/\")")
-        || low.contains("startswith('/')")
+        || ((low.contains("startswith(\"/\")") || low.contains("startswith('/')"))
+            && (low.contains("\"//\"") || low.contains("'//'")))
 }
 
 fn split_simple_assign(stmt: &str) -> Option<(String, &str)> {
@@ -896,7 +954,10 @@ fn is_raw_request_bag(expr: &str) -> bool {
             | "request.get_json()"
             | "request.data"
             | "request.args"
+            | "$request->all()"
             | "params"
+            | "params.permit!"
+            | "params.to_unsafe_h"
             | "$_POST"
             | "$_GET"
     )
@@ -957,12 +1018,21 @@ fn is_nosql_injection_line(
         ".aggregate(",
     ];
 
-    // Check Redis Lua script injection (`redis.eval(userInput)` / `client.evalsha(...)`)
-    if (low.contains("redis.eval(") || low.contains(".evalsha("))
+    // Check Redis Lua script injection (`redis.eval(userInput)` — note `.evalsha()` runs pre-registered SHAs)
+    if low.contains("redis.eval(")
         && (contains_request_source(low)
             || scalar_vars
                 .iter()
                 .any(|v| contains_ident(low, &v.to_ascii_lowercase())))
+    {
+        return true;
+    }
+
+    // Prisma raw filter object injection (`prisma.user.findMany({ where: req.body })`)
+    if (low.contains("where: req.body")
+        || low.contains("where: req.query")
+        || low.contains("where: request.json"))
+        && (low.contains("findmany(") || low.contains("findfirst(") || low.contains("prisma."))
     {
         return true;
     }
@@ -1010,20 +1080,43 @@ fn is_mass_assignment_line(
     if has_schema_validation {
         return false;
     }
+    if (low.contains("$request->all()")
+        || low.contains("params.permit!")
+        || low.contains("params.to_unsafe_h"))
+        && (low.contains(".create(")
+            || low.contains(".update(")
+            || low.contains(".fill(")
+            || low.contains("update_attributes"))
+    {
+        return true;
+    }
     for marker in [
         ".create(",
         ".create!(",
         ".insert(",
         ".insertmany(",
         ".bulkcreate(",
+        ".update(",
+        ".update!(",
+        ".updateone(",
+        ".findoneandupdate(",
+        ".findbyidandupdate(",
+        ".upsert(",
+        ".save(",
+        "object.assign(",
     ] {
         if let Some(arg) = extract_call_arg_inner(low, marker) {
             let trimmed = arg.trim();
             if trimmed == "req.body"
                 || trimmed == "request.json"
+                || trimmed == "$request->all()"
                 || trimmed == "**request.data"
                 || trimmed == "**request.json"
                 || trimmed == "params"
+                || trimmed == "params.permit!"
+                || trimmed == "params.to_unsafe_h"
+                || trimmed.ends_with(", req.body)")
+                || trimmed.ends_with(", req.body")
                 || trimmed.contains("data: req.body")
                 || raw_obj_vars
                     .iter()
@@ -1041,6 +1134,7 @@ fn is_ssti_sink_line(
     trimmed: &str,
     low: &str,
     scalar_vars: &HashSet<String>,
+    block_low: &str,
 ) -> bool {
     let has_taint =
         contains_request_source(trimmed) || scalar_vars.iter().any(|v| contains_ident(trimmed, v));
@@ -1051,18 +1145,31 @@ fn is_ssti_sink_line(
         Language::Python => {
             (low.contains("render_template_string(")
                 || low.contains("jinja2.template(")
-                || low.contains("template(") && (low.contains("jinja") || low.contains("mako")))
+                || low.contains("from_string(") && block_low.contains("jinja")
+                || low.contains("template(")
+                    && (low.contains("jinja")
+                        || low.contains("mako")
+                        || block_low.contains("jinja2")))
                 && !is_first_arg_static_string(trimmed, "(")
         }
         Language::TypeScript | Language::JavaScript => {
-            low.contains("ejs.render(")
+            (low.contains("ejs.render(")
                 || low.contains("pug.render(")
                 || low.contains("handlebars.compile(")
                 || low.contains("nunjucks.renderstring(")
-                || low.contains("lodash.template(")
+                || low.contains("lodash.template("))
+                && !is_first_arg_static_string(trimmed, "(")
+        }
+        Language::Go => {
+            (low.contains(".parse(") && block_low.contains("template"))
+                && !is_first_arg_static_string(trimmed, "(")
         }
         Language::Ruby => low.contains("erb.new(") && low.contains("params["),
-        Language::Java => low.contains("velocity.evaluate("),
+        Language::Java => {
+            low.contains("velocity.evaluate(")
+                || (low.contains("new template(") && low.contains("stringreader("))
+        }
+        Language::CSharp => low.contains("razor.runcompile("),
         _ => false,
     }
 }
@@ -1074,17 +1181,21 @@ fn is_unsafe_deser_line(
     scalar_vars: &HashSet<String>,
     block_low: &str,
 ) -> bool {
-    let has_taint = contains_request_source(trimmed)
-        || scalar_vars.iter().any(|v| contains_ident(trimmed, v))
-        || trimmed.contains("argv")
-        || trimmed.contains("payload");
+    let has_taint =
+        contains_request_source(trimmed) || scalar_vars.iter().any(|v| contains_ident(trimmed, v));
     match lang {
         Language::Python => {
-            has_taint
+            (has_taint
                 && (low.contains("pickle.loads(")
                     || low.contains("pickle.load(")
+                    || low.contains("dill.loads(")
+                    || low.contains("cloudpickle.loads(")
+                    || low.contains("pandas.read_pickle(")
                     || low.contains("marshal.loads(")
-                    || (low.contains("yaml.load(") && !low.contains("safeloader")))
+                    || (low.contains("yaml.load(") && !low.contains("safeloader"))))
+                || (low.contains("torch.load(")
+                    && !low.contains("weights_only=true")
+                    && !low.contains("weights_only = true"))
         }
         Language::TypeScript | Language::JavaScript => {
             has_taint
@@ -1098,12 +1209,19 @@ fn is_unsafe_deser_line(
                 && !low.contains("allowed_classes")
         }
         Language::Java => {
-            (low.contains("objectinputstream") || low.contains(".readobject("))
+            ((low.contains("objectinputstream") || low.contains(".readobject("))
                 && low.contains(".readobject(")
-                && !(block_low.contains("objectinputfilter") || block_low.contains("resolveclass"))
+                && !(block_low.contains("objectinputfilter") || block_low.contains("resolveclass")))
+                || (low.contains("new yaml(")
+                    && low.contains(".load(")
+                    && !block_low.contains("safeconstructor"))
+                || low.contains("enabledefaulttyping(")
+                || low.contains("activatedefaulttyping(")
+                || low.contains("xmldecoder(")
         }
         Language::CSharp => {
-            low.contains("binaryformatter") || low.contains("netdatacontractserializer")
+            (low.contains("binaryformatter") || low.contains("netdatacontractserializer"))
+                && low.contains(".deserialize(")
         }
         Language::Ruby => {
             (low.contains("marshal.load(") || low.contains("yaml.load("))
@@ -1116,13 +1234,12 @@ fn is_unsafe_deser_line(
 fn is_proto_pollution_write(
     trimmed: &str,
     block_low: &str,
-    raw_obj_vars: &HashSet<String>,
+    _raw_obj_vars: &HashSet<String>,
     scalar_vars: &HashSet<String>,
 ) -> bool {
     let has_loop_or_req = block_low.contains("for (")
         || block_low.contains("for(")
         || block_low.contains("object.keys(")
-        || !raw_obj_vars.is_empty()
         || !scalar_vars.is_empty()
         || contains_request_source(block_low);
     if !has_loop_or_req {
@@ -1135,14 +1252,15 @@ fn is_proto_pollution_write(
     });
     if let Some(cap) = re.captures(trimmed) {
         let key_var = &cap[1];
-        // Numeric index loop vars (`i`, `j`, `k`, `idx`, `index`) on arrays are normal; target property names (`key`, `prop`, `k`, tainted var)
+        let rhs = trimmed.split_once('=').map(|(_, r)| r).unwrap_or("");
         let is_key_like = matches!(key_var, "key" | "prop" | "attr" | "field" | "path" | "k")
             || scalar_vars.contains(key_var);
-        let rhs_is_untrusted = trimmed.contains("[key]")
+        let rhs_is_untrusted = rhs.contains(&format!("[{}]", key_var))
+            || trimmed.contains("[key]")
             || trimmed.contains("[prop]")
             || trimmed.contains("[attr]")
-            || contains_request_source(trimmed)
-            || !raw_obj_vars.is_empty();
+            || contains_request_source(rhs)
+            || scalar_vars.iter().any(|v| contains_ident(rhs, v));
         return is_key_like && rhs_is_untrusted;
     }
     false
@@ -1160,29 +1278,54 @@ fn is_open_redirect_line(
         Language::Go => low.contains("http.redirect(") || low.contains("c.redirect("),
         Language::Ruby => low.contains("redirect_to "),
         Language::Php => low.contains("header(") && low.contains("location:"),
+        Language::Java => low.contains(".sendredirect("),
+        Language::CSharp => low.contains("redirect(") || low.contains("results.redirect("),
+        Language::Kotlin => low.contains("respondredirect("),
+        Language::Dart => low.contains("response.found("),
+        Language::Swift => low.contains("req.redirect(to:"),
         _ => false,
     };
     if !is_sink {
         return false;
     }
-    // Safe relative literal (`res.redirect("/dashboard")`) must NEVER fire.
-    if let Some(arg) = extract_call_arg_inner(trimmed, "redirect(") {
-        let a = arg.trim();
-        if (a.starts_with('"') || a.starts_with('\'')) && !a.contains("${") {
-            return false;
-        }
+    if is_first_arg_static_string(trimmed, "redirect(")
+        || is_first_arg_static_string(trimmed, "redirect_to ")
+        || is_first_arg_static_string(trimmed, "sendredirect(")
+    {
+        return false;
     }
     contains_request_source(trimmed) || scalar_vars.iter().any(|v| contains_ident(trimmed, v))
 }
 
 fn is_first_arg_static_string(trimmed: &str, marker: &str) -> bool {
-    if let Some(pos) = trimmed.find(marker) {
-        let rest = trimmed[pos + marker.len()..].trim();
-        return (rest.starts_with('"') || rest.starts_with('\''))
-            && !rest.starts_with("f\"")
-            && !rest.starts_with("f'")
-            && !rest.contains(" + ")
-            && !rest.contains("#{");
+    let Some(pos) = trimmed.to_ascii_lowercase().find(marker) else {
+        return false;
+    };
+    let rest = trimmed[pos + marker.len()..].trim();
+    let Some(quote) = rest.chars().next().filter(|&c| c == '"' || c == '\'') else {
+        return false;
+    };
+    let mut escaped = false;
+    for (idx, ch) in rest[quote.len_utf8()..].char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == quote {
+            let inside = &rest[quote.len_utf8()..quote.len_utf8() + idx];
+            if inside.contains("#{") {
+                return false;
+            }
+            let after = rest[quote.len_utf8() + idx + ch.len_utf8()..].trim_start();
+            return after.is_empty()
+                || after.starts_with(',')
+                || after.starts_with(')')
+                || after.starts_with(';');
+        }
     }
     false
 }

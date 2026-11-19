@@ -24,10 +24,14 @@ pub(crate) const PROFILE: LangProfile = LangProfile {
     tainted_param_markers: &["Request "],
     sql_sinks: &[
         "->query(",
+        "->exec(",
         "mysqli_query(",
         "db::select(",
         "db::statement(",
+        "db::raw(",
         "->whereraw(",
+        "->orwhereraw(",
+        "->orderbyraw(",
         "->selectraw(",
         "pg_query(",
     ],
@@ -46,15 +50,20 @@ pub(crate) const PROFILE: LangProfile = LangProfile {
         "passthru(",
         "proc_open(",
         "popen(",
+        "eval(",
     ],
     cmd_sanitizers: &["escapeshellarg(", "escapeshellcmd("],
     path_sinks: &[
         "file_get_contents(",
+        "file_put_contents(",
+        "move_uploaded_file(",
         "fopen(",
         "readfile(",
         "unlink(",
         "include(",
+        "include_once(",
         "require(",
+        "require_once(",
     ],
     path_sanitizers: &["basename(", "realpath("],
     ssrf_sinks: &[
@@ -66,7 +75,13 @@ pub(crate) const PROFILE: LangProfile = LangProfile {
     ],
     ssrf_sanitizers: &["validateurl", "allowedhosts", "filter_var("],
     xss_sinks: &["echo ", "print "],
-    xss_sanitizers: &["htmlspecialchars(", "htmlentities(", "strip_tags(", " e("],
+    xss_sanitizers: &[
+        "htmlspecialchars(",
+        "htmlentities(",
+        "strip_tags(",
+        "json_encode(",
+        " e(",
+    ],
     ownership_markers: &["auth::id(", "$request->user("],
     db_write_sinks: &[
         "db::insert(",
@@ -201,33 +216,60 @@ fn walk_node(
             .map(|(_, p)| join_route_prefix(route_prefix, &p))
             .unwrap_or_else(|| route_prefix.to_string());
 
+        let mut class_mw_only: HashSet<String> = HashSet::new();
+        let mut class_mw_except: HashSet<String> = HashSet::new();
+        let mut class_has_global_mw = false;
         if let Some(body) = node.child_by_field_name("body") {
             let class_body_txt = strip_comments(node_text(body, ctx.src));
-            // Detect constructor `$this->middleware('auth')` using the actual middleware call arguments
+            // Detect constructor `$this->middleware('auth')` honoring `->only(...)` / `->except(...)`
             let mut rest = class_body_txt.as_str();
             while let Some(pos) = rest.find("$this->middleware(") {
+                let stmt_end = rest[pos..].find(';').unwrap_or(rest[pos..].len());
+                let full_stmt_low = rest[pos..pos + stmt_end].to_ascii_lowercase();
                 let after = &rest[pos + "$this->middleware(".len()..];
-                let call_args = after
-                    .split(';')
-                    .next()
-                    .unwrap_or("")
-                    .split(')')
-                    .next()
-                    .unwrap_or("")
-                    .to_ascii_lowercase();
+                let call_args = after.split(')').next().unwrap_or("").to_ascii_lowercase();
                 if call_args.contains("auth")
                     || call_args.contains("sanctum")
                     || call_args.contains("verified")
                 {
-                    class_guards.insert(GuardKind::Auth);
-                    break;
+                    if let Some(op) = full_stmt_low.find("->only(") {
+                        let inner = full_stmt_low[op + 7..].split(')').next().unwrap_or("");
+                        for tok in inner.split(&[',', '[', ']', '\'', '"', ' '][..]) {
+                            if !tok.is_empty() {
+                                class_mw_only.insert(tok.to_string());
+                            }
+                        }
+                    } else if let Some(ep) = full_stmt_low.find("->except(") {
+                        let inner = full_stmt_low[ep + 9..].split(')').next().unwrap_or("");
+                        for tok in inner.split(&[',', '[', ']', '\'', '"', ' '][..]) {
+                            if !tok.is_empty() {
+                                class_mw_except.insert(tok.to_string());
+                            }
+                        }
+                    } else {
+                        class_has_global_mw = true;
+                    }
                 }
                 rest = after;
             }
             let mut c = body.walk();
             for ch in body.children(&mut c) {
                 if ch.kind() == "method_declaration" {
-                    extract_method_or_fn(ch, ctx, Some(&class_name), &class_prefix, &class_guards);
+                    let m_low = ch
+                        .child_by_field_name("name")
+                        .map(|n| node_text(n, ctx.src).trim().to_ascii_lowercase())
+                        .unwrap_or_default();
+                    let mut method_guards = class_guards.clone();
+                    let mw_applies = if class_has_global_mw {
+                        !class_mw_except.contains(&m_low)
+                    } else {
+                        class_mw_only.contains(&m_low)
+                            || (!class_mw_except.is_empty() && !class_mw_except.contains(&m_low))
+                    };
+                    if mw_applies {
+                        method_guards.insert(GuardKind::Auth);
+                    }
+                    extract_method_or_fn(ch, ctx, Some(&class_name), &class_prefix, &method_guards);
                 }
             }
         }

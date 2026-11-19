@@ -197,12 +197,44 @@ pub fn evaluate_pq_strength(algo_token: &str) -> Option<PqSecurityStrength> {
         || low.contains("secp256k1")
         || low.contains("prime256v1")
         || low.contains("secp256r1")
+        || low.contains("secp192r1")
+        || low.contains("prime192v1")
+        || low.contains("secp224r1")
+        || low.contains("secp384r1")
+        || low.contains("secp521r1")
     {
         return Some(PqSecurityStrength {
             algorithm: "ECDSA",
             oid: "1.2.840.10045.4.3.2",
             family: CryptoFamily::AsymmetricSig,
-            classical_bits: 128,
+            classical_bits: if low.contains("192") || low.contains("224") {
+                96
+            } else {
+                128
+            },
+            quantum_bits: 0,
+            nist_category: 0,
+        });
+    }
+    if low.contains("ssh-dss")
+        || low.contains("dsa-1024")
+        || low.contains("diffie-hellman-group1-sha1")
+    {
+        return Some(PqSecurityStrength {
+            algorithm: "Legacy-SSH-DSA-DH1",
+            oid: "1.2.840.10040.4.1",
+            family: CryptoFamily::AsymmetricKex,
+            classical_bits: 80,
+            quantum_bits: 0,
+            nist_category: 0,
+        });
+    }
+    if low.contains("rsa-512") || low.contains("rsa-1024") || low.contains("rsa1024") {
+        return Some(PqSecurityStrength {
+            algorithm: "RSA-Weak",
+            oid: "1.2.840.113549.1.1.1",
+            family: CryptoFamily::AsymmetricKex,
+            classical_bits: 80,
             quantum_bits: 0,
             nist_category: 0,
         });

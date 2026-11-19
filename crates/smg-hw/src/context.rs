@@ -334,6 +334,26 @@ pub fn parse_linker_or_svd_regions(rel_path: &str, content: &str) -> Vec<MemoryR
                 }
             }
 
+            let mut ro_regs: Vec<(String, u64, u64)> = Vec::new();
+            for reg_cap in svd_register_re().captures_iter(body) {
+                let rbody = &reg_cap[1];
+                if let Some(roff) =
+                    extract_xml_tag(rbody, "addressOffset").and_then(|s| parse_hex_or_dec_u64(&s))
+                {
+                    let rbits = extract_xml_tag(rbody, "size")
+                        .and_then(|s| parse_hex_or_dec_u64(&s))
+                        .unwrap_or(32);
+                    let rbytes = (rbits / 8).max(4);
+                    if extract_xml_tag(rbody, "access")
+                        .is_some_and(|a| a.eq_ignore_ascii_case("read-only"))
+                    {
+                        let rname = extract_xml_tag(rbody, "name")
+                            .unwrap_or_else(|| format!("REG_0x{:X}", roff));
+                        ro_regs.push((rname, base.saturating_add(roff), rbytes));
+                    }
+                }
+            }
+
             if max_span.is_none() {
                 // Check `<registers>` offsets if `<addressBlock>` was omitted
                 let mut reg_max: Option<u64> = None;
@@ -366,6 +386,17 @@ pub fn parse_linker_or_svd_regions(rel_path: &str, content: &str) -> Vec<MemoryR
 
             let access_str = extract_xml_tag(&header_only, "access").or(block_access);
             let writable = access_str.map(|a| !a.eq_ignore_ascii_case("read-only"));
+            for (rname, raddr, rbytes) in ro_regs {
+                if writable.unwrap_or(true) {
+                    regions.push(MemoryRegion {
+                        name: format!("{}::{}", name, rname),
+                        base: raddr,
+                        size: rbytes,
+                        writable: false,
+                        source_file: rel_path.to_string(),
+                    });
+                }
+            }
 
             parsed.push(RawPeriph {
                 name,

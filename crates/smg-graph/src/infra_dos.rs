@@ -118,22 +118,112 @@ fn unpinned_uses_re() -> &'static Regex {
     })
 }
 
-fn scan_cicd_workflow(rel_path: &str, content: &str, out: &mut Vec<LocalStaticFinding>) {
-    let lines: Vec<&str> = content.lines().collect();
-    let has_pr_target = lines.iter().any(|l| {
-        let code = l.split('#').next().unwrap_or("").trim();
-        code.contains("pull_request_target") || code.contains("workflow_run")
-    });
+fn strip_yaml_comment(line: &str) -> &str {
+    let mut in_single = false;
+    let mut in_double = false;
+    let bytes = line.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'\'' && !in_double {
+            in_single = !in_single;
+        } else if b == b'"' && !in_single && (i == 0 || bytes[i - 1] != b'\\') {
+            in_double = !in_double;
+        } else if b == b'#'
+            && !in_single
+            && !in_double
+            && (i == 0 || bytes[i - 1].is_ascii_whitespace())
+        {
+            return &line[..i];
+        }
+    }
+    line
+}
 
-    let mut in_run_block_indent: Option<usize> = None;
-    for (idx, raw) in lines.iter().enumerate() {
-        let ln = idx + 1;
-        let code = raw.split('#').next().unwrap_or("");
+fn has_untrusted_pr_trigger(lines: &[&str]) -> bool {
+    let mut in_on_block = false;
+    for raw in lines {
+        let code = strip_yaml_comment(raw);
         let trimmed = code.trim();
         if trimmed.is_empty() {
             continue;
         }
-        let indent = raw.len() - raw.trim_start().len();
+        let indent = code.len() - code.trim_start().len();
+        if indent == 0 {
+            if trimmed.starts_with("on:") {
+                let after = trimmed.strip_prefix("on:").unwrap_or("");
+                if after.contains("pull_request_target") || after.contains("workflow_run") {
+                    return true;
+                }
+                in_on_block = after.trim().is_empty();
+            } else {
+                in_on_block = false;
+            }
+        } else if in_on_block
+            && (trimmed.starts_with("pull_request_target")
+                || trimmed.starts_with("workflow_run")
+                || trimmed.contains("- pull_request_target")
+                || trimmed.contains("- workflow_run"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn scan_cicd_workflow(rel_path: &str, content: &str, out: &mut Vec<LocalStaticFinding>) {
+    let is_gitlab = rel_path.to_ascii_lowercase().ends_with(".gitlab-ci.yml");
+    let lines: Vec<&str> = content.lines().collect();
+    if is_gitlab {
+        for (idx, raw) in lines.iter().enumerate() {
+            let ln = idx + 1;
+            let trimmed = strip_yaml_comment(raw).trim();
+            let low = trimmed.to_ascii_lowercase();
+            if low.contains("docker_tls_certdir")
+                && (low.ends_with("\"\"") || low.ends_with("''") || low.ends_with(':'))
+            {
+                out.push(mk_finding(
+                    "SMG-CICD-002",
+                    "HIGH",
+                    "GitLab CI disables Docker-in-Docker TLS (`DOCKER_TLS_CERTDIR: \"\"`)".into(),
+                    rel_path,
+                    ln,
+                    "DOCKER_TLS_CERTDIR",
+                    SinkKind::Misconfiguration,
+                    GuardKind::ConfigPolicy,
+                    "Keep `DOCKER_TLS_CERTDIR: \"/certs\"` enabled for Docker-in-Docker CI services.",
+                ));
+            }
+            if (low.contains("eval ") || low.contains("sh -c") || low.contains("bash -c"))
+                && (trimmed.contains("$CI_MERGE_REQUEST_TITLE")
+                    || trimmed.contains("$CI_COMMIT_REF_NAME"))
+            {
+                out.push(mk_finding(
+                    "SMG-CICD-001",
+                    "CRITICAL",
+                    "GitLab CI interpolates untrusted MR/branch variable into shell `eval`/`sh -c`".into(),
+                    rel_path,
+                    ln,
+                    "gitlab-ci",
+                    SinkKind::Misconfiguration,
+                    GuardKind::ConfigPolicy,
+                    "Pass CI variables directly as arguments instead of evaluating them through `eval` or `sh -c`.",
+                ));
+            }
+        }
+        return;
+    }
+
+    let has_pr_target = has_untrusted_pr_trigger(&lines);
+
+    let mut in_run_block_indent: Option<usize> = None;
+    let mut saw_unsafe_checkout = false;
+    for (idx, raw) in lines.iter().enumerate() {
+        let ln = idx + 1;
+        let code = strip_yaml_comment(raw);
+        let trimmed = code.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let indent = code.len() - code.trim_start().len();
 
         // Permissions: write-all check
         if trimmed.eq_ignore_ascii_case("permissions: write-all")
@@ -152,7 +242,7 @@ fn scan_cicd_workflow(rel_path: &str, content: &str, out: &mut Vec<LocalStaticFi
             ));
         }
 
-        // Unpinned mutable @main / @master / @HEAD action ref check
+        // Unpinned mutable ref (`@main` etc. Confirmed) & unpinned 3rd-party `@v*` tag (Heuristic)
         if let Some(cap) = unpinned_uses_re().captures(code) {
             let action = &cap[1];
             let reference = &cap[2];
@@ -171,17 +261,62 @@ fn scan_cicd_workflow(rel_path: &str, content: &str, out: &mut Vec<LocalStaticFi
                     GuardKind::ConfigPolicy,
                     "Pin third-party GitHub Actions to a full 40-character commit SHA (`uses: owner/action@<sha>`).",
                 ));
+            } else if !action.starts_with("actions/")
+                && !action.starts_with("github/")
+                && !(reference.len() == 40 && reference.chars().all(|c| c.is_ascii_hexdigit()))
+            {
+                out.push(mk_finding_conf(
+                    "SMG-CICD-002",
+                    "MEDIUM",
+                    format!(
+                        "Third-party GitHub Action `{}@{}` is pinned to mutable tag instead of commit SHA",
+                        action, reference
+                    ),
+                    rel_path,
+                    ln,
+                    action,
+                    SinkKind::Misconfiguration,
+                    GuardKind::ConfigPolicy,
+                    Confidence::Heuristic,
+                    "Pin third-party GitHub Actions to a full 40-character commit SHA.",
+                ));
+            }
+            if has_pr_target && action == "actions/checkout" {
+                saw_unsafe_checkout = false;
+                let window = lines[idx..(idx + 6).min(lines.len())].join("\n");
+                if window.contains("github.event.pull_request.head.sha")
+                    || window.contains("github.event.pull_request.head.ref")
+                    || window.contains("github.head_ref")
+                {
+                    saw_unsafe_checkout = true;
+                    out.push(mk_finding(
+                        "SMG-CICD-001",
+                        "CRITICAL",
+                        "GitHub Actions `pull_request_target` checks out untrusted PR head ref (`Pwn-Request` risk)".into(),
+                        rel_path,
+                        ln,
+                        "actions/checkout",
+                        SinkKind::Misconfiguration,
+                        GuardKind::ConfigPolicy,
+                        "Avoid checking out PR head code in privileged `pull_request_target` workflows or isolate builds strictly with `contents: read`.",
+                    ));
+                }
             }
         }
+        let _ = saw_unsafe_checkout;
 
         if let Some(run_indent) = in_run_block_indent {
             if indent <= run_indent {
                 in_run_block_indent = None;
-            } else if has_pr_target && untrusted_gha_expr_re().is_match(code) {
+            } else if (has_pr_target
+                || trimmed.contains("GITHUB_ENV")
+                || trimmed.contains("GITHUB_PATH"))
+                && untrusted_gha_expr_re().is_match(code)
+            {
                 out.push(mk_finding(
                     "SMG-CICD-001",
                     "CRITICAL",
-                    "GitHub Actions `pull_request_target`/`workflow_run` evaluates untrusted `${{ github.event.* }}` directly inside `run:` shell (Pwn-Request RCE)".into(),
+                    "GitHub Actions evaluates untrusted `${{ github.event.* }}` directly inside `run:` / `GITHUB_ENV` (Pwn-Request RCE)".into(),
                     rel_path,
                     ln,
                     "pull_request_target",
@@ -197,17 +332,36 @@ fn scan_cicd_workflow(rel_path: &str, content: &str, out: &mut Vec<LocalStaticFi
             let rest = after_run.trim();
             if rest.starts_with('|') || rest.starts_with('>') {
                 in_run_block_indent = Some(indent);
-            } else if has_pr_target && untrusted_gha_expr_re().is_match(rest) {
+            } else if (has_pr_target || rest.contains("GITHUB_ENV") || rest.contains("GITHUB_PATH"))
+                && untrusted_gha_expr_re().is_match(rest)
+            {
                 out.push(mk_finding(
                     "SMG-CICD-001",
                     "CRITICAL",
-                    "GitHub Actions `pull_request_target`/`workflow_run` interpolates untrusted `${{ github.event.* }}` inside `run:` command (Pwn-Request RCE)".into(),
+                    "GitHub Actions interpolates untrusted `${{ github.event.* }}` inside `run:` / `GITHUB_ENV` command (Pwn-Request RCE)".into(),
                     rel_path,
                     ln,
                     "pull_request_target",
                     SinkKind::Misconfiguration,
                     GuardKind::ConfigPolicy,
                     "Pass untrusted GitHub event context through `env:` instead of inline `${{ ... }}` shell interpolation.",
+                ));
+            }
+        } else if let Some(after_script) = after_dash.strip_prefix("script:") {
+            let rest = after_script.trim();
+            if rest.starts_with('|') || rest.starts_with('>') {
+                in_run_block_indent = Some(indent);
+            } else if has_pr_target && untrusted_gha_expr_re().is_match(rest) {
+                out.push(mk_finding(
+                    "SMG-CICD-001",
+                    "CRITICAL",
+                    "GitHub Actions `github-script` interpolates untrusted `${{ github.event.* }}` directly inside JS script".into(),
+                    rel_path,
+                    ln,
+                    "github-script",
+                    SinkKind::Misconfiguration,
+                    GuardKind::ConfigPolicy,
+                    "Pass `${{ github.event.* }}` via `env:` and read `process.env` inside `github-script`.",
                 ));
             }
         }
@@ -279,6 +433,12 @@ fn analyze_k8s_doc(
                     || p == "/"
                     || p == "/etc"
                     || p == "/root"
+                    || p == "/var/run"
+                    || p == "/proc"
+                    || p == "/sys"
+                    || p == "/dev"
+                    || p == "/var/lib/kubelet"
+                    || p == "/etc/kubernetes"
                 {
                     out.push(mk_finding(
                         "SMG-K8S-001",
@@ -312,7 +472,11 @@ fn analyze_k8s_doc(
                     GuardKind::ConfigPolicy,
                     "Set `privileged: false`, `allowPrivilegeEscalation: false`, `runAsNonRoot: true`, and `capabilities.drop: [ALL]`.",
                 ));
-            } else if low == "hostpid: true" || low == "hostipc: true" || low == "hostnetwork: true"
+            } else if low == "hostpid: true"
+                || low == "hostipc: true"
+                || low == "hostnetwork: true"
+                || low == "runasuser: 0"
+                || low == "type: unconfined"
             {
                 out.push(mk_finding(
                     "SMG-K8S-001",
@@ -383,8 +547,10 @@ fn analyze_k8s_doc(
 fn extract_regex_call_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
+        // Focus strictly on backtracking regex engines (JS, Python, Java, C#, PHP).
+        // Linear-time automata (`Go regexp` and `Rust regex`) are excluded to prevent FPs.
         Regex::new(
-            r##"(?:new\s+RegExp\s*\(\s*["']([^"'\n]{3,})["']|\bre\.compile\s*\(\s*r?["']([^"'\n]{3,})["']|\bRegex::new\s*\(\s*(?:r#*"([^"]+)"#*|"([^"\n]{3,})")|\bregexp\.(?:Compile|MustCompile)\s*\(\s*[`"]([^`"\n]{3,})[`"])"##,
+            r##"(?:new\s+RegExp\s*\(\s*["']([^"'\n]{3,})["']|\bre\.compile\s*\(\s*r?["']([^"'\n]{3,})["']|\bPattern\.compile\s*\(\s*["']([^"'\n]{3,})["']|\bnew\s+Regex\s*\(\s*@?["']([^"'\n]{3,})["']|\bpreg_match(?:_all)?\s*\(\s*["']\/([^"'\n]{3,})\/[a-z]*["'])"##,
         )
         .expect("valid regex extractor")
     })
@@ -393,13 +559,21 @@ fn extract_regex_call_re() -> &'static Regex {
 /// Inspects a regex string for nested quantifiers such as `(a+)+`, `(.*)*`, `([a-z]+)*`.
 fn has_nested_quantifier_redos(pat: &str) -> bool {
     let bytes = pat.as_bytes();
-    let mut stack: Vec<bool> = Vec::new();
+    // Skip patterns with unambiguous literal separator tokens inside the outer group (e.g. `([a-z0-9-]+\.)+`)
+    let mut stack: Vec<(bool, bool)> = Vec::new();
     let mut i = 0usize;
     let mut in_char_class = false;
 
     while i < bytes.len() {
         let b = bytes[i];
         if b == b'\\' {
+            if let Some(top) = stack.last_mut()
+                && top.0
+                && matches!(bytes.get(i + 1), Some(b'.' | b'-' | b'/' | b':' | b'_'))
+            {
+                // Escaped literal delimiter following an inner quantifier anchors partitions linearly
+                top.0 = false;
+            }
             i += 2;
             continue;
         }
@@ -419,32 +593,49 @@ fn has_nested_quantifier_redos(pat: &str) -> bool {
         }
         match b {
             b'(' => {
-                // Atomic / lookaround groups avoid naive backtracking amplification
-                stack.push(false);
+                // Atomic `(?>...)` and lookaround groups avoid backtracking amplification
+                let is_non_bt = bytes.get(i + 1) == Some(&b'?')
+                    && matches!(bytes.get(i + 2), Some(b'>' | b'=' | b'!' | b'<'));
+                stack.push((false, is_non_bt));
             }
             b')' => {
-                let inner_has_quant = stack.pop().unwrap_or(false);
-                let next_is_quant = matches!(bytes.get(i + 1), Some(b'+' | b'*' | b'{'));
-                if inner_has_quant && next_is_quant {
+                let (inner_has_quant, is_non_bt) = stack.pop().unwrap_or((false, false));
+                let next_is_unbounded_quant = match bytes.get(i + 1) {
+                    Some(b'+' | b'*') => true,
+                    Some(b'{') => bytes[i + 1..]
+                        .iter()
+                        .position(|&c| c == b'}')
+                        .and_then(|cl| std::str::from_utf8(&bytes[i + 2..i + 1 + cl]).ok())
+                        .is_some_and(|inner| {
+                            inner.split_once(',').is_some_and(|(_, max_s)| {
+                                max_s.trim().is_empty()
+                                    || max_s.trim().parse::<usize>().is_ok_and(|n| n > 3)
+                            })
+                        }),
+                    _ => false,
+                };
+                if !is_non_bt && inner_has_quant && next_is_unbounded_quant {
                     return true;
                 }
                 if inner_has_quant && let Some(top) = stack.last_mut() {
-                    *top = true;
+                    top.0 = true;
                 }
             }
             b'+' | b'*' => {
                 if let Some(top) = stack.last_mut() {
-                    *top = true;
+                    top.0 = true;
                 }
             }
             b'{' => {
-                // Only unbounded or large upper-bound repetitions `{m,}` / `{m,n}` inside groups count as quantifiers
                 if let Some(close_rel) = bytes[i..].iter().position(|&c| c == b'}')
                     && let Some(inner) = std::str::from_utf8(&bytes[i + 1..i + close_rel]).ok()
-                    && inner.contains(',')
+                    && inner.split_once(',').is_some_and(|(_, max_s)| {
+                        max_s.trim().is_empty()
+                            || max_s.trim().parse::<usize>().is_ok_and(|n| n > 3)
+                    })
                 {
                     if let Some(top) = stack.last_mut() {
-                        *top = true;
+                        top.0 = true;
                     }
                     i += close_rel;
                 }
@@ -524,14 +715,26 @@ fn scan_zipslip_patterns(
     out: &mut Vec<LocalStaticFinding>,
 ) {
     let low_all = content.to_ascii_lowercase();
-    let has_path_containment = low_all.contains("starts_with")
-        || low_all.contains("startswith")
-        || low_all.contains("commonpath")
+    let has_path_containment = low_all.contains("commonpath")
         || low_all.contains("commonprefix")
         || low_all.contains("enclosed_name")
         || low_all.contains("getcanonicalpath")
-        || low_all.contains("hasprefix")
-        || low_all.contains("relpath");
+        || low_all.contains("filepath.islocal")
+        || low_all.contains("filter=\"data\"")
+        || low_all.contains("filter='data'")
+        || (low_all.contains("starts_with")
+            && (low_all.contains("canonicalize")
+                || low_all.contains("dest")
+                || low_all.contains("target")
+                || low_all.contains("root")))
+        || (low_all.contains("startswith")
+            && (low_all.contains("realpath")
+                || low_all.contains("abspath")
+                || low_all.contains("dest")
+                || low_all.contains("target")
+                || low_all.contains("root")))
+        || (low_all.contains("hasprefix")
+            && (low_all.contains("clean(") || low_all.contains("dest")));
 
     if has_path_containment {
         return;
@@ -545,13 +748,16 @@ fn scan_zipslip_patterns(
         let low = trimmed.to_ascii_lowercase();
         let is_vuln_extract = match language {
             Language::Python => {
-                (low.contains(".extractall(") || low.contains(".extract("))
-                    && (low_all.contains("zipfile") || low_all.contains("tarfile"))
+                ((low.contains(".extractall(") || low.contains(".extract("))
+                    && (low_all.contains("zipfile") || low_all.contains("tarfile")))
+                    || low.contains("shutil.unpack_archive(")
             }
             Language::JavaScript | Language::TypeScript => {
                 low.contains(".extractallto(")
                     || low.contains("unzipper.extract(")
                     || low.contains("unzip.extract(")
+                    || low.contains("tar.extract(")
+                    || low.contains("tar.x(")
             }
             Language::Go => {
                 low_all.contains("archive/zip")

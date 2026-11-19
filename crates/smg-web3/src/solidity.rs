@@ -163,13 +163,18 @@ fn classify_external_call(call_node: Node, src: &[u8]) -> Option<(bool, String)>
     if full.contains(".call{") || raw_fn.ends_with(".call") || full.contains(".call(") {
         return Some((true, "low_level_call".into()));
     }
-    if raw_fn.ends_with(".send") || raw_fn.ends_with(".transfer") || full.contains("sendValue(") {
-        return Some((true, "eth_transfer_or_token".into()));
+    // 2300-gas Solidity `.transfer()` / `.send()` cannot reenter; only flag callback-capable token/ETH helpers
+    if full.contains("sendValue(") || raw_fn.ends_with(".send") {
+        return Some((true, "eth_send_callback_risk".into()));
     }
     if raw_fn.contains("safeTransferFrom")
+        || raw_fn.contains("safeBatchTransferFrom")
         || raw_fn.contains("safeMint")
         || raw_fn.contains("safeTransferETH")
         || raw_fn.contains("onERC721Received")
+        || raw_fn.contains("onERC1155Received")
+        || raw_fn.contains("operatorSend")
+        || raw_fn.contains("uniswapV3SwapCallback")
         || raw_fn.contains("flashLoan")
         || raw_fn.contains("swap(")
     {
@@ -581,6 +586,7 @@ pub fn parse_solidity_file(rel_path: &str, source: &str) -> Vec<ParsedContract> 
         }
     }
 
+    let mut contract_nodes = Vec::new();
     let mut cur = root.walk();
     for ch in root.named_children(&mut cur) {
         let kind = match ch.kind() {
@@ -596,6 +602,7 @@ pub fn parse_solidity_file(rel_path: &str, source: &str) -> Vec<ParsedContract> 
             "library_declaration" => ContractKind::Library,
             _ => continue,
         };
+        contract_nodes.push(ch);
         contracts.push(extract_contract(
             ch,
             src,
@@ -603,6 +610,7 @@ pub fn parse_solidity_file(rel_path: &str, source: &str) -> Vec<ParsedContract> 
             kind,
             &file_enums,
             &file_contract_types,
+            None,
         ));
     }
 
@@ -612,7 +620,7 @@ pub fn parse_solidity_file(rel_path: &str, source: &str) -> Vec<ParsedContract> 
         .map(|c| (c.name.clone(), c.clone()))
         .collect();
 
-    for c in &mut contracts {
+    for (idx, c) in contracts.iter_mut().enumerate() {
         if c.bases.is_empty() {
             continue;
         }
@@ -638,6 +646,8 @@ pub fn parse_solidity_file(rel_path: &str, source: &str) -> Vec<ParsedContract> 
                 linearized_vars.push(sv.clone());
             }
         }
+        let inherited_state_names: HashSet<String> =
+            linearized_vars.iter().map(|v| v.name.clone()).collect();
         c.state_vars = linearized_vars;
         c.packed_slots = pack_storage_vars_with_defs(
             &c.name,
@@ -647,6 +657,17 @@ pub fn parse_solidity_file(rel_path: &str, source: &str) -> Vec<ParsedContract> 
             &file_enums,
             &file_contract_types,
         );
+        // Re-extract child functions with inherited base state_vars so CEI/view reentrancy catches inherited storage writes
+        let updated = extract_contract(
+            contract_nodes[idx],
+            src,
+            rel_path,
+            c.kind,
+            &file_enums,
+            &file_contract_types,
+            Some(&inherited_state_names),
+        );
+        c.functions = updated.functions;
     }
 
     contracts
@@ -659,6 +680,7 @@ fn extract_contract(
     kind: ContractKind,
     file_enums: &HashSet<String>,
     file_contract_types: &HashSet<String>,
+    override_state_names: Option<&HashSet<String>>,
 ) -> ParsedContract {
     let name = node
         .child_by_field_name("name")
@@ -757,7 +779,10 @@ fn extract_contract(
         }
     }
 
-    let state_names: HashSet<String> = state_vars.iter().map(|v| v.name.clone()).collect();
+    let mut state_names: HashSet<String> = state_vars.iter().map(|v| v.name.clone()).collect();
+    if let Some(ov) = override_state_names {
+        state_names.extend(ov.iter().cloned());
+    }
     let packed_slots = pack_storage_vars_with_defs(
         &name,
         rel_path,
@@ -1286,7 +1311,7 @@ fn check_initializer_and_admin_access(
         }
     }
 
-    let is_privileged_name = matches!(
+    let is_privileged_name = (matches!(
         low.as_str(),
         "setowner"
             | "transferownership"
@@ -1301,8 +1326,7 @@ fn check_initializer_and_admin_access(
             | "setfee"
             | "setoracle"
             | "setadmin"
-            | "mint"
-    );
+    ) || (low == "mint" && f.mutability != "payable"));
     if is_privileged_name && !has_auth {
         findings.push(LocalStaticFinding {
             rule_id: "SMG-WEB3-ACCESS".into(),
@@ -1319,6 +1343,66 @@ fn check_initializer_and_admin_access(
             confidence: Confidence::Confirmed,
             remediation: "Enforce caller authorization (`onlyOwner` / `onlyRole` / explicit `msg.sender` verification) on privileged state transitions.".into(),
         });
+    }
+
+    let body_low = f.body_text.to_ascii_lowercase();
+    if (body_low.contains("for (") || body_low.contains("for(") || body_low.contains("while ("))
+        && body_low.contains("msg.value")
+    {
+        findings.push(LocalStaticFinding {
+            rule_id: "SMG-WEB3-ACCESS".into(),
+            severity: "HIGH".into(),
+            title: format!("`msg.value` reused inside loop in `{}.{}` (double-counting value vulnerability)", c.name, f.name),
+            rel_path: rel_path.into(),
+            line: f.start_line,
+            symbol: format!("{}.{}", c.name, f.name),
+            sink_kind: SinkKind::BalanceUpdate,
+            missing_guard: GuardKind::InputValidation,
+            confidence: Confidence::Confirmed,
+            remediation: "Never accumulate or check `msg.value` inside a loop; decrement remaining value or track explicit per-iteration accounting.".into(),
+        });
+    }
+    if f.mutability == "payable" && body_low.contains("delegatecall(") && low.contains("multicall")
+    {
+        findings.push(LocalStaticFinding {
+            rule_id: "SMG-WEB3-ACCESS".into(),
+            severity: "CRITICAL".into(),
+            title: format!("Payable `multicall` with `delegatecall` in `{}.{}` enables `msg.value` reuse drain", c.name, f.name),
+            rel_path: rel_path.into(),
+            line: f.start_line,
+            symbol: format!("{}.{}", c.name, f.name),
+            sink_kind: SinkKind::BalanceUpdate,
+            missing_guard: GuardKind::InputValidation,
+            confidence: Confidence::Confirmed,
+            remediation: "Make `multicall` non-payable or disallow subcalls that inspect `msg.value` inside batch delegatecall loops.".into(),
+        });
+    }
+    if body_low.contains("transferfrom(") && !has_auth {
+        for call_part in f.body_text.split("transferFrom(").skip(1) {
+            let first_arg = call_part.split(',').next().unwrap_or("").trim();
+            if !first_arg.is_empty()
+                && !first_arg.contains("msg.sender")
+                && !first_arg.contains("_msgSender()")
+                && !first_arg.contains("address(this)")
+                && f.params_text
+                    .split(',')
+                    .any(|p| p.split_whitespace().last() == Some(first_arg))
+            {
+                findings.push(LocalStaticFinding {
+                    rule_id: "SMG-WEB3-ACCESS".into(),
+                    severity: "HIGH".into(),
+                    title: format!("Arbitrary `transferFrom({}, ...)` uses caller-supplied `from` address in `{}.{}`", first_arg, c.name, f.name),
+                    rel_path: rel_path.into(),
+                    line: f.start_line,
+                    symbol: format!("{}.{}", c.name, f.name),
+                    sink_kind: SinkKind::AuthMutation,
+                    missing_guard: GuardKind::Auth,
+                    confidence: Confidence::Heuristic,
+                    remediation: "Pass `msg.sender` (never arbitrary user-controlled `from`) into `safeTransferFrom` unless validating allowance authorization.".into(),
+                });
+                break;
+            }
+        }
     }
 }
 
@@ -1339,9 +1423,18 @@ fn check_signature_replay(
     if uses_raw_ecrecover && !body.contains("address(0)") {
         gaps.push("missing `signer != address(0)` check");
     }
+    if uses_raw_ecrecover
+        && !body.to_ascii_lowercase().contains("0x7fffffff")
+        && !body.contains("ECDSA.")
+    {
+        gaps.push("missing ECDSA `s`-malleability upper-half check (`s <= secp256k1n/2`)");
+    }
     let low = body.to_ascii_lowercase();
     if !low.contains("nonce")
         && !low.contains("used[")
+        && !low.contains("usedsignatures")
+        && !low.contains("nullifier")
+        && !low.contains("consumed")
         && !low.contains("claimed[")
         && !low.contains("executed[")
     {
@@ -1354,6 +1447,9 @@ fn check_signature_replay(
         && !low.contains("chainid")
     {
         gaps.push("missing EIP-712 chainId/verifyingContract domain binding");
+    }
+    if f.name.to_ascii_lowercase().contains("permit") && !low.contains("deadline") {
+        gaps.push("permit() missing `block.timestamp <= deadline` expiry check");
     }
 
     if !gaps.is_empty() {
@@ -1454,6 +1550,9 @@ fn check_math_and_oracle_inside_fn(
     // C. Fee-on-Transfer raw `amount` credit without balance delta
     if low.contains("transferfrom(")
         && !low.contains("balanceof(address(this))")
+        && !low.contains("ownerof(")
+        && low.contains("amount")
+        && !body.contains("+= 1;")
         && f.ops.iter().any(|op| {
             matches!(
                 op,
@@ -1486,12 +1585,14 @@ fn check_math_and_oracle_inside_fn(
     if body.contains("latestRoundData(") {
         let has_updated = low.contains("updatedat") || low.contains("timestamp");
         let has_pos_price = low.contains("> 0") || low.contains("<= 0") || low.contains("!= 0");
-        if !has_updated || !has_pos_price {
+        let round_id_bound = low.contains("uint80 roundid") || low.contains("(roundid,");
+        let missing_answered_in_round = round_id_bound && !low.contains("answeredinround");
+        if !has_updated || !has_pos_price || missing_answered_in_round {
             findings.push(LocalStaticFinding {
                 rule_id: "SMG-WEB3-ORACLE".into(),
                 severity: "HIGH".into(),
                 title: format!(
-                    "Chainlink `latestRoundData()` missing staleness/positive-price validation in `{}.{}`",
+                    "Chainlink `latestRoundData()` missing staleness/`answeredInRound`/positive-price validation in `{}.{}`",
                     c.name, f.name
                 ),
                 rel_path: rel_path.into(),
@@ -1505,13 +1606,20 @@ fn check_math_and_oracle_inside_fn(
         }
     }
 
+    let c_low = c.name.to_ascii_lowercase();
+    let is_amm_pair_contract =
+        (c_low.contains("pair") || c_low.contains("pool") || c_low.contains("router"))
+            && !(fn_low.contains("borrow")
+                || fn_low.contains("liquidat")
+                || fn_low.contains("collateral"));
     let is_valuation_fn = fn_low.contains("price")
         || fn_low.contains("borrow")
         || fn_low.contains("liquidat")
         || fn_low.contains("collateral")
         || fn_low.contains("value");
     let has_pricing_math = body.contains('*') || body.contains('/');
-    if is_valuation_fn
+    if !is_amm_pair_contract
+        && is_valuation_fn
         && has_pricing_math
         && low.contains("getreserves(")
         && !low.contains("twap")

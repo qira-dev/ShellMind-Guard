@@ -16,14 +16,24 @@ fn c_unsafe_copy_re() -> &'static Regex {
 fn c_bounded_copy_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r#"\b(memcpy|memmove|strncpy|read|recv)\s*\("#)
+        Regex::new(r#"\b(memcpy|memmove|strncpy|strncat|read|recv)\s*\("#)
             .expect("valid c bounded copy regex")
     })
 }
 
 fn c_scanf_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r#"\bs?scanf\s*\([^;]*?"[^"]*%s"#).expect("valid scanf regex"))
+    RE.get_or_init(|| {
+        Regex::new(r#"\b(?:f?scanf|sscanf)\s*\([^;]*?"[^"]*(?:%s|%\[\^)""#)
+            .expect("valid scanf regex")
+    })
+}
+
+fn c_fmt_string_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"\b(printf|fprintf|dprintf|syslog)\s*\("#).expect("valid c fmt regex")
+    })
 }
 
 fn c_alloc_re() -> &'static Regex {
@@ -148,8 +158,11 @@ fn has_preceding_bounds_check(preceding_code: &str, len_expr: &str) -> bool {
     for v in &vars {
         for line in prec_low.lines() {
             let trimmed = line.trim();
+            let has_word_v = ident_tok_re().find_iter(trimmed).any(|m| m.as_str() == v);
+            if !has_word_v {
+                continue;
+            }
             if (trimmed.contains("if ") || trimmed.contains("if(") || trimmed.contains("assert"))
-                && trimmed.contains(v)
                 && (trimmed.contains('<')
                     || trimmed.contains("<=")
                     || trimmed.contains('>')
@@ -165,15 +178,78 @@ fn has_preceding_bounds_check(preceding_code: &str, len_expr: &str) -> bool {
             {
                 return true;
             }
-            // Buffer dynamically allocated cleanly to the exact same un-overflowed length right above
             if trimmed.contains(&format!("malloc({})", v))
+                || trimmed.contains(&format!("malloc({} +", v))
                 || trimmed.contains(&format!("calloc({},", v))
+                || trimmed.contains(&format!("[{}]", v))
+                || trimmed.contains(&format!(".resize({})", v))
+                || (trimmed.contains("realloc(") && trimmed.contains(v.as_str()))
             {
                 return true;
             }
         }
     }
     false
+}
+
+fn strip_sizeof_clauses(expr: &str) -> String {
+    let mut out = String::with_capacity(expr.len());
+    let mut i = 0usize;
+    let bytes = expr.as_bytes();
+    while i < bytes.len() {
+        if expr[i..].starts_with("sizeof") {
+            let mut j = i + 6;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if bytes.get(j) == Some(&b'(') {
+                let mut depth = 0usize;
+                while j < bytes.len() {
+                    if bytes[j] == b'(' {
+                        depth += 1;
+                    } else if bytes[j] == b')' {
+                        depth -= 1;
+                        if depth == 0 {
+                            j += 1;
+                            break;
+                        }
+                    }
+                    j += 1;
+                }
+                out.push('1');
+                i = j;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+fn pos_inside_c_string(line: &str, target: usize) -> bool {
+    let mut in_sq = false;
+    let mut in_dq = false;
+    let mut esc = false;
+    for (idx, ch) in line.char_indices() {
+        if idx >= target {
+            break;
+        }
+        if esc {
+            esc = false;
+            continue;
+        }
+        if (in_sq || in_dq) && ch == '\\' {
+            esc = true;
+            continue;
+        }
+        if ch == '"' && !in_sq {
+            in_dq = !in_dq;
+        } else if ch == '\'' && !in_dq {
+            in_sq = !in_sq;
+        }
+    }
+    in_sq || in_dq
 }
 
 fn has_overflow_guard(preceding_code: &str, arith_expr: &str) -> bool {
@@ -192,32 +268,39 @@ fn has_overflow_guard(preceding_code: &str, arith_expr: &str) -> bool {
     {
         return true;
     }
-    // Also honor explicit upper-bound clamp on the multiplier variables (e.g. `if (count > MAX_ITEMS)`)
+    let expr_no_sizeof = strip_sizeof_clauses(&arith_expr.to_ascii_lowercase());
     let vars: Vec<String> = ident_tok_re()
-        .find_iter(&arith_expr.to_ascii_lowercase())
+        .find_iter(&expr_no_sizeof)
         .map(|m| m.as_str().to_string())
         .filter(|v| {
             !matches!(
                 v.as_str(),
-                "sizeof" | "size_t" | "int" | "uint32_t" | "uint64_t"
+                "sizeof" | "size_t" | "int" | "uint32_t" | "uint64_t" | "strlen"
             )
         })
         .collect();
+    if vars.is_empty() {
+        return true;
+    }
     let bounded_count = vars
         .iter()
         .filter(|v| {
             low.lines().any(|l| {
                 let t = l.trim();
-                (t.contains("if ") || t.contains("if(") || t.contains("assert"))
-                    && t.contains(v.as_str())
+                let has_var = ident_tok_re()
+                    .find_iter(t)
+                    .any(|m| m.as_str() == v.as_str());
+                has_var
+                    && (t.contains("if ") || t.contains("if(") || t.contains("assert"))
                     && (t.contains("max")
                         || t.contains("limit")
                         || t.contains("<=")
+                        || t.contains('<')
                         || t.contains('>'))
             })
         })
         .count();
-    !vars.is_empty() && bounded_count == vars.len()
+    bounded_count == vars.len()
 }
 
 fn scan_c_cpp_function(
@@ -236,8 +319,10 @@ fn scan_c_cpp_function(
         }
         let preceding = lines[..idx].join("\n");
 
-        // 1. Always-unsafe unbounded C string/buffer routines
-        if let Some(m) = c_unsafe_copy_re().find(trimmed) {
+        // 1. Always-unsafe unbounded C string/buffer routines (skip string literals)
+        if let Some(m) = c_unsafe_copy_re().find(trimmed)
+            && !pos_inside_c_string(trimmed, m.start())
+        {
             let api = trimmed[m.start()..m.end()].trim_end_matches('(').trim();
             let args = extract_call_args(trimmed, m.start()).unwrap_or_default();
             let src_arg = if api == "gets" {
@@ -270,12 +355,46 @@ fn scan_c_cpp_function(
             }
         }
 
+        // 1b. Format string injection (`printf(user_var)`, `fprintf(f, user_var)`, `syslog(prio, user_var)`)
+        if let Some(m) = c_fmt_string_re().find(trimmed)
+            && !pos_inside_c_string(trimmed, m.start())
+            && !trimmed[..m.start()].ends_with('.')
+            && !trimmed[..m.start()].ends_with("->")
+        {
+            let api = trimmed[m.start()..m.end()].trim_end_matches('(').trim();
+            if let Some(args) = extract_call_args(trimmed, m.start()) {
+                let fmt_idx = if api == "printf" { 0 } else { 1 };
+                if let Some(fmt_arg) = args.get(fmt_idx)
+                    && args.len() == fmt_idx + 1
+                    && !fmt_arg.starts_with('"')
+                    && !fmt_arg.starts_with('\'')
+                    && !fmt_arg.chars().all(|c| c.is_ascii_uppercase() || c == '_')
+                {
+                    out.push(make_phase9_finding(
+                        "SMG-MEM-BOUNDS",
+                        "HIGH",
+                        format!(
+                            "Non-literal format argument `{}` passed to `{}()` in `{}` (format-string vulnerability)",
+                            fmt_arg, api, fn_name
+                        ),
+                        rel_path,
+                        ln,
+                        fn_name,
+                        SinkKind::MemorySafety,
+                        GuardKind::MemoryBounds,
+                        Confidence::Confirmed,
+                        "Always pass a string literal format specifier (`printf(\"%s\", msg)`).",
+                    ));
+                }
+            }
+        }
+
         if c_scanf_re().is_match(trimmed) {
             out.push(make_phase9_finding(
                 "SMG-MEM-BOUNDS",
                 "HIGH",
                 format!(
-                    "Unbounded `%s` format specifier in `scanf`/`sscanf` inside `{}`",
+                    "Unbounded `%s` / `%[^` format specifier in `scanf`/`fscanf`/`sscanf` inside `{}`",
                     fn_name
                 ),
                 rel_path,
@@ -288,60 +407,95 @@ fn scan_c_cpp_function(
             ));
         }
 
-        // 2. Bounded copies/reads whose length comes from an unchecked variable
-        if let Some(m) = c_bounded_copy_re().find(trimmed) {
+        // 2. Bounded copies/reads whose length comes from an unchecked variable (skip C++ member `.read(`/`->read(`)
+        if let Some(m) = c_bounded_copy_re().find(trimmed)
+            && !pos_inside_c_string(trimmed, m.start())
+        {
+            let before = trimmed[..m.start()].trim_end();
+            let is_member_call =
+                before.ends_with('.') || before.ends_with("->") || before.ends_with("::");
             let api = trimmed[m.start()..m.end()].trim_end_matches('(').trim();
-            if let Some(args) = extract_call_args(trimmed, m.start())
+            let is_posix_stream = matches!(api, "read" | "recv");
+            if !(is_member_call && is_posix_stream)
+                && let Some(args) = extract_call_args(trimmed, m.start())
                 && let Some(len_arg) = args.get(2)
-                && !has_preceding_bounds_check(&preceding, len_arg)
             {
-                out.push(make_phase9_finding(
-                    "SMG-MEM-BOUNDS",
-                    "HIGH",
-                    format!(
-                        "`{}()` copy/read uses unchecked length `{}` in `{}` (buffer overflow risk)",
-                        api, len_arg, fn_name
-                    ),
-                    rel_path,
-                    ln,
-                    fn_name,
-                    SinkKind::MemorySafety,
-                    GuardKind::MemoryBounds,
-                    Confidence::Confirmed,
-                    "Validate `len <= sizeof(dst)` (checking signedness `len >= 0` if signed) before calling `memcpy`/`memmove`/`read`/`recv`.",
-                ));
+                if api == "strncat"
+                    && len_arg.contains("sizeof(")
+                    && args.first().is_some_and(|d| len_arg.contains(d))
+                {
+                    out.push(make_phase9_finding(
+                        "SMG-MEM-BOUNDS",
+                        "HIGH",
+                        format!("`strncat(dst, src, sizeof(dst))` off-by-one overflow in `{}`", fn_name),
+                        rel_path,
+                        ln,
+                        fn_name,
+                        SinkKind::MemorySafety,
+                        GuardKind::MemoryBounds,
+                        Confidence::Confirmed,
+                        "Pass remaining free capacity `sizeof(dst) - strlen(dst) - 1` rather than total `sizeof(dst)` to `strncat`.",
+                    ));
+                } else if api != "strncat" && !has_preceding_bounds_check(&preceding, len_arg) {
+                    out.push(make_phase9_finding(
+                        "SMG-MEM-BOUNDS",
+                        "HIGH",
+                        format!(
+                            "`{}()` copy/read uses unchecked length `{}` in `{}` (buffer overflow risk)",
+                            api, len_arg, fn_name
+                        ),
+                        rel_path,
+                        ln,
+                        fn_name,
+                        SinkKind::MemorySafety,
+                        GuardKind::MemoryBounds,
+                        Confidence::Confirmed,
+                        "Validate `len <= sizeof(dst)` (checking signedness `len >= 0` if signed) before calling `memcpy`/`memmove`/`read`/`recv`.",
+                    ));
+                }
             }
         }
 
         // 3. Integer overflow in `malloc(a * b)` / `realloc(p, a * b)` / `new T[a * b]`
-        for cap in c_alloc_re().captures_iter(trimmed) {
-            let expr = cap
-                .get(2)
-                .or_else(|| cap.get(3))
-                .or_else(|| cap.get(4))
-                .map(|m| m.as_str().trim())
-                .unwrap_or("");
-            let has_arith = expr.contains('*') || expr.contains('+') || expr.contains("<<");
-            let non_const = ident_tok_re().captures_iter(expr).any(|c| {
-                let tok = &c[1];
-                tok != "sizeof" && !tok.chars().all(|ch| ch.is_ascii_uppercase() || ch == '_')
-            });
-            if has_arith && non_const && !has_overflow_guard(&preceding, expr) {
-                out.push(make_phase9_finding(
-                    "SMG-ENG-INT",
-                    "CRITICAL",
-                    format!(
-                        "Unchecked arithmetic `{}` in memory allocation inside `{}` (integer overflow -> undersized heap allocation)",
-                        expr, fn_name
-                    ),
-                    rel_path,
-                    ln,
-                    fn_name,
-                    SinkKind::IntegerOverflow,
-                    GuardKind::MemoryBounds,
-                    Confidence::Confirmed,
-                    "Check for overflow with `__builtin_mul_overflow` / `SIZE_MAX / elem_size` validation or `calloc(count, elem_size)` before allocating.",
-                ));
+        if !pos_inside_c_string(trimmed, 0) {
+            for cap in c_alloc_re().captures_iter(trimmed) {
+                if cap
+                    .get(0)
+                    .is_some_and(|m| pos_inside_c_string(trimmed, m.start()))
+                {
+                    continue;
+                }
+                let expr = cap
+                    .get(2)
+                    .or_else(|| cap.get(3))
+                    .or_else(|| cap.get(4))
+                    .map(|m| m.as_str().trim())
+                    .unwrap_or("");
+                let has_arith = expr.contains('*') || expr.contains('+') || expr.contains("<<");
+                let cleaned_expr = strip_sizeof_clauses(expr);
+                let non_const = ident_tok_re().captures_iter(&cleaned_expr).any(|c| {
+                    let tok = &c[1];
+                    tok != "sizeof"
+                        && tok != "strlen"
+                        && !tok.chars().all(|ch| ch.is_ascii_uppercase() || ch == '_')
+                });
+                if has_arith && non_const && !has_overflow_guard(&preceding, expr) {
+                    out.push(make_phase9_finding(
+                        "SMG-ENG-INT",
+                        "CRITICAL",
+                        format!(
+                            "Unchecked arithmetic `{}` in memory allocation inside `{}` (integer overflow -> undersized heap allocation)",
+                            expr, fn_name
+                        ),
+                        rel_path,
+                        ln,
+                        fn_name,
+                        SinkKind::IntegerOverflow,
+                        GuardKind::MemoryBounds,
+                        Confidence::Confirmed,
+                        "Check for overflow with `__builtin_mul_overflow` / `SIZE_MAX / elem_size` validation or `calloc(count, elem_size)` before allocating.",
+                    ));
+                }
             }
         }
     }
@@ -395,6 +549,9 @@ fn walk_rust_unsafe(node: Node, src: &[u8], rel_path: &str, out: &mut Vec<LocalS
         let fn_code = strip_comments_and_strings(node, src);
         let fn_low = fn_code.to_ascii_lowercase();
 
+        let is_unsafe_fn = fn_low.starts_with("unsafe fn ")
+            || fn_low.starts_with("pub unsafe fn ")
+            || fn_low.starts_with("pub(crate) unsafe fn ");
         // Check `wrapping_mul` / `wrapping_add` flowing directly into allocation / unsafe indexing
         if (fn_low.contains("wrapping_mul(") || fn_low.contains("wrapping_add("))
             && (fn_low.contains("with_capacity(")
@@ -416,11 +573,23 @@ fn walk_rust_unsafe(node: Node, src: &[u8], rel_path: &str, out: &mut Vec<LocalS
                         &name,
                         SinkKind::IntegerOverflow,
                         GuardKind::MemoryBounds,
-                        Confidence::Confirmed,
+                        Confidence::Heuristic,
                         "Use `checked_mul`/`checked_add` (`ok_or(...)`) instead of `wrapping_*` before sizing buffers or unsafe offsets.",
                     ));
                 }
             }
+        }
+
+        if is_unsafe_fn {
+            walk_rust_unsafe_block_lines(
+                &fn_code,
+                node.start_position().row + 1,
+                rel_path,
+                &name,
+                &fn_code,
+                out,
+            );
+            return;
         }
 
         let mut c = node.walk();
@@ -436,6 +605,116 @@ fn walk_rust_unsafe(node: Node, src: &[u8], rel_path: &str, out: &mut Vec<LocalS
     }
 }
 
+fn walk_rust_unsafe_block_lines(
+    block_code: &str,
+    start_ln: usize,
+    rel_path: &str,
+    fn_name: &str,
+    enclosing_fn_code: &str,
+    out: &mut Vec<LocalStaticFinding>,
+) {
+    let has_bounds_guard = enclosing_fn_code.contains(".len()")
+        && (enclosing_fn_code.contains('<')
+            || enclosing_fn_code.contains("<=")
+            || enclosing_fn_code.contains("assert!")
+            || enclosing_fn_code.contains("assert_eq!")
+            || enclosing_fn_code.contains(".min("));
+    let has_checked_arith = enclosing_fn_code.contains("checked_mul")
+        || enclosing_fn_code.contains("checked_add")
+        || enclosing_fn_code.contains("saturating_");
+
+    for (idx, raw_line) in block_code.lines().enumerate() {
+        let ln = start_ln + idx;
+        let trimmed = raw_line.trim();
+
+        if trimmed.contains("mem::uninitialized(")
+            || (trimmed.contains("MaybeUninit::uninit().assume_init(")
+                && !enclosing_fn_code.contains(".write(")
+                && !enclosing_fn_code.contains("as_mut_ptr"))
+        {
+            out.push(make_phase9_finding(
+                "SMG-MEM-BOUNDS",
+                "CRITICAL",
+                format!("Uninitialized memory UB (`mem::uninitialized`/`assume_init`) in `{}`", fn_name),
+                rel_path,
+                ln,
+                fn_name,
+                SinkKind::MemorySafety,
+                GuardKind::MemoryBounds,
+                Confidence::Confirmed,
+                "Initialize `MaybeUninit<T>` completely via `.write(...)` before calling `.assume_init()`.",
+            ));
+        }
+
+        if (trimmed.contains(".get_unchecked(") || trimmed.contains(".get_unchecked_mut("))
+            && !has_bounds_guard
+        {
+            out.push(make_phase9_finding(
+                "SMG-MEM-BOUNDS",
+                "HIGH",
+                format!(
+                    "Unchecked slice access (`get_unchecked`) in `unsafe` block inside `{}` without `.len()` bounds validation",
+                    fn_name
+                ),
+                rel_path,
+                ln,
+                fn_name,
+                SinkKind::MemorySafety,
+                GuardKind::MemoryBounds,
+                Confidence::Confirmed,
+                "Use checked `.get(idx)` or explicitly assert `idx < slice.len()` before entering `unsafe`.",
+            ));
+        }
+
+        let is_raw_ptr_op = trimmed.contains("from_raw_parts")
+            || trimmed.contains("copy_nonoverlapping")
+            || trimmed.contains("ptr::copy(")
+            || trimmed.contains(".offset(")
+            || (trimmed.contains(".add(")
+                && (trimmed.contains("ptr") || trimmed.contains("as_ptr")));
+        if is_raw_ptr_op && !has_bounds_guard && !trimmed.contains(".min(") {
+            out.push(make_phase9_finding(
+                "SMG-MEM-BOUNDS",
+                "HIGH",
+                format!(
+                    "Unchecked raw pointer/slice operation inside `unsafe` block in `{}`",
+                    fn_name
+                ),
+                rel_path,
+                ln,
+                fn_name,
+                SinkKind::MemorySafety,
+                GuardKind::MemoryBounds,
+                Confidence::Heuristic,
+                "Verify non-null alignment and `len`/`offset <= cap.len()` before raw pointer manipulation.",
+            ));
+        }
+
+        if (trimmed.contains("from_size_align_unchecked")
+            || trimmed.contains("from_raw_parts")
+            || trimmed.contains("alloc("))
+            && (trimmed.contains(" * ") || trimmed.contains(" + "))
+            && !has_checked_arith
+        {
+            out.push(make_phase9_finding(
+                "SMG-ENG-INT",
+                "HIGH",
+                format!(
+                    "Unchecked allocation arithmetic in `unsafe` block inside `{}`",
+                    fn_name
+                ),
+                rel_path,
+                ln,
+                fn_name,
+                SinkKind::IntegerOverflow,
+                GuardKind::MemoryBounds,
+                Confidence::Confirmed,
+                "Compute byte sizes with `checked_mul` / `checked_add` or `Layout::array::<T>(n)?` instead of raw arithmetic.",
+            ));
+        }
+    }
+}
+
 fn walk_rust_unsafe_in_fn(
     node: Node,
     src: &[u8],
@@ -447,88 +726,14 @@ fn walk_rust_unsafe_in_fn(
     if node.kind() == "unsafe_block" {
         let block_code = strip_comments_and_strings(node, src);
         let start_ln = node.start_position().row + 1;
-        let has_bounds_guard = enclosing_fn_code.contains(".len()")
-            && (enclosing_fn_code.contains('<')
-                || enclosing_fn_code.contains("<=")
-                || enclosing_fn_code.contains("assert!")
-                || enclosing_fn_code.contains("assert_eq!")
-                || enclosing_fn_code.contains(".min("));
-        let has_checked_arith = enclosing_fn_code.contains("checked_mul")
-            || enclosing_fn_code.contains("checked_add")
-            || enclosing_fn_code.contains("saturating_");
-
-        for (idx, raw_line) in block_code.lines().enumerate() {
-            let ln = start_ln + idx;
-            let trimmed = raw_line.trim();
-
-            if (trimmed.contains(".get_unchecked(") || trimmed.contains(".get_unchecked_mut("))
-                && !has_bounds_guard
-            {
-                out.push(make_phase9_finding(
-                    "SMG-MEM-BOUNDS",
-                    "HIGH",
-                    format!(
-                        "Unchecked slice access (`get_unchecked`) in `unsafe` block inside `{}` without `.len()` bounds validation",
-                        fn_name
-                    ),
-                    rel_path,
-                    ln,
-                    fn_name,
-                    SinkKind::MemorySafety,
-                    GuardKind::MemoryBounds,
-                    Confidence::Confirmed,
-                    "Use checked `.get(idx)` or explicitly assert `idx < slice.len()` before entering `unsafe`.",
-                ));
-            }
-
-            if (trimmed.contains("from_raw_parts")
-                || trimmed.contains("copy_nonoverlapping")
-                || trimmed.contains("ptr::copy(")
-                || trimmed.contains(".offset(")
-                || trimmed.contains(".add("))
-                && !has_bounds_guard
-                && !trimmed.contains(".min(")
-            {
-                out.push(make_phase9_finding(
-                    "SMG-MEM-BOUNDS",
-                    "HIGH",
-                    format!(
-                        "Unchecked raw pointer/slice operation inside `unsafe` block in `{}`",
-                        fn_name
-                    ),
-                    rel_path,
-                    ln,
-                    fn_name,
-                    SinkKind::MemorySafety,
-                    GuardKind::MemoryBounds,
-                    Confidence::Confirmed,
-                    "Verify non-null alignment and `len`/`offset <= cap.len()` before raw pointer manipulation.",
-                ));
-            }
-
-            if (trimmed.contains("from_size_align_unchecked")
-                || trimmed.contains("from_raw_parts")
-                || trimmed.contains("alloc("))
-                && (trimmed.contains(" * ") || trimmed.contains(" + "))
-                && !has_checked_arith
-            {
-                out.push(make_phase9_finding(
-                    "SMG-ENG-INT",
-                    "HIGH",
-                    format!(
-                        "Unchecked allocation arithmetic in `unsafe` block inside `{}`",
-                        fn_name
-                    ),
-                    rel_path,
-                    ln,
-                    fn_name,
-                    SinkKind::IntegerOverflow,
-                    GuardKind::MemoryBounds,
-                    Confidence::Confirmed,
-                    "Compute byte sizes with `checked_mul` / `checked_add` or `Layout::array::<T>(n)?` instead of raw arithmetic.",
-                ));
-            }
-        }
+        walk_rust_unsafe_block_lines(
+            &block_code,
+            start_ln,
+            rel_path,
+            fn_name,
+            enclosing_fn_code,
+            out,
+        );
         return;
     }
 

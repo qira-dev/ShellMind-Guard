@@ -25,6 +25,7 @@ pub(crate) const PROFILE: LangProfile = LangProfile {
         ".executequery(",
         ".executeupdate(",
         "createnativequery(",
+        "createquery(",
         "jdbctemplate.query(",
     ],
     sql_sanitizers: &[
@@ -46,7 +47,12 @@ pub(crate) const PROFILE: LangProfile = LangProfile {
         "resttemplate.",
     ],
     ssrf_sanitizers: &["allowedhosts", "validateurl", "isvalidhost"],
-    xss_sinks: &["respondtext(", "loadurl(\"javascript:", "loaddata("],
+    xss_sinks: &[
+        "contenttype.text.html",
+        "text/html",
+        "loadurl(\"javascript:",
+        "loaddata(",
+    ],
     xss_sanitizers: &["htmlescape(", "escapehtml("],
     ownership_markers: &[
         "principal?.getname",

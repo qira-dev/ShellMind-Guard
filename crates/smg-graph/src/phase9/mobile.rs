@@ -26,6 +26,13 @@ fn manifest_tag_re() -> &'static Regex {
 
 /// Scans Android/iOS mobile manifests and network security XML/plist files.
 pub fn scan_mobile_config(rel_path: &str, source: &str) -> Vec<LocalStaticFinding> {
+    if smg_core::is_test_source_path(rel_path) {
+        return Vec::new();
+    }
+    let rel_low = rel_path.replace('\\', "/").to_ascii_lowercase();
+    if rel_low.contains("/src/debug/") || rel_low.contains("/androidtest/") {
+        return Vec::new();
+    }
     let fname = Path::new(rel_path)
         .file_name()
         .and_then(|n| n.to_str())
@@ -42,6 +49,25 @@ pub fn scan_mobile_config(rel_path: &str, source: &str) -> Vec<LocalStaticFindin
     findings
 }
 
+fn blank_xml_comments(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+    while let Some(start) = rest.find("<!--") {
+        out.push_str(&rest[..start]);
+        if let Some(end_rel) = rest[start + 4..].find("-->") {
+            let comment = &rest[start..start + 4 + end_rel + 3];
+            for ch in comment.chars() {
+                out.push(if ch == '\n' { '\n' } else { ' ' });
+            }
+            rest = &rest[start + 4 + end_rel + 3..];
+        } else {
+            break;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 fn line_at_byte(src: &str, byte_offset: usize) -> usize {
     src[..byte_offset.min(src.len())]
         .bytes()
@@ -50,8 +76,11 @@ fn line_at_byte(src: &str, byte_offset: usize) -> usize {
         + 1
 }
 
-fn scan_android_manifest(rel_path: &str, source: &str, out: &mut Vec<LocalStaticFinding>) {
+fn scan_android_manifest(rel_path: &str, raw_source: &str, out: &mut Vec<LocalStaticFinding>) {
+    let cleaned = blank_xml_comments(raw_source);
+    let source = cleaned.as_str();
     let source_low = source.to_ascii_lowercase();
+    let mut app_has_permission = false;
     for cap in manifest_tag_re().captures_iter(source) {
         let full = cap.get(0).unwrap();
         let tag = cap
@@ -74,6 +103,9 @@ fn scan_android_manifest(rel_path: &str, source: &str, out: &mut Vec<LocalStatic
         };
 
         if tag == "application" {
+            if attrs_low.contains("android:permission=") {
+                app_has_permission = true;
+            }
             if attrs_low.contains("android:usescleartexttraffic=\"true\"") {
                 out.push(make_phase9_finding(
                     "SMG-MOB-TLS",
@@ -129,7 +161,8 @@ fn scan_android_manifest(rel_path: &str, source: &str, out: &mut Vec<LocalStatic
         let explicitly_exported = attrs_low.contains("android:exported=\"true\"");
         let explicitly_disabled = attrs_low.contains("android:exported=\"false\"");
         let has_intent_filter = body_low.contains("<intent-filter");
-        let has_permission = attrs_low.contains("android:permission=")
+        let has_permission = app_has_permission
+            || attrs_low.contains("android:permission=")
             || attrs_low.contains("android:readpermission=")
             || attrs_low.contains("android:writepermission=");
 
@@ -153,10 +186,36 @@ fn scan_android_manifest(rel_path: &str, source: &str, out: &mut Vec<LocalStatic
     }
 }
 
-fn scan_network_security_config(rel_path: &str, source: &str, out: &mut Vec<LocalStaticFinding>) {
-    for (idx, line) in source.lines().enumerate() {
+fn scan_network_security_config(
+    rel_path: &str,
+    raw_source: &str,
+    out: &mut Vec<LocalStaticFinding>,
+) {
+    let cleaned = blank_xml_comments(raw_source);
+    let mut in_debug_overrides = false;
+    let mut in_local_domain = false;
+    for (idx, line) in cleaned.lines().enumerate() {
         let ln = idx + 1;
         let low = line.to_ascii_lowercase();
+        if low.contains("<debug-overrides") {
+            in_debug_overrides = true;
+        } else if low.contains("</debug-overrides>") {
+            in_debug_overrides = false;
+        }
+        if low.contains("<domain-config") {
+            in_local_domain = false;
+        }
+        if low.contains("<domain")
+            && (low.contains("localhost") || low.contains("127.0.0.1") || low.contains("10.0.2.2"))
+        {
+            in_local_domain = true;
+        }
+        if low.contains("</domain-config>") {
+            in_local_domain = false;
+        }
+        if in_debug_overrides || in_local_domain {
+            continue;
+        }
         if low.contains("cleartexttrafficpermitted=\"true\"") {
             out.push(make_phase9_finding(
                 "SMG-MOB-TLS",
@@ -188,25 +247,60 @@ fn scan_network_security_config(rel_path: &str, source: &str, out: &mut Vec<Loca
     }
 }
 
-fn scan_info_plist(rel_path: &str, source: &str, out: &mut Vec<LocalStaticFinding>) {
-    let lines: Vec<&str> = source.lines().collect();
+fn scan_info_plist(rel_path: &str, raw_source: &str, out: &mut Vec<LocalStaticFinding>) {
+    let cleaned = blank_xml_comments(raw_source);
+    let lines: Vec<&str> = cleaned.lines().collect();
     for (idx, line) in lines.iter().enumerate() {
-        if line.contains("NSAllowsArbitraryLoads") {
-            let next_few = lines[idx..lines.len().min(idx + 3)].join(" ");
-            if next_few.contains("<true/>") || next_few.contains("<true />") {
-                out.push(make_phase9_finding(
-                    "SMG-MOB-TLS",
-                    "HIGH",
-                    "iOS `Info.plist` disables App Transport Security (`NSAllowsArbitraryLoads = true`)".into(),
-                    rel_path,
-                    idx + 1,
-                    "Info.plist",
-                    SinkKind::MobileSecurity,
-                    GuardKind::MobilePolicy,
-                    Confidence::Confirmed,
-                    "Remove `NSAllowsArbitraryLoads` or scope exceptions strictly via `NSExceptionDomains` with TLS 1.2+.",
-                ));
+        for key in [
+            "NSAllowsArbitraryLoads",
+            "NSAllowsArbitraryLoadsInWebContent",
+            "NSExceptionAllowsInsecureHTTPLoads",
+        ] {
+            if let Some(pos) = line.find(key) {
+                let after_on_line = &line[pos + key.len()..];
+                let immediate_next = lines.get(idx + 1).copied().unwrap_or("");
+                let candidate = if after_on_line.contains("<true/>")
+                    || after_on_line.contains("<true />")
+                    || after_on_line.contains("<false/>")
+                    || after_on_line.contains("<false />")
+                {
+                    after_on_line
+                        .split("</key>")
+                        .nth(1)
+                        .unwrap_or(after_on_line)
+                } else {
+                    immediate_next
+                };
+                if candidate.contains("<true/>") || candidate.contains("<true />") {
+                    out.push(make_phase9_finding(
+                        "SMG-MOB-TLS",
+                        "HIGH",
+                        format!("iOS `Info.plist` weakens App Transport Security (`{} = true`)", key),
+                        rel_path,
+                        idx + 1,
+                        "Info.plist",
+                        SinkKind::MobileSecurity,
+                        GuardKind::MobilePolicy,
+                        Confidence::Confirmed,
+                        "Remove ATS exceptions or restrict strictly via `NSExceptionDomains` with TLS 1.2+.",
+                    ));
+                }
             }
+        }
+        if line.contains("TLSv1.0") || line.contains("TLSv1.1") {
+            out.push(make_phase9_finding(
+                "SMG-MOB-TLS",
+                "HIGH",
+                "iOS `Info.plist` permits legacy TLS 1.0/1.1 via `NSExceptionMinimumTLSVersion`"
+                    .into(),
+                rel_path,
+                idx + 1,
+                "Info.plist",
+                SinkKind::MobileSecurity,
+                GuardKind::MobilePolicy,
+                Confidence::Confirmed,
+                "Set `NSExceptionMinimumTLSVersion` to `TLSv1.2` or higher.",
+            ));
         }
     }
 }
@@ -269,9 +363,14 @@ fn scan_android_code(
             ));
         }
 
+        let is_prefs_write = low.contains(".putstring(")
+            || (low.contains("sharedpreferences") && low.contains(".edit("));
+        let is_benign_clear_or_bool =
+            low.contains(".remove(") || low.contains(".getboolean(") || low.contains(".contains(");
         if !has_encrypted_prefs
             && !has_keystore
-            && (low.contains(".putstring(") || low.contains("sharedpreferences"))
+            && is_prefs_write
+            && !is_benign_clear_or_bool
             && sensitive_key_re().is_match(trimmed)
         {
             out.push(make_phase9_finding(
@@ -288,7 +387,23 @@ fn scan_android_code(
             ));
         }
 
-        // 2. SMG-MOB-IPC: Unsafe WebView JS bridge / exported registerReceiver / implicit broadcast Intent
+        // 2. SMG-MOB-IPC: Unsafe WebView JS bridge / exported registerReceiver / PendingIntent / implicit Intent
+        if low.contains("pendingintent.") && low.contains("flag_mutable") && low.contains("intent(")
+        {
+            out.push(make_phase9_finding(
+                "SMG-MOB-IPC",
+                "HIGH",
+                "Android `PendingIntent.FLAG_MUTABLE` paired with implicit `Intent` risks Intent hijacking".into(),
+                rel_path,
+                ln,
+                "PendingIntent",
+                SinkKind::MobileSecurity,
+                GuardKind::MobilePolicy,
+                Confidence::Confirmed,
+                "Use `PendingIntent.FLAG_IMMUTABLE` or bind explicit component/package on the wrapped `Intent`.",
+            ));
+        }
+
         if low.contains("addjavascriptinterface(") {
             out.push(make_phase9_finding(
                 "SMG-MOB-IPC",
@@ -307,22 +422,25 @@ fn scan_android_code(
         if low.contains("setallowfileaccessfromfileurls(true)")
             || low.contains("allowfileaccessfromfileurls = true")
             || low.contains("allowuniversalaccessfromfileurls = true")
+            || low.contains("setallowfileaccess(true)")
+            || low.contains("allowfileaccess = true")
         {
             out.push(make_phase9_finding(
                 "SMG-MOB-IPC",
                 "HIGH",
-                "Android WebView enables cross-file URL access (`allowFileAccessFromFileURLs = true`)".into(),
+                "Android WebView enables file/cross-file URL access (`allowFileAccess = true` / `allowFileAccessFromFileURLs = true`)".into(),
                 rel_path,
                 ln,
                 "WebViewSettings",
                 SinkKind::MobileSecurity,
                 GuardKind::MobilePolicy,
                 Confidence::Confirmed,
-                "Keep `allowFileAccessFromFileURLs = false` and `allowUniversalAccessFromFileURLs = false` on WebView settings.",
+                "Keep `allowFileAccess = false`, `allowFileAccessFromFileURLs = false`, and `allowUniversalAccessFromFileURLs = false` on WebView settings.",
             ));
         }
 
         if low.contains("registerreceiver(")
+            && !low.contains("localbroadcastmanager")
             && !low.contains("receiver_not_exported")
             && trimmed.matches(',').count() <= 2
             && !lines[idx..lines.len().min(idx + 3)]
@@ -441,10 +559,13 @@ fn scan_swift_mobile(
         let trimmed = line.trim();
         let low = trimmed.to_ascii_lowercase();
 
-        // 1. SMG-MOB-STORAGE: UserDefaults storing secrets/tokens
+        // 1. SMG-MOB-STORAGE: UserDefaults storing secrets/tokens (skip nil/bool deletes & check kSecAttrAccessibleAlways)
+        let is_ud_delete_or_bool =
+            low.contains(".set(nil,") || low.contains(".set(true,") || low.contains(".set(false,");
         if !uses_keychain
             && low.contains("userdefaults")
             && low.contains(".set(")
+            && !is_ud_delete_or_bool
             && sensitive_key_re().is_match(trimmed)
         {
             out.push(make_phase9_finding(
@@ -458,6 +579,35 @@ fn scan_swift_mobile(
                 GuardKind::MobilePolicy,
                 Confidence::Confirmed,
                 "Store tokens, keys, and passwords in iOS Keychain (`SecItemAdd` with `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`).",
+            ));
+        }
+        if trimmed.contains("kSecAttrAccessibleAlways") {
+            out.push(make_phase9_finding(
+                "SMG-MOB-STORAGE",
+                "HIGH",
+                "iOS Keychain uses deprecated insecure `kSecAttrAccessibleAlways` accessibility (readable while device locked)".into(),
+                rel_path,
+                ln,
+                "kSecAttrAccessible",
+                SinkKind::MobileSecurity,
+                GuardKind::MobilePolicy,
+                Confidence::Confirmed,
+                "Use `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` or `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`.",
+            ));
+        }
+        if low.contains("allowfileaccessfromfileurls") && low.contains("true") {
+            out.push(make_phase9_finding(
+                "SMG-MOB-IPC",
+                "HIGH",
+                "iOS WKWebView enables `allowFileAccessFromFileURLs` (local file disclosure risk)"
+                    .into(),
+                rel_path,
+                ln,
+                "WKWebView",
+                SinkKind::MobileSecurity,
+                GuardKind::MobilePolicy,
+                Confidence::Confirmed,
+                "Keep `allowFileAccessFromFileURLs` disabled on `WKPreferences`.",
             ));
         }
 
@@ -528,9 +678,10 @@ fn scan_dart_mobile(
         let trimmed = line.trim();
         let low = trimmed.to_ascii_lowercase();
 
-        // 1. SMG-MOB-STORAGE: SharedPreferences storing sensitive tokens/secrets
+        // 1. SMG-MOB-STORAGE: SharedPreferences / GetStorage / unencrypted Hive storing sensitive tokens/secrets
+        let is_prefs_receiver = low.contains("sharedpreferences") || low.contains("prefs.");
         if !uses_secure_storage
-            && (low.contains("sharedpreferences") || full_low.contains("sharedpreferences"))
+            && is_prefs_receiver
             && low.contains(".setstring(")
             && sensitive_key_re().is_match(trimmed)
         {
@@ -547,8 +698,40 @@ fn scan_dart_mobile(
                 "Use `FlutterSecureStorage` (Keychain/EncryptedSharedPreferences) instead of `SharedPreferences` for tokens and secrets.",
             ));
         }
+        if !uses_secure_storage
+            && (low.contains("getstorage().write(")
+                || (low.contains("hive.openbox") && !low.contains("encryptioncipher")))
+            && sensitive_key_re().is_match(trimmed)
+        {
+            out.push(make_phase9_finding(
+                "SMG-MOB-STORAGE",
+                "HIGH",
+                "Sensitive secret written to unencrypted Flutter local box (`GetStorage` / `Hive` without encryptionCipher)".into(),
+                rel_path,
+                ln,
+                "Hive/GetStorage",
+                SinkKind::MobileSecurity,
+                GuardKind::MobilePolicy,
+                Confidence::Confirmed,
+                "Store sensitive tokens in `FlutterSecureStorage` or encrypt Hive boxes with `HiveAesCipher`.",
+            ));
+        }
 
-        // 2. SMG-MOB-TLS: HttpClient.badCertificateCallback = (...) => true
+        // 2. SMG-MOB-TLS: HttpClient.badCertificateCallback = (...) => true & InAppWebView proceed
+        if low.contains("servertrustauthresponseaction.proceed") {
+            out.push(make_phase9_finding(
+                "SMG-MOB-TLS",
+                "CRITICAL",
+                "Flutter `InAppWebView` proceeds past TLS error via `ServerTrustAuthResponseAction.PROCEED`".into(),
+                rel_path,
+                ln,
+                "InAppWebView",
+                SinkKind::MobileSecurity,
+                GuardKind::MobilePolicy,
+                Confidence::Confirmed,
+                "Reject untrusted TLS challenges with `ServerTrustAuthResponseAction.CANCEL`.",
+            ));
+        }
         if low.contains("badcertificatecallback") {
             let window = lines[idx..lines.len().min(idx + 3)].join(" ");
             if window.contains("=> true") || window.contains("return true") {
