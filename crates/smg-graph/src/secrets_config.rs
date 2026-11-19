@@ -1,18 +1,21 @@
 use crate::ast::{Confidence, GuardKind, LocalStaticFinding, SinkKind};
-use regex::Regex;
+use regex::{Regex, RegexSet};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::OnceLock;
 
 fn aws_key_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"\b((?:AKIA|ASIA)[0-9A-Z]{16})\b").expect("valid aws regex"))
+    RE.get_or_init(|| {
+        Regex::new(r"\b((?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16})\b").expect("valid aws regex")
+    })
 }
 
 fn stripe_key_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"\b((?:sk|rk)_live_[0-9A-Za-z_]{10,})\b").expect("valid stripe regex")
+        Regex::new(r"\b((?:sk|rk)_live_[0-9A-Za-z_]{10,}|whsec_[0-9A-Za-z+/=_-]{24,})\b")
+            .expect("valid stripe regex")
     })
 }
 
@@ -24,13 +27,173 @@ fn github_pat_re() -> &'static Regex {
     })
 }
 
-fn ai_or_cloud_key_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(
-            r"\b(sk-proj-[0-9A-Za-z_-]{20,}|sk-ant-api[0-9A-Za-z_-]{20,}|xox[baprs]-[0-9A-Za-z-]{16,}|AIza[0-9A-Za-z_-]{35})\b",
-        )
-        .expect("valid ai/cloud key regex")
+#[derive(Clone, Copy)]
+struct SecretTokenSpec {
+    provider: &'static str,
+    rule_id: &'static str,
+    severity: &'static str,
+    prefix_skip: usize,
+    min_entropy: f64,
+    requires_keyword: Option<&'static str>,
+}
+
+fn secret_token_pack() -> &'static (RegexSet, Vec<(SecretTokenSpec, Regex)>) {
+    static PACK: OnceLock<(RegexSet, Vec<(SecretTokenSpec, Regex)>)> = OnceLock::new();
+    PACK.get_or_init(|| {
+        let defs: &[(&str, SecretTokenSpec)] = &[
+            (
+                r"\b(sk-proj-[0-9A-Za-z_-]{20,}|sk-svcacct-[0-9A-Za-z_-]{20,}|sk-admin-[0-9A-Za-z_-]{20,})\b",
+                SecretTokenSpec { provider: "OpenAI API Key", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 8, min_entropy: 3.0, requires_keyword: None },
+            ),
+            (
+                r"\b(sk-ant-(?:api|admin)[0-9A-Za-z_-]{20,})\b",
+                SecretTokenSpec { provider: "Anthropic API Key", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 10, min_entropy: 3.0, requires_keyword: None },
+            ),
+            (
+                r"\b(xox[baprs]-[0-9A-Za-z-]{16,})\b",
+                SecretTokenSpec { provider: "Slack Token", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 5, min_entropy: 3.0, requires_keyword: None },
+            ),
+            (
+                r"(https://hooks\.slack\.com/services/T[0-9A-Z]{8,}/B[0-9A-Z]{8,}/[0-9A-Za-z]{20,})",
+                SecretTokenSpec { provider: "Slack Webhook URL", rule_id: "SMG-SEC-APIKEY", severity: "HIGH", prefix_skip: 33, min_entropy: 3.0, requires_keyword: None },
+            ),
+            (
+                r"(https://(?:ptb\.|canary\.)?discord(?:app)?\.com/api/webhooks/[0-9]{17,22}/[0-9A-Za-z_-]{50,})",
+                SecretTokenSpec { provider: "Discord Webhook URL", rule_id: "SMG-SEC-APIKEY", severity: "HIGH", prefix_skip: 36, min_entropy: 3.0, requires_keyword: None },
+            ),
+            (
+                r"\b(AIza[0-9A-Za-z_-]{35})\b",
+                SecretTokenSpec { provider: "Google Cloud / Gemini API Key", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 4, min_entropy: 3.0, requires_keyword: None },
+            ),
+            (
+                r"\b(gl(?:pat|dt|rt|ft)-[0-9A-Za-z_-]{20,})\b",
+                SecretTokenSpec { provider: "GitLab Token", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 6, min_entropy: 3.0, requires_keyword: None },
+            ),
+            (
+                r"\b(hf_[A-Za-z]{24,})\b",
+                SecretTokenSpec { provider: "Hugging Face Token", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 3, min_entropy: 3.1, requires_keyword: None },
+            ),
+            (
+                r"\b(r8_[0-9A-Za-z]{24,})\b",
+                SecretTokenSpec { provider: "Replicate API Token", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 3, min_entropy: 3.0, requires_keyword: None },
+            ),
+            (
+                r"\b(gsk_[0-9A-Za-z]{40,})\b",
+                SecretTokenSpec { provider: "Groq API Key", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 4, min_entropy: 3.2, requires_keyword: None },
+            ),
+            (
+                r"\b(pplx-[0-9a-fA-F]{40,})\b",
+                SecretTokenSpec { provider: "Perplexity API Key", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 5, min_entropy: 3.0, requires_keyword: None },
+            ),
+            (
+                r"\b(xai-[0-9A-Za-z]{32,})\b",
+                SecretTokenSpec { provider: "xAI API Key", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 4, min_entropy: 3.1, requires_keyword: None },
+            ),
+            (
+                r"\b(npm_[0-9A-Za-z]{30,})\b",
+                SecretTokenSpec { provider: "npm Access Token", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 4, min_entropy: 3.1, requires_keyword: None },
+            ),
+            (
+                r"\b(pypi-AgE(?:IcHlwaS5vcmc|NdGVzdC5weXBpLm9yZw)[0-9A-Za-z_-]{30,})\b",
+                SecretTokenSpec { provider: "PyPI API Token", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 20, min_entropy: 3.2, requires_keyword: None },
+            ),
+            (
+                r"\b(rubygems_[0-9a-f]{40,})\b",
+                SecretTokenSpec { provider: "RubyGems API Key", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 9, min_entropy: 2.9, requires_keyword: None },
+            ),
+            (
+                r"\b(SG\.[0-9A-Za-z_-]{16,}\.[0-9A-Za-z_-]{20,})\b",
+                SecretTokenSpec { provider: "SendGrid API Key", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 3, min_entropy: 3.2, requires_keyword: None },
+            ),
+            (
+                r"\b(do[por]_v1_[0-9a-f]{64})\b",
+                SecretTokenSpec { provider: "DigitalOcean Token", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 7, min_entropy: 3.0, requires_keyword: None },
+            ),
+            (
+                r"\b(dapi[0-9a-f]{32}(?:-[0-9])?)\b",
+                SecretTokenSpec { provider: "Databricks Token", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 4, min_entropy: 2.9, requires_keyword: None },
+            ),
+            (
+                r"\b(dp\.(?:st|pt|sa|scim)\.(?:[a-z0-9_-]+\.)?[0-9A-Za-z]{30,})\b",
+                SecretTokenSpec { provider: "Doppler Token", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 6, min_entropy: 3.2, requires_keyword: None },
+            ),
+            (
+                r"\b(lin_api_[0-9A-Za-z]{35,})\b",
+                SecretTokenSpec { provider: "Linear API Key", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 8, min_entropy: 3.1, requires_keyword: None },
+            ),
+            (
+                r"\b(pscale_(?:tkn|pw)_[0-9A-Za-z_.-]{32,})\b",
+                SecretTokenSpec { provider: "PlanetScale Token", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 10, min_entropy: 3.1, requires_keyword: None },
+            ),
+            (
+                r"\b(sbp_[0-9a-f]{40}|sb_secret_[0-9A-Za-z_-]{24,})\b",
+                SecretTokenSpec { provider: "Supabase Secret Key", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 4, min_entropy: 3.0, requires_keyword: None },
+            ),
+            (
+                r"\b(glc_eyJ[0-9A-Za-z+/=_-]{20,}|glsa_[0-9A-Za-z]{32}_[0-9a-f]{8})\b",
+                SecretTokenSpec { provider: "Grafana Token", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 5, min_entropy: 3.1, requires_keyword: None },
+            ),
+            (
+                r"\b(PMAK-[0-9a-f]{24}-[0-9a-f]{34})\b",
+                SecretTokenSpec { provider: "Postman API Key", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 5, min_entropy: 2.9, requires_keyword: None },
+            ),
+            (
+                r"\b(hv[sb]\.[0-9A-Za-z_-]{24,})\b",
+                SecretTokenSpec { provider: "HashiCorp Vault Token", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 4, min_entropy: 3.1, requires_keyword: None },
+            ),
+            (
+                r"\b([0-9A-Za-z]{14}\.atlasv1\.[0-9A-Za-z_-]{60,})\b",
+                SecretTokenSpec { provider: "Terraform Cloud Token", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 23, min_entropy: 3.3, requires_keyword: None },
+            ),
+            (
+                r"\b(shp(?:at|ca|pa|ss)_[0-9a-fA-F]{32})\b",
+                SecretTokenSpec { provider: "Shopify Access Token", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 6, min_entropy: 2.9, requires_keyword: None },
+            ),
+            (
+                r"\b(sq0(?:atp|csp)-[0-9A-Za-z_-]{22,})\b",
+                SecretTokenSpec { provider: "Square API Secret", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 7, min_entropy: 3.1, requires_keyword: None },
+            ),
+            (
+                r"\b(AGE-SECRET-KEY-1[0-9A-Z]{58})\b",
+                SecretTokenSpec { provider: "Age Private Key", rule_id: "SMG-SEC-KEY", severity: "CRITICAL", prefix_skip: 16, min_entropy: 3.2, requires_keyword: None },
+            ),
+            (
+                r"\b(tskey-(?:auth|api|client)-[0-9A-Za-z-]{16,})\b",
+                SecretTokenSpec { provider: "Tailscale Key", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 10, min_entropy: 3.1, requires_keyword: None },
+            ),
+            (
+                r"\b(pul-[0-9a-f]{40})\b",
+                SecretTokenSpec { provider: "Pulumi Access Token", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 4, min_entropy: 2.9, requires_keyword: None },
+            ),
+            (
+                r"\b(figd_[0-9A-Za-z_-]{35,})\b",
+                SecretTokenSpec { provider: "Figma Access Token", rule_id: "SMG-SEC-APIKEY", severity: "HIGH", prefix_skip: 5, min_entropy: 3.1, requires_keyword: None },
+            ),
+            (
+                r"\b(ntn_[0-9A-Za-z]{40,})\b",
+                SecretTokenSpec { provider: "Notion Integration Token", rule_id: "SMG-SEC-APIKEY", severity: "HIGH", prefix_skip: 4, min_entropy: 3.1, requires_keyword: None },
+            ),
+            (
+                r"\b(sntrys_eyJ[0-9A-Za-z+/=_-]{30,}|sntryu_[0-9a-f]{64})\b",
+                SecretTokenSpec { provider: "Sentry Auth Token", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 7, min_entropy: 3.1, requires_keyword: None },
+            ),
+            (
+                r"\b(vcp_[0-9A-Za-z]{20,})\b",
+                SecretTokenSpec { provider: "Vercel Token", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 4, min_entropy: 3.0, requires_keyword: None },
+            ),
+            (
+                r"\b(SK[0-9a-f]{32})\b",
+                SecretTokenSpec { provider: "Twilio API Secret", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 2, min_entropy: 2.9, requires_keyword: Some("twilio") },
+            ),
+        ];
+
+        let patterns: Vec<&str> = defs.iter().map(|(p, _)| *p).collect();
+        let set = RegexSet::new(&patterns).expect("valid secret_token_pack RegexSet");
+        let compiled = defs
+            .iter()
+            .map(|(p, spec)| (*spec, Regex::new(p).expect("valid secret_token_pack Regex")))
+            .collect();
+        (set, compiled)
     })
 }
 
@@ -229,14 +392,145 @@ pub fn is_placeholder_secret(val: &str) -> bool {
         "xxxx",
         "****",
         "insert_",
+        "ci-pass",
+        "ci_pass",
+        "test-pass",
+        "test_pass",
+        "testpass",
+        "dev-pass",
+        "dev_pass",
+        "devpass",
+        "localdev",
+        "local-dev",
+        "local_dev",
+        "not-a-secret",
+        "not_a_secret",
+        "redacted",
+        "fake-",
+        "fake_",
+        "mock-",
+        "mock_",
     ];
     if MARKERS.iter().any(|m| low.contains(m)) {
         return true;
     }
     matches!(
         low.as_str(),
-        "password" | "pass" | "pwd" | "secret" | "token" | "api-key" | "apikey" | "root" | "123456"
+        "password"
+            | "pass"
+            | "pwd"
+            | "secret"
+            | "token"
+            | "api-key"
+            | "apikey"
+            | "root"
+            | "123456"
+            | "cipass"
+            | "localpass"
+            | "local-pass"
+            | "docker"
+            | "postgres"
+            | "mysql"
+            | "mariadb"
+            | "mongodb"
+            | "redis"
+            | "test123"
+            | "test1234"
+            | "pass123"
+            | "password123"
+            | "secret123"
+            | "qwerty"
+            | "letmein"
+            | "fixture"
+            | "mock"
+            | "testing"
+            | "test"
     )
+}
+
+fn line_has_sops_ciphertext(line: &str) -> bool {
+    if !line.contains("ENC[") {
+        return false;
+    }
+    const SOPS_MODES: &[&str] = &[
+        "AES256_GCM,",
+        "AGE,",
+        "PGP,",
+        "KMS,",
+        "GCP_KMS,",
+        "AZURE_KV,",
+        "HASHICORP_VAULT,",
+    ];
+    SOPS_MODES.iter().any(|m| line.contains(m))
+}
+
+pub fn is_sops_encrypted_content(content: &str) -> bool {
+    if !line_has_sops_ciphertext(content) {
+        return false;
+    }
+    content.contains("\nsops:")
+        || content.starts_with("sops:")
+        || content.contains("\"sops\":")
+        || content.contains("sops_mac=")
+        || content.contains("sops_version=")
+}
+
+fn is_ci_or_compose_or_test_path(rel_path: &str) -> bool {
+    if smg_core::is_test_source_path(rel_path) {
+        return true;
+    }
+    let low = rel_path.replace('\\', "/").to_ascii_lowercase();
+    let fname = low.rsplit('/').next().unwrap_or(&low);
+    low.contains(".github/workflows/")
+        || low.contains(".gitlab-ci")
+        || low.contains(".circleci/")
+        || low.contains("/testdata/")
+        || low.contains("/fixtures/")
+        || low.contains("/mocks/")
+        || low.contains("/e2e/")
+        || fname.contains("docker-compose")
+        || fname == "compose.yml"
+        || fname == "compose.yaml"
+        || fname == "makefile"
+        || fname == "justfile"
+        || fname.starts_with("taskfile.")
+}
+
+fn is_loopback_or_service_host(host_port_path: &str) -> bool {
+    let authority = host_port_path
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .trim();
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else {
+        authority.split(':').next().unwrap_or("")
+    }
+    .to_ascii_lowercase();
+    matches!(
+        host.as_str(),
+        "localhost"
+            | "127.0.0.1"
+            | "0.0.0.0"
+            | "::1"
+            | "postgres"
+            | "postgresql"
+            | "pg"
+            | "mysql"
+            | "mariadb"
+            | "redis"
+            | "mongo"
+            | "mongodb"
+            | "db"
+            | "database"
+            | "cache"
+            | "test-db"
+            | "db-test"
+            | "host.docker.internal"
+    ) || host.ends_with(".local")
+        || host.ends_with(".localhost")
+        || host.ends_with(".test")
 }
 
 fn redact_token(tok: &str) -> String {
@@ -313,6 +607,47 @@ pub fn is_sensitive_env_or_pem(rel_path: &str) -> bool {
     low.ends_with(".pem")
 }
 
+/// Content-aware check for committed `.env*` / `.pem` artifacts:
+/// exempts public X.509 certificates/public keys/CSRs and fully SOPS-encrypted files.
+pub fn is_sensitive_env_or_pem_with_content(rel_path: &str, content: &str) -> bool {
+    if !is_sensitive_env_or_pem(rel_path) {
+        return false;
+    }
+    let low = rel_path.to_ascii_lowercase();
+    if low.ends_with(".pem") {
+        let has_private_key = content.contains("PRIVATE KEY");
+        let is_public_cert_only = content.contains("-----BEGIN ")
+            && !has_private_key
+            && (content.contains("-----BEGIN CERTIFICATE-----")
+                || content.contains("-----BEGIN X509 CRL-----")
+                || content.contains("-----BEGIN TRUSTED CERTIFICATE-----")
+                || content.contains("-----BEGIN PUBLIC KEY-----")
+                || content.contains("-----BEGIN RSA PUBLIC KEY-----")
+                || content.contains("-----BEGIN EC PUBLIC KEY-----")
+                || content.contains("-----BEGIN CERTIFICATE REQUEST-----"));
+        if is_public_cert_only {
+            return false;
+        }
+        if is_sops_encrypted_content(content) {
+            return false;
+        }
+    }
+    if is_sops_encrypted_content(content) {
+        let all_encrypted = content.lines().all(|l| {
+            let t = l.trim();
+            t.is_empty()
+                || t.starts_with('#')
+                || t.starts_with("sops_")
+                || t == "sops:"
+                || line_has_sops_ciphertext(t)
+        });
+        if all_encrypted {
+            return false;
+        }
+    }
+    true
+}
+
 fn make_sec_finding(
     rule_id: &str,
     severity: &str,
@@ -383,6 +718,9 @@ pub fn scan_secrets_and_config(rel_path: &str, content: &str) -> Vec<LocalStatic
     let is_rust = rel_path.ends_with(".rs");
     let is_docker = is_dockerfile(rel_path);
     let is_yaml = is_yaml_file(rel_path);
+    let is_ci_or_test = is_ci_or_compose_or_test_path(rel_path);
+    let is_sops_file = is_sops_encrypted_content(content);
+    let mut in_sops_meta = false;
     let lines: Vec<&str> = content.lines().collect();
     let mut findings = Vec::new();
 
@@ -448,8 +786,45 @@ pub fn scan_secrets_and_config(rel_path: &str, content: &str) -> Vec<LocalStatic
             }
         }
 
+        // Skip SOPS encrypted ciphertext values & SOPS metadata footer (`sops:` block)
+        if is_sops_file {
+            if trimmed == "sops:" || trimmed == "\"sops\": {" || trimmed.starts_with("sops_mac=") {
+                in_sops_meta = true;
+                continue;
+            }
+            if in_sops_meta {
+                if !line.starts_with(' ')
+                    && !line.starts_with('\t')
+                    && !trimmed.starts_with('}')
+                    && !trimmed.starts_with("sops_")
+                {
+                    in_sops_meta = false;
+                } else {
+                    continue;
+                }
+            }
+            if line_has_sops_ciphertext(line) {
+                continue;
+            }
+        } else if line_has_sops_ciphertext(line) {
+            continue;
+        }
+
+        // Skip regex pattern literals in rule/analyzer definitions themselves
+        if trimmed.contains("Regex::new(")
+            || trimmed.contains("RegexSet::new(")
+            || trimmed.starts_with("r\"")
+            || trimmed.starts_with("r#\"")
+        {
+            continue;
+        }
+
         // --- Layer 1a: Secrets & Credential Leak Rules (SMG-SEC-*) ---
-        if line.contains("AKIA") || line.contains("ASIA") {
+        if line.contains("AKIA")
+            || line.contains("ASIA")
+            || line.contains("ABIA")
+            || line.contains("ACCA")
+        {
             for cap in aws_key_re().captures_iter(line) {
                 let tok = &cap[1];
                 let suffix = &tok[4..];
@@ -466,18 +841,22 @@ pub fn scan_secrets_and_config(rel_path: &str, content: &str) -> Vec<LocalStatic
             }
         }
 
-        if line.contains("sk_live_") || line.contains("rk_live_") {
+        if line.contains("sk_live_") || line.contains("rk_live_") || line.contains("whsec_") {
             for cap in stripe_key_re().captures_iter(line) {
                 let tok = &cap[1];
-                let suffix = &tok[8..];
+                let suffix = tok
+                    .strip_prefix("sk_live_")
+                    .or_else(|| tok.strip_prefix("rk_live_"))
+                    .or_else(|| tok.strip_prefix("whsec_"))
+                    .unwrap_or(tok);
                 if !is_placeholder_secret(suffix) && shannon_entropy(suffix) >= 2.5 {
                     findings.push(make_sec_finding(
                         "SMG-SEC-STRIPE",
                         "CRITICAL",
-                        format!("Hardcoded Stripe live API key ({})", redact_token(tok)),
+                        format!("Hardcoded Stripe live/webhook secret ({})", redact_token(tok)),
                         rel_path,
                         ln,
-                        "Revoke and roll the Stripe secret key in the Stripe Dashboard and read it from `process.env.STRIPE_SECRET_KEY` / a secret manager.",
+                        "Revoke and roll the Stripe secret key/webhook secret in the Stripe Dashboard and read it from `process.env.STRIPE_SECRET_KEY` / a secret manager.",
                     ));
                 }
             }
@@ -509,23 +888,32 @@ pub fn scan_secrets_and_config(rel_path: &str, content: &str) -> Vec<LocalStatic
             }
         }
 
-        if line.contains("sk-proj-")
-            || line.contains("sk-ant-api")
-            || line.contains("xoxb-")
-            || line.contains("xoxp-")
-            || line.contains("AIza")
-        {
-            for cap in ai_or_cloud_key_re().captures_iter(line) {
-                let tok = &cap[1];
-                if !is_placeholder_secret(tok) && shannon_entropy(tok) >= 3.0 {
-                    findings.push(make_sec_finding(
-                        "SMG-SEC-APIKEY",
-                        "CRITICAL",
-                        format!("Hardcoded API/Cloud Token ({})", redact_token(tok)),
-                        rel_path,
-                        ln,
-                        "Revoke the leaked API token immediately and load secrets from environment variables or a secret manager.",
-                    ));
+        let (pack_set, pack_specs) = secret_token_pack();
+        let pack_matches = pack_set.matches(line);
+        if pack_matches.matched_any() {
+            for pat_idx in pack_matches.iter() {
+                let (spec, re) = &pack_specs[pat_idx];
+                if let Some(kw) = spec.requires_keyword
+                    && !has_context_keyword(&lines, idx, 2, &[kw])
+                {
+                    continue;
+                }
+                for cap in re.captures_iter(line) {
+                    let tok = &cap[1];
+                    let suffix = tok.get(spec.prefix_skip..).unwrap_or(tok);
+                    if !is_placeholder_secret(tok)
+                        && !is_placeholder_secret(suffix)
+                        && shannon_entropy(suffix) >= spec.min_entropy
+                    {
+                        findings.push(make_sec_finding(
+                            spec.rule_id,
+                            spec.severity,
+                            format!("Hardcoded {} ({})", spec.provider, redact_token(tok)),
+                            rel_path,
+                            ln,
+                            "Revoke the leaked API token immediately and load secrets from environment variables or a secret manager.",
+                        ));
+                    }
                 }
             }
         }
@@ -544,15 +932,24 @@ pub fn scan_secrets_and_config(rel_path: &str, content: &str) -> Vec<LocalStatic
         if line.contains("://") && line.contains('@') {
             for cap in db_uri_re().captures_iter(line) {
                 let pass = &cap[2];
-                if !is_placeholder_secret(pass) && shannon_entropy(pass) >= 2.0 {
-                    findings.push(make_sec_finding(
+                let host_port_path = &cap[3];
+                let is_local_host = is_loopback_or_service_host(host_port_path);
+                if is_placeholder_secret(pass) || (is_ci_or_test && is_local_host) {
+                    continue;
+                }
+                if shannon_entropy(pass) >= 2.2 {
+                    let mut f = make_sec_finding(
                         "SMG-SEC-DBURI",
-                        "HIGH",
+                        if is_local_host { "MEDIUM" } else { "HIGH" },
                         "Hardcoded database URI with embedded credentials".into(),
                         rel_path,
                         ln,
                         "Move the database connection string to an environment variable (e.g., `DATABASE_URL`) and rotate the database password.",
-                    ));
+                    );
+                    if is_local_host {
+                        f.confidence = Confidence::Heuristic;
+                    }
+                    findings.push(f);
                 }
             }
         }
@@ -1272,5 +1669,83 @@ const pwHash = crypto.createHash('md5').update(password).digest('hex');
             check_gitignore_exposure(&[".env", ".env.local", "certs/dev.pem"], &gi_safe_refs)
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn test_pem_cert_sops_ci_dsn_and_provider_pack() {
+        let public_cert = concat!(
+            "-----BEGIN ",
+            "CERTIFICATE-----\n",
+            "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA\n",
+            "-----END ",
+            "CERTIFICATE-----\n"
+        );
+        assert!(!is_sensitive_env_or_pem_with_content(
+            "certs/service-ca.pem",
+            public_cert
+        ));
+        assert!(scan_secrets_and_config("certs/service-ca.pem", public_cert).is_empty());
+
+        let private_pem = concat!(
+            "-----BEGIN ",
+            "PRIVATE KEY-----\n",
+            "MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSk\n",
+            "-----END ",
+            "PRIVATE KEY-----\n"
+        );
+        assert!(is_sensitive_env_or_pem_with_content(
+            "certs/server-key.pem",
+            private_pem
+        ));
+        assert!(
+            scan_secrets_and_config("certs/server-key.pem", private_pem)
+                .iter()
+                .any(|f| f.rule_id == "SMG-SEC-KEY")
+        );
+
+        let sops_yaml = concat!(
+            "db_url: ",
+            "ENC[AES256_GCM,data:xK9mZp4qR2wL8vN1tY5bC7dF0hJ3nQ==,iv:AbCdEfGhIjKlMnOp,tag:QrStUvWxYz123456,type:str]\n",
+            "sops:\n",
+            "    age:\n",
+            "        - recipient: age1examplekey\n",
+            "    mac: ENC[AES256_GCM,data:AbCdEfGhIjKlMnOp,iv:1234,tag:5678,type:str]\n"
+        );
+        assert!(scan_secrets_and_config("deploy/secrets.enc.yaml", sops_yaml).is_empty());
+        assert!(!is_sensitive_env_or_pem_with_content(
+            ".env",
+            "DB_PASS=ENC[AES256_GCM,data:abc123def456,iv:x,tag:y,type:str]\nsops_version=3.8.1\n"
+        ));
+
+        let ci_workflow = concat!(
+            "jobs:\n  test:\n    env:\n",
+            "      DATABASE_URL: ",
+            "postgres://postgres:ci-pass@localhost:5432/testdb\n",
+            "      SVC_URL: ",
+            "postgres://appuser:Rand0mCiOnly@postgres:5432/ci\n"
+        );
+        assert!(scan_secrets_and_config(".github/workflows/ci.yml", ci_workflow).is_empty());
+
+        let provider_src = format!(
+            "const gl = '{gl}';\nconst hf = '{hf}';\nconst wh = '{wh}';\nconst sg = '{sg}';\n",
+            gl = concat!("glpat-", "9xKmPq2RtYv8ZwNc3VbH7dFj"),
+            hf = concat!("hf_", "AbCdEfGhIjKlMnOpQrStUvWxYzAbCdEf"),
+            wh = concat!("whsec_", "8kLmNpQrStUvWxYz23456789AbCdEfGh"),
+            sg = concat!(
+                "SG.",
+                "aBcDeFgHiJkLmNoP1234",
+                ".",
+                "qRsTuVwXyZ0123456789AbCdEf"
+            ),
+        );
+        let hits = scan_secrets_and_config("src/providers.ts", &provider_src);
+        assert!(
+            hits.iter()
+                .filter(|h| h.rule_id == "SMG-SEC-APIKEY")
+                .count()
+                >= 3
+        );
+        assert!(hits.iter().any(|h| h.rule_id == "SMG-SEC-STRIPE"));
+        assert!(hits.iter().all(|h| h.confidence == Confidence::Confirmed));
     }
 }

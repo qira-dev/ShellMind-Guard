@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::sync::OnceLock;
 
 #[allow(clippy::too_many_arguments)]
-fn mk_finding(
+fn mk_finding_conf(
     rule_id: &str,
     severity: &str,
     title: String,
@@ -14,6 +14,7 @@ fn mk_finding(
     symbol: &str,
     sink_kind: SinkKind,
     missing_guard: GuardKind,
+    confidence: Confidence,
     remediation: &str,
 ) -> LocalStaticFinding {
     LocalStaticFinding {
@@ -25,9 +26,35 @@ fn mk_finding(
         symbol: symbol.to_string(),
         sink_kind,
         missing_guard,
-        confidence: Confidence::Confirmed,
+        confidence,
         remediation: remediation.to_string(),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mk_finding(
+    rule_id: &str,
+    severity: &str,
+    title: String,
+    rel_path: &str,
+    line: usize,
+    symbol: &str,
+    sink_kind: SinkKind,
+    missing_guard: GuardKind,
+    remediation: &str,
+) -> LocalStaticFinding {
+    mk_finding_conf(
+        rule_id,
+        severity,
+        title,
+        rel_path,
+        line,
+        symbol,
+        sink_kind,
+        missing_guard,
+        Confidence::Confirmed,
+        remediation,
+    )
 }
 
 /// Scans structural CI/CD pipelines, Kubernetes/Helm manifests, ReDoS nested quantifiers,
@@ -285,7 +312,8 @@ fn analyze_k8s_doc(
                     GuardKind::ConfigPolicy,
                     "Set `privileged: false`, `allowPrivilegeEscalation: false`, `runAsNonRoot: true`, and `capabilities.drop: [ALL]`.",
                 ));
-            } else if low == "hostpid: true" || low == "hostipc: true" {
+            } else if low == "hostpid: true" || low == "hostipc: true" || low == "hostnetwork: true"
+            {
                 out.push(mk_finding(
                     "SMG-K8S-001",
                     "HIGH",
@@ -298,7 +326,7 @@ fn analyze_k8s_doc(
                     k_str,
                     SinkKind::Misconfiguration,
                     GuardKind::ConfigPolicy,
-                    "Disable `hostPID` and `hostIPC` to enforce pod isolation boundaries.",
+                    "Disable `hostPID`, `hostIPC`, and `hostNetwork` to enforce pod isolation boundaries.",
                 ));
             }
         }
@@ -443,7 +471,7 @@ fn scan_redos_patterns(rel_path: &str, content: &str, out: &mut Vec<LocalStaticF
             if let Some(p) = pat
                 && has_nested_quantifier_redos(p)
             {
-                out.push(mk_finding(
+                out.push(mk_finding_conf(
                     "SMG-DOS-001",
                     "HIGH",
                     format!(
@@ -455,6 +483,7 @@ fn scan_redos_patterns(rel_path: &str, content: &str, out: &mut Vec<LocalStaticF
                     "regex",
                     SinkKind::SchemaTampering,
                     GuardKind::InputValidation,
+                    Confidence::Heuristic,
                     "Eliminate nested quantifiers (`(a+)+`), limit input string length before matching, or use a linear-time regex engine.",
                 ));
             }
@@ -467,7 +496,7 @@ fn scan_redos_patterns(rel_path: &str, content: &str, out: &mut Vec<LocalStaticF
             if let Some(end) = rest.find('/') {
                 let lit = &rest[..end];
                 if !lit.is_empty() && has_nested_quantifier_redos(lit) {
-                    out.push(mk_finding(
+                    out.push(mk_finding_conf(
                         "SMG-DOS-001",
                         "HIGH",
                         format!(
@@ -479,6 +508,7 @@ fn scan_redos_patterns(rel_path: &str, content: &str, out: &mut Vec<LocalStaticF
                         "regex_literal",
                         SinkKind::SchemaTampering,
                         GuardKind::InputValidation,
+                        Confidence::Heuristic,
                         "Rewrite nested quantifiers in regex literal into possessive/flat character classes and cap input length.",
                     ));
                 }
@@ -562,7 +592,7 @@ fn ecb_or_static_iv_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r#"(?i)(?:aes-(?:128|192|256)-ecb|['"]AES/ECB|MODE_ECB|\bmodes\.ECB\s*\(\s*\)|createCipheriv\s*\([^,\n]+,[^,\n]+,\s*(?:['"][0-9a-fA-Fx]{16,}['"]|Buffer\.from\s*\(\s*['"][^'"]+['"]))"#,
+            r#"(?i)(?:aes-(?:128|192|256)-ecb|des-ede3?(?:-cbc|-ecb)?|['"]rc4['"]|\brc4\.NewCipher\s*\(|\bDES\.new\s*\(|['"]AES/ECB|MODE_ECB|\bmodes\.ECB\s*\(\s*\)|createCipheriv\s*\([^,\n]+,[^,\n]+,\s*(?:['"][0-9a-fA-Fx]{16,}['"]|Buffer\.from\s*\(\s*['"][^'"]+['"]))"#,
         )
         .expect("valid ecb/iv regex")
     })
@@ -572,10 +602,107 @@ fn secret_timing_cmp_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r#"(?i)\b(?:signature|hmac|expected_sig|expectedSig|webhook_sig|webhookSig|mac|digest|api_secret|apiSecret)\w*\s*(?:===|==|!==|!=)\s*[A-Za-z0-9_.\[\]"']+"#,
+            r#"(?i)\b(signature|hmac|cmac|expected_sig|expectedSig|webhook_sig|webhookSig|mac|digest|api_secret|apiSecret|[a-z0-9_]*(?:_signature|_hmac|_digest|_mac|_secret))\s*(?:===|==|!==|!=)\s*([^\s),;&|{}:]+)"#,
         )
         .expect("valid timing cmp regex")
     })
+}
+
+fn is_benign_timing_cmp(lhs: &str, rhs: &str) -> bool {
+    let lhs_low = lhs.to_ascii_lowercase();
+    const BENIGN_LHS_SUFFIXES: &[&str] = &[
+        "_type",
+        "_kind",
+        "_alg",
+        "_algo",
+        "_algorithm",
+        "_scheme",
+        "_version",
+        "_ver",
+        "_mode",
+        "_format",
+        "_encoding",
+        "_len",
+        "_length",
+        "_size",
+        "_count",
+        "_header",
+        "_name",
+        "_addr",
+        "_address",
+        "_err",
+        "_error",
+        "_enabled",
+        "_valid",
+    ];
+    if BENIGN_LHS_SUFFIXES.iter().any(|suf| lhs_low.ends_with(suf)) {
+        return true;
+    }
+
+    let r_trimmed = rhs.trim_end_matches([';', '{', ':']);
+    let r_low = r_trimmed.to_ascii_lowercase();
+    if matches!(
+        r_low.as_str(),
+        "\"\""
+            | "''"
+            | "``"
+            | "null"
+            | "none"
+            | "nil"
+            | "undefined"
+            | "true"
+            | "false"
+            | "empty"
+            | "0"
+            | "-1"
+            | "\"nil\""
+            | "'nil'"
+    ) {
+        return true;
+    }
+    if r_low.contains("length")
+        || r_low.contains(".len(")
+        || r_low.contains("len(")
+        || r_low.contains(".size(")
+    {
+        return true;
+    }
+    if (r_trimmed.starts_with('"') && r_trimmed.ends_with('"') && r_trimmed.len() >= 2)
+        || (r_trimmed.starts_with('\'') && r_trimmed.ends_with('\'') && r_trimmed.len() >= 2)
+        || (r_trimmed.starts_with('`') && r_trimmed.ends_with('`') && r_trimmed.len() >= 2)
+    {
+        let inner = &r_trimmed[1..r_trimmed.len() - 1];
+        if inner.len() < 12 {
+            return true;
+        }
+        let inner_low = inner.to_ascii_lowercase();
+        if matches!(
+            inner_low.as_str(),
+            "hmac-sha256" | "hmac-sha512" | "sha256" | "sha512" | "default" | "not_configured"
+        ) {
+            return true;
+        }
+    }
+    false
+}
+
+fn timing_cmp_confidence(rhs: &str) -> Confidence {
+    let low = rhs.to_ascii_lowercase();
+    if low.contains("sig")
+        || low.contains("hmac")
+        || low.contains("mac")
+        || low.contains("digest")
+        || low.contains("secret")
+        || low.contains("token")
+        || low.contains("expected")
+        || low.contains("computed")
+        || low.contains("actual")
+        || low.contains("hash")
+    {
+        Confidence::Confirmed
+    } else {
+        Confidence::Heuristic
+    }
 }
 
 fn scan_crypto_math_patterns(rel_path: &str, content: &str, out: &mut Vec<LocalStaticFinding>) {
@@ -600,7 +727,7 @@ fn scan_crypto_math_patterns(rel_path: &str, content: &str, out: &mut Vec<LocalS
             out.push(mk_finding(
                 "SMG-CRYPTO-001",
                 "HIGH",
-                "Broken symmetric cipher configuration (`AES-ECB` mode or static hardcoded IV)".into(),
+                "Broken symmetric cipher configuration (`AES-ECB` / `DES` / `RC4` or static hardcoded IV)".into(),
                 rel_path,
                 idx + 1,
                 "cipher",
@@ -609,7 +736,7 @@ fn scan_crypto_math_patterns(rel_path: &str, content: &str, out: &mut Vec<LocalS
                 "Switch to authenticated encryption (`AES-256-GCM` or `ChaCha20-Poly1305`) with a fresh CSPRNG nonce per encryption.",
             ));
         } else if !has_const_time_api
-            && secret_timing_cmp_re().is_match(line)
+            && let Some(cap) = secret_timing_cmp_re().captures(line)
             && !line.contains("null")
             && !line.contains("None")
             && !line.contains("nil")
@@ -617,8 +744,9 @@ fn scan_crypto_math_patterns(rel_path: &str, content: &str, out: &mut Vec<LocalS
             && !line.contains("length")
             && !line.contains(".len(")
             && !line.contains("len(")
+            && !is_benign_timing_cmp(&cap[1], &cap[2])
         {
-            out.push(mk_finding(
+            out.push(mk_finding_conf(
                 "SMG-CRYPTO-001",
                 "HIGH",
                 "Non-constant-time (`===` / `==`) comparison of cryptographic HMAC/signature enables timing side-channel".into(),
@@ -627,6 +755,7 @@ fn scan_crypto_math_patterns(rel_path: &str, content: &str, out: &mut Vec<LocalS
                 "signature_compare",
                 SinkKind::Misconfiguration,
                 GuardKind::ConfigPolicy,
+                timing_cmp_confidence(&cap[2]),
                 "Use constant-time comparison (`crypto.timingSafeEqual`, `hmac.compare_digest`, `hmac.Equal`, or `subtle::ConstantTimeEq`).",
             ));
         }
@@ -683,7 +812,7 @@ fn scan_async_queue_context(rel_path: &str, content: &str, out: &mut Vec<LocalSt
             && !has_tenant_or_schema_guard
             && seen_lines.insert(idx)
         {
-            out.push(mk_finding(
+            out.push(mk_finding_conf(
                 "SMG-QUEUE-001",
                 "HIGH",
                 "Async queue worker executes privileged sink directly on job payload without tenant/schema/idempotency validation".into(),
@@ -692,6 +821,7 @@ fn scan_async_queue_context(rel_path: &str, content: &str, out: &mut Vec<LocalSt
                 "async_worker",
                 SinkKind::BalanceUpdate,
                 GuardKind::InputValidation,
+                Confidence::Heuristic,
                 "Propagate verified `tenantId`/`userId` + idempotency key from authenticated producer and validate job schema inside the consumer before sinks.",
             ));
         }
@@ -825,6 +955,20 @@ spec:
         assert!(
             scan_infra_dos_crypto_and_queues("src/crypto.ts", Language::TypeScript, crypto_safe)
                 .is_empty()
+        );
+
+        let benign_digest_go = r#"
+func check(digest, macAddress string) bool {
+    if digest == "" || digest != "" { return false }
+    if digest == "sha256" { return true }
+    if macAddress == "aa:bb:cc:dd:ee:ff" { return false }
+    return true
+}
+"#;
+        assert!(
+            scan_infra_dos_crypto_and_queues("pkg/hash.go", Language::Go, benign_digest_go)
+                .is_empty(),
+            "Benign empty string / algorithm tag / macAddress checks must not trigger SMG-CRYPTO-001"
         );
     }
 }

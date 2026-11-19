@@ -1,5 +1,5 @@
 use smg_core::{IndexedFile, Language, ShellMindGuardConfig};
-use smg_graph::{GraphAnalysisResult, analyze_codebase};
+use smg_graph::{Confidence, GraphAnalysisResult, analyze_codebase};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -1421,6 +1421,290 @@ export async function shipOrderSafe(req, db) {
 "#,
             }],
         },
+        // -----------------------------------------------------------------
+        // 15. Real-World CI-Green Regression & Deep Rule Pack Matrix
+        // -----------------------------------------------------------------
+        AdversarialCase {
+            id: "rw_sec_public_pem_cert_safe",
+            family: "SEC",
+            expected_prefix: "SMG-SEC",
+            expect_finding: false,
+            trap_kind: TrapKind::BaselineSafe,
+            files: vec![
+                BenchFile {
+                    rel_path: ".gitignore",
+                    lang: Language::Config,
+                    code: ".env\n",
+                },
+                BenchFile {
+                    rel_path: "certs/ca-bundle-prod.pem",
+                    lang: Language::Config,
+                    code: concat!(
+                        "-----BEGIN ",
+                        "CERTIFICATE-----\n",
+                        "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA\n",
+                        "-----END ",
+                        "CERTIFICATE-----\n"
+                    ),
+                },
+            ],
+        },
+        AdversarialCase {
+            id: "rw_sec_sops_encrypted_safe",
+            family: "SEC",
+            expected_prefix: "SMG-SEC",
+            expect_finding: false,
+            trap_kind: TrapKind::BaselineSafe,
+            files: vec![BenchFile {
+                rel_path: "deploy/secrets.enc.yaml",
+                lang: Language::Config,
+                code: concat!(
+                    "db_dsn: ENC[AES256_GCM,data:aBcDeFgHiJkLmNoPqRsTuVwXyZ012345,iv:AbCdEf,tag:GhIjKl,type:str]\n",
+                    "sops:\n",
+                    "    mac: ENC[AES256_GCM,data:1234567890AbCdEfGhIjKlMnOpQrStUv,iv:x,tag:y,type:str]\n"
+                ),
+            }],
+        },
+        AdversarialCase {
+            id: "rw_sec_ci_throwaway_dsn_safe",
+            family: "SEC",
+            expected_prefix: "SMG-SEC",
+            expect_finding: false,
+            trap_kind: TrapKind::BaselineSafe,
+            files: vec![BenchFile {
+                rel_path: ".github/workflows/ci.yml",
+                lang: Language::Config,
+                code: concat!(
+                    "jobs:\n  test:\n    env:\n",
+                    "      DATABASE_URL: ",
+                    "postgres://postgres:ci-pass@localhost:5432/testdb\n"
+                ),
+            }],
+        },
+        AdversarialCase {
+            id: "rw_sec_provider_token_pack_vuln",
+            family: "SEC",
+            expected_prefix: "SMG-SEC",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "src/config/tokens.ts",
+                lang: Language::TypeScript,
+                code: concat!(
+                    "export const GL = '",
+                    "glpat-",
+                    "9xKmPq2RtYv8ZwNc3VbH7dFj';\n",
+                    "export const HF = '",
+                    "hf_",
+                    "AbCdEfGhIjKlMnOpQrStUvWxYzAbCdEf';\n"
+                ),
+            }],
+        },
+        AdversarialCase {
+            id: "rw_crypto_empty_digest_safe",
+            family: "CRYPTO",
+            expected_prefix: "SMG-CRYPTO",
+            expect_finding: false,
+            trap_kind: TrapKind::BaselineSafe,
+            files: vec![BenchFile {
+                rel_path: "internal/auth/digest.go",
+                lang: Language::Go,
+                code: r#"
+package auth
+func validateDigest(digest, macAddress string) bool {
+    if digest == "" || digest != "" { return false }
+    if digest == "sha256" { return true }
+    return macAddress != "00:00:00:00:00:00"
+}
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "rw_sqli_go_const_placeholder_builder_safe",
+            family: "SQLI",
+            expected_prefix: "SMG-SQLI",
+            expect_finding: false,
+            trap_kind: TrapKind::CheckedBoundsTrap,
+            files: vec![BenchFile {
+                rel_path: "internal/store/items.go",
+                lang: Language::Go,
+                code: r#"
+package store
+import (
+    "context"
+    "database/sql"
+    "fmt"
+    "strconv"
+    "strings"
+)
+const baseSelect = "SELECT id, name FROM items WHERE org_id = $1"
+var sortColumns = map[string]string{
+    "name": "name",
+    "created": "created_at",
+}
+func ListItems(ctx context.Context, db *sql.DB, orgID, status, sortKey string, ids []string) (*sql.Rows, error) {
+    query := baseSelect
+    args := []any{orgID}
+    if status != "" {
+        args = append(args, status)
+        query += fmt.Sprintf(" AND status = $%d", len(args))
+    }
+    if len(ids) > 0 {
+        placeholders := make([]string, 0, len(ids))
+        for _, id := range ids {
+            args = append(args, id)
+            placeholders = append(placeholders, "$"+strconv.Itoa(len(args)))
+        }
+        query += " AND id IN (" + strings.Join(placeholders, ", ") + ")"
+    }
+    if col, ok := sortColumns[sortKey]; ok {
+        query += " ORDER BY " + col + " DESC"
+    }
+    return db.QueryContext(ctx, query, args...)
+}
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "rw_sqli_go_dynamic_fmt_sprintf_vuln",
+            family: "SQLI",
+            expected_prefix: "SMG-SQLI",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "internal/store/items_vuln.go",
+                lang: Language::Go,
+                code: r#"
+package store
+import (
+    "context"
+    "database/sql"
+    "fmt"
+    "net/http"
+)
+const baseQuery = "SELECT id, name FROM items WHERE org_id = $1"
+func SearchItems(ctx context.Context, db *sql.DB, r *http.Request) (*sql.Rows, error) {
+    name := r.URL.Query().Get("name")
+    q := baseQuery + fmt.Sprintf(" AND name = '%s'", name)
+    return db.QueryContext(ctx, q)
+}
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "rw_auth_go_nested_require_session_safe",
+            family: "AUTH",
+            expected_prefix: "SMG-AUTH",
+            expect_finding: false,
+            trap_kind: TrapKind::OneHopWrapperTrap,
+            files: vec![BenchFile {
+                rel_path: "internal/api/server.go",
+                lang: Language::Go,
+                code: r#"
+package api
+import "net/http"
+func customGate(next http.HandlerFunc) http.HandlerFunc {
+    return func(w http.ResponseWriter, r *http.Request) {
+        sess, ok := loadSess(r)
+        if !ok || sess == nil {
+            http.Error(w, "unauthorized", http.StatusUnauthorized)
+            return
+        }
+        next(w, r)
+    }
+}
+func Register(mux *http.ServeMux) {
+    mux.HandleFunc("POST /api/v1/billing/charge", withTrace(customGate(handleCharge)))
+}
+func handleCharge(w http.ResponseWriter, r *http.Request) {
+    stripe.charges.Create(100)
+}
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "rw_auth_go_unguarded_handle_vuln",
+            family: "AUTH",
+            expected_prefix: "SMG-AUTH",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "internal/api/server_vuln.go",
+                lang: Language::Go,
+                code: r#"
+package api
+import "net/http"
+func RegisterVuln(mux *http.ServeMux) {
+    mux.HandleFunc("POST /api/v1/billing/charge", handleChargeVuln)
+}
+func handleChargeVuln(w http.ResponseWriter, r *http.Request) {
+    stripe.charges.Create(100)
+}
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "rw_fe404_go_scoped_route_and_122_parity_safe",
+            family: "FE",
+            expected_prefix: "SMG-FE-404",
+            expect_finding: false,
+            trap_kind: TrapKind::ScopeCollisionTrap,
+            files: vec![
+                BenchFile {
+                    rel_path: "internal/api/router.go",
+                    lang: Language::Go,
+                    code: r#"
+package api
+import "net/http"
+func Mount(r chi.Router, mux *http.ServeMux) {
+    r.Route("/api/v1", func(r chi.Router) {
+        r.Use(RequireSession)
+        r.Post("/orders", createOrder)
+    })
+    mux.HandleFunc("GET /api/v1/items/{id}", RequireSession(getItem))
+}
+"#,
+                },
+                BenchFile {
+                    rel_path: "web/src/client.tsx",
+                    lang: Language::TypeScript,
+                    code: r#"
+export async function syncData(id: string) {
+    try {
+        await fetch('/api/v1/orders', { method: 'POST' });
+        await fetch('/api/v1/items/' + id);
+    } catch (err) {
+        reportError(err);
+    }
+}
+"#,
+                },
+            ],
+        },
+        AdversarialCase {
+            id: "rw_pack_python_yaml_unsafe_vuln",
+            family: "CMDI",
+            expected_prefix: "SMG-CMDI",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "app/config_loader.py",
+                lang: Language::Python,
+                code: "import yaml\ndef parse_cfg(raw: str):\n    return yaml.load(raw, Loader=yaml.Loader)\n",
+            }],
+        },
+        AdversarialCase {
+            id: "rw_pack_go_weak_tls10_vuln",
+            family: "CFG",
+            expected_prefix: "SMG-CFG-TLS",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "pkg/net/tls.go",
+                lang: Language::Go,
+                code: "package netpkg\nfunc insecureTLS() any {\n    return &tls.Config{MinVersion: tls.VersionTLS10}\n}\n",
+            }],
+        },
     ]
 }
 
@@ -1610,5 +1894,149 @@ fn test_adversarial_precision_recall_and_latency_benchmark() {
         scale_p99 < 2000.0,
         "120-module P99 {:.2}ms >= 2000ms budget",
         scale_p99
+    );
+}
+
+#[test]
+fn test_realworld_ci_green_zero_confirmed_fps() {
+    let files = build_indexed(&[
+        BenchFile {
+            rel_path: ".gitignore",
+            lang: Language::Config,
+            code: ".env\ndist/\n",
+        },
+        BenchFile {
+            rel_path: ".github/workflows/ci.yml",
+            lang: Language::Config,
+            code: concat!(
+                "on: [push]\njobs:\n  test:\n    runs-on: ubuntu-latest\n    env:\n",
+                "      DATABASE_URL: postgres://postgres:ci-pass@localhost:5432/ci\n"
+            ),
+        },
+        BenchFile {
+            rel_path: "certs/public-root.pem",
+            lang: Language::Config,
+            code: concat!(
+                "-----BEGIN ",
+                "CERTIFICATE-----\n",
+                "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA\n",
+                "-----END ",
+                "CERTIFICATE-----\n"
+            ),
+        },
+        BenchFile {
+            rel_path: "deploy/secrets.enc.yaml",
+            lang: Language::Config,
+            code: concat!(
+                "api_key: ENC[AES256_GCM,data:xK9mZp4qR2wL8vN1tY5bC7dF0hJ3nQ==,iv:AbCdEf,tag:GhIjKl,type:str]\n",
+                "sops:\n",
+                "    mac: ENC[AES256_GCM,data:AbCdEfGhIjKlMnOpQrStUvWxYz012345,iv:x,tag:y,type:str]\n"
+            ),
+        },
+        BenchFile {
+            rel_path: "internal/store/orders.go",
+            lang: Language::Go,
+            code: r#"
+package store
+import (
+    "context"
+    "database/sql"
+    "fmt"
+    "strconv"
+    "strings"
+)
+const orderSelectSQL = "SELECT id, status FROM orders WHERE org_id = $1"
+var orderSortMap = map[string]string{"created": "created_at", "total": "total_cents"}
+func QueryOrders(ctx context.Context, db *sql.DB, orgID, status, sortKey string, ids []string) (*sql.Rows, error) {
+    q := orderSelectSQL
+    args := []any{orgID}
+    if status != "" {
+        args = append(args, status)
+        q += fmt.Sprintf(" AND status = $%d", len(args))
+    }
+    if len(ids) > 0 {
+        ph := make([]string, 0, len(ids))
+        for _, id := range ids {
+            args = append(args, id)
+            ph = append(ph, "$"+strconv.Itoa(len(args)))
+        }
+        q += " AND id IN (" + strings.Join(ph, ", ") + ")"
+    }
+    if col, ok := orderSortMap[sortKey]; ok {
+        q += " ORDER BY " + col + " DESC"
+    }
+    return db.QueryContext(ctx, q, args...)
+}
+"#,
+        },
+        BenchFile {
+            rel_path: "internal/http/routes.go",
+            lang: Language::Go,
+            code: r#"
+package httpapi
+import "net/http"
+func RequireSession(next http.HandlerFunc) http.HandlerFunc {
+    return func(w http.ResponseWriter, r *http.Request) {
+        if r.Header.Get("X-Session") == "" {
+            http.Error(w, "unauthorized", http.StatusUnauthorized)
+            return
+        }
+        next(w, r)
+    }
+}
+func verifySig(digest string) bool {
+    if digest == "" { return false }
+    return true
+}
+func Mount(r chi.Router, mux *http.ServeMux) {
+    r.Route("/api/v1", func(r chi.Router) {
+        r.Use(RequireSession)
+        r.Post("/orders", handleCreateOrder)
+    })
+    mux.HandleFunc("GET /api/v1/orders/{id}", RequireSession(handleGetOrder))
+}
+func handleCreateOrder(w http.ResponseWriter, r *http.Request) {
+    tx.Exec("INSERT INTO orders (id) VALUES ($1)", "ok")
+}
+func handleGetOrder(w http.ResponseWriter, r *http.Request) {
+    w.WriteHeader(200)
+}
+"#,
+        },
+        BenchFile {
+            rel_path: "web/src/orders.tsx",
+            lang: Language::TypeScript,
+            code: r#"
+export async function fetchOrders(id: string) {
+    try {
+        await fetch('/api/v1/orders', { method: 'POST' });
+        await fetch('/api/v1/orders/' + id);
+    } catch (err) {
+        reportError(err);
+    }
+}
+"#,
+        },
+    ]);
+
+    let cfg = ShellMindGuardConfig::default();
+    let res = analyze_codebase(&files, &cfg).expect("CI-green integration scan must succeed");
+    let confirmed: Vec<_> = res
+        .findings
+        .iter()
+        .filter(|f| matches!(f.confidence, Confidence::Confirmed | Confidence::Proven))
+        .collect();
+    assert!(
+        confirmed.is_empty(),
+        "CI-green repo must produce 0 CONFIRMED/PROVEN false positives, got: {:?}",
+        confirmed
+            .iter()
+            .map(|f| (&f.rule_id, &f.title, &f.file, f.line, &f.entry_route))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        res.findings.iter().all(|f| f.rule_id != "SMG-FE-404"),
+        "All frontend calls match Go routes; expected 0 SMG-FE-404 findings, got: {:?}",
+        res.findings
     );
 }

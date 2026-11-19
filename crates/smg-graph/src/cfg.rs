@@ -21,6 +21,7 @@ pub struct CfgBlock {
     pub post_guards: GuardBitset,
     pub has_sink: bool,
     pub is_exit: bool,
+    pub is_abort_exit: bool,
 }
 
 /// Evaluates whether guards strictly dominate every reachable sink (or exit block if sinkless
@@ -106,8 +107,14 @@ pub fn compute_cfg_guard_dominance(
             proven = proven.intersect(at_sink);
         }
     } else {
+        let has_normal_exit = builder.blocks.iter().enumerate().any(|(i, b)| {
+            !b.is_abort_exit && b.succs.is_empty() && (i == 0 || !b.preds.is_empty())
+        });
         for (i, b) in builder.blocks.iter().enumerate() {
-            if b.succs.is_empty() && (i == 0 || !b.preds.is_empty()) {
+            if b.succs.is_empty()
+                && (i == 0 || !b.preds.is_empty())
+                && (!has_normal_exit || !b.is_abort_exit)
+            {
                 inspected = true;
                 proven = proven.intersect(out_bits[i]);
             }
@@ -181,6 +188,7 @@ impl<'a> CfgBuilder<'a> {
                 post_guards: entry_guards,
                 has_sink: false,
                 is_exit: false,
+                is_abort_exit: false,
             }],
         }
     }
@@ -197,6 +205,7 @@ impl<'a> CfgBuilder<'a> {
             post_guards: GuardBitset::EMPTY,
             has_sink: false,
             is_exit: false,
+            is_abort_exit: false,
         });
         Some(id)
     }
@@ -249,7 +258,11 @@ impl<'a> CfgBuilder<'a> {
             }
             if matches!(
                 sk,
-                "else_clause" | "statement_block" | "block" | "compound_statement"
+                "else_clause"
+                    | "statement_block"
+                    | "statement_list"
+                    | "block"
+                    | "compound_statement"
             ) {
                 cur_bb = self.lower_block(stmt, cur_bb, depth + 1)?;
                 continue;
@@ -315,6 +328,13 @@ impl<'a> CfgBuilder<'a> {
             self.lower_block(alt, else_start, depth)
         } else {
             // Fallthrough edge (condition false / early-return guard passed).
+            if then_terminated && !cond_guards.is_empty() {
+                for b in &mut self.blocks[then_start..] {
+                    if b.succs.is_empty() {
+                        b.is_abort_exit = true;
+                    }
+                }
+            }
             let fall_bb = self.new_block()?;
             self.link(pre_bb, fall_bb);
             if then_terminated && let Some(b) = self.blocks.get_mut(fall_bb) {
@@ -360,13 +380,27 @@ impl<'a> CfgBuilder<'a> {
                     bits.insert(GuardKind::TxLock);
                 }
             }
-            if (cond_head.contains("req.user")
+            let is_user_forbidden = (cond_head.contains("req.user")
                 || cond_head.contains("session.user")
                 || cond_head.contains("current_user"))
                 && (if_txt.contains("401")
                     || if_txt.contains("403")
-                    || if_txt.contains("unauthoriz"))
-            {
+                    || if_txt.contains("unauthoriz"));
+            let is_unauth_early_exit = (if_txt.contains("401")
+                || if_txt.contains("statusunauthorized")
+                || if_txt.contains("errunauthorized"))
+                && (cond_head.contains("req.")
+                    || cond_head.contains("session")
+                    || cond_head.contains("sess")
+                    || cond_head.contains("user")
+                    || cond_head.contains("auth")
+                    || cond_head.contains("token")
+                    || cond_head.contains("claims")
+                    || cond_head.contains("err != nil")
+                    || cond_head.contains("!ok")
+                    || cond_head.contains("== nil")
+                    || cond_head.contains("== \"\""));
+            if is_user_forbidden || is_unauth_early_exit {
                 bits.insert(GuardKind::Auth);
             }
         }
@@ -417,6 +451,7 @@ fn stmt_unconditionally_exits(stmt: Node, src: &[u8]) -> bool {
         || code.starts_with("raise ")
         || code.contains("bail!(")
         || code.contains("abort(")
+        || code.contains("abortwithstatus")
         || code.contains("http.error(")
         || code.contains("return res.status(")
 }
@@ -473,5 +508,29 @@ mod tests {
             }"#,
         );
         assert!(diamond.contains(&GuardKind::Auth));
+
+        let go_code = r#"
+package main
+func customGate(w http.ResponseWriter, r *http.Request) {
+    sess, ok := getSession(r)
+    if !ok || sess == nil {
+        http.Error(w, "unauthorized", http.StatusUnauthorized)
+        return
+    }
+    chargeAccount()
+}
+"#;
+        let mut gp = Parser::new();
+        gp.set_language(&tree_sitter_go::LANGUAGE.into()).unwrap();
+        let gtree = gp.parse(go_code, None).unwrap();
+        let groot = gtree.root_node();
+        let mut gc = groot.walk();
+        let gfn = groot
+            .children(&mut gc)
+            .find(|n| n.kind() == "function_declaration")
+            .unwrap();
+        let go_guards =
+            compute_cfg_guard_dominance(gfn, go_code.as_bytes(), &ShellMindGuardConfig::default());
+        assert!(go_guards.contains(&GuardKind::Auth));
     }
 }

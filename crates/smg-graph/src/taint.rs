@@ -57,6 +57,8 @@ struct TaintEnv {
     object_cleared_fields: HashMap<(String, String), u8>,
     /// Wave 3A: variables known to hold pure compile-time/string literals (must hold on all paths).
     safe_literals: HashSet<String>,
+    /// Lookup tables/maps whose values are strictly pure literals (`map[string]string{"a": "col_a"}`).
+    safe_literal_maps: HashSet<String>,
     /// Wave 3A: handler/callback lookup maps (`handlers = { a: fnA, b: fnB }`).
     handler_maps: HashMap<String, Vec<String>>,
     /// Wave 3A: local callable alias bound from a handler map (`const fn = handlers[k]`).
@@ -107,6 +109,11 @@ impl TaintEnv {
         // keep only facts guaranteed along BOTH joined control-flow branches.
         self.safe_literals.retain(|k| {
             other.safe_literals.contains(k)
+                && !self.direct.contains_key(k)
+                && !self.params.contains_key(k)
+        });
+        self.safe_literal_maps.retain(|k| {
+            other.safe_literal_maps.contains(k)
                 && !self.direct.contains_key(k)
                 && !self.params.contains_key(k)
         });
@@ -1213,22 +1220,60 @@ fn extract_assigned_targets<'a>(
                 false,
             ))
         }
-        "var_declaration" => {
+        "var_declaration" | "const_declaration" => {
             let mut c = stmt.walk();
             for ch in stmt.children(&mut c) {
-                if ch.kind() == "var_spec"
+                if matches!(ch.kind(), "var_spec" | "const_spec")
                     && let (Some(n), Some(v)) = (
                         ch.child_by_field_name("name"),
                         ch.child_by_field_name("value"),
                     )
                 {
+                    let val_node = if v.kind() == "expression_list" {
+                        v.named_child(0).unwrap_or(v)
+                    } else {
+                        v
+                    };
                     return Some((
                         collect_lhs(n),
                         vec![node_text(n, src).trim().to_string()],
-                        v,
+                        val_node,
                         false,
                     ));
                 }
+            }
+            None
+        }
+        "var_spec" | "const_spec" => {
+            if let (Some(n), Some(v)) = (
+                stmt.child_by_field_name("name"),
+                stmt.child_by_field_name("value"),
+            ) {
+                let val_node = if v.kind() == "expression_list" {
+                    v.named_child(0).unwrap_or(v)
+                } else {
+                    v
+                };
+                return Some((
+                    collect_lhs(n),
+                    vec![node_text(n, src).trim().to_string()],
+                    val_node,
+                    false,
+                ));
+            }
+            None
+        }
+        "const_item" | "static_item" => {
+            if let (Some(n), Some(v)) = (
+                stmt.child_by_field_name("name"),
+                stmt.child_by_field_name("value"),
+            ) {
+                return Some((
+                    collect_lhs(n),
+                    vec![node_text(n, src).trim().to_string()],
+                    v,
+                    false,
+                ));
             }
             None
         }
@@ -1551,13 +1596,29 @@ fn ast_eval_masks(node: Node, src: &[u8], env: &TaintEnv) -> (u8, u8) {
         "member_expression"
             | "attribute"
             | "subscript_expression"
+            | "index_expression"
             | "field_expression"
             | "selector_expression"
     ) {
         if has_taint_source_expr(txt) {
             return (TAINT_ALL, 0);
         }
+        if matches!(k, "subscript_expression" | "index_expression")
+            && let Some(obj) = node
+                .child_by_field_name("object")
+                .or_else(|| node.child_by_field_name("value"))
+                .or_else(|| node.child_by_field_name("operand"))
+        {
+            let obj_name = node_text(obj, src).trim();
+            if is_plain_ident(obj_name) && env.safe_literal_maps.contains(obj_name) {
+                // Static constant lookup table (`map[string]string{"name": "col_name"}`) only yields literals.
+                return (0, 0);
+            }
+        }
         if let Some((base, field)) = extract_member_base_field(node, src) {
+            if matches!(field.as_str(), "length" | "len" | "size" | "count") {
+                return (0, 0);
+            }
             let f_direct = env
                 .field_direct
                 .get(&(base.clone(), field.clone()))
@@ -1606,6 +1667,12 @@ fn ast_eval_masks(node: Node, src: &[u8], env: &TaintEnv) -> (u8, u8) {
             .child_by_field_name("function")
             .map(|f| node_text(f, src).trim())
             .unwrap_or("");
+        if is_safe_numeric_or_len_call(ftxt) && !has_taint_source_expr(txt) {
+            return (0, 0);
+        }
+        if is_safe_fmt_or_join_call(node, src, env) {
+            return (0, 0);
+        }
         let mut d = 0u8;
         let mut p = 0u8;
         if has_taint_source_expr(ftxt)
@@ -1776,17 +1843,113 @@ fn is_non_sql_log_or_ui_stmt(stmt_code: &str) -> bool {
         || trimmed.starts_with("throw new Error(")
 }
 
+fn is_safe_numeric_or_len_call(ftxt: &str) -> bool {
+    matches!(
+        ftxt,
+        "len"
+            | "cap"
+            | "strconv.Itoa"
+            | "strconv.FormatInt"
+            | "strconv.FormatUint"
+            | "strconv.FormatBool"
+            | "parseInt"
+            | "parseFloat"
+            | "Number"
+            | "Number.parseInt"
+            | "Number.parseFloat"
+            | "int"
+            | "float"
+            | "uint"
+            | "usize"
+            | "isize"
+    ) || ftxt.ends_with(".len")
+        || ftxt.ends_with(".length")
+        || ftxt.ends_with(".count")
+        || ftxt.ends_with(".Count")
+        || ftxt.ends_with(".size")
+        || ftxt.ends_with(".Size")
+}
+
+fn extract_call_args_nodes<'a>(node: Node<'a>) -> Vec<Node<'a>> {
+    let Some(an) = node.child_by_field_name("arguments") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut c = an.walk();
+    for ch in an.children(&mut c) {
+        if !matches!(ch.kind(), "(" | ")" | "," | "comment") {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn is_plain_string_lit_node(node: Node, src: &[u8]) -> bool {
+    let k = node.kind();
+    let txt = node_text(node, src).trim();
+    matches!(
+        k,
+        "string" | "string_literal" | "interpreted_string_literal" | "raw_string_literal"
+    ) && !txt.starts_with("f\"")
+        && !txt.starts_with("f'")
+        && !txt.contains("${")
+}
+
+fn is_safe_fmt_or_join_call(node: Node, src: &[u8], env: &TaintEnv) -> bool {
+    let Some(func) = node.child_by_field_name("function") else {
+        return false;
+    };
+    let ftxt = node_text(func, src).trim();
+    let args = extract_call_args_nodes(node);
+    if ftxt == "fmt.Sprintf" || ftxt.ends_with(".Sprintf") || ftxt == "String.format" {
+        return !args.is_empty()
+            && is_plain_string_lit_node(args[0], src)
+            && args[1..]
+                .iter()
+                .all(|a| is_pure_safe_literal_expr(*a, src, env));
+    }
+    if ftxt == "strings.Join" || ftxt == "strings.Repeat" {
+        return !args.is_empty() && args.iter().all(|a| is_pure_safe_literal_expr(*a, src, env));
+    }
+    if ftxt == "make" {
+        return args.iter().all(|a| {
+            let ak = a.kind();
+            ak.contains("type")
+                || ak == "slice_type"
+                || ak == "map_type"
+                || ak == "type_identifier"
+                || is_pure_safe_literal_expr(*a, src, env)
+        });
+    }
+    if ftxt == "append" && !args.is_empty() {
+        return is_pure_safe_literal_expr(args[0], src, env)
+            && args[1..]
+                .iter()
+                .all(|a| is_pure_safe_literal_expr(*a, src, env));
+    }
+    false
+}
+
 fn is_pure_safe_literal_expr(node: Node, src: &[u8], env: &TaintEnv) -> bool {
     let k = node.kind();
     let txt = node_text(node, src).trim();
     if txt.is_empty() {
         return false;
     }
+    if k == "expression_list" {
+        let mut c = node.walk();
+        let items: Vec<Node> = node.named_children(&mut c).collect();
+        return !items.is_empty()
+            && items
+                .iter()
+                .all(|ch| is_pure_safe_literal_expr(*ch, src, env));
+    }
     if matches!(
         k,
         "number"
             | "integer_literal"
             | "float_literal"
+            | "int_literal"
             | "true"
             | "false"
             | "boolean_literal"
@@ -1877,9 +2040,57 @@ fn is_pure_safe_literal_expr(node: Node, src: &[u8], env: &TaintEnv) -> bool {
         return saw_sub;
     }
     if k == "identifier" {
-        return env.safe_literals.contains(txt)
+        return (env.safe_literals.contains(txt) || env.safe_literal_maps.contains(txt))
             && !env.direct.contains_key(txt)
             && !env.params.contains_key(txt);
+    }
+    if matches!(k, "subscript_expression" | "index_expression")
+        && let Some(obj) = node
+            .child_by_field_name("object")
+            .or_else(|| node.child_by_field_name("value"))
+            .or_else(|| node.child_by_field_name("operand"))
+    {
+        let obj_name = node_text(obj, src).trim();
+        if is_plain_ident(obj_name) && env.safe_literal_maps.contains(obj_name) {
+            return true;
+        }
+    }
+    if matches!(
+        k,
+        "member_expression" | "attribute" | "field_expression" | "selector_expression"
+    ) && !has_taint_source_expr(txt)
+        && let Some((_, field)) = extract_member_base_field(node, src)
+        && matches!(field.as_str(), "length" | "len" | "size" | "count")
+    {
+        return true;
+    }
+    if k == "call_expression" || k == "call" {
+        let ftxt = node
+            .child_by_field_name("function")
+            .map(|f| node_text(f, src).trim())
+            .unwrap_or("");
+        if is_safe_numeric_or_len_call(ftxt) || is_safe_fmt_or_join_call(node, src, env) {
+            return true;
+        }
+        if matches!(ftxt, "make" | "[]string" | "[]any") && !has_taint_source_expr(txt) {
+            return true;
+        }
+    }
+    if matches!(k, "composite_literal" | "slice_expression")
+        && !has_taint_source_expr(txt)
+        && (txt.starts_with("[]string{}")
+            || txt.starts_with("[]interface{}{}")
+            || txt.starts_with("[]any{}"))
+    {
+        return true;
+    }
+    if matches!(k, "ternary_expression" | "conditional_expression") {
+        let cons = node.child_by_field_name("consequence");
+        let alt = node.child_by_field_name("alternative");
+        if let (Some(cn), Some(an)) = (cons, alt) {
+            return is_pure_safe_literal_expr(cn, src, env)
+                && is_pure_safe_literal_expr(an, src, env);
+        }
     }
     if k == "parenthesized_expression" {
         let mut c = node.walk();
@@ -1889,11 +2100,13 @@ fn is_pure_safe_literal_expr(node: Node, src: &[u8], env: &TaintEnv) -> bool {
             .collect();
         return inner.len() == 1 && is_pure_safe_literal_expr(inner[0], src, env);
     }
-    if matches!(k, "binary_expression" | "binary_operator") && txt.contains('+') {
+    if matches!(k, "binary_expression" | "binary_operator")
+        && (txt.contains('+') || txt.contains('-') || txt.contains('*') || txt.contains('/'))
+    {
         let mut c = node.walk();
         let mut any_child = false;
         for ch in node.children(&mut c) {
-            if ch.kind() == "+" || ch.kind() == "comment" {
+            if matches!(ch.kind(), "+" | "-" | "*" | "/" | "comment") {
                 continue;
             }
             any_child = true;
@@ -1950,43 +2163,95 @@ fn extract_callable_target_name(node: Node, src: &[u8]) -> Option<String> {
     None
 }
 
-fn collect_file_handler_maps(fn_node: Node, src: &[u8]) -> HashMap<String, Vec<String>> {
-    let mut maps: HashMap<String, Vec<String>> = HashMap::new();
+fn collect_top_level_bindings<'a>(fn_node: Node<'a>, src: &[u8]) -> Vec<(String, Node<'a>)> {
+    let mut out = Vec::new();
     let mut root = fn_node;
     while let Some(p) = root.parent() {
         root = p;
     }
     let mut cursor = root.walk();
     for top in root.children(&mut cursor) {
-        let mut stmts = vec![top];
+        let mut nodes = vec![top];
         if top.kind() == "export_statement"
             && let Some(decl) = top.child_by_field_name("declaration")
         {
-            stmts.push(decl);
+            nodes.push(decl);
         }
-        for stmt in stmts {
-            if let Some((lhs_names, _, rhs_node, is_aug)) = extract_assigned_targets(stmt, src)
-                && !is_aug
-                && lhs_names.len() == 1
-            {
-                let pairs = extract_object_pairs(rhs_node, src);
-                if !pairs.is_empty() {
-                    let mut targets = Vec::new();
-                    for (_, vn) in pairs {
-                        if let Some(t) = extract_callable_target_name(vn, src)
-                            && !targets.contains(&t)
-                        {
-                            targets.push(t);
-                        }
-                    }
-                    if !targets.is_empty() {
-                        maps.insert(lhs_names[0].clone(), targets);
+        for stmt in nodes {
+            if matches!(stmt.kind(), "const_declaration" | "var_declaration") {
+                let mut sc = stmt.walk();
+                for spec in stmt.children(&mut sc) {
+                    if matches!(spec.kind(), "const_spec" | "var_spec")
+                        && let Some((lhs, _, val, is_aug)) = extract_assigned_targets(spec, src)
+                        && !is_aug
+                        && lhs.len() == 1
+                    {
+                        out.push((lhs[0].clone(), val));
                     }
                 }
+            } else if let Some((lhs, _, val, is_aug)) = extract_assigned_targets(stmt, src)
+                && !is_aug
+                && lhs.len() == 1
+            {
+                out.push((lhs[0].clone(), val));
+            }
+        }
+    }
+    out
+}
+
+fn collect_file_handler_maps(fn_node: Node, src: &[u8]) -> HashMap<String, Vec<String>> {
+    let mut maps: HashMap<String, Vec<String>> = HashMap::new();
+    for (name, rhs_node) in collect_top_level_bindings(fn_node, src) {
+        let pairs = extract_object_pairs(rhs_node, src);
+        if !pairs.is_empty() {
+            let mut targets = Vec::new();
+            for (_, vn) in pairs {
+                if let Some(t) = extract_callable_target_name(vn, src)
+                    && !targets.contains(&t)
+                {
+                    targets.push(t);
+                }
+            }
+            if !targets.is_empty() {
+                maps.insert(name, targets);
             }
         }
     }
     maps
+}
+
+fn collect_file_safe_literals_and_const_maps(
+    fn_node: Node,
+    src: &[u8],
+) -> (HashSet<String>, HashSet<String>) {
+    let bindings = collect_top_level_bindings(fn_node, src);
+    let mut safe_lits: HashSet<String> = HashSet::new();
+    let mut safe_maps: HashSet<String> = HashSet::new();
+    let mut tmp_env = TaintEnv::default();
+
+    for (name, rhs_node) in &bindings {
+        let pairs = extract_object_pairs(*rhs_node, src);
+        if !pairs.is_empty()
+            && pairs
+                .iter()
+                .all(|(_, vn)| is_pure_safe_literal_expr(*vn, src, &tmp_env))
+        {
+            safe_maps.insert(name.clone());
+        }
+    }
+    tmp_env.safe_literal_maps = safe_maps.clone();
+
+    for _ in 0..2 {
+        for (name, rhs_node) in &bindings {
+            if is_pure_safe_literal_expr(*rhs_node, src, &tmp_env) {
+                safe_lits.insert(name.clone());
+            }
+        }
+        tmp_env.safe_literals = safe_lits.clone();
+    }
+
+    (safe_lits, safe_maps)
 }
 
 fn has_dynamic_sql_interpolation_with_env(node: Node, src: &[u8], env: Option<&TaintEnv>) -> bool {
@@ -2022,6 +2287,11 @@ fn has_dynamic_sql_interpolation_with_env(node: Node, src: &[u8], env: Option<&T
             || ftxt.ends_with(".format")
             || ftxt.ends_with(".concat")
         {
+            if let Some(e) = env
+                && is_pure_safe_literal_expr(node, src, e)
+            {
+                return false;
+            }
             return true;
         }
     }
@@ -2452,31 +2722,54 @@ fn check_call_taint_sinks(
             }
         }
 
-        // 0. SQL Execution Sink with tainted first argument (`db.query(q)` where `q` is tainted variable)
-        let is_sql_exec_sink = matches!(
-            ftxt,
-            "db.query"
-                | "db.queryRow"
-                | "db.exec"
-                | "db.prepare"
-                | "db.raw"
-                | "tx.query"
-                | "tx.exec"
-                | "pool.query"
-                | "pool.execute"
-                | "client.query"
-                | "cursor.execute"
-                | "session.execute"
-                | "conn.execute"
-                | "conn.fetch"
-                | "knex.raw"
-                | "sequelize.query"
-                | "sequelize.literal"
-                | "queryRunner.query"
-                | "entityManager.query"
-                | "sql.unsafe"
-                | "sqlx::query"
-        ) || ftxt.ends_with(".$queryRawUnsafe")
+        // 0. SQL Execution Sink with tainted query argument (`db.query(q)` or `db.QueryContext(ctx, q, ...)`)
+        let is_ctx_sql_sink = ftxt.ends_with(".QueryContext")
+            || ftxt.ends_with(".QueryRowContext")
+            || ftxt.ends_with(".ExecContext")
+            || ftxt == "sqlx.Select"
+            || ftxt == "sqlx.Get";
+        let is_sql_exec_sink = is_ctx_sql_sink
+            || matches!(
+                ftxt,
+                "db.query"
+                    | "db.Query"
+                    | "db.queryRow"
+                    | "db.QueryRow"
+                    | "db.exec"
+                    | "db.Exec"
+                    | "db.prepare"
+                    | "db.Prepare"
+                    | "db.raw"
+                    | "tx.query"
+                    | "tx.Query"
+                    | "tx.queryRow"
+                    | "tx.QueryRow"
+                    | "tx.exec"
+                    | "tx.Exec"
+                    | "conn.Query"
+                    | "conn.QueryRow"
+                    | "conn.Exec"
+                    | "pool.query"
+                    | "pool.Query"
+                    | "pool.QueryRow"
+                    | "pool.Exec"
+                    | "pool.execute"
+                    | "client.query"
+                    | "cursor.execute"
+                    | "cursor.executemany"
+                    | "session.execute"
+                    | "conn.execute"
+                    | "conn.fetch"
+                    | "knex.raw"
+                    | "sequelize.query"
+                    | "sequelize.literal"
+                    | "queryRunner.query"
+                    | "entityManager.query"
+                    | "sql.unsafe"
+                    | "sql.raw"
+                    | "sqlx::query"
+            )
+            || ftxt.ends_with(".$queryRawUnsafe")
             || ftxt.ends_with(".$executeRawUnsafe")
             || ftxt.ends_with(".whereRaw")
             || ftxt.ends_with(".havingRaw")
@@ -2487,10 +2780,19 @@ fn check_call_taint_sinks(
             && let Some(an) = args_node
         {
             let mut ac = an.walk();
-            if let Some(arg0) = an
+            let args_vec: Vec<Node> = an
                 .children(&mut ac)
-                .find(|a| !matches!(a.kind(), "(" | ")" | ","))
-            {
+                .filter(|a| !matches!(a.kind(), "(" | ")" | "," | "comment"))
+                .collect();
+            let query_arg_opt = if is_ctx_sql_sink {
+                args_vec
+                    .get(1)
+                    .copied()
+                    .or_else(|| args_vec.first().copied())
+            } else {
+                args_vec.first().copied()
+            };
+            if let Some(arg0) = query_arg_opt {
                 let arg0_txt = node_text(arg0, src).trim();
                 let is_plain_string_lit = matches!(
                     arg0.kind(),
@@ -2501,6 +2803,7 @@ fn check_call_taint_sinks(
                 ) && !arg0_txt.starts_with("f\"")
                     && !arg0_txt.starts_with("f'");
                 if !is_plain_string_lit
+                    && !is_pure_safe_literal_expr(arg0, src, env)
                     && let Some((tkind, _)) = ast_sink_status(arg0, src, TAINT_SQL, env)
                 {
                     let hit = LocalStaticFinding {
@@ -2829,13 +3132,33 @@ fn extract_object_pairs<'a>(rhs: Node<'a>, src: &[u8]) -> Vec<(Option<String>, N
     let k = rhs.kind();
     if !matches!(
         k,
-        "object" | "dictionary" | "struct_expression" | "composite_literal"
+        "object" | "dictionary" | "struct_expression" | "composite_literal" | "literal_value"
     ) {
         return pairs;
     }
     let mut c = rhs.walk();
     for ch in rhs.children(&mut c) {
         match ch.kind() {
+            "literal_value" => {
+                pairs.extend(extract_object_pairs(ch, src));
+            }
+            "keyed_element" => {
+                let mut kc = ch.walk();
+                let named: Vec<Node> = ch.named_children(&mut kc).collect();
+                if named.len() >= 2 {
+                    let key_n = named[0].named_child(0).unwrap_or(named[0]);
+                    let val_n = named[1].named_child(0).unwrap_or(named[1]);
+                    let key = node_text(key_n, src)
+                        .trim()
+                        .trim_matches(|q| q == '"' || q == '\'' || q == '`')
+                        .to_string();
+                    if is_plain_ident(&key) {
+                        pairs.push((Some(key), val_n));
+                    } else if !key.is_empty() {
+                        pairs.push((None, val_n));
+                    }
+                }
+            }
             "pair" => {
                 if let (Some(kn), Some(vn)) = (
                     ch.child_by_field_name("key"),
@@ -3115,6 +3438,8 @@ fn analyze_statement_block_depth(
                 | "with_statement"
                 | "match_expression"
                 | "switch_statement"
+                | "expression_switch_statement"
+                | "type_switch_statement"
                 | "statement_block"
                 | "block"
         );
@@ -3252,6 +3577,7 @@ fn analyze_statement_block_depth(
                 || expr_references_any(rhs_txt, &env.sql_vars);
 
             if !rhs_is_safe_tagged_sql
+                && !is_pure_safe_literal_expr(rhs_node, src, env)
                 && ((rhs_direct_mask & TAINT_SQL != 0) || (rhs_param_mask & TAINT_SQL != 0))
                 && touches_sql_var
                 && (is_aug || rhs_txt.contains('+') || rhs_txt.contains("${"))
@@ -3407,6 +3733,7 @@ fn analyze_statement_block_depth(
                         }
                     }
                 } else {
+                    let rhs_is_safe_lit = is_pure_safe_literal_expr(rhs_node, src, env);
                     for n in lhs_names {
                         if is_aug {
                             if rhs_direct_mask != 0 {
@@ -3414,6 +3741,9 @@ fn analyze_statement_block_depth(
                             }
                             if rhs_param_mask != 0 {
                                 *env.params.entry(n.clone()).or_insert(0) |= rhs_param_mask;
+                            }
+                            if rhs_direct_mask != 0 || rhs_param_mask != 0 || !rhs_is_safe_lit {
+                                env.safe_literals.remove(&n);
                             }
                         } else {
                             if rhs_direct_mask != 0 {
@@ -3428,10 +3758,7 @@ fn analyze_statement_block_depth(
                             } else {
                                 env.params.remove(&n);
                             }
-                            if rhs_direct_mask == 0
-                                && rhs_param_mask == 0
-                                && is_pure_safe_literal_expr(rhs_node, src, env)
-                            {
+                            if rhs_direct_mask == 0 && rhs_param_mask == 0 && rhs_is_safe_lit {
                                 env.safe_literals.insert(n.clone());
                             } else {
                                 env.safe_literals.remove(&n);
@@ -3464,6 +3791,14 @@ fn analyze_statement_block_depth(
                             }
                             if !obj_pairs.is_empty() {
                                 env.object_vars.insert(n.clone());
+                                if obj_pairs
+                                    .iter()
+                                    .all(|(_, vn)| is_pure_safe_literal_expr(*vn, src, env))
+                                {
+                                    env.safe_literal_maps.insert(n.clone());
+                                } else {
+                                    env.safe_literal_maps.remove(&n);
+                                }
                                 let mut handler_targets = Vec::new();
                                 for (k_opt, vn) in &obj_pairs {
                                     if let Some(target_fn) = extract_callable_target_name(*vn, src)
@@ -3511,6 +3846,8 @@ fn analyze_statement_block_depth(
                                 if !handler_targets.is_empty() {
                                     env.handler_maps.insert(n.clone(), handler_targets);
                                 }
+                            } else {
+                                env.safe_literal_maps.remove(&n);
                             }
                         }
                     }
@@ -3600,6 +3937,8 @@ fn analyze_statement_block_depth(
                         | "switch_body"
                         | "switch_case"
                         | "switch_default"
+                        | "expression_case"
+                        | "default_case"
                         | "match_block"
                         | "match_arm"
                 ) {
@@ -3654,7 +3993,11 @@ pub fn analyze_function_taint(
         .map(|b| strip_comments_simple(node_text(b, src)))
         .unwrap_or_default();
 
+    let (file_safe_literals, file_safe_maps) =
+        collect_file_safe_literals_and_const_maps(fn_node, src);
     let mut env = TaintEnv {
+        safe_literals: file_safe_literals,
+        safe_literal_maps: file_safe_maps,
         handler_maps: collect_file_handler_maps(fn_node, src),
         ..Default::default()
     };
@@ -3904,18 +4247,30 @@ pub fn extract_frontend_calls_and_bugs(
                 .find(|a| !matches!(a.kind(), "(" | ")" | ","));
             if let Some(arg0) = first_arg {
                 let raw_arg = if arg0.kind() == "binary_expression" {
-                    arg0.child_by_field_name("left")
-                        .map(|l| {
-                            let s = node_text(l, src)
-                                .trim()
-                                .trim_matches(|ch| ch == '\'' || ch == '"' || ch == '`');
-                            if s.starts_with("/api/") {
-                                format!("{}/*", s.trim_end_matches('/'))
-                            } else {
-                                String::new()
-                            }
-                        })
-                        .unwrap_or_default()
+                    let mut leaves = Vec::new();
+                    collect_plus_leaves(arg0, &mut leaves);
+                    let mut rebuilt = String::new();
+                    for leaf in leaves {
+                        if is_plain_string_lit_node(leaf, src) {
+                            rebuilt.push_str(
+                                node_text(leaf, src)
+                                    .trim()
+                                    .trim_matches(|ch| ch == '\'' || ch == '"' || ch == '`'),
+                            );
+                        } else if !rebuilt.is_empty()
+                            && !rebuilt.ends_with('/')
+                            && !rebuilt.contains('?')
+                        {
+                            rebuilt.push_str("/*");
+                        } else {
+                            rebuilt.push('*');
+                        }
+                    }
+                    if rebuilt.starts_with("/api/") {
+                        rebuilt
+                    } else {
+                        String::new()
+                    }
                 } else {
                     node_text(arg0, src)
                         .trim()

@@ -9,6 +9,7 @@ pub mod lattice;
 pub mod phase10;
 pub mod phase9;
 pub mod protocols_ai;
+pub mod rule_pack;
 pub mod rules;
 pub mod scope;
 pub mod secrets_config;
@@ -44,7 +45,7 @@ fn load_or_parse_summaries_cached(
     let cfg_json = serde_json::to_string(&cfg.guards).unwrap_or_default();
     let adv_stamp = smg_core::advisories_db_stamp();
     let versioned_cfg = format!(
-        "v17-web3-sol-move-clean-{}|{}|{}",
+        "v18-precision-deep-rulepack-{}|{}|{}",
         env!("CARGO_PKG_VERSION"),
         adv_stamp,
         cfg_json

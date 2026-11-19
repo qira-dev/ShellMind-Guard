@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::sync::OnceLock;
 
 #[allow(clippy::too_many_arguments)]
-fn mk_finding(
+fn mk_finding_conf(
     rule_id: &str,
     severity: &str,
     title: String,
@@ -14,6 +14,7 @@ fn mk_finding(
     symbol: &str,
     sink_kind: SinkKind,
     missing_guard: GuardKind,
+    confidence: Confidence,
     remediation: &str,
 ) -> LocalStaticFinding {
     LocalStaticFinding {
@@ -25,9 +26,35 @@ fn mk_finding(
         symbol: symbol.to_string(),
         sink_kind,
         missing_guard,
-        confidence: Confidence::Confirmed,
+        confidence,
         remediation: remediation.to_string(),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mk_finding(
+    rule_id: &str,
+    severity: &str,
+    title: String,
+    rel_path: &str,
+    line: usize,
+    symbol: &str,
+    sink_kind: SinkKind,
+    missing_guard: GuardKind,
+    remediation: &str,
+) -> LocalStaticFinding {
+    mk_finding_conf(
+        rule_id,
+        severity,
+        title,
+        rel_path,
+        line,
+        symbol,
+        sink_kind,
+        missing_guard,
+        Confidence::Confirmed,
+        remediation,
+    )
 }
 
 fn push_unique(out: &mut Vec<LocalStaticFinding>, hit: LocalStaticFinding) {
@@ -116,7 +143,7 @@ fn scan_graphql_ws_grpc(
                 if !gated_env {
                     push_unique(
                         out,
-                        mk_finding(
+                        mk_finding_conf(
                             "SMG-API-001",
                             "MEDIUM",
                             "GraphQL introspection unconditionally enabled in server configuration"
@@ -126,6 +153,7 @@ fn scan_graphql_ws_grpc(
                             "graphql-introspection",
                             SinkKind::Misconfiguration,
                             GuardKind::ConfigPolicy,
+                            Confidence::Heuristic,
                             "Disable `introspection` in production (`introspection: process.env.NODE_ENV !== 'production'`).",
                         ),
                     );
@@ -147,7 +175,7 @@ fn scan_graphql_ws_grpc(
                 if !has_depth_guard {
                     push_unique(
                         out,
-                        mk_finding(
+                        mk_finding_conf(
                             "SMG-API-001",
                             "HIGH",
                             "GraphQL server lacks query depth or complexity limiting (`depthLimit` / `validationRules`)"
@@ -157,6 +185,7 @@ fn scan_graphql_ws_grpc(
                             "graphql-depth",
                             SinkKind::Misconfiguration,
                             GuardKind::ConfigPolicy,
+                            Confidence::Heuristic,
                             "Add query depth & complexity guards (e.g. `validationRules: [depthLimit(7)]`) to prevent deeply nested DoS queries.",
                         ),
                     );
@@ -348,7 +377,7 @@ fn scan_ai_prompt_and_agent_tools(
             {
                 push_unique(
                     out,
-                    mk_finding(
+                    mk_finding_conf(
                         "SMG-AI-001",
                         "HIGH",
                         "Agent tool-calling loop lacks bounded step/iteration limit (`maxSteps`)"
@@ -358,6 +387,7 @@ fn scan_ai_prompt_and_agent_tools(
                         "agent-tool-loop",
                         SinkKind::CommandInjection,
                         GuardKind::CmdSanitizer,
+                        Confidence::Heuristic,
                         "Enforce an explicit `maxSteps` iteration cap, tool allowlist, and user confirmation before running side-effecting agent actions.",
                     ),
                 );
@@ -456,7 +486,7 @@ fn scan_oauth_pkce_state_redirect(
             if !has_state || !has_pkce {
                 push_unique(
                     out,
-                    mk_finding(
+                    mk_finding_conf(
                         "SMG-AUTH-PKCE",
                         "HIGH",
                         "OAuth2 authorization flow missing PKCE (`code_challenge`) or CSRF `state` binding".into(),
@@ -465,6 +495,7 @@ fn scan_oauth_pkce_state_redirect(
                         "oauth-authorize",
                         SinkKind::AuthMutation,
                         GuardKind::Auth,
+                        Confidence::Heuristic,
                         "Generate cryptographic per-session `state` and PKCE `code_challenge` (`S256`) on authorize requests, and verify `state` & `code_verifier` on callback.",
                     ),
                 );
@@ -631,7 +662,7 @@ fn scan_workflow_state_machine(rel_path: &str, lines: &[&str], out: &mut Vec<Loc
         if mutates_state && !checks_prior_state {
             push_unique(
                 out,
-                mk_finding(
+                mk_finding_conf(
                     "SMG-STATE-001",
                     "HIGH",
                     "Workflow state transition mutates fulfillment/payout/refund status without asserting prerequisite state".into(),
@@ -640,6 +671,7 @@ fn scan_workflow_state_machine(rel_path: &str, lines: &[&str], out: &mut Vec<Loc
                     "workflow-state-transition",
                     SinkKind::BalanceUpdate,
                     GuardKind::InputValidation,
+                    Confidence::Heuristic,
                     "Enforce an explicit finite-state transition guard (`if (order.status !== 'PAID') throw ...` AND atomic `WHERE id = $1 AND status = 'PAID'`) before granting fulfillment or payout.",
                 ),
             );

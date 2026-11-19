@@ -211,6 +211,9 @@ pub struct SymbolInfo {
     /// Phase 10: `(callee, wrapper_fn, field, mask)` for inter-procedural wrapper suppression.
     #[serde(default)]
     pub tainted_call_wrappers: Vec<(String, String, Option<String>, u8)>,
+    /// Route middleware wrapper callees (e.g. `RequireSession(h)`, `r.With(mw)`).
+    #[serde(default)]
+    pub middleware_callees: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -288,6 +291,7 @@ impl SymbolInfo {
             callback_forwards: Vec::new(),
             local_hit_wrappers: Vec::new(),
             tainted_call_wrappers: Vec::new(),
+            middleware_callees: Vec::new(),
         }
     }
 
@@ -359,11 +363,11 @@ pub fn parse_file_ast_with_hash(
     } else {
         blake3::hash(bytes).to_hex().to_string()
     };
-    let is_sensitive = crate::secrets_config::is_sensitive_env_or_pem(&file.rel_path);
+    let is_sensitive_path = crate::secrets_config::is_sensitive_env_or_pem(&file.rel_path);
     let source = match std::str::from_utf8(bytes) {
         Ok(s) => s,
         Err(_) => {
-            if is_sensitive {
+            if is_sensitive_path {
                 return Some((
                     actual_hash,
                     FileAstSummary {
@@ -376,6 +380,8 @@ pub fn parse_file_ast_with_hash(
             return None;
         }
     };
+    let is_sensitive =
+        crate::secrets_config::is_sensitive_env_or_pem_with_content(&file.rel_path, source);
 
     let gitignore_lines = if Path::new(&file.rel_path)
         .file_name()
@@ -400,6 +406,14 @@ pub fn parse_file_ast_with_hash(
             file.language,
             source,
         ));
+        for pf in crate::rule_pack::scan_rule_pack(&file.rel_path, file.language, source) {
+            if !static_findings
+                .iter()
+                .any(|x| x.rule_id == pf.rule_id && x.line == pf.line)
+            {
+                static_findings.push(pf);
+            }
+        }
     }
     if matches!(file.language, Language::Manifest) {
         static_findings.extend(crate::deps::scan_dependencies(&file.rel_path, source));
@@ -639,7 +653,15 @@ pub(crate) fn strip_comments(src: &str) -> String {
 
 pub(crate) fn is_auth_guard_ident(name: &str, cfg: &ShellMindGuardConfig) -> bool {
     let low = name.to_ascii_lowercase();
-    if low.contains("unauthenticated") || low.contains("allowanonymous") {
+    if low.contains("unauthenticated")
+        || low.contains("allowanonymous")
+        || low.contains("optionalauth")
+        || low.contains("optional_auth")
+        || low.contains("noauth")
+        || low.contains("no_auth")
+        || low.contains("skipauth")
+        || low.contains("skip_auth")
+    {
         return false;
     }
     cfg.guards.auth_guards.iter().any(|pat| {
@@ -660,6 +682,19 @@ pub(crate) fn contains_guard_pattern(low_text: &str, pat_low: &str) -> bool {
     if pat_low == "authenticate" && low_text.contains("unauthenticated") {
         let cleaned = low_text.replace("unauthenticated", "");
         return cleaned.contains("authenticate");
+    }
+    if (pat_low.contains("auth") || pat_low.contains("session"))
+        && (low_text.contains("optionalauth")
+            || low_text.contains("optional_auth")
+            || low_text.contains("skipauth")
+            || low_text.contains("noauth"))
+    {
+        let cleaned = low_text
+            .replace("optionalauth", "")
+            .replace("optional_auth", "")
+            .replace("skipauth", "")
+            .replace("noauth", "");
+        return cleaned.contains(pat_low);
     }
     if pat_low == "useguards"
         && (low_text.contains("throttlerguard") || low_text.contains("ratelimitguard"))
@@ -757,13 +792,52 @@ pub(crate) fn stmt_has_sink_or_mutation(stmt: Node, src: &[u8]) -> bool {
         || txt.contains("balance")
 }
 
+fn collect_returned_closures<'a>(node: Node<'a>, out: &mut Vec<Node<'a>>) {
+    let mut stack = vec![(node, 0usize)];
+    while let Some((cur, d)) = stack.pop() {
+        if d > 6 {
+            continue;
+        }
+        if cur.kind() == "return_statement" {
+            let mut rc = cur.walk();
+            for ret_expr in cur.children(&mut rc) {
+                if let Some(closure) = find_inline_fn_node(ret_expr) {
+                    out.push(closure);
+                }
+            }
+            continue;
+        }
+        if matches!(
+            cur.kind(),
+            "function_declaration" | "method_declaration" | "func_literal" | "arrow_function"
+        ) && cur.id() != node.id()
+        {
+            continue;
+        }
+        let mut c = cur.walk();
+        for ch in cur.children(&mut c) {
+            stack.push((ch, d + 1));
+        }
+    }
+}
+
 /// Control-flow & Dominator-tree aware guard extractor backed by `crate::cfg`.
 fn classify_fn_guards_cfg(
     fn_node: Node,
     src: &[u8],
     cfg: &ShellMindGuardConfig,
 ) -> HashSet<GuardKind> {
-    crate::cfg::compute_cfg_guard_dominance(fn_node, src, cfg)
+    let mut guards = crate::cfg::compute_cfg_guard_dominance(fn_node, src, cfg);
+    if !guards.contains(&GuardKind::Auth)
+        && let Some(body) = fn_node.child_by_field_name("body")
+    {
+        let mut closures = Vec::new();
+        collect_returned_closures(body, &mut closures);
+        for closure in closures {
+            guards.extend(crate::cfg::compute_cfg_guard_dominance(closure, src, cfg));
+        }
+    }
+    guards
 }
 
 pub(crate) fn classify_sink(name: &str, body: &str) -> Option<SinkKind> {
@@ -866,6 +940,14 @@ fn find_inline_fn_node(arg: Node) -> Option<Node> {
     ) {
         return Some(arg);
     }
+    if matches!(arg.kind(), "expression_list" | "parenthesized_expression") {
+        let mut c = arg.walk();
+        for ch in arg.children(&mut c) {
+            if let Some(found) = find_inline_fn_node(ch) {
+                return Some(found);
+            }
+        }
+    }
     if (arg.kind() == "call_expression" || arg.kind() == "call")
         && let Some(inner_args) = arg.child_by_field_name("arguments")
     {
@@ -897,6 +979,514 @@ pub(crate) fn is_rust_test_item(node: Node, src: &[u8]) -> bool {
     false
 }
 
+#[derive(Debug, Clone)]
+struct GoRouteSpan {
+    start_byte: usize,
+    end_byte: usize,
+    prefix: String,
+    guards: HashSet<GuardKind>,
+    mw_calls: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct GoRouterVarScope {
+    prefix: String,
+    guards: HashSet<GuardKind>,
+    mw_calls: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct GoRouterScopes {
+    spans: Vec<GoRouteSpan>,
+    router_vars: std::collections::HashMap<String, GoRouterVarScope>,
+    wrapped_routers: std::collections::HashMap<String, (HashSet<GuardKind>, Vec<String>)>,
+}
+
+fn join_route_prefix(prefix: &str, path: &str) -> String {
+    let p = prefix.trim().trim_end_matches('/');
+    let c = path.trim();
+    if p.is_empty() {
+        if c.is_empty() {
+            return "/".to_string();
+        }
+        return if c.starts_with('/') {
+            c.to_string()
+        } else {
+            format!("/{}", c)
+        };
+    }
+    let clean_c = c.trim_start_matches('/');
+    if clean_c.is_empty() {
+        p.to_string()
+    } else {
+        format!("{}/{}", p, clean_c)
+    }
+}
+
+fn split_go_method_and_path(raw: &str) -> (Option<String>, String) {
+    let trimmed = raw.trim();
+    if let Some((verb, rest)) = trimmed.split_once(char::is_whitespace) {
+        let up = verb.trim().to_ascii_uppercase();
+        let rest_t = rest.trim();
+        if matches!(
+            up.as_str(),
+            "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS"
+        ) && rest_t.starts_with('/')
+        {
+            return (Some(up), rest_t.to_string());
+        }
+    }
+    (None, trimmed.to_string())
+}
+
+fn collect_go_mw_arg_recursive(
+    node: Node,
+    src: &[u8],
+    cfg: &ShellMindGuardConfig,
+    is_mw_pos: bool,
+    guards: &mut HashSet<GuardKind>,
+    mw_calls: &mut Vec<String>,
+    calls: &mut Vec<String>,
+) {
+    let k = node.kind();
+    if matches!(k, "(" | ")" | "," | "comment") {
+        return;
+    }
+    if k == "call_expression" {
+        if let Some(func) = node.child_by_field_name("function") {
+            let ftxt = node_text(func, src).trim();
+            let short = ftxt
+                .rsplit('.')
+                .next()
+                .unwrap_or(ftxt)
+                .rsplit("::")
+                .next()
+                .unwrap_or(ftxt)
+                .trim();
+            let is_adapter = matches!(ftxt, "http.HandlerFunc" | "HandlerFunc");
+            if !is_adapter && !short.is_empty() {
+                if is_auth_guard_ident(short, cfg) {
+                    guards.insert(GuardKind::Auth);
+                } else if is_lock_guard_ident(short, cfg) {
+                    guards.insert(GuardKind::TxLock);
+                }
+                guards.extend(classify_guards(ftxt, cfg));
+                calls.push(short.to_string());
+                if !mw_calls.iter().any(|x| x == short) {
+                    mw_calls.push(short.to_string());
+                }
+            }
+        }
+        if let Some(args) = node.child_by_field_name("arguments") {
+            let mut c = args.walk();
+            let mut arg_nodes: Vec<Node> = args
+                .children(&mut c)
+                .filter(|a| !matches!(a.kind(), "(" | ")" | "," | "comment"))
+                .collect();
+            let total = arg_nodes.len();
+            for (idx, a) in arg_nodes.drain(..).enumerate() {
+                collect_go_mw_arg_recursive(
+                    a,
+                    src,
+                    cfg,
+                    idx + 1 < total || is_mw_pos,
+                    guards,
+                    mw_calls,
+                    calls,
+                );
+            }
+        }
+        return;
+    }
+    let txt = node_text(node, src).trim();
+    if txt.is_empty() || txt.starts_with('"') || txt.starts_with('`') {
+        return;
+    }
+    let short = txt
+        .split('(')
+        .next()
+        .unwrap_or(txt)
+        .rsplit('.')
+        .next()
+        .unwrap_or(txt)
+        .trim();
+    if short.is_empty() {
+        return;
+    }
+    if is_auth_guard_ident(short, cfg) || is_auth_guard_ident(txt, cfg) {
+        guards.insert(GuardKind::Auth);
+        if !mw_calls.iter().any(|x| x == short) {
+            mw_calls.push(short.to_string());
+        }
+    } else if is_lock_guard_ident(short, cfg) {
+        guards.insert(GuardKind::TxLock);
+    } else if is_mw_pos && !mw_calls.iter().any(|x| x == short) {
+        mw_calls.push(short.to_string());
+    }
+    if !calls.iter().any(|x| x == short) {
+        calls.push(short.to_string());
+    }
+}
+
+fn extract_go_chained_receiver<'a>(
+    call_fn: Node<'a>,
+    src: &[u8],
+    cfg: &ShellMindGuardConfig,
+) -> (Option<String>, HashSet<GuardKind>, Vec<String>, String) {
+    let mut guards = HashSet::new();
+    let mut mw_calls = Vec::new();
+    let mut prefix = String::new();
+    let mut cur = call_fn;
+    loop {
+        if cur.kind() == "selector_expression"
+            && let Some(op) = cur.child_by_field_name("operand")
+        {
+            if op.kind() == "call_expression" {
+                if let Some(inner_fn) = op.child_by_field_name("function") {
+                    let m = node_text(inner_fn, src)
+                        .rsplit('.')
+                        .next()
+                        .unwrap_or("")
+                        .trim();
+                    if let Some(args) = op.child_by_field_name("arguments") {
+                        let mut c = args.walk();
+                        for a in args.children(&mut c) {
+                            let atxt = node_text(a, src).trim();
+                            if matches!(a.kind(), "(" | ")" | "," | "comment") {
+                                continue;
+                            }
+                            if (atxt.starts_with('"') || atxt.starts_with('`'))
+                                && matches!(m, "PathPrefix" | "Group" | "Route")
+                            {
+                                let unq = atxt.trim_matches(|q| q == '"' || q == '`');
+                                if unq.starts_with('/') {
+                                    prefix = join_route_prefix(unq, &prefix);
+                                }
+                            } else if matches!(m, "With" | "Use" | "Group") {
+                                let mut dummy = Vec::new();
+                                collect_go_mw_arg_recursive(
+                                    a,
+                                    src,
+                                    cfg,
+                                    true,
+                                    &mut guards,
+                                    &mut mw_calls,
+                                    &mut dummy,
+                                );
+                            }
+                        }
+                    }
+                    cur = inner_fn;
+                    continue;
+                }
+            } else if op.kind() == "identifier" {
+                return (
+                    Some(node_text(op, src).trim().to_string()),
+                    guards,
+                    mw_calls,
+                    prefix,
+                );
+            }
+        } else if cur.kind() == "identifier" {
+            return (
+                Some(node_text(cur, src).trim().to_string()),
+                guards,
+                mw_calls,
+                prefix,
+            );
+        }
+        return (None, guards, mw_calls, prefix);
+    }
+}
+
+fn scan_direct_go_block_use(
+    fn_lit: Node,
+    src: &[u8],
+    cfg: &ShellMindGuardConfig,
+    guards: &mut HashSet<GuardKind>,
+    mw_calls: &mut Vec<String>,
+) {
+    let Some(body) = fn_lit.child_by_field_name("body") else {
+        return;
+    };
+    let mut c = body.walk();
+    for stmt in body.children(&mut c) {
+        if stmt.kind() != "call_expression" {
+            // Check single-expression child in expression_statement wrapper if needed
+            let mut sc = stmt.walk();
+            for ch in stmt.children(&mut sc) {
+                if ch.kind() == "call_expression"
+                    && let Some(func) = ch.child_by_field_name("function")
+                    && node_text(func, src).trim().ends_with(".Use")
+                    && let Some(args) = ch.child_by_field_name("arguments")
+                {
+                    let mut ac = args.walk();
+                    let mut dummy = Vec::new();
+                    for a in args.children(&mut ac) {
+                        collect_go_mw_arg_recursive(
+                            a, src, cfg, true, guards, mw_calls, &mut dummy,
+                        );
+                    }
+                }
+            }
+            continue;
+        }
+        if let Some(func) = stmt.child_by_field_name("function")
+            && node_text(func, src).trim().ends_with(".Use")
+            && let Some(args) = stmt.child_by_field_name("arguments")
+        {
+            let mut ac = args.walk();
+            let mut dummy = Vec::new();
+            for a in args.children(&mut ac) {
+                collect_go_mw_arg_recursive(a, src, cfg, true, guards, mw_calls, &mut dummy);
+            }
+        }
+    }
+}
+
+fn collect_go_router_scopes(root: Node, src: &[u8], cfg: &ShellMindGuardConfig) -> GoRouterScopes {
+    let mut info = GoRouterScopes::default();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        let k = node.kind();
+        if k == "call_expression"
+            && let Some(func) = node.child_by_field_name("function")
+        {
+            let ftxt = node_text(func, src).trim();
+            let m = ftxt.rsplit('.').next().unwrap_or("");
+            if matches!(m, "Route" | "Group")
+                && let Some(args) = node.child_by_field_name("arguments")
+            {
+                let mut prefix = String::new();
+                let (_, mut guards, mut mw_calls, chained_pref) =
+                    extract_go_chained_receiver(func, src, cfg);
+                if !chained_pref.is_empty() {
+                    prefix = chained_pref;
+                }
+                let mut fn_lit_opt: Option<Node> = None;
+                let mut ac = args.walk();
+                let mut dummy = Vec::new();
+                for a in args.children(&mut ac) {
+                    if matches!(a.kind(), "(" | ")" | "," | "comment") {
+                        continue;
+                    }
+                    let atxt = node_text(a, src).trim();
+                    if (atxt.starts_with('"') || atxt.starts_with('`')) && prefix.is_empty() {
+                        let unq = atxt.trim_matches(|q| q == '"' || q == '`');
+                        if unq.starts_with('/') {
+                            prefix = unq.to_string();
+                        }
+                    } else if a.kind() == "func_literal" {
+                        fn_lit_opt = Some(a);
+                    } else {
+                        collect_go_mw_arg_recursive(
+                            a,
+                            src,
+                            cfg,
+                            true,
+                            &mut guards,
+                            &mut mw_calls,
+                            &mut dummy,
+                        );
+                    }
+                }
+                if let Some(fn_lit) = fn_lit_opt {
+                    scan_direct_go_block_use(fn_lit, src, cfg, &mut guards, &mut mw_calls);
+                    info.spans.push(GoRouteSpan {
+                        start_byte: fn_lit.start_byte(),
+                        end_byte: fn_lit.end_byte(),
+                        prefix,
+                        guards,
+                        mw_calls,
+                    });
+                }
+            } else if m == "Use"
+                && let Some(args) = node.child_by_field_name("arguments")
+            {
+                let (base_opt, _, _, _) = extract_go_chained_receiver(func, src, cfg);
+                if let Some(base_var) = base_opt
+                    && let Some(entry) = info.router_vars.get_mut(&base_var)
+                {
+                    let mut ac = args.walk();
+                    let mut dummy = Vec::new();
+                    for a in args.children(&mut ac) {
+                        collect_go_mw_arg_recursive(
+                            a,
+                            src,
+                            cfg,
+                            true,
+                            &mut entry.guards,
+                            &mut entry.mw_calls,
+                            &mut dummy,
+                        );
+                    }
+                }
+            } else if m == "ListenAndServe"
+                && let Some(args) = node.child_by_field_name("arguments")
+            {
+                let mut ac = args.walk();
+                for a in args.children(&mut ac) {
+                    if a.kind() == "call_expression" {
+                        let mut g = HashSet::new();
+                        let mut mc = Vec::new();
+                        let mut dummy = Vec::new();
+                        collect_go_mw_arg_recursive(a, src, cfg, true, &mut g, &mut mc, &mut dummy);
+                        for cand in &dummy {
+                            if matches!(cand.as_str(), "mux" | "router" | "r" | "app" | "handler")
+                                || info.router_vars.contains_key(cand)
+                            {
+                                let entry = info.wrapped_routers.entry(cand.clone()).or_default();
+                                entry.0.extend(g.iter().copied());
+                                for call in &mc {
+                                    if call != cand && !entry.1.contains(call) {
+                                        entry.1.push(call.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } else if matches!(k, "short_var_declaration" | "assignment_statement")
+            && let (Some(left), Some(right)) = (
+                node.child_by_field_name("left"),
+                node.child_by_field_name("right"),
+            )
+        {
+            let lhs = node_text(left, src).trim();
+            let rhs_node = right.named_child(0).unwrap_or(right);
+            if is_plain_ident_ast(lhs) && rhs_node.kind() == "call_expression" {
+                let mut lhs_scope = GoRouterVarScope::default();
+                if let Some(rfunc) = rhs_node.child_by_field_name("function") {
+                    let rm = node_text(rfunc, src).rsplit('.').next().unwrap_or("");
+                    let (base_opt, c_guards, c_mw, c_pref) =
+                        extract_go_chained_receiver(rfunc, src, cfg);
+                    if let Some(ref b) = base_opt
+                        && let Some(parent) = info.router_vars.get(b)
+                    {
+                        lhs_scope.prefix = parent.prefix.clone();
+                        lhs_scope.guards.extend(parent.guards.iter().copied());
+                        lhs_scope.mw_calls.extend(parent.mw_calls.iter().cloned());
+                    }
+                    if !c_pref.is_empty() {
+                        lhs_scope.prefix = join_route_prefix(&lhs_scope.prefix, &c_pref);
+                    }
+                    lhs_scope.guards.extend(c_guards);
+                    lhs_scope.mw_calls.extend(c_mw);
+                    if matches!(rm, "Group" | "PathPrefix" | "Subrouter" | "With")
+                        && let Some(rargs) = rhs_node.child_by_field_name("arguments")
+                    {
+                        let mut ac = rargs.walk();
+                        let mut dummy = Vec::new();
+                        for a in rargs.children(&mut ac) {
+                            let atxt = node_text(a, src).trim();
+                            if atxt.starts_with('"') || atxt.starts_with('`') {
+                                let unq = atxt.trim_matches(|q| q == '"' || q == '`');
+                                if unq.starts_with('/') {
+                                    lhs_scope.prefix = join_route_prefix(&lhs_scope.prefix, unq);
+                                }
+                            } else {
+                                collect_go_mw_arg_recursive(
+                                    a,
+                                    src,
+                                    cfg,
+                                    true,
+                                    &mut lhs_scope.guards,
+                                    &mut lhs_scope.mw_calls,
+                                    &mut dummy,
+                                );
+                            }
+                        }
+                        info.router_vars.insert(lhs.to_string(), lhs_scope);
+                    } else if let Some(rargs) = rhs_node.child_by_field_name("arguments") {
+                        // Outer wrapper call: `handler := RequireSession(mux)`
+                        let mut wrap_guards = HashSet::new();
+                        let mut wrap_mw = Vec::new();
+                        let mut dummy = Vec::new();
+                        collect_go_mw_arg_recursive(
+                            rhs_node,
+                            src,
+                            cfg,
+                            true,
+                            &mut wrap_guards,
+                            &mut wrap_mw,
+                            &mut dummy,
+                        );
+                        let _ = rargs;
+                        for cand in &dummy {
+                            if matches!(cand.as_str(), "mux" | "router" | "r" | "app" | "api")
+                                || info.router_vars.contains_key(cand)
+                            {
+                                let entry = info.wrapped_routers.entry(cand.clone()).or_default();
+                                entry.0.extend(wrap_guards.iter().copied());
+                                for call in &wrap_mw {
+                                    if call != cand && !entry.1.contains(call) {
+                                        entry.1.push(call.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } else if k == "return_statement" {
+            let mut rc = node.walk();
+            for ch in node.children(&mut rc) {
+                let target_call = if ch.kind() == "expression_list" {
+                    ch.named_child(0)
+                } else {
+                    Some(ch)
+                };
+                if let Some(call_n) = target_call
+                    && call_n.kind() == "call_expression"
+                {
+                    let mut wrap_guards = HashSet::new();
+                    let mut wrap_mw = Vec::new();
+                    let mut dummy = Vec::new();
+                    collect_go_mw_arg_recursive(
+                        call_n,
+                        src,
+                        cfg,
+                        true,
+                        &mut wrap_guards,
+                        &mut wrap_mw,
+                        &mut dummy,
+                    );
+                    for cand in &dummy {
+                        if matches!(cand.as_str(), "mux" | "router" | "r" | "app" | "api")
+                            || info.router_vars.contains_key(cand)
+                        {
+                            let entry = info.wrapped_routers.entry(cand.clone()).or_default();
+                            entry.0.extend(wrap_guards.iter().copied());
+                            for call in &wrap_mw {
+                                if call != cand && !entry.1.contains(call) {
+                                    entry.1.push(call.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let prev_len = stack.len();
+        let mut cursor = node.walk();
+        for ch in node.children(&mut cursor) {
+            stack.push(ch);
+        }
+        stack[prev_len..].reverse();
+    }
+    info.spans.sort_by_key(|s| s.start_byte);
+    info
+}
+
+fn is_plain_ident_ast(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
 #[allow(clippy::too_many_arguments)]
 fn extract_node<'a>(
     root: Node<'a>,
@@ -909,6 +1499,29 @@ fn extract_node<'a>(
     symbols: &mut Vec<SymbolInfo>,
     route_prefixes: &mut Vec<String>,
 ) {
+    let go_scopes = if lang == Language::Go {
+        Some(collect_go_router_scopes(root, src, cfg))
+    } else {
+        None
+    };
+    if let Some(ref gs) = go_scopes {
+        for sp in &gs.spans {
+            if !sp.prefix.is_empty()
+                && sp.prefix != "/"
+                && !route_prefixes.iter().any(|p| p == &sp.prefix)
+            {
+                route_prefixes.push(sp.prefix.clone());
+            }
+        }
+        for rv in gs.router_vars.values() {
+            if !rv.prefix.is_empty()
+                && rv.prefix != "/"
+                && !route_prefixes.iter().any(|p| p == &rv.prefix)
+            {
+                route_prefixes.push(rv.prefix.clone());
+            }
+        }
+    }
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         if !extract_single_node(
@@ -921,6 +1534,7 @@ fn extract_node<'a>(
             imports,
             symbols,
             route_prefixes,
+            go_scopes.as_ref(),
             &mut stack,
         ) {
             continue;
@@ -945,6 +1559,7 @@ fn extract_single_node<'a>(
     imports: &mut Vec<ImportRef>,
     symbols: &mut Vec<SymbolInfo>,
     route_prefixes: &mut Vec<String>,
+    go_scopes: Option<&GoRouterScopes>,
     stack: &mut Vec<Node<'a>>,
 ) -> bool {
     let kind = node.kind();
@@ -1258,6 +1873,7 @@ fn extract_single_node<'a>(
                 }
             }
             let mut calls = Vec::new();
+            let mut mw_callees = Vec::new();
             let mut guards = file_middleware_guards.clone();
             let mut seen_handler = false;
             let mut route_taints = Vec::new();
@@ -1265,12 +1881,15 @@ fn extract_single_node<'a>(
             let line_end = node.end_position().row + 1;
 
             let mut c = args.walk();
-            for arg in args.children(&mut c) {
+            let arg_list: Vec<Node> = args
+                .children(&mut c)
+                .filter(|a| !matches!(a.kind(), "(" | ")" | "," | "comment"))
+                .collect();
+            let arg_count = arg_list.len();
+            for (arg_idx, arg) in arg_list.into_iter().enumerate() {
                 let ak = arg.kind();
-                if matches!(ak, "(" | ")" | ",") {
-                    continue;
-                }
                 let atxt = node_text(arg, src).trim();
+                let has_more_args = arg_idx + 1 < arg_count;
                 if (atxt.starts_with('\'') || atxt.starts_with('"')) && route_path.is_none() {
                     let unq = atxt.trim_matches(|ch| ch == '\'' || ch == '"');
                     if unq.starts_with('/') || is_custom {
@@ -1280,9 +1899,13 @@ fn extract_single_node<'a>(
                     if ak == "identifier" {
                         if !seen_handler && is_auth_guard_ident(atxt, cfg) {
                             guards.insert(GuardKind::Auth);
+                            mw_callees.push(atxt.to_string());
                         } else if !seen_handler && is_lock_guard_ident(atxt, cfg) {
                             guards.insert(GuardKind::TxLock);
                         } else {
+                            if !seen_handler && has_more_args {
+                                mw_callees.push(atxt.to_string());
+                            }
                             seen_handler = true;
                         }
                         calls.push(atxt.to_string());
@@ -1353,6 +1976,12 @@ fn extract_single_node<'a>(
                         {
                             guards.insert(GuardKind::TxLock);
                         }
+                        if !seen_handler && has_more_args {
+                            let s = short_call.rsplit('.').next().unwrap_or(short_call).trim();
+                            if !s.is_empty() {
+                                mw_callees.push(s.to_string());
+                            }
+                        }
                         collect_calls(arg, src, &mut calls);
                     }
                 }
@@ -1400,6 +2029,7 @@ fn extract_single_node<'a>(
                 if has_res_id {
                     route_sym.has_resource_id = true;
                 }
+                route_sym.middleware_callees = mw_callees;
                 for t in route_taints {
                     route_sym.apply_taint(t);
                 }
@@ -1797,7 +2427,7 @@ fn extract_single_node<'a>(
         }
     }
 
-    // 2d. Go Gin/Echo/Fiber/Chi + `net/http` `HandleFunc` + `r.Group(..., mw...)`
+    // 2d. Go Gin/Echo/Fiber/Chi + `net/http` `Handle`/`HandleFunc` + Go 1.22 `"METHOD /path"` + scoped `r.Route`/`r.Group`/`r.With`
     if lang == Language::Go
         && kind == "call_expression"
         && let Some(func) = node.child_by_field_name("function")
@@ -1805,8 +2435,21 @@ fn extract_single_node<'a>(
         let ftxt = node_text(func, src);
         let method = ftxt.rsplit('.').next().unwrap_or("");
         let method_upper = method.to_ascii_uppercase();
+        let node_byte = node.start_byte();
+        let in_scoped_span = go_scopes.is_some_and(|gs| {
+            gs.spans
+                .iter()
+                .any(|sp| node_byte >= sp.start_byte && node_byte <= sp.end_byte)
+        });
+        let (chained_recv, chained_guards, chained_mw, chained_pref) =
+            extract_go_chained_receiver(func, src, cfg);
+        let recv_is_distinct_sub = chained_recv
+            .as_deref()
+            .and_then(|rname| go_scopes.and_then(|gs| gs.router_vars.get(rname)))
+            .is_some();
+
         let mut group_prefix: Option<String> = None;
-        if (method == "Group" || method == "Use")
+        if (method == "Group" || method == "Use" || method == "Route")
             && let Some(args) = node.child_by_field_name("arguments")
         {
             let mut c = args.walk();
@@ -1823,7 +2466,30 @@ fn extract_single_node<'a>(
                 }
             }
         }
-        if method == "Group" || method == "Use" {
+        // Only root-level `.Use(...)` outside scoped `r.Route` / subrouter var updates `file_middleware_guards`
+        if method == "Use" && !in_scoped_span && !recv_is_distinct_sub {
+            let gtxt = node_text(node, src);
+            let mw_guards = classify_guards(gtxt, cfg);
+            if !mw_guards.is_empty() {
+                match group_prefix.as_deref() {
+                    None | Some("/") | Some("/api") => {
+                        file_middleware_guards.extend(mw_guards);
+                    }
+                    Some(p) if p.starts_with("/api/v") => {
+                        file_middleware_guards.extend(mw_guards);
+                    }
+                    Some(sub) => {
+                        if mw_guards.contains(&GuardKind::Auth) {
+                            route_prefixes.push(format!("__AUTH_PREFIX__:{}", sub));
+                        }
+                    }
+                }
+            }
+        } else if method == "Group"
+            && !in_scoped_span
+            && !recv_is_distinct_sub
+            && !node_text(node, src).contains("func(")
+        {
             let gtxt = node_text(node, src);
             let mw_guards = classify_guards(gtxt, cfg);
             if !mw_guards.is_empty() {
@@ -1842,41 +2508,62 @@ fn extract_single_node<'a>(
                 }
             }
         }
+
         let is_go_http = matches!(
             method_upper.as_str(),
-            "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HANDLEFUNC"
+            "GET"
+                | "POST"
+                | "PUT"
+                | "PATCH"
+                | "DELETE"
+                | "HEAD"
+                | "OPTIONS"
+                | "ANY"
+                | "HANDLE"
+                | "HANDLEFUNC"
         );
         if is_go_http
             && ftxt.contains('.')
             && let Some(args) = node.child_by_field_name("arguments")
         {
-            let mut route_path = None;
+            let mut raw_route_path = None;
             let mut calls = Vec::new();
-            let mut guards = if method_upper == "HANDLEFUNC" {
-                HashSet::new()
-            } else {
-                file_middleware_guards.clone()
-            };
+            let mut mw_callees = Vec::new();
+            let mut explicit_guards = HashSet::new();
+            explicit_guards.extend(chained_guards);
+            for call in chained_mw {
+                if !mw_callees.iter().any(|x| x == &call) {
+                    mw_callees.push(call.clone());
+                }
+                if !calls.iter().any(|x| x == &call) {
+                    calls.push(call);
+                }
+            }
+
             let mut seen_handler = false;
             let mut route_taints = Vec::new();
             let line_start = node.start_position().row + 1;
             let line_end = node.end_position().row + 1;
 
             let mut c = args.walk();
-            for arg in args.children(&mut c) {
+            let arg_nodes: Vec<Node> = args
+                .children(&mut c)
+                .filter(|a| !matches!(a.kind(), "(" | ")" | "," | "comment"))
+                .collect();
+            let arg_count = arg_nodes.len();
+            for (arg_idx, arg) in arg_nodes.into_iter().enumerate() {
                 let ak = arg.kind();
-                if matches!(ak, "(" | ")" | ",") {
-                    continue;
-                }
                 let atxt = node_text(arg, src).trim();
-                if (atxt.starts_with('"') || atxt.starts_with('`')) && route_path.is_none() {
-                    route_path = Some(atxt.trim_matches(|ch| ch == '"' || ch == '`').to_string());
+                let has_more_args = arg_idx + 1 < arg_count;
+                if (atxt.starts_with('"') || atxt.starts_with('`')) && raw_route_path.is_none() {
+                    raw_route_path =
+                        Some(atxt.trim_matches(|ch| ch == '"' || ch == '`').to_string());
                 } else if ak == "func_literal" {
                     seen_handler = true;
                     let inline_body = node_text(arg, src);
-                    guards.extend(classify_fn_guards_cfg(arg, src, cfg));
+                    explicit_guards.extend(classify_fn_guards_cfg(arg, src, cfg));
                     collect_calls(arg, src, &mut calls);
-                    let handler_label = route_path
+                    let handler_label = raw_route_path
                         .as_deref()
                         .map(|rp| format!("{} {}", method_upper, rp))
                         .unwrap_or_else(|| format!("go_inline_{}", line_start));
@@ -1886,10 +2573,10 @@ fn extract_single_node<'a>(
                         rel_path,
                         lang,
                         &handler_label,
-                        route_path.as_deref(),
+                        raw_route_path.as_deref(),
                     );
                     if let Some(sk) =
-                        classify_sink(route_path.as_deref().unwrap_or("inline"), inline_body)
+                        classify_sink(raw_route_path.as_deref().unwrap_or("inline"), inline_body)
                     {
                         let inline_name = format!("inline_sink_{}", line_start);
                         let mut inline_calls = Vec::new();
@@ -1922,30 +2609,87 @@ fn extract_single_node<'a>(
                     }
                     route_taints.push(t_inline);
                 } else {
-                    let short = atxt
-                        .split('(')
-                        .next()
-                        .unwrap_or(atxt)
-                        .rsplit('.')
-                        .next()
-                        .unwrap_or(atxt)
-                        .trim();
-                    if !seen_handler && is_auth_guard_ident(short, cfg) {
-                        guards.insert(GuardKind::Auth);
-                    } else if !seen_handler && is_lock_guard_ident(short, cfg) {
-                        guards.insert(GuardKind::TxLock);
-                    } else if !short.is_empty() {
+                    if let Some(fn_arg) = find_inline_fn_node(arg) {
                         seen_handler = true;
-                        calls.push(short.to_string());
+                        explicit_guards.extend(classify_fn_guards_cfg(fn_arg, src, cfg));
+                    }
+                    collect_go_mw_arg_recursive(
+                        arg,
+                        src,
+                        cfg,
+                        !seen_handler && (has_more_args || ak == "call_expression"),
+                        &mut explicit_guards,
+                        &mut mw_callees,
+                        &mut calls,
+                    );
+                    if !has_more_args {
+                        seen_handler = true;
                     }
                     collect_calls(arg, src, &mut calls);
                 }
             }
 
-            if let Some(rp) = route_path {
-                let rp_low = rp.to_ascii_lowercase();
+            if let Some(raw_rp) = raw_route_path {
+                let (explicit_verb, clean_rp) = split_go_method_and_path(&raw_rp);
+                let mut scope_prefix = String::new();
+                let mut scope_guards = HashSet::new();
+                let mut scope_mw_calls = Vec::new();
+
+                if let Some(gs) = go_scopes {
+                    for sp in &gs.spans {
+                        if node_byte >= sp.start_byte && node_byte <= sp.end_byte {
+                            if !sp.prefix.is_empty() {
+                                scope_prefix = join_route_prefix(&scope_prefix, &sp.prefix);
+                            }
+                            scope_guards.extend(sp.guards.iter().copied());
+                            for mc in &sp.mw_calls {
+                                if !scope_mw_calls.contains(mc) {
+                                    scope_mw_calls.push(mc.clone());
+                                }
+                            }
+                        }
+                    }
+                    if let Some(ref recv) = chained_recv {
+                        if let Some(rv) = gs.router_vars.get(recv) {
+                            if !rv.prefix.is_empty() {
+                                scope_prefix = join_route_prefix(&scope_prefix, &rv.prefix);
+                            }
+                            scope_guards.extend(rv.guards.iter().copied());
+                            for mc in &rv.mw_calls {
+                                if !scope_mw_calls.contains(mc) {
+                                    scope_mw_calls.push(mc.clone());
+                                }
+                            }
+                        }
+                        if let Some((wg, wmw)) = gs.wrapped_routers.get(recv) {
+                            scope_guards.extend(wg.iter().copied());
+                            for mc in wmw {
+                                if !scope_mw_calls.contains(mc) {
+                                    scope_mw_calls.push(mc.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                if !chained_pref.is_empty() {
+                    scope_prefix = join_route_prefix(&scope_prefix, &chained_pref);
+                }
+
+                let full_rp = if scope_prefix.is_empty() {
+                    clean_rp.clone()
+                } else {
+                    join_route_prefix(&scope_prefix, &clean_rp)
+                };
+                if !scope_prefix.is_empty()
+                    && scope_prefix != "/"
+                    && !route_prefixes.iter().any(|p| p == &scope_prefix)
+                {
+                    route_prefixes.push(scope_prefix);
+                }
+
+                let full_low = full_rp.to_ascii_lowercase();
                 let is_explicit_unauth_sub = matches!(
-                    rp_low.as_str(),
+                    full_low.as_str(),
                     "/public"
                         | "/health"
                         | "/healthz"
@@ -1954,25 +2698,53 @@ fn extract_single_node<'a>(
                         | "/login"
                         | "/register"
                         | "/signup"
-                ) || rp_low.starts_with("/public/")
-                    || rp_low.starts_with("/health/")
-                    || rp_low.starts_with("/webhook");
+                ) || full_low.starts_with("/public/")
+                    || full_low.starts_with("/health/")
+                    || full_low.ends_with("/health")
+                    || full_low.ends_with("/healthz")
+                    || full_low.ends_with("/readyz")
+                    || full_low.ends_with("/metrics")
+                    || full_low.ends_with("/login")
+                    || full_low.ends_with("/register")
+                    || full_low.ends_with("/signup")
+                    || full_low.contains("/webhook");
+
+                let mut guards = explicit_guards;
+                if !is_explicit_unauth_sub {
+                    guards.extend(file_middleware_guards.iter().copied());
+                    guards.extend(scope_guards);
+                }
+                for mc in scope_mw_calls {
+                    if !mw_callees.contains(&mc) {
+                        mw_callees.push(mc.clone());
+                    }
+                    if !calls.contains(&mc) {
+                        calls.push(mc);
+                    }
+                }
                 for marker in route_prefixes.iter() {
                     if let Some(_mount) = marker.strip_prefix("__AUTH_PREFIX__:MOUNT:") {
                         if !is_explicit_unauth_sub {
                             guards.insert(GuardKind::Auth);
                         }
                     } else if let Some(sub) = marker.strip_prefix("__AUTH_PREFIX__:")
-                        && (rp == sub || rp.starts_with(&format!("{}/", sub.trim_end_matches('/'))))
+                        && (full_rp == sub
+                            || full_rp.starts_with(&format!("{}/", sub.trim_end_matches('/')))
+                            || clean_rp == sub
+                            || clean_rp.starts_with(&format!("{}/", sub.trim_end_matches('/'))))
                     {
                         guards.insert(GuardKind::Auth);
                     }
                 }
-                let label_method = if method_upper == "HANDLEFUNC" {
-                    "HTTP".to_string()
-                } else {
-                    method_upper
-                };
+
+                let label_method = explicit_verb.unwrap_or_else(|| {
+                    if matches!(method_upper.as_str(), "HANDLEFUNC" | "HANDLE" | "ANY") {
+                        "HTTP".to_string()
+                    } else {
+                        method_upper
+                    }
+                });
+                let rp = clean_rp;
                 let has_res_id = crate::taint::has_resource_id_expr("", Some(&rp));
                 let mut route_sym = SymbolInfo::base(
                     format!("{}::route:{}", rel_path, line_start),
@@ -1987,6 +2759,7 @@ fn extract_single_node<'a>(
                     Some(rp),
                 );
                 route_sym.has_resource_id = has_res_id;
+                route_sym.middleware_callees = mw_callees;
                 for t in route_taints {
                     route_sym.apply_taint(t);
                 }

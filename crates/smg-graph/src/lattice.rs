@@ -725,6 +725,40 @@ pub fn solve_guard_lattice_with_public(
         }
     }
 
+    // Propagate CFG-verified Auth/TxLock guards from resolved middleware callees onto Route & Function nodes
+    for _ in 0..2 {
+        let mut add_guards: Vec<(NodeIndex, HashSet<GuardKind>)> = Vec::new();
+        for u in graph.node_indices() {
+            if graph[u].middleware_callees.is_empty() {
+                continue;
+            }
+            let mw_set: HashSet<&str> = graph[u]
+                .middleware_callees
+                .iter()
+                .map(|s| s.as_str())
+                .collect();
+            let mut found = HashSet::new();
+            for v in graph.neighbors_directed(u, Direction::Outgoing) {
+                let vname = graph[v].name.as_str();
+                let vshort = vname.rsplit('.').next().unwrap_or(vname);
+                if mw_set.contains(vname) || mw_set.contains(vshort) {
+                    if graph[v].guards.contains(&GuardKind::Auth) {
+                        found.insert(GuardKind::Auth);
+                    }
+                    if graph[v].guards.contains(&GuardKind::TxLock) {
+                        found.insert(GuardKind::TxLock);
+                    }
+                }
+            }
+            if !found.is_empty() {
+                add_guards.push((u, found));
+            }
+        }
+        for (u, fg) in add_guards {
+            graph[u].guards.extend(fg);
+        }
+    }
+
     // O(V + E) Worklist Fixed-Point Guard-Set Lattice using Copy-only 4-byte GuardBitset(u32):
     // G(v) = Intersection_{p in Pred(v)} ( G(p) ) U NodeGuards(v)
     let node_count = graph.node_count();
@@ -1423,7 +1457,7 @@ pub fn solve_guard_lattice_with_public(
                         file: sym.rel_path.clone(),
                         line: sym.line_start,
                         status: "SUSPECT_UNGUARDED".into(),
-                        confidence: Confidence::Confirmed,
+                        confidence: Confidence::Heuristic,
                         entry_route: sym.name.clone(),
                         sink_kind: SinkKind::Csrf,
                         missing_guard: GuardKind::CsrfProtection,
@@ -1452,6 +1486,22 @@ pub fn solve_guard_lattice_with_public(
         }
 
         let mut routes_by_seg_len: HashMap<usize, Vec<(String, Vec<String>)>> = HashMap::new();
+        let mut wildcard_prefix_routes: Vec<(String, Vec<String>)> = Vec::new();
+        let mut index_route = |method: &str, rp: &str, segs: Vec<String>| {
+            if rp.ends_with("/*") || (rp.len() > 1 && rp.ends_with('/')) {
+                let mut prefix_segs = segs.clone();
+                if prefix_segs.last().is_some_and(|s| s == "*") {
+                    prefix_segs.pop();
+                }
+                if !prefix_segs.is_empty() {
+                    wildcard_prefix_routes.push((method.to_string(), prefix_segs));
+                }
+            }
+            routes_by_seg_len
+                .entry(segs.len())
+                .or_default()
+                .push((method.to_string(), segs));
+        };
         for idx in graph.node_indices() {
             let sym = &graph[idx];
             if sym.kind == SymbolKind::Route
@@ -1469,10 +1519,7 @@ pub fn solve_guard_lattice_with_public(
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string())
                     .collect();
-                routes_by_seg_len
-                    .entry(segs.len())
-                    .or_default()
-                    .push((method.clone(), segs));
+                index_route(&method, rp, segs);
 
                 for pref in &all_prefixes {
                     if !rp.starts_with(pref) {
@@ -1487,10 +1534,7 @@ pub fn solve_guard_lattice_with_public(
                             .filter(|s| !s.is_empty())
                             .map(|s| s.to_string())
                             .collect();
-                        routes_by_seg_len
-                            .entry(psegs.len())
-                            .or_default()
-                            .push((method.clone(), psegs));
+                        index_route(&method, &combined, psegs);
                     }
                 }
             }
@@ -1503,7 +1547,7 @@ pub fn solve_guard_lattice_with_public(
                     .split('/')
                     .filter(|s| !s.is_empty())
                     .collect();
-                let matched = routes_by_seg_len.get(&csegs.len()).is_some_and(|cands| {
+                let exact_match = routes_by_seg_len.get(&csegs.len()).is_some_and(|cands| {
                     cands.iter().any(|(rmethod, rsegs)| {
                         let method_ok = rmethod == &call.method
                             || matches!(rmethod.as_str(), "HTTP" | "DJANGO" | "ANY");
@@ -1514,6 +1558,17 @@ pub fn solve_guard_lattice_with_public(
                                 .all(|(b, fseg)| b == *fseg || b == "*" || *fseg == "*")
                     })
                 });
+                let wildcard_match = wildcard_prefix_routes.iter().any(|(rmethod, psegs)| {
+                    let method_ok = rmethod == &call.method
+                        || matches!(rmethod.as_str(), "HTTP" | "DJANGO" | "ANY");
+                    method_ok
+                        && csegs.len() >= psegs.len()
+                        && psegs
+                            .iter()
+                            .zip(csegs.iter())
+                            .all(|(b, fseg)| b == *fseg || b == "*" || *fseg == "*")
+                });
+                let matched = exact_match || wildcard_match;
                 if !matched {
                     let key = (
                         format!("{}:{}", call.rel_path, call.line),
