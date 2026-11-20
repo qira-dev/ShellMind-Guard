@@ -129,11 +129,28 @@ fn extract_call_args(line: &str, call_start: usize) -> Option<Vec<String>> {
     None
 }
 
+fn is_c_const_macro_expr(expr: &str) -> bool {
+    let t = expr.trim();
+    !t.is_empty()
+        && t.chars().any(|c| c.is_ascii_uppercase())
+        && t.chars().all(|c| {
+            c.is_ascii_uppercase()
+                || c.is_ascii_digit()
+                || matches!(c, '_' | '+' | '-' | '*' | '/' | ' ' | '(' | ')')
+        })
+}
+
 fn has_preceding_bounds_check(preceding_code: &str, len_expr: &str) -> bool {
+    if is_c_const_macro_expr(len_expr) {
+        return true;
+    }
     let len_low = len_expr.to_ascii_lowercase();
     if len_low.chars().all(|c| c.is_ascii_digit() || c == '_')
         || len_low.contains("sizeof")
         || len_low.starts_with("min(")
+        || len_low.starts_with("min_t(")
+        || len_low.starts_with("curlmin(")
+        || len_low.starts_with("clamp(")
         || len_low.starts_with("std::min")
         || len_low.contains(".min(")
     {
@@ -213,7 +230,11 @@ fn has_preceding_bounds_check(preceding_code: &str, len_expr: &str) -> bool {
                     || trimmed.contains(&format!("calloc({},", v))
                     || trimmed.contains(&format!("[{}]", v))
                     || trimmed.contains(&format!(".resize({})", v))
-                    || (trimmed.contains("realloc(") && trimmed.contains(v.as_str()))
+                    || ((trimmed.contains("malloc(")
+                        || trimmed.contains("calloc(")
+                        || trimmed.contains("realloc(")
+                        || trimmed.contains("alloca("))
+                        && has_word_v)
                 {
                     verified = true;
                 }
@@ -370,7 +391,7 @@ fn scan_c_cpp_function(
         if trimmed.is_empty() {
             continue;
         }
-        let preceding = lines[..idx].join("\n");
+        let mut preceding_cache: Option<String> = None;
 
         // 1. Always-unsafe unbounded C string/buffer routines (skip string literals)
         if let Some(m) = c_unsafe_copy_re().find(trimmed)
@@ -489,7 +510,12 @@ fn scan_c_cpp_function(
                         Confidence::Confirmed,
                         "Pass remaining free capacity `sizeof(dst) - strlen(dst) - 1` rather than total `sizeof(dst)` to `strncat`.",
                     ));
-                } else if api != "strncat" && !has_preceding_bounds_check(&preceding, len_arg) {
+                } else if api != "strncat"
+                    && !has_preceding_bounds_check(
+                        preceding_cache.get_or_insert_with(|| lines[..idx].join("\n")),
+                        len_arg,
+                    )
+                {
                     out.push(make_phase9_finding(
                         "SMG-MEM-BOUNDS",
                         "HIGH",
@@ -532,7 +558,13 @@ fn scan_c_cpp_function(
                         && tok != "strlen"
                         && !tok.chars().all(|ch| ch.is_ascii_uppercase() || ch == '_')
                 });
-                if has_arith && non_const && !has_overflow_guard(&preceding, expr) {
+                if has_arith
+                    && non_const
+                    && !has_overflow_guard(
+                        preceding_cache.get_or_insert_with(|| lines[..idx].join("\n")),
+                        expr,
+                    )
+                {
                     out.push(make_phase9_finding(
                         "SMG-ENG-INT",
                         "CRITICAL",

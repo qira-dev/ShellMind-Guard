@@ -478,3 +478,47 @@ Future<void> storeSafe(String secret) async {
         clean.findings
     );
 }
+
+#[test]
+fn test_phase18_c_memory_const_macros_and_multifield_alloc_precision() {
+    let safe_c = r#"
+#include <stdlib.h>
+#include <string.h>
+
+void safe_hash_and_alloc(const char *host, size_t hlen, const char *dom, size_t dlen, unsigned char *out, const unsigned char *tmp) {
+    memcpy(out, tmp, CURL_SHA512_256_DIGEST_LENGTH);
+    char *buf = calloc(1, sizeof(int) + hlen + dlen + 2);
+    if (!buf) return;
+    memcpy(buf, host, hlen);
+    memcpy(buf + hlen, dom, dlen);
+    free(buf);
+}
+"#;
+    let safe_res = run_inline(&[("lib/altsvc.c", safe_c)]);
+    assert!(
+        !safe_res
+            .findings
+            .iter()
+            .any(|f| f.rule_id == "SMG-MEM-BOUNDS"),
+        "Compile-time macro and multi-field calloc-sized memcpy must not FP, got: {:#?}",
+        safe_res.findings
+    );
+
+    let vuln_c = r#"
+#include <string.h>
+
+void unsafe_copy(const char *src, size_t user_len) {
+    char stack_buf[64];
+    memcpy(stack_buf, src, user_len);
+}
+"#;
+    let vuln_res = run_inline(&[("lib/vuln.c", vuln_c)]);
+    assert!(
+        vuln_res
+            .findings
+            .iter()
+            .any(|f| f.rule_id == "SMG-MEM-BOUNDS"),
+        "Unchecked stack memcpy must still trigger SMG-MEM-BOUNDS, got: {:#?}",
+        vuln_res.findings
+    );
+}
