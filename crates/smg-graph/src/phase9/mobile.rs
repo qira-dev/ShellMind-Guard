@@ -302,11 +302,28 @@ fn scan_info_plist(rel_path: &str, raw_source: &str, out: &mut Vec<LocalStaticFi
                 "Set `NSExceptionMinimumTLSVersion` to `TLSv1.2` or higher.",
             ));
         }
+        if line.contains("UIFileSharingEnabled") {
+            let next = lines.get(idx + 1).copied().unwrap_or("");
+            if line.contains("<true") || next.contains("<true") {
+                out.push(make_phase9_finding(
+                    "SMG-MOB-STORAGE",
+                    "MEDIUM",
+                    "iOS `Info.plist` enables `UIFileSharingEnabled = true` (exposes app Documents via iTunes/Finder)".into(),
+                    rel_path,
+                    idx + 1,
+                    "Info.plist",
+                    SinkKind::MobileSecurity,
+                    GuardKind::MobilePolicy,
+                    Confidence::Confirmed,
+                    "Set `UIFileSharingEnabled` to `<false/>` unless user file sharing is explicitly required.",
+                ));
+            }
+        }
     }
 }
 
-/// Scans Kotlin, Java, Swift, and Dart mobile application sources for
-/// `SMG-MOB-STORAGE`, `SMG-MOB-IPC`, and `SMG-MOB-TLS`.
+/// Scans Kotlin, Java, Swift, Dart, and React Native JS/TS mobile application sources for
+/// `SMG-MOB-STORAGE`, `SMG-MOB-IPC`, and `SMG-MOB-TLS` (MobSF-Scan 100% parity).
 pub fn analyze_mobile_ast(
     root: Node,
     src: &[u8],
@@ -328,6 +345,11 @@ pub fn analyze_mobile_ast(
         }
         Language::Dart => {
             scan_dart_mobile(rel_path, &lines, &low_full, out);
+        }
+        Language::JavaScript | Language::TypeScript
+            if low_full.contains("react-native") || low_full.contains("asyncstorage") =>
+        {
+            scan_react_native_mobile(rel_path, &lines, &low_full, out);
         }
         _ => {}
     }
@@ -545,6 +567,138 @@ fn scan_android_code(
                 ));
             }
         }
+
+        // 4. Phase 23 MobSF-Scan 100% Android Parity:
+        // Weak cipher (ECB/DES/RC4), hardcoded IV, WebView file-URL & debug, sensitive Log/Clipboard, SQLite SQLi, BiometricPrompt without CryptoObject
+        if low.contains("cipher.getinstance(")
+            && (low.contains("/ecb/")
+                || low.contains("\"aes\"")
+                || low.contains("\"des\"")
+                || low.contains("\"desede")
+                || low.contains("\"rc4"))
+        {
+            out.push(make_phase9_finding(
+                "SMG-MOB-STORAGE",
+                "HIGH",
+                "Android weak/ECB symmetric cipher (`Cipher.getInstance` with ECB/DES/RC4)".into(),
+                rel_path,
+                ln,
+                "Cipher.getInstance",
+                SinkKind::MobileSecurity,
+                GuardKind::MobilePolicy,
+                Confidence::Confirmed,
+                "Use `AES/GCM/NoPadding` with a random 12-byte IV via Android Keystore.",
+            ));
+        }
+        if low.contains("ivparameterspec(")
+            && (low.contains(".getbytes(") || low.contains("new byte[]{") || low.contains("bytearrayof("))
+        {
+            out.push(make_phase9_finding(
+                "SMG-MOB-STORAGE",
+                "HIGH",
+                "Android `IvParameterSpec` initialized with hardcoded static IV bytes".into(),
+                rel_path,
+                ln,
+                "IvParameterSpec",
+                SinkKind::MobileSecurity,
+                GuardKind::MobilePolicy,
+                Confidence::Confirmed,
+                "Generate a fresh cryptographically random IV via `SecureRandom` for every encryption operation.",
+            ));
+        }
+        if low.contains("setallowfileaccessfromfileurls(true)")
+            || low.contains("setallowuniversalaccessfromfileurls(true)")
+        {
+            out.push(make_phase9_finding(
+                "SMG-MOB-IPC",
+                "HIGH",
+                "Android WebView enables cross-origin `file://` URL access (local file exfiltration risk)".into(),
+                rel_path,
+                ln,
+                "WebSettings",
+                SinkKind::MobileSecurity,
+                GuardKind::MobilePolicy,
+                Confidence::Confirmed,
+                "Set `setAllowFileAccessFromFileURLs(false)` and `setAllowUniversalAccessFromFileURLs(false)`.",
+            ));
+        }
+        if low.contains("setwebcontentsdebuggingenabled(true)") {
+            out.push(make_phase9_finding(
+                "SMG-MOB-IPC",
+                "MEDIUM",
+                "Android `WebView.setWebContentsDebuggingEnabled(true)` enabled unconditionally".into(),
+                rel_path,
+                ln,
+                "WebView",
+                SinkKind::MobileSecurity,
+                GuardKind::MobilePolicy,
+                Confidence::Confirmed,
+                "Guard `setWebContentsDebuggingEnabled` behind `BuildConfig.DEBUG`.",
+            ));
+        }
+        if (low.contains("log.d(")
+            || low.contains("log.v(")
+            || low.contains("log.i(")
+            || low.contains("log.e("))
+            && sensitive_key_re().is_match(trimmed)
+        {
+            out.push(make_phase9_finding(
+                "SMG-MOB-STORAGE",
+                "MEDIUM",
+                "Android `Log.*` writes sensitive credential/token material to logcat".into(),
+                rel_path,
+                ln,
+                "android.util.Log",
+                SinkKind::MobileSecurity,
+                GuardKind::MobilePolicy,
+                Confidence::Confirmed,
+                "Never log tokens, passwords, or secrets to Android logcat.",
+            ));
+        }
+        if low.contains("clipdata.newplaintext(") && sensitive_key_re().is_match(trimmed) {
+            out.push(make_phase9_finding(
+                "SMG-MOB-STORAGE",
+                "MEDIUM",
+                "Android `ClipData.newPlainText` copies sensitive credential to global clipboard".into(),
+                rel_path,
+                ln,
+                "ClipboardManager",
+                SinkKind::MobileSecurity,
+                GuardKind::MobilePolicy,
+                Confidence::Confirmed,
+                "Avoid placing secrets on the system clipboard, or mark `ClipDescription.EXTRA_IS_SENSITIVE = true`.",
+            ));
+        }
+        if (low.contains(".rawquery(") || low.contains(".execsql("))
+            && (trimmed.contains(" + ") || trimmed.contains("\"$") || trimmed.contains("${"))
+        {
+            out.push(make_phase9_finding(
+                "SMG-MOB-STORAGE",
+                "HIGH",
+                "Android SQLite `rawQuery`/`execSQL` concatenates dynamic input (local SQL injection)".into(),
+                rel_path,
+                ln,
+                "SQLiteDatabase",
+                SinkKind::MobileSecurity,
+                GuardKind::MobilePolicy,
+                Confidence::Confirmed,
+                "Use parameterized `?` selectionArgs with `rawQuery(sql, selectionArgs)` or Room `@Query`.",
+            ));
+        }
+        if low.contains("biometricprompt.authenticate(") && !low.contains(',') {
+            out.push(make_phase9_finding(
+                "SMG-MOB-IPC",
+                "MEDIUM",
+                "Android `BiometricPrompt.authenticate(promptInfo)` called without `CryptoObject` (boolean auth bypass risk)".into(),
+                rel_path,
+                ln,
+                "BiometricPrompt",
+                SinkKind::MobileSecurity,
+                GuardKind::MobilePolicy,
+                Confidence::Confirmed,
+                "Bind biometric authentication to a Keystore-backed `BiometricPrompt.CryptoObject`.",
+            ));
+        }
     }
 }
 
@@ -666,6 +820,64 @@ fn scan_swift_mobile(
                 "Evaluate server trust via `SecTrustEvaluateWithError` and compare against pinned public keys/certificates.",
             ));
         }
+
+        // 4. Phase 23 MobSF-Scan 100% iOS Parity:
+        if trimmed.contains("NSFileProtectionNone") || trimmed.contains("FileProtectionType.none") {
+            out.push(make_phase9_finding(
+                "SMG-MOB-STORAGE",
+                "HIGH",
+                "iOS file protection disabled (`NSFileProtectionNone` / `FileProtectionType.none`)".into(),
+                rel_path,
+                ln,
+                "FileProtectionType",
+                SinkKind::MobileSecurity,
+                GuardKind::MobilePolicy,
+                Confidence::Confirmed,
+                "Use `FileProtectionType.complete` or `completeUntilFirstUserAuthentication`.",
+            ));
+        }
+        if trimmed.contains("UIWebView(") {
+            out.push(make_phase9_finding(
+                "SMG-MOB-IPC",
+                "MEDIUM",
+                "Deprecated insecure iOS `UIWebView` used instead of `WKWebView`".into(),
+                rel_path,
+                ln,
+                "UIWebView",
+                SinkKind::MobileSecurity,
+                GuardKind::MobilePolicy,
+                Confidence::Confirmed,
+                "Migrate from `UIWebView` to `WKWebView` with isolated process sandboxing.",
+            ));
+        }
+        if low.contains("uipasteboard.general") && sensitive_key_re().is_match(trimmed) {
+            out.push(make_phase9_finding(
+                "SMG-MOB-STORAGE",
+                "MEDIUM",
+                "iOS `UIPasteboard.general` copies sensitive credential to global pasteboard".into(),
+                rel_path,
+                ln,
+                "UIPasteboard",
+                SinkKind::MobileSecurity,
+                GuardKind::MobilePolicy,
+                Confidence::Confirmed,
+                "Avoid copying secrets to `UIPasteboard.general` or set `localOnly` + short `expirationDate`.",
+            ));
+        }
+        if trimmed.contains("kCCAlgorithmDES") || trimmed.contains("kCCOptionECBMode") {
+            out.push(make_phase9_finding(
+                "SMG-MOB-STORAGE",
+                "HIGH",
+                "iOS CommonCrypto uses weak algorithm or ECB mode (`kCCAlgorithmDES` / `kCCOptionECBMode`)".into(),
+                rel_path,
+                ln,
+                "CommonCrypto",
+                SinkKind::MobileSecurity,
+                GuardKind::MobilePolicy,
+                Confidence::Confirmed,
+                "Use `CryptoKit` `AES.GCM` or `ChaChaPoly` instead of DES/ECB.",
+            ));
+        }
     }
 }
 
@@ -752,6 +964,60 @@ fn scan_dart_mobile(
                     "Remove `badCertificateCallback => true` or verify pinned certificate SHA-256 fingerprints strictly.",
                 ));
             }
+        }
+
+        // 3. Phase 23 MobSF-Scan Flutter SQLite rawQuery interpolation (SQLi)
+        if (low.contains(".rawquery(")
+            || low.contains(".rawinsert(")
+            || low.contains(".rawdelete(")
+            || low.contains(".rawupdate("))
+            && (trimmed.contains('\x24') || trimmed.contains(" + "))
+        {
+            out.push(make_phase9_finding(
+                "SMG-MOB-STORAGE",
+                "HIGH",
+                "Flutter `sqflite` raw SQL call interpolates dynamic input (local SQL injection)".into(),
+                rel_path,
+                ln,
+                "sqflite",
+                SinkKind::MobileSecurity,
+                GuardKind::MobilePolicy,
+                Confidence::Confirmed,
+                "Pass `?` placeholders and a separate arguments list to `db.rawQuery(sql, [arg])`.",
+            ));
+        }
+    }
+}
+
+fn scan_react_native_mobile(
+    rel_path: &str,
+    lines: &[&str],
+    full_low: &str,
+    out: &mut Vec<LocalStaticFinding>,
+) {
+    let uses_secure = full_low.contains("react-native-keychain")
+        || full_low.contains("expo-secure-store")
+        || full_low.contains("encrypted-storage");
+    for (idx, line) in lines.iter().enumerate() {
+        let ln = idx + 1;
+        let trimmed = line.trim();
+        let low = trimmed.to_ascii_lowercase();
+        if !uses_secure
+            && low.contains("asyncstorage.setitem(")
+            && sensitive_key_re().is_match(trimmed)
+        {
+            out.push(make_phase9_finding(
+                "SMG-MOB-STORAGE",
+                "HIGH",
+                "React Native `AsyncStorage.setItem` stores sensitive token/secret in unencrypted storage".into(),
+                rel_path,
+                ln,
+                "AsyncStorage",
+                SinkKind::MobileSecurity,
+                GuardKind::MobilePolicy,
+                Confidence::Confirmed,
+                "Store credentials in `react-native-keychain` or `expo-secure-store` instead of `AsyncStorage`.",
+            ));
         }
     }
 }

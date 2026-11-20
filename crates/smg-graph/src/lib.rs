@@ -6,6 +6,7 @@ pub mod deep_stack;
 pub mod deps;
 pub mod git_history;
 pub mod gitleaks_config;
+pub mod iac_policy;
 pub mod infra_dos;
 pub mod langs;
 pub mod lattice;
@@ -58,7 +59,7 @@ fn load_or_parse_summaries_cached(
     let cfg_json = serde_json::to_string(&cfg.guards).unwrap_or_default();
     let adv_stamp = smg_core::advisories_db_stamp();
     let versioned_cfg = format!(
-        "v30-phase20c-mobile-{}|{}|{}|{}",
+        "v31-phase23-mobsf-iac-{}|{}|{}|{}",
         env!("CARGO_PKG_VERSION"),
         adv_stamp,
         cfg.scan.deep_audit,

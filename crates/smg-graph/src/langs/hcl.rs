@@ -263,6 +263,54 @@ fn analyze_top_block(block: Node, ctx: &mut ExtractContext<'_>, graph: &HclFileG
 
     // 4. Over-permissive IAM Policies (`SMG-CFG-IAC-IAM`)
     check_iam_wildcards(ctx, &res_type, &sym_name, line, body, &attrs);
+
+    // 5. Phase 23: Declarative Checkov-class Cloud/IaC Policy Pack (52+ AWS/GCP/Azure policies)
+    if block_type == "resource" {
+        let mut nested_map: HashMap<String, Vec<HashMap<String, String>>> = HashMap::new();
+        collect_nested_block_attrs(body, ctx.src, &graph.var_defaults, &mut nested_map);
+        let view = crate::iac_policy::HclResourceView {
+            rel_path: ctx.rel_path,
+            res_type: &res_type,
+            res_name: &res_name,
+            line,
+            attrs: &attrs,
+            nested: &nested_map,
+        };
+        for hit in crate::iac_policy::evaluate_hcl_resource_policies(&view) {
+            let dup = ctx
+                .static_findings
+                .iter()
+                .any(|e| e.rule_id == hit.rule_id && e.line == hit.line && e.title == hit.title);
+            if !dup {
+                ctx.static_findings.push(hit);
+            }
+        }
+    }
+}
+
+fn collect_nested_block_attrs(
+    body: Node,
+    src: &[u8],
+    var_defaults: &HashMap<String, String>,
+    out: &mut HashMap<String, Vec<HashMap<String, String>>>,
+) {
+    for nb in collect_nested_blocks(body) {
+        let (nb_type, _) = block_header(nb, src);
+        if let Some(nb_body) = find_block_body(nb) {
+            let mut nb_attrs = collect_body_attrs(nb_body, src);
+            for val in nb_attrs.values_mut() {
+                let key_low = val.trim().to_ascii_lowercase();
+                if let Some(resolved) = var_defaults.get(&key_low) {
+                    *val = resolved.clone();
+                }
+            }
+            out.entry(nb_type.to_ascii_lowercase())
+                .or_default()
+                .push(nb_attrs);
+            // Recurse one level deeper (e.g., `settings { ip_configuration { ... } }`)
+            collect_nested_block_attrs(nb_body, src, var_defaults, out);
+        }
+    }
 }
 
 fn push_iac_finding(
