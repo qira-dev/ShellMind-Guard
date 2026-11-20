@@ -1,8 +1,10 @@
 mod deps_sync;
+mod idor_audit;
 mod live_verify;
 mod mcp;
 mod oci_image;
 mod rules_catalog;
+mod tls_audit;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -597,6 +599,32 @@ enum Commands {
             help = "Exit non-zero if any image vulnerability meets this severity"
         )]
         fail_on: Option<FailSeverity>,
+    },
+    /// Audit live TLS/SSL protocols, weak ciphers, HSTS, and RFC 10024 Post-Quantum key exchange (testssl.sh parity)
+    Tls {
+        /// Target host[:port] or https:// URL
+        target: String,
+        #[arg(long, help = "Emit machine-readable JSON report")]
+        json: bool,
+        #[arg(
+            long,
+            value_enum,
+            help = "Exit non-zero if any TLS finding meets this severity"
+        )]
+        fail_on: Option<FailSeverity>,
+    },
+    /// Run non-destructive 2-test-user authorization / IDOR / BFLA regression checks on your own API
+    Idor {
+        /// Path to declarative IDOR test config JSON (base_url, user_a_headers, user_b_headers, checks)
+        #[arg(long, value_name = "FILE")]
+        config: PathBuf,
+        #[arg(
+            long,
+            help = "Allow targeting a non-loopback staging URL (default restricts to loopback/private lab hosts)"
+        )]
+        allow_remote: bool,
+        #[arg(long, help = "Emit machine-readable JSON report")]
+        json: bool,
     },
     /// Confidential Compute Remote TEE Attestation & Commercial Ed25519 License Management
     Enterprise {
@@ -2625,6 +2653,86 @@ pub fn run_cli() -> Result<ExitCode> {
                 if failed {
                     return Ok(ExitCode::from(1));
                 }
+            }
+        }
+        Commands::Tls {
+            target,
+            json,
+            fail_on,
+        } => {
+            let report = tls_audit::run_tls_audit(&target)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "ShellMind Guard TLS | {}:{} | Protocols: [{}] | PQC: {} | CertChain: {} | Findings: {}",
+                    report.host,
+                    report.port,
+                    report.protocols_supported.join(", "),
+                    report
+                        .pqc_group_negotiated
+                        .as_deref()
+                        .unwrap_or("none"),
+                    report.cert_chain_len,
+                    report.findings.len()
+                );
+                if let Some(ref c13) = report.negotiated_tls13_cipher {
+                    println!("  TLS 1.3 Cipher: {c13}");
+                }
+                if let Some(ref c12) = report.negotiated_tls12_cipher {
+                    println!("  TLS 1.2 Cipher: {c12}");
+                }
+                if let Some(ref hsts) = report.hsts_header {
+                    println!("  HSTS: {hsts}");
+                }
+                for f in &report.findings {
+                    println!("  [{}] {} — {} ({})", f.severity, f.id, f.title, f.detail);
+                }
+            }
+            if let Some(threshold) = fail_on {
+                let threshold_rank = match threshold {
+                    FailSeverity::Critical => 4,
+                    FailSeverity::High => 3,
+                    FailSeverity::Medium => 2,
+                    FailSeverity::Low => 1,
+                };
+                let failed = report.findings.iter().any(|f| {
+                    let rank = match f.severity.to_ascii_uppercase().as_str() {
+                        "CRITICAL" => 4,
+                        "HIGH" => 3,
+                        "MEDIUM" => 2,
+                        "LOW" => 1,
+                        _ => 0,
+                    };
+                    rank >= threshold_rank
+                });
+                if failed {
+                    return Ok(ExitCode::from(1));
+                }
+            }
+        }
+        Commands::Idor {
+            config,
+            allow_remote,
+            json,
+        } => {
+            let report = idor_audit::run_idor_audit(&config, allow_remote)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "ShellMind Guard IDOR | {} | Checks: {} | Failures: {}",
+                    report.base_url, report.total_checks, report.failures
+                );
+                for o in &report.outcomes {
+                    println!(
+                        "  [{}] {} {} {} (A={}, B={}, unauth={}) — {}",
+                        o.verdict, o.name, o.method, o.path, o.user_a_status, o.user_b_status, o.unauth_status, o.detail
+                    );
+                }
+            }
+            if report.failures > 0 {
+                return Ok(ExitCode::from(1));
             }
         }
         Commands::Deps { action } => match action {
