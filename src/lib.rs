@@ -1,4 +1,5 @@
 mod deps_sync;
+mod live_verify;
 mod mcp;
 mod rules_catalog;
 
@@ -398,6 +399,33 @@ struct ScanCmdArgs {
         help = "Include test, mock, and harness directories (useful for security benchmark repos like DeFiVulnLabs)"
     )]
     include_tests: bool,
+    #[arg(
+        long,
+        help = "Scan full git commit history for deleted or historical leaked secrets (Gitleaks git parity)"
+    )]
+    git_history: bool,
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Limit --git-history scan to the latest N commits (0 = full history)"
+    )]
+    git_depth: Option<usize>,
+    #[arg(
+        long,
+        value_name = "FILE",
+        help = "Explicit path to a .gitleaks.toml allowlist/rules policy file (auto-detected at repo root if omitted)"
+    )]
+    gitleaks_config: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Opt-in live read-only verification of detected credentials against provider APIs (TruffleHog parity; OFF by default)"
+    )]
+    verify_live: bool,
+    #[arg(
+        long,
+        help = "When combined with --verify-live, keep only confirmed-live secrets (mirrors trufflehog --only-verified)"
+    )]
+    only_verified: bool,
     #[arg(long)]
     html: Option<PathBuf>,
     #[arg(long)]
@@ -1217,6 +1245,123 @@ fn resolve_sandbox_port(cli_port: u16, cfg: &ShellMindGuardConfig) -> Result<u16
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn apply_phase21_secrets_extensions(
+    repo_root: &Path,
+    layers: &[String],
+    include_tests: bool,
+    run_git_history: bool,
+    git_depth: Option<usize>,
+    gitleaks_config_path: Option<&Path>,
+    verify_live: bool,
+    only_verified: bool,
+    outcome: &mut ScanOutcome,
+) -> Result<()> {
+    if only_verified && !verify_live {
+        anyhow::bail!(
+            "`--only-verified` requires `--verify-live` (live credential verification is opt-in and OFF by default)."
+        );
+    }
+
+    let gitleaks_cfg = smg_graph::GitleaksConfig::load(repo_root, gitleaks_config_path);
+    let secrets_layer_active = layers.is_empty()
+        || layers.iter().any(|l| {
+            matches!(
+                l.trim().to_ascii_lowercase().as_str(),
+                "all" | "*" | "secrets" | "secret" | "gitleaks" | "trufflehog" | "5" | "layer5"
+            )
+        });
+
+    // 1. Honor `.gitleaks.toml` allowlists + inline `gitleaks:allow` on working-tree secret findings
+    if secrets_layer_active {
+        let mut file_cache: HashMap<String, String> = HashMap::new();
+        outcome.graph.findings.retain(|f| {
+            if !f.rule_id.starts_with("SMG-SEC-") {
+                return true;
+            }
+            let content = file_cache
+                .entry(f.file.clone())
+                .or_insert_with(|| fs::read_to_string(repo_root.join(&f.file)).unwrap_or_default());
+            let line_str = content
+                .lines()
+                .nth(f.line.saturating_sub(1))
+                .unwrap_or("");
+            if smg_graph::has_inline_allow_marker(line_str) {
+                return false;
+            }
+            if let Some(cfg) = gitleaks_cfg.as_ref() {
+                let tok = smg_graph::extract_tokens_from_line(line_str)
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default();
+                if cfg.is_allowed(&f.file, None, line_str, &tok) {
+                    return false;
+                }
+            }
+            true
+        });
+
+        // Also evaluate custom `[[rules]]` from `.gitleaks.toml` across working-tree files
+        if let Some(cfg) = gitleaks_cfg.as_ref()
+            && !cfg.custom_rules.is_empty()
+        {
+            let smg_cfg = ShellMindGuardConfig::load_from_dir(repo_root)?;
+            let summary = scan_repository(repo_root, &smg_cfg)?;
+            let mut custom_hits = Vec::new();
+            for indexed in &summary.files {
+                if let Ok(content) = fs::read_to_string(repo_root.join(&indexed.rel_path)) {
+                    for (idx, line) in content.lines().enumerate() {
+                        for (hit, _) in
+                            cfg.scan_custom_rules_line(&indexed.rel_path, idx + 1, line, None)
+                        {
+                            custom_hits.push(hit);
+                        }
+                    }
+                }
+            }
+            smg_graph::append_local_static_findings(&mut outcome.graph.findings, &custom_hits);
+        }
+    }
+
+    // 2. Full Git Commit-History secret scanning (`--git-history` / `--git-depth`)
+    let mut history_candidates: Vec<smg_graph::SecretCandidate> = Vec::new();
+    if run_git_history && secrets_layer_active {
+        let hist = smg_graph::scan_git_history(
+            repo_root,
+            git_depth,
+            gitleaks_cfg.as_ref(),
+            include_tests,
+        )?;
+        if std::io::stderr().is_terminal() {
+            eprintln!(
+                "[SMG] --git-history scanned {} commit(s) -> {} historical secret finding(s)",
+                hist.commits_scanned,
+                hist.findings.len()
+            );
+        }
+        smg_graph::append_local_static_findings(&mut outcome.graph.findings, &hist.findings);
+        history_candidates = hist.candidates;
+    }
+
+    // 3. Opt-in TruffleHog-style Live Credential Verification (`--verify-live`)
+    if verify_live && secrets_layer_active {
+        let summary = live_verify::run_live_secret_verification(
+            repo_root,
+            &mut outcome.graph.findings,
+            &history_candidates,
+            only_verified,
+        )?;
+        if std::io::stderr().is_terminal() {
+            eprintln!(
+                "[SMG] --verify-live checked {} credential(s): {} LIVE, {} inactive, {} unverified",
+                summary.checked, summary.verified_live, summary.inactive, summary.unverified
+            );
+        }
+    }
+
+    Ok(())
+}
+
 pub(crate) fn execute_scan_pipeline(opts: ScanRunOptions<'_>) -> Result<ScanOutcome> {
     execute_scan_pipeline_with_wave2(opts, None, false)
 }
@@ -1687,6 +1832,11 @@ pub fn run_cli() -> Result<ExitCode> {
                 changed_since,
                 include_generated,
                 include_tests,
+                git_history,
+                git_depth,
+                gitleaks_config,
+                verify_live,
+                only_verified,
                 html,
                 patch,
                 unsafe_host_fallback,
@@ -1734,6 +1884,17 @@ pub fn run_cli() -> Result<ExitCode> {
                 include_generated,
                 run_pqc,
                 cbom.as_deref(),
+            )?;
+            apply_phase21_secrets_extensions(
+                &path,
+                &layers,
+                include_tests,
+                git_history || git_depth.is_some(),
+                git_depth,
+                gitleaks_config.as_deref(),
+                verify_live,
+                only_verified,
+                &mut outcome,
             )?;
             let mut verified_list: Vec<VerifiedFinding> = outcome
                 .sandbox

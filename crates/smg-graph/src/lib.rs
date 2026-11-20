@@ -4,6 +4,8 @@ pub mod call_hierarchy;
 pub mod cfg;
 pub mod deep_stack;
 pub mod deps;
+pub mod git_history;
+pub mod gitleaks_config;
 pub mod infra_dos;
 pub mod langs;
 pub mod lattice;
@@ -28,6 +30,11 @@ pub use ast::{
     TypeImplSummary, check_source_syntax, parse_file_ast, parse_file_ast_with_hash,
 };
 pub use deps::{ReachableVulnStatus, assess_dependency_reachability, compute_reachable_packages};
+pub use git_history::{
+    GitHistoryScanResult, SecretCandidate, extract_aws_secret_near, extract_tokens_from_line,
+    scan_git_history,
+};
+pub use gitleaks_config::{GitleaksConfig, has_inline_allow_marker};
 pub use lattice::{
     GraphAnalysisResult, LatticeFinding, RuleHitStat, TraceHop, append_local_static_findings,
     compute_rule_telemetry, finding_matches_layer, solve_guard_lattice,
