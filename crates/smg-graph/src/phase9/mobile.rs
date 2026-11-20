@@ -644,9 +644,11 @@ fn scan_swift_mobile(
         // 3. SMG-MOB-TLS: URLSession challenge trust bypass
         if low.contains(".usecredential")
             && low.contains("urlcredential(trust:")
-            && !lines[idx.saturating_sub(5)..idx].iter().any(|l| {
+            && !lines[idx.saturating_sub(12)..idx].iter().any(|l| {
                 let ll = l.to_ascii_lowercase();
                 ll.contains("sectrustevaluate")
+                    || ll.contains("servertrustevaluator")
+                    || ll.contains(".evaluate(")
                     || ll.contains("pinned")
                     || ll.contains("seccertificate")
             })
