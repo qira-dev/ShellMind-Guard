@@ -109,11 +109,11 @@ struct Form {
 }
 
 #[derive(Debug, Clone)]
-struct PageResponse {
-    url: String,
-    status: u16,
-    headers: String,
-    body: String,
+pub(crate) struct PageResponse {
+    pub(crate) url: String,
+    pub(crate) status: u16,
+    pub(crate) headers: String,
+    pub(crate) body: String,
 }
 
 struct HttpHelper {
@@ -171,7 +171,10 @@ impl HttpHelper {
     }
 }
 
-fn to_page_response(url: &str, resp: reqwest::blocking::Response) -> Result<PageResponse> {
+pub(crate) fn to_page_response(
+    url: &str,
+    resp: reqwest::blocking::Response,
+) -> Result<PageResponse> {
     let status = resp.status().as_u16();
     let mut header_str = String::new();
     let hm: &HeaderMap = resp.headers();
@@ -304,7 +307,7 @@ fn header_all(headers: &str, name: &str) -> Vec<String> {
         .collect()
 }
 
-fn passive_header_findings(page: &PageResponse) -> Vec<DastFinding> {
+pub(crate) fn passive_header_findings(page: &PageResponse) -> Vec<DastFinding> {
     let mut out = Vec::new();
     let is_https = page.url.starts_with("https://");
     let mut push = |id: &str, severity: &str, evidence: String| {
@@ -422,6 +425,26 @@ fn passive_header_findings(page: &PageResponse) -> Vec<DastFinding> {
             "high",
             "CORS wildcard Allow-Origin combined with Allow-Credentials: true".into(),
         );
+    }
+    // Session-bearing responses (Set-Cookie) must opt out of shared caching.
+    if !header_all(&page.headers, "Set-Cookie").is_empty() {
+        let cache = header_value(&page.headers, "Cache-Control")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !cache.contains("no-store") && !cache.contains("private") {
+            push(
+                "SMG-DAST-CACHE",
+                "medium",
+                format!(
+                    "Set-Cookie response lacks Cache-Control no-store/private (got: {})",
+                    if cache.is_empty() {
+                        "<missing>".into()
+                    } else {
+                        cache
+                    }
+                ),
+            );
+        }
     }
     out
 }

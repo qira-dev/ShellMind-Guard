@@ -60,6 +60,13 @@
   - `src/proxy.rs` + `crates/smg-tui/src/proxy_tui.rs` (`smg proxy [--listen] [--no-tui] [--log]`) — localhost HTTP inspection proxy: full plain-HTTP interception (origin-form rewrite, `Connection: close`, `Accept-Encoding` stripped so bodies are inspectable), HTTPS `CONNECT` logging + transparent byte relay (TLS stays opaque by design), capture-bounded history, headless JSONL sink, and a ratatui TUI (history list, request/response panes, `r` Repeater replay with `replay_of` provenance, `d` Base64/URL/JWT decoder, `i` bounded wordlist Intruder (`{FUZZ}` marker, GET, ≤100 words), `e` export).
 - **Verification:** `smg-tui` 13/13 tests, `clippy -D warnings` 0 warnings, self-scan clean; live lab loop: XSS reflection, open-redirect `Location` proof, SSTI math proof, real-shell arithmetic CMDi proof (and zero CMDi false positives on reflection-only endpoints), headless proxy JSONL capture, and TLS/PQC regression (`smg tls cloudflare.com`) all verified on loopback.
 
+### Phase 26 Part B — Passive Posture Auditor, Schema Linter & Proxy Compare (Implemented, Defensive Scope)
+- **Status:** Completed & Pushed
+- **Modules:**
+  - `src/http_audit.rs` (`smg http-audit <URL> [--schema <FILE>] [--graphql <URL>]`) — strictly non-destructive passive auditor: one GET for the response-header posture (shared `passive_header_findings` engine with dast, now including the **Cache-Control no-store/private on Set-Cookie** check `SMG-DAST-CACHE`), passive OpenAPI/Swagger discovery with **static spec lints** (`SMG-OAPI-INSECURE-SERVER` plaintext `http://` servers / Swagger-2 plaintext-only `schemes`, `SMG-OAPI-NO-AUTH-SCHEME`, `SMG-OAPI-BASIC-AUTH`, `SMG-OAPI-APIKEY-QUERY`), a read-only GraphQL `__schema` introspection probe (`SMG-GQL-INTROSPECTION`), **offline schema-file linting** with zero network (OpenAPI 3 / Swagger 2 JSON + GraphQL SDL: `SMG-GQL-NO-QUERY-ROOT`, `SMG-GQL-SENSITIVE-FIELD`, `SMG-GQL-DEBUG-FIELD`), and remote-host guardrails identical to the other live engines.
+  - `crates/smg-tui/src/proxy_tui.rs` — **Compare (Burp-CE diff parity)**: `x` marks a compare-from entry and a second `x` opens a bounded LCS **line diff** modal (`same/removed/added` counters, red/green colouring, 900-line render cap, `DIFF_MAX_LINES` DP bound) between any two captured transactions.
+- **Verification:** 225/225 workspace tests (incl. offline schema lint, Cache-Control check, diff LCS correctness), `clippy -D warnings` 0 warnings, dogfood self-scan 0 findings; live lab loop verified: passive posture 8 findings incl. `SMG-DAST-CACHE`, OpenAPI lints (`SMG-OAPI-INSECURE-SERVER`, `SMG-OAPI-APIKEY-QUERY`), `SMG-GQL-INTROSPECTION`, offline GraphQL SDL lint with no network, and remote-target refusal.
+
 ---
 
 ## Deliberate Out-of-Scope Boundaries (Unchanged)

@@ -224,6 +224,66 @@ pub fn intruder_run(
     results
 }
 
+const DIFF_MAX_LINES: usize = 1_500;
+
+/// Line-based LCS diff: `' '` = same, `'-'` = only in `a`, `'+'` = only in `b`.
+/// Bounded to the first `DIFF_MAX_LINES` lines of each side so the DP table
+/// stays small even for large captured bodies.
+pub fn diff_lines(a: &str, b: &str) -> Vec<(char, String)> {
+    let la: Vec<&str> = a.lines().take(DIFF_MAX_LINES).collect();
+    let lb: Vec<&str> = b.lines().take(DIFF_MAX_LINES).collect();
+    let n = la.len();
+    let m = lb.len();
+    let mut dp = vec![vec![0u32; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            dp[i][j] = if la[i] == lb[j] {
+                dp[i + 1][j + 1] + 1
+            } else {
+                dp[i + 1][j].max(dp[i][j + 1])
+            };
+        }
+    }
+    let mut out = Vec::new();
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < n && j < m {
+        if la[i] == lb[j] {
+            out.push((' ', la[i].to_string()));
+            i += 1;
+            j += 1;
+        } else if dp[i + 1][j] >= dp[i][j + 1] {
+            out.push(('-', la[i].to_string()));
+            i += 1;
+        } else {
+            out.push(('+', lb[j].to_string()));
+            j += 1;
+        }
+    }
+    while i < n {
+        out.push(('-', la[i].to_string()));
+        i += 1;
+    }
+    while j < m {
+        out.push(('+', lb[j].to_string()));
+        j += 1;
+    }
+    out
+}
+
+fn entry_transaction_text(entry: &ProxyEntry) -> String {
+    format!(
+        "{} {}\r\n{}\r\n{}\n--- response ({} {}) ---\r\n{}\r\n{}",
+        entry.method,
+        entry.url,
+        entry.req_headers,
+        entry.req_body,
+        entry.status,
+        entry.duration_ms,
+        entry.resp_headers,
+        entry.resp_body
+    )
+}
+
 // ---------------------------------------------------------------------------
 // TUI
 // ---------------------------------------------------------------------------
@@ -241,6 +301,7 @@ enum Modal {
     None,
     Decoder(Vec<(String, String)>),
     Intruder(IntruderState),
+    Diff(Vec<(char, String)>, u64, u64),
 }
 
 struct App {
@@ -253,6 +314,7 @@ struct App {
     modal: Modal,
     quit: bool,
     status_message: Option<String>,
+    compare_from: Option<u64>,
 }
 
 impl App {
@@ -475,7 +537,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             Style::default().fg(Color::Black).bg(Color::Yellow),
         )),
         None => Line::from(Span::raw(
-            " j/k select · Tab focus · PgUp/PgDn scroll · r replay · d decode · i intruder · e export · q quit ",
+            " j/k select · Tab focus · PgUp/PgDn scroll · r replay · d decode · i intruder · e export · x compare · q quit ",
         )),
     };
     f.render_widget(Paragraph::new(help), chunks[2]);
@@ -483,6 +545,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     match &app.modal {
         Modal::Decoder(decoded) => draw_decoder_modal(f, decoded),
         Modal::Intruder(state) => draw_intruder_modal(f, state),
+        Modal::Diff(diff, from_id, to_id) => draw_diff_modal(f, diff, *from_id, *to_id),
         Modal::None => {}
     }
 }
@@ -604,6 +667,49 @@ fn draw_intruder_modal(f: &mut Frame, state: &IntruderState) {
     );
 }
 
+fn draw_diff_modal(f: &mut Frame, diff: &[(char, String)], from_id: u64, to_id: u64) {
+    let area = centered_rect(88, 24, f.area());
+    f.render_widget(Clear, area);
+    let mut lines: Vec<Line> = Vec::new();
+    let same = diff.iter().filter(|(t, _)| *t == ' ').count();
+    let removed = diff.iter().filter(|(t, _)| *t == '-').count();
+    let added = diff.iter().filter(|(t, _)| *t == '+').count();
+    lines.push(Line::from(Span::styled(
+        format!(" #{from_id} → #{to_id}   same: {same}   removed: {removed}   added: {added} "),
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+    for (tag, text) in diff.iter().take(900) {
+        let style = match tag {
+            '-' => Style::default().fg(Color::Red),
+            '+' => Style::default().fg(Color::Green),
+            _ => Style::default().fg(Color::DarkGray),
+        };
+        lines.push(Line::from(Span::styled(format!("{tag} {text}"), style)));
+    }
+    if diff.len() > 900 {
+        lines.push(Line::from(Span::styled(
+            format!(
+                " … {} more lines (export entries with `e` for the full text)",
+                diff.len() - 900
+            ),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .title(" Compare — line diff A → B (Esc closes) ");
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
 /// Blocking TUI loop. Returns when the user presses `q` (or `Esc` closes a
 /// modal / `Ctrl+C` quits) or the terminal fails.
 pub fn run_proxy_tui(
@@ -625,6 +731,7 @@ pub fn run_proxy_tui(
         modal: Modal::None,
         quit: false,
         status_message: None,
+        compare_from: None,
     };
 
     let result = (|| -> Result<()> {
@@ -645,6 +752,11 @@ pub fn run_proxy_tui(
 
             match &mut app.modal {
                 Modal::Decoder(_) => {
+                    if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+                        app.modal = Modal::None;
+                    }
+                }
+                Modal::Diff(_, _, _) => {
                     if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
                         app.modal = Modal::None;
                     }
@@ -772,6 +884,48 @@ pub fn run_proxy_tui(
                             Err(e) => app.status_message = Some(format!("export failed: {e}")),
                         }
                     }
+                    KeyCode::Char('x') => {
+                        let Some(entry) = app.selected() else {
+                            app.status_message = Some("nothing selected".into());
+                            continue;
+                        };
+                        match app.compare_from {
+                            None => {
+                                app.compare_from = Some(entry.id);
+                                app.status_message = Some(format!(
+                                    "compare-from: #{} (navigate to another entry and press x again)",
+                                    entry.id
+                                ));
+                            }
+                            Some(from_id) => {
+                                if from_id == entry.id {
+                                    app.status_message = Some(
+                                        "compare target equals source; pick a different entry"
+                                            .into(),
+                                    );
+                                    continue;
+                                }
+                                let entries = app.entries.lock().ok();
+                                let Some(entries) = entries else {
+                                    continue;
+                                };
+                                let Some(base) = entries.iter().find(|e| e.id == from_id) else {
+                                    app.status_message = Some(format!(
+                                        "compare-from #{} no longer captured",
+                                        from_id
+                                    ));
+                                    app.compare_from = None;
+                                    continue;
+                                };
+                                let diff = diff_lines(
+                                    &entry_transaction_text(base),
+                                    &entry_transaction_text(&entry),
+                                );
+                                app.modal = Modal::Diff(diff, from_id, entry.id);
+                                app.compare_from = None;
+                            }
+                        }
+                    }
                     _ => {}
                 },
             }
@@ -823,6 +977,32 @@ mod tests {
     #[test]
     fn decode_all_is_empty_for_plain_text() {
         assert!(decode_all("just some plain sentence").is_empty());
+    }
+
+    #[test]
+    fn diff_lines_marks_changes_and_preserves_order() {
+        let a = "GET /a\r\nHost: x\r\nid=1\r\nfooter";
+        let b = "GET /b\r\nHost: x\r\nid=2\r\nfooter\r\nextra";
+        let diff = diff_lines(a, b);
+        let tags: Vec<char> = diff.iter().map(|(t, _)| *t).collect();
+        assert_eq!(tags, vec!['-', '+', ' ', '-', '+', ' ', '+']);
+        let added: Vec<&str> = diff
+            .iter()
+            .filter(|(t, _)| *t == '+')
+            .map(|(_, s)| s.as_str())
+            .collect();
+        assert_eq!(added, vec!["GET /b", "id=2", "extra"]);
+        let removed: Vec<&str> = diff
+            .iter()
+            .filter(|(t, _)| *t == '-')
+            .map(|(_, s)| s.as_str())
+            .collect();
+        assert_eq!(removed, vec!["GET /a", "id=1"]);
+        // Identical texts produce only same-lines.
+        assert!(diff_lines("a\n", "a\n").iter().all(|(t, _)| *t == ' '));
+        // Long inputs are bounded.
+        let big = "x\n".repeat(4_000);
+        assert!(diff_lines(&big, &big).len() <= DIFF_MAX_LINES);
     }
 
     fn echo_server() -> String {

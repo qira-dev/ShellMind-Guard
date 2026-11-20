@@ -1,5 +1,6 @@
 mod dast_audit;
 mod deps_sync;
+mod http_audit;
 mod idor_audit;
 mod live_verify;
 mod mcp;
@@ -757,6 +758,39 @@ enum Commands {
             help = "Allow binding a non-loopback address (proxy is loopback-only by default)"
         )]
         allow_remote_bind: bool,
+    },
+    /// Passive HTTP security posture + static OpenAPI/GraphQL schema linter (non-destructive)
+    HttpAudit {
+        /// Target URL (passive single-GET posture audit + schema discovery); omit with --schema for offline linting
+        url: Option<String>,
+        #[arg(
+            long,
+            value_delimiter = ',',
+            value_name = "K=V",
+            help = "Extra request headers, e.g. Authorization=Bearer\\ x"
+        )]
+        header: Vec<String>,
+        #[arg(
+            long,
+            value_name = "FILE",
+            help = "Lint a local OpenAPI/Swagger JSON or GraphQL SDL schema file (offline, no network)"
+        )]
+        schema: Option<PathBuf>,
+        #[arg(
+            long,
+            value_name = "URL",
+            help = "Explicit GraphQL endpoint for the read-only introspection probe (default: <origin>/graphql)"
+        )]
+        graphql: Option<String>,
+        #[arg(long, default_value_t = 8_000, value_name = "MS")]
+        timeout_ms: u64,
+        #[arg(
+            long,
+            help = "Allow targeting a non-loopback staging URL (default restricts to loopback/private lab hosts)"
+        )]
+        allow_remote: bool,
+        #[arg(long, help = "Emit machine-readable JSON report")]
+        json: bool,
     },
     /// Confidential Compute Remote TEE Attestation & Commercial Ed25519 License Management
     Enterprise {
@@ -3147,6 +3181,63 @@ pub fn run_cli() -> Result<ExitCode> {
                 "  Stopped | HTTP: {} | TLS tunnels: {} | Errors: {}",
                 summary.http_intercepted, summary.https_tunneled, summary.errors
             );
+        }
+        Commands::HttpAudit {
+            url,
+            header,
+            schema,
+            graphql,
+            timeout_ms,
+            allow_remote,
+            json,
+        } => {
+            let headers: HashMap<String, String> = header
+                .iter()
+                .filter_map(|h| h.split_once('='))
+                .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+                .collect();
+            let report = http_audit::run_http_audit(&http_audit::HttpAuditConfig {
+                url: url.clone().unwrap_or_default(),
+                headers,
+                schema_file: schema,
+                graphql_endpoint: graphql,
+                timeout: Duration::from_millis(timeout_ms),
+                allow_remote,
+            })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "ShellMind Guard HTTP-Audit | {} | Passive: {} | Schema: {} ({}) | {}ms",
+                    report.url,
+                    report.passive_findings.len(),
+                    report.schema_findings.len(),
+                    report.schema_kind.as_deref().unwrap_or("none discovered"),
+                    report.elapsed_ms
+                );
+                for f in report
+                    .passive_findings
+                    .iter()
+                    .chain(report.schema_findings.iter())
+                {
+                    println!(
+                        "  [{}] {} {} {} — {}",
+                        f.severity.to_ascii_uppercase(),
+                        f.id,
+                        f.url,
+                        f.param.as_deref().unwrap_or("-"),
+                        f.evidence
+                    );
+                }
+            }
+            let blocking = report
+                .passive_findings
+                .iter()
+                .chain(report.schema_findings.iter())
+                .any(|f| matches!(f.severity.as_str(), "critical" | "high"));
+            if blocking {
+                return Ok(ExitCode::from(1));
+            }
         }
         Commands::Deps { action } => match action {
             DepsAction::Sync {
