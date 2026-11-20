@@ -1282,15 +1282,19 @@ fn is_unsafe_deser_line(
 fn is_proto_pollution_write(
     trimmed: &str,
     block_low: &str,
-    _raw_obj_vars: &HashSet<String>,
+    raw_obj_vars: &HashSet<String>,
     scalar_vars: &HashSet<String>,
 ) -> bool {
+    // Require concrete untrusted request/input taint in the function so internal library
+    // schema/config loops (e.g. Fastify `lib/schemas.js`) do not false-positive.
+    let has_taint_context =
+        !raw_obj_vars.is_empty() || !scalar_vars.is_empty() || contains_request_source(block_low);
     let has_loop_or_req = block_low.contains("for (")
         || block_low.contains("for(")
         || block_low.contains("object.keys(")
         || !scalar_vars.is_empty()
         || contains_request_source(block_low);
-    if !has_loop_or_req {
+    if !has_taint_context || !has_loop_or_req {
         return false;
     }
     static BRACKET_ASSIGN_RE: OnceLock<Regex> = OnceLock::new();
@@ -1742,6 +1746,27 @@ function ResearchHandler(db) {
             rules.contains(&"SMG-SSRF-001"),
             "expected needle.get() SSRF in this.displayResearch, got: {:?}",
             rules
+        );
+
+        // Phase 16C: Internal schema compiler loop (Fastify `lib/schemas.js`) with no HTTP request taint must NOT trigger SMG-CFG-PROTO
+        let fastify_safe = run_inline(&[(
+            "lib/schemas.js",
+            r#"function lowerCaseHeadersSchema(schema) {
+    const out = {};
+    for (const key in schema) {
+        out[key.toLowerCase()] = schema[key];
+    }
+    return out;
+}
+"#,
+        )]);
+        assert!(
+            !fastify_safe
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "SMG-CFG-PROTO"),
+            "Internal non-request schema loop must not trigger SMG-CFG-PROTO, got: {:#?}",
+            fastify_safe.findings
         );
     }
 }

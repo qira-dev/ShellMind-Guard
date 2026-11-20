@@ -206,14 +206,36 @@ pub fn has_generated_header(bytes: &[u8]) -> bool {
         || low.contains("auto-generated file. do not edit")
 }
 
-/// Identifies dedicated unit/integration test paths so scanners can suppress noisy
-/// non-secret findings while preserving secret/credential leak checks.
+static INCLUDE_TESTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Enables or disables scanning of test/mock/harness source paths (used by `--include-tests`
+/// for security benchmark / PoC repositories such as `DeFiVulnLabs`).
+pub fn set_include_tests(enabled: bool) {
+    INCLUDE_TESTS.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Identifies dedicated unit/integration test, mock, and formal-verification harness paths so
+/// scanners can suppress noisy non-secret findings while preserving secret/credential leak checks.
 pub fn is_test_source_path(rel_path: &str) -> bool {
+    if INCLUDE_TESTS.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
     let low = rel_path.replace('\\', "/").to_ascii_lowercase();
     let fname = low.rsplit('/').next().unwrap_or(&low);
-    let has_test_dir = low
-        .split('/')
-        .any(|seg| matches!(seg, "tests" | "test" | "__tests__" | "spec" | "testdata"));
+    let has_test_dir = low.split('/').any(|seg| {
+        matches!(
+            seg,
+            "tests"
+                | "test"
+                | "__tests__"
+                | "spec"
+                | "testdata"
+                | "mocks"
+                | "mock"
+                | "harnesses"
+                | "harness"
+        )
+    });
     has_test_dir
         || fname.ends_with("_test.go")
         || fname.ends_with("_test.rs")
@@ -230,6 +252,8 @@ pub fn is_test_source_path(rel_path: &str) -> bool {
         || fname.ends_with("_spec.rb")
         || fname.ends_with("_test.rb")
         || fname.ends_with(".t.sol")
+        || fname.ends_with("mock.sol")
+        || fname.ends_with("harness.sol")
 }
 
 fn should_visit_entry(entry: &ignore::DirEntry, root: &Path, ignore_set: &[String]) -> bool {

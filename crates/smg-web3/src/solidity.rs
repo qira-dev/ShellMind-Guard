@@ -1533,8 +1533,8 @@ fn check_initializer_and_admin_access(
             remediation: "Make `multicall` non-payable or disallow subcalls that inspect `msg.value` inside batch delegatecall loops.".into(),
         });
     }
-    if body_low.contains("transferfrom(") && !has_auth {
-        for call_part in f.body_text.split("transferFrom(").skip(1) {
+    if body_low.contains(".transferfrom(") && !has_auth {
+        for call_part in f.body_text.split(".transferFrom(").skip(1) {
             let first_arg = call_part.split(',').next().unwrap_or("").trim();
             if !first_arg.is_empty()
                 && !first_arg.contains("msg.sender")
@@ -1897,6 +1897,25 @@ contract FreeRiderNFTMarketplace {
                 .any(|h| h.rule_id == "SMG-WEB3-ACCESS" && h.severity == "CRITICAL"),
             "expected CRITICAL SMG-WEB3-ACCESS on FreeRider inter-procedural msg.value loop, got: {:#?}",
             freerider_hits
+        );
+
+        // Phase 16C: ERC721 self-call `transferFrom(from, to, tokenId)` must NOT false-positive
+        let erc721_self = r#"
+pragma solidity ^0.8.20;
+contract ERC721 {
+    function safeTransferFrom(address from, address to, uint256 tokenId, bytes memory data) public {
+        transferFrom(from, to, tokenId);
+    }
+}
+"#;
+        let (_, erc721_hits) =
+            analyze_solidity_file("contracts/token/ERC721/ERC721.sol", erc721_self, &ctx);
+        assert!(
+            !erc721_hits
+                .iter()
+                .any(|h| h.title.contains("Arbitrary `transferFrom")),
+            "ERC721 internal self-call transferFrom must not false-positive, got: {:#?}",
+            erc721_hits
         );
     }
 }

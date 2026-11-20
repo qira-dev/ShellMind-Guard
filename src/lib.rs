@@ -393,6 +393,11 @@ struct ScanCmdArgs {
         help = "Include generated stub files (*.pb.go, *.min.js, etc.) usually skipped by default"
     )]
     include_generated: bool,
+    #[arg(
+        long,
+        help = "Include test, mock, and harness directories (useful for security benchmark repos like DeFiVulnLabs)"
+    )]
+    include_tests: bool,
     #[arg(long)]
     html: Option<PathBuf>,
     #[arg(long)]
@@ -1681,6 +1686,7 @@ pub fn run_cli() -> Result<ExitCode> {
                 export_test,
                 changed_since,
                 include_generated,
+                include_tests,
                 html,
                 patch,
                 unsafe_host_fallback,
@@ -1689,6 +1695,7 @@ pub fn run_cli() -> Result<ExitCode> {
                 fail_on,
                 watch,
             } = *boxed_scan;
+            smg_core::set_include_tests(include_tests);
             let effective_format = if json { OutputFormat::Json } else { format };
             let min_conf = min_confidence.map(|m| m.to_confidence());
             let run_pqc = match compliance.as_deref().map(|s| s.trim().to_ascii_lowercase()) {

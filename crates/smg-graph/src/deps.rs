@@ -1601,7 +1601,14 @@ fn audit_pyproject_toml(
     }
 
     if !pep621_specs.is_empty() {
-        let joined = pep621_specs.join("\n");
+        // Phase 16C: Open-ended PEP-621 lower-bound ranges (`pkg>=X.Y.Z` without `==` or `<`)
+        // in library `pyproject.toml` resolve to the latest patched version at install time and
+        // are not pinned vulnerable versions.
+        let actionable_specs: Vec<&str> = pep621_specs
+            .into_iter()
+            .filter(|s| !(s.contains(">=") && !s.contains("==") && !s.contains('<')))
+            .collect();
+        let joined = actionable_specs.join("\n");
         for mut finding in audit_requirements_txt(rel_path, &joined, store) {
             let pkg_token = finding
                 .title
@@ -2515,6 +2522,18 @@ urllib3 = "1.26.4"
         let pp_hits = scan_dependencies_with_store("pyproject.toml", pyproj, None);
         assert!(pp_hits.iter().any(|h| h.title.contains("pyyaml@5.3.1")));
         assert!(pp_hits.iter().any(|h| h.title.contains("urllib3@1.26.4")));
+
+        // Phase 16C: Open-ended `>=` lower-bound library specs in pyproject.toml (e.g. Flask/FastAPI) must NOT false-positive
+        let lib_pyproj = r#"
+[project]
+dependencies = ["Jinja2>=3.1.2", "pyyaml>=5.3.1"]
+"#;
+        let lib_hits = scan_dependencies_with_store("pyproject.toml", lib_pyproj, None);
+        assert!(
+            lib_hits.is_empty(),
+            "Open-ended >= lower-bound library specs in pyproject.toml must not FP, got: {:?}",
+            lib_hits
+        );
 
         let pre_pkg = r#"{"dependencies": {"axios": "1.6.0-alpha.1"}}"#;
         let pre_hits = scan_dependencies_with_store("package.json", pre_pkg, None);
