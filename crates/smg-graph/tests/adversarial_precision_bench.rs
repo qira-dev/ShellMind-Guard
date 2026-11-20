@@ -2051,6 +2051,153 @@ export async function syncData(id: string) {
                 code: "export async function findUsers(req: any, db: any) {\n  const rows = await db.users.find(req.body);\n  AuditSchema.parse(req.headers);\n  return rows;\n}\n",
             }],
         },
+        // ------------------------------------------------------------------
+        // Phase 12A Sprint 3: Qualified Call Graph & Sound CHA/RTA Hierarchy
+        // ------------------------------------------------------------------
+        AdversarialCase {
+            id: "sprint3_sibling_class_save_isolation_safe",
+            family: "SQLI",
+            expected_prefix: "SMG-SQLI",
+            expect_finding: false,
+            trap_kind: TrapKind::ScopeCollisionTrap,
+            files: vec![
+                BenchFile {
+                    rel_path: "src/repo.ts",
+                    lang: Language::TypeScript,
+                    code: r#"
+export class UserRepo {
+    async save(id: string) {
+        return await db.query(`SELECT * FROM users WHERE id = '${id}'`);
+    }
+}
+export class AuditLogger {
+    async save(msg: string) {
+        console.log(msg);
+    }
+}
+"#,
+                },
+                BenchFile {
+                    rel_path: "src/audit_route.ts",
+                    lang: Language::TypeScript,
+                    code: r#"
+import { AuditLogger } from './repo';
+app.post('/api/audit-log', requireAuth, async (req, res) => {
+    const logger: AuditLogger = new AuditLogger();
+    await logger.save(req.body.msg);
+    res.json({ ok: true });
+});
+"#,
+                },
+            ],
+        },
+        AdversarialCase {
+            id: "sprint3_python_import_alias_sqli_vuln",
+            family: "SQLI",
+            expected_prefix: "SMG-SQLI",
+            expect_finding: true,
+            trap_kind: TrapKind::OneHopWrapperTrap,
+            files: vec![
+                BenchFile {
+                    rel_path: "services/db.py",
+                    lang: Language::Python,
+                    code: r#"
+def run_query(user_id):
+    return cursor.execute(f"SELECT * FROM users WHERE id = {user_id}")
+"#,
+                },
+                BenchFile {
+                    rel_path: "app.py",
+                    lang: Language::Python,
+                    code: r#"
+import services.db as db
+
+@app.get("/users")
+def list_users(request):
+    uid = request.args.get("id")
+    return db.run_query(uid)
+"#,
+                },
+            ],
+        },
+        AdversarialCase {
+            id: "sprint3_cha_interface_auth_guard_safe",
+            family: "AUTH",
+            expected_prefix: "SMG-AUTH",
+            expect_finding: false,
+            trap_kind: TrapKind::OneHopWrapperTrap,
+            files: vec![
+                BenchFile {
+                    rel_path: "src/auth_iface.ts",
+                    lang: Language::TypeScript,
+                    code: r#"
+export interface IAuthGuard {
+    verify(req: any): Promise<void>;
+}
+export class JwtAuthGuard implements IAuthGuard {
+    async verify(req: any) {
+        verifyJwt(req.headers.authorization);
+    }
+}
+"#,
+                },
+                BenchFile {
+                    rel_path: "src/charge_route.ts",
+                    lang: Language::TypeScript,
+                    code: r#"
+import { IAuthGuard, JwtAuthGuard } from './auth_iface';
+const guardImpl = new JwtAuthGuard();
+app.post('/api/charge', async (req, res) => {
+    const guard: IAuthGuard = guardImpl;
+    await guard.verify(req);
+    await stripe.charges.create({ amount: 500 });
+    res.json({ ok: true });
+});
+"#,
+                },
+            ],
+        },
+        AdversarialCase {
+            id: "sprint3_cha_rta_narrowed_single_impl_sqli_vuln",
+            family: "SQLI",
+            expected_prefix: "SMG-SQLI",
+            expect_finding: true,
+            trap_kind: TrapKind::OneHopWrapperTrap,
+            files: vec![
+                BenchFile {
+                    rel_path: "src/store_iface.ts",
+                    lang: Language::TypeScript,
+                    code: r#"
+export interface UserStore {
+    findById(id: string): Promise<any>;
+}
+export class PgUserStore implements UserStore {
+    async findById(id: string) {
+        return await db.query(`SELECT * FROM users WHERE id = '${id}'`);
+    }
+}
+export class NoopUserStore implements UserStore {
+    async findById(_id: string) {
+        return null;
+    }
+}
+"#,
+                },
+                BenchFile {
+                    rel_path: "src/user_route.ts",
+                    lang: Language::TypeScript,
+                    code: r#"
+import { UserStore, PgUserStore } from './store_iface';
+const liveStore = new PgUserStore();
+app.get('/api/user', requireAuth, async (req, res) => {
+    const store: UserStore = liveStore;
+    const row = await store.findById(req.query.id);
+    res.json(row);
+});
+"#,
+                },
+            ],
+        },
     ]
 }
 

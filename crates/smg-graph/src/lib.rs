@@ -1,5 +1,6 @@
 pub mod arena;
 pub mod ast;
+pub mod call_hierarchy;
 pub mod cfg;
 pub mod deep_stack;
 pub mod deps;
@@ -22,8 +23,8 @@ use smg_core::{IndexedFile, ShellMindGuardConfig, StateStore};
 use std::collections::HashSet;
 
 pub use ast::{
-    Confidence, FileAstSummary, FrontendApiCall, GuardKind, LocalStaticFinding, SinkKind,
-    check_source_syntax, parse_file_ast, parse_file_ast_with_hash,
+    CallSite, Confidence, FileAstSummary, FrontendApiCall, GuardKind, LocalStaticFinding, SinkKind,
+    TypeImplSummary, check_source_syntax, parse_file_ast, parse_file_ast_with_hash,
 };
 pub use deps::{ReachableVulnStatus, assess_dependency_reachability, compute_reachable_packages};
 pub use lattice::{
@@ -45,7 +46,7 @@ fn load_or_parse_summaries_cached(
     let cfg_json = serde_json::to_string(&cfg.guards).unwrap_or_default();
     let adv_stamp = smg_core::advisories_db_stamp();
     let versioned_cfg = format!(
-        "v22-ultra-max-precision-{}|{}|{}",
+        "v23-ultra-max-precision-{}|{}|{}",
         env!("CARGO_PKG_VERSION"),
         adv_stamp,
         cfg_json

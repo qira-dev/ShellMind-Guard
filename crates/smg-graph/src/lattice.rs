@@ -486,23 +486,41 @@ pub fn solve_guard_lattice_with_public(
     summaries: &[FileAstSummary],
     public_routes: &[String],
 ) -> GraphAnalysisResult {
+    const MAX_CHA_TARGETS: usize = 8;
+
     let mut arena = SymbolArena::default();
     let wildcard_id = arena.intern("*");
     let mut graph = DiGraph::<SymbolInfo, ()>::new();
     let mut id_to_idx: HashMap<SymbolId, NodeIndex> = HashMap::new();
     let mut file_symbols_map: HashMap<(SymbolId, SymbolId), Vec<NodeIndex>> = HashMap::new();
+    let mut type_methods_map: HashMap<(SymbolId, SymbolId), Vec<NodeIndex>> = HashMap::new();
     let mut go_dir_map: HashMap<(SymbolId, SymbolId), Vec<NodeIndex>> = HashMap::new();
+    let mut known_go_dirs: HashSet<String> = HashSet::new();
     let mut pkg_dir_map: HashMap<(SymbolId, SymbolId), Vec<NodeIndex>> = HashMap::new();
-    let mut go_exported_map: HashMap<SymbolId, Vec<NodeIndex>> = HashMap::new();
     let mut known_files: HashSet<String> = HashSet::new();
+
+    // Phase 12A (`P12-02`): Global Type Hierarchy (CHA), Go Structural Interfaces, DI Bindings & RTA Instantiations
+    let mut direct_implements: HashMap<SymbolId, Vec<SymbolId>> = HashMap::new();
+    let mut concrete_type_methods: HashMap<SymbolId, HashSet<String>> = HashMap::new();
+    let mut interface_defs: Vec<(SymbolId, bool /* is_go */, Vec<String>)> = Vec::new();
+    let mut interface_type_ids: HashSet<SymbolId> = HashSet::new();
+    let mut rta_instantiated_types: HashSet<SymbolId> = HashSet::new();
 
     for f in summaries {
         known_files.insert(f.rel_path.clone());
         let file_id = arena.intern(&f.rel_path);
         let is_go = f.rel_path.ends_with(".go");
         let is_pkg = is_phase8_pkg_scoped(&f.rel_path);
+        let go_dir_str = if is_go || is_pkg {
+            go_parent_dir(&f.rel_path)
+        } else {
+            String::new()
+        };
+        if is_go && !go_dir_str.is_empty() {
+            known_go_dirs.insert(go_dir_str.clone());
+        }
         let dir_id = if is_go || is_pkg {
-            arena.intern(&go_parent_dir(&f.rel_path))
+            arena.intern(&go_dir_str)
         } else {
             SymbolId(0)
         };
@@ -515,21 +533,126 @@ pub fn solve_guard_lattice_with_public(
                 .entry((file_id, name_id))
                 .or_default()
                 .push(idx);
+            if let Some(ref enc_ty) = sym.enclosing_type {
+                let ty_id = arena.intern(enc_ty);
+                type_methods_map
+                    .entry((ty_id, name_id))
+                    .or_default()
+                    .push(idx);
+                concrete_type_methods
+                    .entry(ty_id)
+                    .or_default()
+                    .insert(sym.name.clone());
+            }
             if is_go {
                 go_dir_map.entry((dir_id, name_id)).or_default().push(idx);
-                if sym.name.chars().next().is_some_and(|c| c.is_uppercase()) {
-                    go_exported_map.entry(name_id).or_default().push(idx);
-                }
             } else if is_pkg {
                 pkg_dir_map.entry((dir_id, name_id)).or_default().push(idx);
             }
         }
+        for ti in &f.type_impls {
+            let tid = arena.intern(&ti.type_name);
+            if ti.is_interface {
+                interface_type_ids.insert(tid);
+                interface_defs.push((tid, is_go, ti.methods.clone()));
+            } else {
+                let mset = concrete_type_methods.entry(tid).or_default();
+                for m in &ti.methods {
+                    mset.insert(m.clone());
+                }
+            }
+            for base in &ti.implements {
+                let bid = arena.intern(base);
+                let subs = direct_implements.entry(bid).or_default();
+                if !subs.contains(&tid) {
+                    subs.push(tid);
+                }
+            }
+        }
+        for (token, concrete) in &f.di_bindings {
+            let tok_id = arena.intern(token);
+            let conc_id = arena.intern(concrete);
+            let subs = direct_implements.entry(tok_id).or_default();
+            if !subs.contains(&conc_id) {
+                subs.push(conc_id);
+            }
+            rta_instantiated_types.insert(conc_id);
+        }
+        for inst in &f.instantiated_types {
+            rta_instantiated_types.insert(arena.intern(inst));
+        }
+    }
+
+    // Go Structural Interface Satisfaction: concrete Go struct with superset of interface methods implements interface
+    for &(iface_id, is_go_iface, ref req_methods) in &interface_defs {
+        if !is_go_iface || req_methods.is_empty() {
+            continue;
+        }
+        for (&cand_ty, cand_methods) in &concrete_type_methods {
+            if cand_ty == iface_id || interface_type_ids.contains(&cand_ty) {
+                continue;
+            }
+            if req_methods.iter().all(|m| cand_methods.contains(m)) {
+                let subs = direct_implements.entry(iface_id).or_default();
+                if !subs.contains(&cand_ty) {
+                    subs.push(cand_ty);
+                }
+            }
+        }
+    }
+
+    // Bounded transitive CHA closure (depth <= 6) from base/interface/DI token -> concrete types
+    let mut cha_implementors: HashMap<SymbolId, Vec<SymbolId>> = HashMap::new();
+    for (&base_id, direct_subs) in &direct_implements {
+        let mut visited: HashSet<SymbolId> = HashSet::new();
+        let mut q: VecDeque<(SymbolId, usize)> = VecDeque::new();
+        for &sub in direct_subs {
+            if visited.insert(sub) {
+                q.push_back((sub, 1));
+            }
+        }
+        let mut concrete_list = Vec::new();
+        while let Some((cur, depth)) = q.pop_front() {
+            if !interface_type_ids.contains(&cur) && !concrete_list.contains(&cur) {
+                concrete_list.push(cur);
+            }
+            if depth < 6
+                && let Some(next_subs) = direct_implements.get(&cur)
+            {
+                for &ns in next_subs {
+                    if visited.insert(ns) {
+                        q.push_back((ns, depth + 1));
+                    }
+                }
+            }
+        }
+        if !concrete_list.is_empty() {
+            cha_implementors.insert(base_id, concrete_list);
+        }
     }
 
     let mut file_imports: HashMap<SymbolId, Vec<(SymbolId, SymbolId, SymbolId)>> = HashMap::new();
+    let mut namespace_imports: HashMap<(SymbolId, SymbolId), SymbolId> = HashMap::new();
+    let mut go_pkg_imports: HashMap<(SymbolId, SymbolId), Vec<SymbolId>> = HashMap::new();
+
     for f in summaries {
+        let fid = arena.intern(&f.rel_path);
         let mut imps = Vec::new();
         for imp in &f.imports {
+            if let Some(go_path) = imp.from_specifier.strip_prefix("go::") {
+                let clean_go = go_path.trim().trim_matches('/');
+                let local_id = arena.intern(&imp.symbol_name);
+                for dir in &known_go_dirs {
+                    if clean_go == dir.as_str() || clean_go.ends_with(&format!("/{dir}")) {
+                        let dir_id = arena.intern(dir);
+                        let entry = go_pkg_imports.entry((fid, local_id)).or_default();
+                        if !entry.contains(&dir_id) {
+                            entry.push(dir_id);
+                        }
+                    }
+                }
+                continue;
+            }
             if let Some(target_file) =
                 resolve_import_target(&f.rel_path, &imp.from_specifier, &known_files)
             {
@@ -537,11 +660,13 @@ pub fn solve_guard_lattice_with_public(
                 let local_id = arena.intern(&imp.symbol_name);
                 let target_id = arena.intern(&target_file);
                 let remote_id = arena.intern(remote);
+                if remote_id == wildcard_id && local_id != wildcard_id {
+                    namespace_imports.insert((fid, local_id), target_id);
+                }
                 imps.push((local_id, target_id, remote_id));
             }
         }
         if !imps.is_empty() {
-            let fid = arena.intern(&f.rel_path);
             file_imports.insert(fid, imps);
         }
     }
@@ -549,6 +674,10 @@ pub fn solve_guard_lattice_with_public(
     // B11: O(1) edge deduplication via HashSet<(usize, usize)> & u32 SymbolId arena keys
     let mut seen_edges: HashSet<(usize, usize)> = HashSet::new();
     let mut resolved_callee_map: HashMap<(usize, SymbolId), Vec<NodeIndex>> = HashMap::new();
+    // Phase 12A: Ambiguous polymorphic dispatch edges `(src, dst) -> all concrete sibling targets`
+    let mut ambiguous_dispatch_edges: HashMap<(usize, usize), Vec<NodeIndex>> = HashMap::new();
+    // Phase 12A: Track CHA-resolved guard callees per caller for sound interface-wrapped guard propagation
+    let mut caller_cha_guard_groups: HashMap<usize, Vec<Vec<NodeIndex>>> = HashMap::new();
 
     for f in summaries {
         let file_id = arena.intern(&f.rel_path);
@@ -568,11 +697,156 @@ pub fn solve_guard_lattice_with_public(
             let Some(&src_idx) = arena.get(&sym.id).and_then(|sid| id_to_idx.get(&sid)) else {
                 continue;
             };
+            let src_enclosing_ty_id = sym.enclosing_type.as_deref().map(|t| arena.intern(t));
+
+            // 1. Resolve qualified `CallSite`s first (namespace imports, Go package imports, CHA/RTA receiver dispatch)
+            let mut qualified_members_handled: HashSet<SymbolId> = HashSet::new();
+            for cs in &sym.call_sites {
+                let member_id = arena.intern(&cs.member);
+                let mut dst_indices: Vec<NodeIndex> = Vec::new();
+                let mut is_cha_dispatch = false;
+
+                // 1a. Explicit namespace/module import (`ns.fn()` / `db.query()`)
+                if let Some(ref qual) = cs.qualifier {
+                    let qual_id = arena.intern(qual);
+                    if let Some(&target_file_id) = namespace_imports.get(&(file_id, qual_id)) {
+                        let resolved = resolve_symbol_in_file(
+                            target_file_id,
+                            member_id,
+                            &file_symbols_map,
+                            &file_imports,
+                            wildcard_id,
+                            0,
+                        );
+                        for idx in resolved {
+                            if !dst_indices.contains(&idx) {
+                                dst_indices.push(idx);
+                            }
+                        }
+                        qualified_members_handled.insert(member_id);
+                    } else if is_go
+                        && let Some(target_dirs) = go_pkg_imports.get(&(file_id, qual_id))
+                    {
+                        for &tdir in target_dirs {
+                            if let Some(pkg_idxs) = go_dir_map.get(&(tdir, member_id)) {
+                                for &idx in pkg_idxs {
+                                    if !dst_indices.contains(&idx) {
+                                        dst_indices.push(idx);
+                                    }
+                                }
+                            }
+                        }
+                        qualified_members_handled.insert(member_id);
+                    }
+                }
+
+                // 1b. Typed receiver / Class / Interface / Trait / DI CHA+RTA dispatch
+                if dst_indices.is_empty()
+                    && let Some(ref recv_ty) = cs.resolved_recv_type
+                {
+                    let recv_ty_id = arena.intern(recv_ty);
+                    // Direct method on concrete receiver type
+                    if !interface_type_ids.contains(&recv_ty_id)
+                        && let Some(direct) = type_methods_map.get(&(recv_ty_id, member_id))
+                    {
+                        for &idx in direct {
+                            if !dst_indices.contains(&idx) {
+                                dst_indices.push(idx);
+                            }
+                        }
+                    }
+                    // CHA/RTA subtype & DI implementor dispatch
+                    if let Some(all_impls) = cha_implementors.get(&recv_ty_id) {
+                        // RTA narrowing: if any implementor of `recv_ty` is instantiated, narrow to instantiated subset
+                        let rta_subset: Vec<SymbolId> = all_impls
+                            .iter()
+                            .copied()
+                            .filter(|t| rta_instantiated_types.contains(t))
+                            .collect();
+                        let chosen_impls = if !rta_subset.is_empty() {
+                            &rta_subset
+                        } else {
+                            all_impls
+                        };
+                        for &impl_ty_id in chosen_impls.iter().take(MAX_CHA_TARGETS) {
+                            if let Some(m_idxs) = type_methods_map.get(&(impl_ty_id, member_id)) {
+                                for &idx in m_idxs {
+                                    if !dst_indices.contains(&idx) {
+                                        dst_indices.push(idx);
+                                    }
+                                }
+                            }
+                        }
+                        if !dst_indices.is_empty() {
+                            is_cha_dispatch = true;
+                        }
+                    }
+                    if !dst_indices.is_empty() || interface_type_ids.contains(&recv_ty_id) {
+                        qualified_members_handled.insert(member_id);
+                    }
+                }
+
+                if !dst_indices.is_empty() {
+                    let is_ambiguous = is_cha_dispatch && dst_indices.len() > 1;
+                    if is_cha_dispatch {
+                        caller_cha_guard_groups
+                            .entry(src_idx.index())
+                            .or_default()
+                            .push(dst_indices.clone());
+                    }
+                    for &dst_idx in &dst_indices {
+                        if src_idx != dst_idx {
+                            let entry = resolved_callee_map
+                                .entry((src_idx.index(), member_id))
+                                .or_default();
+                            if !entry.contains(&dst_idx) {
+                                entry.push(dst_idx);
+                            }
+                            if seen_edges.insert((src_idx.index(), dst_idx.index())) {
+                                graph.add_edge(src_idx, dst_idx, ());
+                            }
+                            if is_ambiguous {
+                                ambiguous_dispatch_edges.insert(
+                                    (src_idx.index(), dst_idx.index()),
+                                    dst_indices.clone(),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 2. Standard unqualified / imported / package-scoped call resolution for remaining callees
             let mut resolve_one = |callee: &String, add_edge: bool| {
                 let callee_id = arena.intern(callee);
+                if qualified_members_handled.contains(&callee_id) {
+                    return;
+                }
                 let mut dst_indices: Vec<NodeIndex> = Vec::new();
                 if let Some(same_file_idxs) = file_symbols_map.get(&(file_id, callee_id)) {
-                    dst_indices.extend(same_file_idxs.iter().copied());
+                    // Prefer free functions or methods on the same enclosing type to avoid sibling-class `.save()` collisions
+                    let scoped: Vec<NodeIndex> = same_file_idxs
+                        .iter()
+                        .copied()
+                        .filter(|&idx| {
+                            let dst_enc = graph[idx].enclosing_type.as_deref();
+                            match (dst_enc, src_enclosing_ty_id) {
+                                (None, _) => true,
+                                (Some(dt), Some(st_id)) => arena.get(dt) == Some(st_id),
+                                (Some(_), None) => false,
+                            }
+                        })
+                        .collect();
+                    if !scoped.is_empty() {
+                        dst_indices.extend(scoped);
+                    } else if !sym.call_sites.iter().any(|cs| {
+                        cs.member == *callee
+                            && cs.qualifier.is_some()
+                            && cs.qualifier.as_deref() != Some("this")
+                            && cs.qualifier.as_deref() != Some("self")
+                    }) {
+                        dst_indices.extend(same_file_idxs.iter().copied());
+                    }
                 }
                 if dst_indices.is_empty()
                     && let Some(imps) = file_imports.get(&file_id)
@@ -613,28 +887,17 @@ pub fn solve_guard_lattice_with_public(
                     if let Some(same_pkg_idxs) = go_dir_map.get(&(go_dir_id, callee_id)) {
                         dst_indices.extend(same_pkg_idxs.iter().copied());
                     }
+                    // Go dot-import `. "pkg/path"` resolves unqualified exported symbols strictly from imported dirs
                     if dst_indices.is_empty()
-                        && let Some(exp_idxs) = go_exported_map.get(&callee_id)
+                        && let Some(dot_dirs) = go_pkg_imports.get(&(file_id, wildcard_id))
                     {
-                        if exp_idxs.len() == 1 {
-                            dst_indices.extend(exp_idxs.iter().copied());
-                        } else {
-                            let matched_by_import: Vec<NodeIndex> = exp_idxs
-                                .iter()
-                                .copied()
-                                .filter(|&idx| {
-                                    let target_dir = go_parent_dir(&graph[idx].rel_path);
-                                    !target_dir.is_empty()
-                                        && f.imports.iter().any(|imp| {
-                                            imp.from_specifier == target_dir
-                                                || imp
-                                                    .from_specifier
-                                                    .ends_with(&format!("/{}", target_dir))
-                                        })
-                                })
-                                .collect();
-                            if !matched_by_import.is_empty() {
-                                dst_indices.extend(matched_by_import);
+                        for &tdir in dot_dirs {
+                            if let Some(pkg_idxs) = go_dir_map.get(&(tdir, callee_id)) {
+                                for &idx in pkg_idxs {
+                                    if !dst_indices.contains(&idx) {
+                                        dst_indices.push(idx);
+                                    }
+                                }
                             }
                         }
                     }
@@ -725,28 +988,45 @@ pub fn solve_guard_lattice_with_public(
         }
     }
 
-    // Propagate CFG-verified Auth/TxLock guards from resolved middleware callees onto Route & Function nodes
+    // Propagate CFG-verified Auth/TxLock guards from resolved middleware & interface-wrapped CHA guard callees
+    let mut ambiguous_guard_callers: HashSet<(usize, GuardKind)> = HashSet::new();
     for _ in 0..2 {
         let mut add_guards: Vec<(NodeIndex, HashSet<GuardKind>)> = Vec::new();
         for u in graph.node_indices() {
-            if graph[u].middleware_callees.is_empty() {
-                continue;
-            }
-            let mw_set: HashSet<&str> = graph[u]
-                .middleware_callees
-                .iter()
-                .map(|s| s.as_str())
-                .collect();
             let mut found = HashSet::new();
-            for v in graph.neighbors_directed(u, Direction::Outgoing) {
-                let vname = graph[v].name.as_str();
-                let vshort = vname.rsplit('.').next().unwrap_or(vname);
-                if mw_set.contains(vname) || mw_set.contains(vshort) {
-                    if graph[v].guards.contains(&GuardKind::Auth) {
-                        found.insert(GuardKind::Auth);
+            if !graph[u].middleware_callees.is_empty() {
+                let mw_set: HashSet<&str> = graph[u]
+                    .middleware_callees
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect();
+                for v in graph.neighbors_directed(u, Direction::Outgoing) {
+                    let vname = graph[v].name.as_str();
+                    let vshort = vname.rsplit('.').next().unwrap_or(vname);
+                    if mw_set.contains(vname) || mw_set.contains(vshort) {
+                        if graph[v].guards.contains(&GuardKind::Auth) {
+                            found.insert(GuardKind::Auth);
+                        }
+                        if graph[v].guards.contains(&GuardKind::TxLock) {
+                            found.insert(GuardKind::TxLock);
+                        }
                     }
-                    if graph[v].guards.contains(&GuardKind::TxLock) {
-                        found.insert(GuardKind::TxLock);
+                }
+            }
+            // Phase 12A (`P12-02`): Interface-wrapped Auth/TxLock guard propagation (sound universal intersection)
+            if let Some(groups) = caller_cha_guard_groups.get(&u.index()) {
+                for targets in groups {
+                    if targets.is_empty() {
+                        continue;
+                    }
+                    for gk in [GuardKind::Auth, GuardKind::TxLock] {
+                        let any_has = targets.iter().any(|&t| graph[t].guards.contains(&gk));
+                        let all_have = targets.iter().all(|&t| graph[t].guards.contains(&gk));
+                        if all_have {
+                            found.insert(gk);
+                        } else if any_has && targets.len() > 1 {
+                            ambiguous_guard_callers.insert((u.index(), gk));
+                        }
                     }
                 }
             }
@@ -1164,6 +1444,37 @@ pub fn solve_guard_lattice_with_public(
     // Deduplicate on the fly by (entry_route, rule_id)
     let mut best_by_key: HashMap<(String, String), LatticeFinding> = HashMap::new();
 
+    // Helper: returns true if a witness path traverses an ambiguous polymorphic dispatch edge
+    // where NOT all concrete sibling targets share the vulnerability/missing guard (Zero-Hallucination gate).
+    let witness_is_polymorphically_ambiguous =
+        |tree: &BfsTree, sink: NodeIndex, required_guard: GuardKind| -> bool {
+            let mut cur = sink;
+            for _ in 0..64 {
+                if ambiguous_guard_callers.contains(&(cur.index(), required_guard)) {
+                    return true;
+                }
+                let Some(p) = tree.parent[cur.index()] else {
+                    break;
+                };
+                if p == cur {
+                    break;
+                }
+                if let Some(siblings) = ambiguous_dispatch_edges.get(&(p.index(), cur.index())) {
+                    // Confirmed ONLY if every concrete implementor lacks the guard AND is a matching sink;
+                    // if any sibling implementor is safe/guarded or not a sink, downgrade to Heuristic.
+                    let all_vulnerable = siblings.iter().all(|&sib| {
+                        !guard_out[sib.index()].contains(required_guard)
+                            && graph[sib].sink_kind.is_some()
+                    });
+                    if !all_vulnerable {
+                        return true;
+                    }
+                }
+                cur = p;
+            }
+            false
+        };
+
     for idx in graph.node_indices() {
         let vi = idx.index();
         let sym = &graph[idx];
@@ -1178,6 +1489,16 @@ pub fn solve_guard_lattice_with_public(
                 && let Some((entry_name, witness)) = reconstruct_witness(&graph, &auth_parents, idx)
                 && !is_public_route(&entry_name, public_routes)
             {
+                let poly_ambig =
+                    witness_is_polymorphically_ambiguous(&auth_parents, idx, GuardKind::Auth);
+                let mut reasons = vec![
+                    "O(V+E)Lattice".into(),
+                    "CFGDominated".into(),
+                    "AuthGuardMissing".into(),
+                ];
+                if poly_ambig {
+                    reasons.push("AmbiguousPolymorphicDispatch".into());
+                }
                 insert_shorter(
                     &mut best_by_key,
                     LatticeFinding {
@@ -1188,17 +1509,17 @@ pub fn solve_guard_lattice_with_public(
                         file: String::new(),
                         line: 0,
                         status: "SUSPECT_UNGUARDED".into(),
-                        confidence: Confidence::Confirmed,
+                        confidence: if poly_ambig {
+                            Confidence::Heuristic
+                        } else {
+                            Confidence::Confirmed
+                        },
                         entry_route: entry_name,
                         sink_kind,
                         missing_guard: GuardKind::Auth,
                         witness_path: witness,
                         remediation: remediation_for_guard(GuardKind::Auth).into(),
-                        proof_reasons: vec![
-                            "O(V+E)Lattice".into(),
-                            "CFGDominated".into(),
-                            "AuthGuardMissing".into(),
-                        ],
+                        proof_reasons: reasons,
                     },
                 );
             }
@@ -1210,6 +1531,16 @@ pub fn solve_guard_lattice_with_public(
                 && can_improve_witness(&best_by_key, &graph, &lock_parents, idx, "SMG-RACE-001")
                 && let Some((entry_name, witness)) = reconstruct_witness(&graph, &lock_parents, idx)
             {
+                let poly_ambig =
+                    witness_is_polymorphically_ambiguous(&lock_parents, idx, GuardKind::TxLock);
+                let mut reasons = vec![
+                    "O(V+E)Lattice".into(),
+                    "CFGDominated".into(),
+                    "TxLockMissing".into(),
+                ];
+                if poly_ambig {
+                    reasons.push("AmbiguousPolymorphicDispatch".into());
+                }
                 insert_shorter(
                     &mut best_by_key,
                     LatticeFinding {
@@ -1223,17 +1554,17 @@ pub fn solve_guard_lattice_with_public(
                         file: String::new(),
                         line: 0,
                         status: "SUSPECT_UNGUARDED".into(),
-                        confidence: Confidence::Confirmed,
+                        confidence: if poly_ambig {
+                            Confidence::Heuristic
+                        } else {
+                            Confidence::Confirmed
+                        },
                         entry_route: entry_name,
                         sink_kind,
                         missing_guard: GuardKind::TxLock,
                         witness_path: witness,
                         remediation: remediation_for_guard(GuardKind::TxLock).into(),
-                        proof_reasons: vec![
-                            "O(V+E)Lattice".into(),
-                            "CFGDominated".into(),
-                            "TxLockMissing".into(),
-                        ],
+                        proof_reasons: reasons,
                     },
                 );
             }
@@ -1324,6 +1655,41 @@ pub fn solve_guard_lattice_with_public(
                     if let Some(last) = witness.last_mut() {
                         last.line = hit.line;
                     }
+                    // Check whether cross-file taint traversed an ambiguous polymorphic dispatch edge
+                    let mut poly_ambig = false;
+                    let mut cur_t = idx;
+                    for _ in 0..64 {
+                        let parent_opt = taint_bit_parents[cur_t.index()]
+                            .get(req_bit.trailing_zeros() as usize)
+                            .copied()
+                            .flatten()
+                            .or(taint_parents[cur_t.index()]);
+                        let Some(p) = parent_opt else {
+                            break;
+                        };
+                        if p == cur_t {
+                            break;
+                        }
+                        if let Some(siblings) =
+                            ambiguous_dispatch_edges.get(&(p.index(), cur_t.index()))
+                        {
+                            let all_vuln = siblings.iter().all(|&sib| {
+                                graph[sib]
+                                    .param_sinks
+                                    .iter()
+                                    .any(|ps| ps.rule_id == hit.rule_id)
+                            });
+                            if !all_vuln {
+                                poly_ambig = true;
+                                break;
+                            }
+                        }
+                        cur_t = p;
+                    }
+                    let mut reasons = vec!["CrossFileTaint".into(), "ParamForwarding".into()];
+                    if poly_ambig {
+                        reasons.push("AmbiguousPolymorphicDispatch".into());
+                    }
                     insert_shorter(
                         &mut best_by_key,
                         LatticeFinding {
@@ -1334,13 +1700,17 @@ pub fn solve_guard_lattice_with_public(
                             file: hit.rel_path.clone(),
                             line: hit.line,
                             status: "SUSPECT_UNGUARDED".into(),
-                            confidence: hit.confidence,
+                            confidence: if poly_ambig {
+                                Confidence::Heuristic
+                            } else {
+                                hit.confidence
+                            },
                             entry_route,
                             sink_kind: hit.sink_kind,
                             missing_guard: hit.missing_guard,
                             witness_path: witness,
                             remediation: hit.remediation.clone(),
-                            proof_reasons: vec!["CrossFileTaint".into(), "ParamForwarding".into()],
+                            proof_reasons: reasons,
                         },
                     );
                 }
@@ -3090,6 +3460,375 @@ app.post('/dynamic-dispatch', requireAuth, async (req, res) => {
                 .any(|f| f.rule_id == "SMG-CMDI-001" && f.entry_route.contains("/dynamic-dispatch")),
             "Dynamic handler map dispatch handlers[action](cmd) must propagate taint to sink: {:?}",
             res.findings
+        );
+    }
+
+    #[test]
+    fn test_sprint3_p12_01_qualified_calls_sibling_isolation_and_python_go_imports() {
+        let cfg = ShellMindGuardConfig::default();
+
+        // 1. TS sibling-class `.save()` isolation + namespace import (`import * as billing`)
+        let repo_src = r#"
+export class UserRepo {
+    async save(userId: string) {
+        return await db.query(`SELECT * FROM users WHERE id = '${userId}'`);
+    }
+}
+export class AuditLogger {
+    async save(msg: string) {
+        console.log(msg);
+    }
+}
+"#;
+        let billing_src = r#"
+export async function chargeCard(amount: number) {
+    return await stripe.charges.create({ amount });
+}
+"#;
+        let routes_src = r#"
+import { UserRepo, AuditLogger } from './repo';
+import * as billing from './billing';
+
+app.post('/api/audit-only', requireAuth, async (req, res) => {
+    const logger: AuditLogger = new AuditLogger();
+    await logger.save(req.body.msg);
+    res.json({ ok: true });
+});
+
+app.post('/api/user-save', requireAuth, async (req, res) => {
+    const repo: UserRepo = new UserRepo();
+    await repo.save(req.body.userId);
+    res.json({ ok: true });
+});
+
+app.post('/api/unauth-billing', async (req, res) => {
+    await billing.chargeCard(req.body.amount);
+    res.json({ ok: true });
+});
+"#;
+        let mk = |rel: &str, lang: Language, src: &str| IndexedFile {
+            abs_path: std::path::PathBuf::from(rel),
+            rel_path: rel.into(),
+            language: lang,
+            size_bytes: src.len() as u64,
+            mtime_ns: 0,
+            blake3_hash: String::new(),
+            cached_bytes: Some(src.as_bytes().to_vec()),
+        };
+
+        let s_repo =
+            parse_file_ast(&mk("src/repo.ts", Language::TypeScript, repo_src), &cfg).unwrap();
+        let s_bill = parse_file_ast(
+            &mk("src/billing.ts", Language::TypeScript, billing_src),
+            &cfg,
+        )
+        .unwrap();
+        let s_rt =
+            parse_file_ast(&mk("src/routes.ts", Language::TypeScript, routes_src), &cfg).unwrap();
+        let ts_res = solve_guard_lattice(&[s_repo, s_bill, s_rt]);
+
+        assert!(
+            !ts_res
+                .findings
+                .iter()
+                .any(|f| f.entry_route.contains("/api/audit-only")),
+            "Sibling class AuditLogger.save() must NOT collide with UserRepo.save(): {:?}",
+            ts_res.findings
+        );
+        assert!(
+            ts_res
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "SMG-SQLI-001" && f.entry_route.contains("/api/user-save")),
+            "Qualified UserRepo.save() must still resolve cross-file SQLi: {:?}",
+            ts_res.findings
+        );
+        assert!(
+            ts_res
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "SMG-AUTH-001"
+                    && f.entry_route.contains("/api/unauth-billing")),
+            "Namespace import `billing.chargeCard()` must resolve to billing.ts::chargeCard: {:?}",
+            ts_res.findings
+        );
+
+        // 2. Python `import services.db as db` qualified resolution
+        let py_db = r#"
+def run_raw_sql(user_id):
+    return cursor.execute(f"SELECT * FROM accounts WHERE id = {user_id}")
+"#;
+        let py_app = r#"
+import services.db as db
+
+@app.get("/py/account")
+def get_account(request):
+    uid = request.args.get("id")
+    return db.run_raw_sql(uid)
+"#;
+        let s_py_db = parse_file_ast(&mk("services/db.py", Language::Python, py_db), &cfg).unwrap();
+        let s_py_app = parse_file_ast(&mk("app.py", Language::Python, py_app), &cfg).unwrap();
+        assert!(
+            s_py_app.imports.iter().any(|i| {
+                i.from_specifier == "py::services.db"
+                    && i.symbol_name == "db"
+                    && i.remote_name.as_deref() == Some("*")
+            }),
+            "Python `import services.db as db` must emit namespace ImportRef: {:?}",
+            s_py_app.imports
+        );
+        let py_res = solve_guard_lattice(&[s_py_db, s_py_app]);
+        assert!(
+            py_res.findings.iter().any(|f| f.rule_id == "SMG-SQLI-001"),
+            "Python `import services.db as db` + `db.run_raw_sql(uid)` must detect cross-file SQLi: {:?}",
+            py_res.findings
+        );
+
+        // 3. Go `import_spec` (standard, aliased, blank) + NO blind repo-wide unique-name guessing
+        let go_unimported = r#"
+package secret
+func UniqueChargeUnimported() {
+    stripe.charges.Create(100)
+}
+"#;
+        let go_pay = r#"
+package pay
+func ExecuteCharge() {
+    stripe.charges.Create(100)
+}
+"#;
+        let go_api = r#"
+package api
+import (
+    _ "myapp/pkg/unused"
+    pay "myapp/pkg/pay"
+    "net/http"
+)
+func Register(mux *http.ServeMux) {
+    mux.HandleFunc("POST /go/unimported", handleUnimported)
+    mux.HandleFunc("POST /go/imported", handleImported)
+}
+func handleUnimported(w http.ResponseWriter, r *http.Request) {
+    UniqueChargeUnimported()
+}
+func handleImported(w http.ResponseWriter, r *http.Request) {
+    pay.ExecuteCharge()
+}
+"#;
+        let s_go_unimp = parse_file_ast(
+            &mk("pkg/secret/secret.go", Language::Go, go_unimported),
+            &cfg,
+        )
+        .unwrap();
+        let s_go_pay = parse_file_ast(&mk("pkg/pay/pay.go", Language::Go, go_pay), &cfg).unwrap();
+        let s_go_api =
+            parse_file_ast(&mk("pkg/api/handler.go", Language::Go, go_api), &cfg).unwrap();
+        assert!(
+            !s_go_api
+                .imports
+                .iter()
+                .any(|i| i.from_specifier.contains("unused")),
+            "Blank Go import `_` must be ignored: {:?}",
+            s_go_api.imports
+        );
+        let go_res = solve_guard_lattice(&[s_go_unimp, s_go_pay, s_go_api]);
+        assert!(
+            !go_res
+                .findings
+                .iter()
+                .any(|f| f.entry_route.contains("/go/unimported")),
+            "Unimported Go symbol must NOT be blindly linked repo-wide: {:?}",
+            go_res.findings
+        );
+        assert!(
+            go_res
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "SMG-AUTH-001" && f.entry_route.contains("/go/imported")),
+            "Aliased Go import `pay.ExecuteCharge()` must resolve cross-package: {:?}",
+            go_res.findings
+        );
+    }
+
+    #[test]
+    fn test_sprint3_p12_02_cha_rta_polymorphic_dispatch_and_zero_hallucination_tiering() {
+        let cfg = ShellMindGuardConfig::default();
+        let mk = |rel: &str, lang: Language, src: &str| IndexedFile {
+            abs_path: std::path::PathBuf::from(rel),
+            rel_path: rel.into(),
+            language: lang,
+            size_bytes: src.len() as u64,
+            mtime_ns: 0,
+            blake3_hash: String::new(),
+            cached_bytes: Some(src.as_bytes().to_vec()),
+        };
+
+        // 1. Interface-wrapped AuthGuard (single implementor + NestJS DI binding) -> 0 FP
+        let auth_iface_src = r#"
+export interface AuthService {
+    verify(req: any): Promise<void>;
+}
+export class JwtAuthService implements AuthService {
+    async verify(req: any) {
+        verifyJwt(req.headers.authorization);
+    }
+}
+export const AUTH_PROVIDERS = [
+    { provide: 'AUTH_SVC', useClass: JwtAuthService }
+];
+"#;
+        let auth_route_src = r#"
+import { AuthService, JwtAuthService } from './auth';
+const boot = new JwtAuthService();
+
+app.post('/api/cha-guarded', async (req, res) => {
+    const auth: AuthService = boot;
+    await auth.verify(req);
+    await stripe.charges.create({ amount: 500 });
+    res.json({ ok: true });
+});
+"#;
+        let s_ai = parse_file_ast(
+            &mk("src/auth.ts", Language::TypeScript, auth_iface_src),
+            &cfg,
+        )
+        .unwrap();
+        let s_ar = parse_file_ast(
+            &mk("src/route.ts", Language::TypeScript, auth_route_src),
+            &cfg,
+        )
+        .unwrap();
+        assert!(
+            s_ai.di_bindings
+                .iter()
+                .any(|(k, v)| k == "AUTH_SVC" && v == "JwtAuthService"),
+            "NestJS DI binding must be extracted: {:?}",
+            s_ai.di_bindings
+        );
+        let auth_res = solve_guard_lattice(&[s_ai, s_ar]);
+        assert!(
+            !auth_res
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "SMG-AUTH-001"),
+            "Single-implementor CHA AuthGuard must suppress SMG-AUTH-001: {:?}",
+            auth_res.findings
+        );
+
+        // 2. Ambiguous polymorphic dispatch (2 instantiated implementors: 1 guarded, 1 unguarded) -> Heuristic!
+        let poly_src = r#"
+export interface PaymentGateway {
+    process(req: any): Promise<void>;
+}
+export class SafeGateway implements PaymentGateway {
+    async process(req: any) {
+        verifyJwt(req.headers.authorization);
+        await stripe.charges.create({ amount: 100 });
+    }
+}
+export class RawGateway implements PaymentGateway {
+    async process(req: any) {
+        await stripe.charges.create({ amount: 100 });
+    }
+}
+const g1 = new SafeGateway();
+const g2 = new RawGateway();
+app.post('/api/poly-pay', async (req, res) => {
+    const gw: PaymentGateway = req.body.safe ? g1 : g2;
+    await gw.process(req);
+    res.json({ ok: true });
+});
+"#;
+        let s_poly =
+            parse_file_ast(&mk("src/poly.ts", Language::TypeScript, poly_src), &cfg).unwrap();
+        let poly_res = solve_guard_lattice(&[s_poly]);
+        let poly_auth = poly_res
+            .findings
+            .iter()
+            .find(|f| f.rule_id == "SMG-AUTH-001" && f.entry_route.contains("/api/poly-pay"))
+            .expect("Ambiguous polymorphic route with unguarded RawGateway must emit finding");
+        assert_eq!(
+            poly_auth.confidence,
+            Confidence::Heuristic,
+            "Ambiguous polymorphic dispatch MUST downgrade to Confidence::Heuristic (Zero Hallucination): {:?}",
+            poly_auth
+        );
+        assert!(
+            poly_auth
+                .proof_reasons
+                .iter()
+                .any(|r| r.contains("AmbiguousPolymorphicDispatch")),
+            "Finding proof_reasons must note AmbiguousPolymorphicDispatch: {:?}",
+            poly_auth.proof_reasons
+        );
+
+        // 3. RTA narrowing: DeadMockGateway is NOT instantiated -> narrows to SafeGateway -> 0 FP!
+        let rta_src = r#"
+export interface WalletGateway {
+    debit(req: any): Promise<void>;
+}
+export class SafeWalletGateway implements WalletGateway {
+    async debit(req: any) {
+        verifyJwt(req.headers.authorization);
+        await stripe.charges.create({ amount: 100 });
+    }
+}
+export class DeadMockGateway implements WalletGateway {
+    async debit(req: any) {
+        await stripe.charges.create({ amount: 100 });
+    }
+}
+const liveGw = new SafeWalletGateway();
+app.post('/api/rta-pay', async (req, res) => {
+    const gw: WalletGateway = liveGw;
+    await gw.debit(req);
+    res.json({ ok: true });
+});
+"#;
+        let s_rta = parse_file_ast(&mk("src/rta.ts", Language::TypeScript, rta_src), &cfg).unwrap();
+        let rta_res = solve_guard_lattice(&[s_rta]);
+        assert!(
+            !rta_res
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "SMG-AUTH-001" && f.entry_route.contains("/api/rta-pay")),
+            "RTA must prune uninstantiated DeadMockGateway and suppress FP: {:?}",
+            rta_res.findings
+        );
+
+        // 4. Go structural interface satisfaction
+        let go_iface_src = r#"
+package billing
+import "net/http"
+
+type Charger interface {
+    Charge()
+}
+type StripeCharger struct{}
+func (s *StripeCharger) Charge() {
+    stripe.charges.Create(100)
+}
+func Register(mux *http.ServeMux) {
+    mux.HandleFunc("POST /go/cha-charge", handleCharge)
+}
+func handleCharge(w http.ResponseWriter, r *http.Request) {
+    var c Charger = &StripeCharger{}
+    c.Charge()
+}
+"#;
+        let s_go_iface = parse_file_ast(
+            &mk("pkg/billing/charger.go", Language::Go, go_iface_src),
+            &cfg,
+        )
+        .unwrap();
+        let go_iface_res = solve_guard_lattice(&[s_go_iface]);
+        assert!(
+            go_iface_res
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "SMG-AUTH-001" && f.entry_route.contains("/go/cha-charge")),
+            "Go structural interface Charger.Charge() must resolve to StripeCharger.Charge(): {:?}",
+            go_iface_res.findings
         );
     }
 }

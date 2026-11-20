@@ -145,6 +145,30 @@ pub struct DomainHints {
     pub mobile: bool,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallSite {
+    #[serde(default)]
+    pub qualifier: Option<String>,
+    pub member: String,
+    #[serde(default)]
+    pub resolved_recv_type: Option<String>,
+    #[serde(default)]
+    pub line: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypeImplSummary {
+    pub type_name: String,
+    #[serde(default)]
+    pub implements: Vec<String>,
+    #[serde(default)]
+    pub methods: Vec<String>,
+    #[serde(default)]
+    pub is_interface: bool,
+    #[serde(default)]
+    pub line: usize,
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct SymbolInfo {
     pub id: String,
@@ -214,6 +238,12 @@ pub struct SymbolInfo {
     /// Route middleware wrapper callees (e.g. `RequireSession(h)`, `r.With(mw)`).
     #[serde(default)]
     pub middleware_callees: Vec<String>,
+    /// Phase 12A: Qualified call sites preserving `(qualifier, member, resolved_recv_type, line)`.
+    #[serde(default)]
+    pub call_sites: Vec<CallSite>,
+    /// Phase 12A: Enclosing class, struct, impl, or Go receiver type name (if this symbol is a method).
+    #[serde(default)]
+    pub enclosing_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -241,6 +271,15 @@ pub struct FileAstSummary {
     pub domain_hints: DomainHints,
     #[serde(default)]
     pub route_schemas: Vec<crate::phase10::RouteSchema>,
+    /// Phase 12A: Extracted class/interface/trait/struct type hierarchy summaries.
+    #[serde(default)]
+    pub type_impls: Vec<TypeImplSummary>,
+    /// Phase 12A: Extracted DI container bindings `(abstract_token, concrete_impl_type)`.
+    #[serde(default)]
+    pub di_bindings: Vec<(String, String)>,
+    /// Phase 12A: Concrete types instantiated in this file (for RTA narrowing).
+    #[serde(default)]
+    pub instantiated_types: Vec<String>,
 }
 
 impl SymbolInfo {
@@ -292,6 +331,8 @@ impl SymbolInfo {
             local_hit_wrappers: Vec::new(),
             tainted_call_wrappers: Vec::new(),
             middleware_callees: Vec::new(),
+            call_sites: Vec::new(),
+            enclosing_type: None,
         }
     }
 
@@ -518,6 +559,13 @@ pub fn parse_file_ast_with_hash(
         );
     }
 
+    let call_hier = crate::call_hierarchy::enrich_file_call_hierarchy(
+        root,
+        src_bytes,
+        file.language,
+        &mut symbols,
+    );
+
     let mut frontend_calls = Vec::new();
     crate::taint::extract_frontend_calls_and_bugs(
         root,
@@ -582,6 +630,9 @@ pub fn parse_file_ast_with_hash(
             has_global_csrf_guard,
             domain_hints,
             route_schemas,
+            type_impls: call_hier.type_impls,
+            di_bindings: call_hier.di_bindings,
+            instantiated_types: call_hier.instantiated_types,
         },
     ))
 }
@@ -1771,6 +1822,88 @@ fn extract_single_node<'a>(
                         from_specifier: spec.clone(),
                         remote_name: None,
                     });
+                }
+            }
+        }
+    }
+
+    // 1c-py. Python `import pkg.sub`, `import services.db as db`
+    if lang == Language::Python && kind == "import_statement" {
+        let txt = node_text(node, src);
+        if let Some(rest) = txt.strip_prefix("import ") {
+            for item in rest.split(',') {
+                let clean = item.trim();
+                if clean.is_empty() {
+                    continue;
+                }
+                if let Some((mod_path, alias)) = clean.split_once(" as ") {
+                    let mod_path = mod_path.trim();
+                    let alias = alias.trim();
+                    if !mod_path.is_empty() && !alias.is_empty() {
+                        imports.push(ImportRef {
+                            symbol_name: alias.to_string(),
+                            from_specifier: format!("py::{mod_path}"),
+                            remote_name: Some("*".to_string()),
+                        });
+                    }
+                } else {
+                    let leaf = clean.rsplit('.').next().unwrap_or(clean).trim();
+                    if !leaf.is_empty() {
+                        imports.push(ImportRef {
+                            symbol_name: leaf.to_string(),
+                            from_specifier: format!("py::{clean}"),
+                            remote_name: Some("*".to_string()),
+                        });
+                    }
+                    if clean.contains('.') {
+                        imports.push(ImportRef {
+                            symbol_name: clean.to_string(),
+                            from_specifier: format!("py::{clean}"),
+                            remote_name: Some("*".to_string()),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // 1d. Go `import_spec`: `import "acme/internal/auth"`, `import a "acme/auth"`, `import . "acme/dot"`, skipping `_`
+    if lang == Language::Go
+        && kind == "import_spec"
+        && let Some(path_n) = node.child_by_field_name("path")
+    {
+        let raw_path = node_text(path_n, src)
+            .trim()
+            .trim_matches(|c| c == '"' || c == '`');
+        if !raw_path.is_empty() {
+            let alias_opt = node
+                .child_by_field_name("name")
+                .map(|n| node_text(n, src).trim().to_string());
+            match alias_opt.as_deref() {
+                Some("_") => {}
+                Some(".") => {
+                    imports.push(ImportRef {
+                        symbol_name: "*".to_string(),
+                        from_specifier: format!("go::{raw_path}"),
+                        remote_name: Some("*".to_string()),
+                    });
+                }
+                Some(alias) if !alias.is_empty() => {
+                    imports.push(ImportRef {
+                        symbol_name: alias.to_string(),
+                        from_specifier: format!("go::{raw_path}"),
+                        remote_name: Some("*".to_string()),
+                    });
+                }
+                _ => {
+                    let pkg_name = raw_path.rsplit('/').next().unwrap_or(raw_path).trim();
+                    if !pkg_name.is_empty() {
+                        imports.push(ImportRef {
+                            symbol_name: pkg_name.to_string(),
+                            from_specifier: format!("go::{raw_path}"),
+                            remote_name: Some("*".to_string()),
+                        });
+                    }
                 }
             }
         }
