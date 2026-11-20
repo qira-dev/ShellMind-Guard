@@ -237,6 +237,10 @@ pub fn is_test_source_path(rel_path: &str) -> bool {
         )
     });
     has_test_dir
+        || matches!(
+            fname,
+            "test.rs" | "tests.rs" | "test.py" | "tests.py" | "test.js" | "test.ts"
+        )
         || fname.ends_with("_test.go")
         || fname.ends_with("_test.rs")
         || fname.ends_with("_test.py")

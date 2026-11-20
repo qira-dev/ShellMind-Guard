@@ -470,6 +470,14 @@ pub fn analyze_pqc_inventory(
         let mut cfg_brace_depth: i32 = 0;
         let mut filtered_lines: Vec<(usize, String)> = Vec::new();
         let is_cargo_toml = f.rel_path.ends_with("Cargo.toml");
+        let file_implements_mlkem_hybrid = {
+            let fl = cleaned.to_ascii_lowercase();
+            (fl.contains("mlkem768")
+                || fl.contains("ml-kem-768")
+                || fl.contains("mlkem1024")
+                || fl.contains("ml-kem-1024"))
+                && fl.contains("x25519")
+        };
         let lines: Vec<&str> = cleaned.lines().collect();
 
         for (idx, &line) in lines.iter().enumerate() {
@@ -506,7 +514,12 @@ pub fn analyze_pqc_inventory(
                 }
                 continue;
             }
-            if trimmed.is_empty() || is_pattern_matcher_or_doc_line(line) {
+            if trimmed.is_empty()
+                || is_pattern_matcher_or_doc_line(line)
+                || (trimmed.starts_with('"')
+                    && trimmed.ends_with('"')
+                    && trimmed.contains("crypto/"))
+            {
                 continue;
             }
             if is_cargo_toml && (trimmed.contains("features =") || trimmed.starts_with("features"))
@@ -541,7 +554,10 @@ pub fn analyze_pqc_inventory(
                 }
 
                 // Gate 1: Shor-vulnerable asymmetric exchange/signatures with HNDL or classical dependency
-                if strength.quantum_bits == 0 {
+                // Phase 20B: Do not flag the X25519 half of an in-file FIPS-203 hybrid ML-KEM-768/1024 + X25519 KEX.
+                if strength.quantum_bits == 0
+                    && !(strength.algorithm == "X25519" && file_implements_mlkem_hybrid)
+                {
                     let (rule_id, sev, msg) = if hndl_urgency > 0 {
                         (
                             "SMG-PQC-HNDL",
