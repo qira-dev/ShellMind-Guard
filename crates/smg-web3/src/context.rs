@@ -460,12 +460,40 @@ fn collect_json_artifacts(
     }
 }
 
-pub fn decode_hex_bytecode(hex_str: &str) -> Vec<u8> {
+/// Links Solidity library placeholders (`__$34-hex$__` or `__LibName___...`) to a deterministic
+/// 20-byte mock library address (`0x0000000000000000000000000000000000003333`) before hex decoding.
+pub fn link_library_placeholders(hex_str: &str) -> String {
+    const MOCK_LIB_ADDR_HEX: &str = "0000000000000000000000000000000000003333";
     let trimmed = hex_str.trim();
     let clean = trimmed
         .strip_prefix("0x")
         .or_else(|| trimmed.strip_prefix("0X"))
         .unwrap_or(trimmed);
+    if !clean.contains("__") {
+        return clean.to_string();
+    }
+    let bytes = clean.as_bytes();
+    let mut out = String::with_capacity(clean.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if i + 40 <= bytes.len() && bytes[i] == b'_' && bytes[i + 1] == b'_' {
+            // Standard solc v0.5+ (`__$<34 hex>$__`) or legacy (`__<name>___...`) 40-char placeholder
+            let slice = &clean[i..i + 40];
+            if (slice.starts_with("__$") && slice.ends_with("$__")) || slice.ends_with("__") {
+                out.push_str(MOCK_LIB_ADDR_HEX);
+                i += 40;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+pub fn decode_hex_bytecode(hex_str: &str) -> Vec<u8> {
+    let linked = link_library_placeholders(hex_str);
+    let clean = linked.as_str();
     if clean.is_empty() || !clean.is_ascii() || !clean.len().is_multiple_of(2) {
         return Vec::new();
     }

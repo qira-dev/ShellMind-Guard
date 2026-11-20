@@ -553,6 +553,14 @@ fn modifier_is_lock_name(name: &str, custom_locks: &HashSet<String>) -> bool {
 
 /// Parses a Solidity file into contract metadata, linearized packed storage layout, and function effect summaries.
 pub fn parse_solidity_file(rel_path: &str, source: &str) -> Vec<ParsedContract> {
+    parse_solidity_file_with_bases(rel_path, source, None)
+}
+
+pub fn parse_solidity_file_with_bases(
+    rel_path: &str,
+    source: &str,
+    workspace_bases: Option<&HashMap<String, ParsedContract>>,
+) -> Vec<ParsedContract> {
     let mut parser = Parser::new();
     if parser
         .set_language(&tree_sitter_solidity::LANGUAGE.into())
@@ -615,17 +623,35 @@ pub fn parse_solidity_file(rel_path: &str, source: &str) -> Vec<ParsedContract> 
     }
 
     // Linearize inherited base contracts' state variables, auth modifiers, and lock modifiers
-    let by_name: HashMap<String, ParsedContract> = contracts
-        .iter()
-        .map(|c| (c.name.clone(), c.clone()))
-        .collect();
+    // (merging both same-file bases and cross-file workspace bases via bounded transitive walk).
+    let mut by_name: HashMap<String, ParsedContract> = workspace_bases.cloned().unwrap_or_default();
+    for c in &contracts {
+        by_name.insert(c.name.clone(), c.clone());
+    }
 
     for (idx, c) in contracts.iter_mut().enumerate() {
         if c.bases.is_empty() {
             continue;
         }
+        // Bounded C3-style transitive base order (depth <= 8)
+        let mut ordered_bases: Vec<String> = Vec::new();
+        let mut queue: std::collections::VecDeque<(String, usize)> =
+            c.bases.iter().cloned().map(|b| (b, 0)).collect();
+        while let Some((bname, depth)) = queue.pop_front() {
+            if depth >= 8 || ordered_bases.contains(&bname) {
+                continue;
+            }
+            ordered_bases.push(bname.clone());
+            if let Some(bc) = by_name.get(&bname) {
+                for parent in &bc.bases {
+                    if !ordered_bases.contains(parent) {
+                        queue.push_back((parent.clone(), depth + 1));
+                    }
+                }
+            }
+        }
         let mut linearized_vars = Vec::new();
-        for base_name in &c.bases {
+        for base_name in &ordered_bases {
             if let Some(base_c) = by_name.get(base_name) {
                 for sv in &base_c.state_vars {
                     if !linearized_vars
@@ -1008,7 +1034,18 @@ pub fn analyze_solidity_file(
     source: &str,
     ctx: &Web3Context,
 ) -> (Vec<ParsedContract>, Vec<LocalStaticFinding>) {
-    let contracts = parse_solidity_file(rel_path, source);
+    analyze_solidity_file_with_bases(rel_path, source, ctx, None)
+}
+
+/// Runs EVM/Solidity security passes with workspace-wide multi-file C3 inheritance bases
+/// (`Ownable`, `ReentrancyGuard`, abstract storage bases) and ERC-7201 slot-0 collision checks.
+pub fn analyze_solidity_file_with_bases(
+    rel_path: &str,
+    source: &str,
+    ctx: &Web3Context,
+    workspace_bases: Option<&HashMap<String, ParsedContract>>,
+) -> (Vec<ParsedContract>, Vec<LocalStaticFinding>) {
+    let contracts = parse_solidity_file_with_bases(rel_path, source, workspace_bases);
     let mut findings = Vec::new();
     let is_test = smg_core::is_test_source_path(rel_path);
     if is_test {
@@ -1021,6 +1058,30 @@ pub fn analyze_solidity_file(
     for c in &contracts {
         if matches!(c.kind, ContractKind::Interface) {
             continue;
+        }
+        // ERC-7201 slot-0 check: proxy using `@custom:storage-location erc7201:...` with raw slot-0 vars
+        if c.has_erc7201_namespace
+            && c.is_proxy_like
+            && !c.packed_slots.is_empty()
+            && matches!(c.kind, ContractKind::Contract)
+        {
+            findings.push(LocalStaticFinding {
+                rule_id: "SMG-WEB3-STORAGE".into(),
+                severity: "HIGH".into(),
+                title: format!(
+                    "ERC-7201 namespaced contract `{}` also declares {} raw slot-0 storage variable(s) (`{}`)",
+                    c.name,
+                    c.packed_slots.len(),
+                    c.packed_slots[0].var_name
+                ),
+                rel_path: rel_path.into(),
+                line: c.packed_slots[0].line,
+                symbol: c.name.clone(),
+                sink_kind: SinkKind::Misconfiguration,
+                missing_guard: GuardKind::ConfigPolicy,
+                confidence: Confidence::Confirmed,
+                remediation: "Move all mutable state variables into the ERC-7201 namespaced struct (`@custom:storage-location erc7201:...`) so slot 0 remains untouched across upgrades.".into(),
+            });
         }
         let mut stale_vars_exposed_after_call: HashMap<String, usize> = HashMap::new();
         let artifact = ctx.artifacts.get(&c.name);

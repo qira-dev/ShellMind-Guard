@@ -1,31 +1,53 @@
 pub mod inventory;
 pub mod lattice;
+pub mod x509;
 
 use inventory::{CryptoAssetRecord, analyze_pqc_inventory, build_static_cbom_cyclonedx};
 use smg_core::IndexedFile;
 use smg_graph::LocalStaticFinding;
 use std::path::Path;
+use x509::X509CertRecord;
 
 #[derive(Debug, Clone)]
 pub struct PqcScanResult {
     pub findings: Vec<LocalStaticFinding>,
     pub cbom_json: String,
     pub assets: Vec<CryptoAssetRecord>,
+    pub certificates: Vec<X509CertRecord>,
 }
 
-/// Runs Post-Quantum Crypto-Agility, Mosca HNDL urgency, and honest partial CycloneDX CBOM analysis.
+/// Runs Post-Quantum Crypto-Agility, Mosca HNDL urgency, X.509 chain audit, and honest partial CycloneDX CBOM analysis.
 /// Designed for explicit opt-in `--compliance pqc`, `--layers pqc`, or `--cbom <FILE>`.
 pub fn scan_pqc_repo(
     project_root: &Path,
     files: &[IndexedFile],
     min_pq_category: u8,
 ) -> PqcScanResult {
-    let (findings, assets) = analyze_pqc_inventory(files, min_pq_category);
-    let cbom_json = build_static_cbom_cyclonedx(project_root, &assets);
+    let (mut findings, assets) = analyze_pqc_inventory(files, min_pq_category);
+    let mut certificates = Vec::new();
+    for f in files {
+        let low = f.rel_path.to_ascii_lowercase();
+        if low.ends_with(".pem") || low.ends_with(".crt") || low.ends_with(".cer") {
+            let text_opt = if let Some(b) = f.cached_bytes.as_deref() {
+                std::str::from_utf8(b).ok().map(str::to_string)
+            } else {
+                std::fs::read_to_string(&f.abs_path).ok()
+            };
+            if let Some(text) = text_opt {
+                let parsed = x509::parse_pem_certificates(&f.rel_path, &text);
+                if !parsed.is_empty() {
+                    findings.extend(x509::audit_x509_chain(&parsed));
+                    certificates.extend(parsed);
+                }
+            }
+        }
+    }
+    let cbom_json = build_static_cbom_cyclonedx(project_root, &assets, &certificates);
     PqcScanResult {
         findings,
         cbom_json,
         assets,
+        certificates,
     }
 }
 
@@ -166,6 +188,142 @@ pub fn broken_hybrid_and_underscore_suite() {
         assert_eq!(
             params_hit.severity, "CRITICAL",
             "Same-line deduplication must retain CRITICAL weak-seed severity over MEDIUM parameter severity"
+        );
+    }
+
+    #[test]
+    fn test_sprint6_p13_04_x509_der_chain_per_fn_kdf_multiline_hmac_and_pqc_algos() {
+        // Helper to build minimal valid DER X.509 certificate with given signature OID & UTCTime notAfter
+        fn der_tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+            let mut out = vec![tag];
+            if content.len() < 128 {
+                out.push(content.len() as u8);
+            } else {
+                out.push(0x82);
+                out.extend_from_slice(&(content.len() as u16).to_be_bytes());
+            }
+            out.extend_from_slice(content);
+            out
+        }
+        fn b64_encode(bytes: &[u8]) -> String {
+            const TAB: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut out = String::new();
+            for chunk in bytes.chunks(3) {
+                let b0 = chunk[0] as usize;
+                let b1 = *chunk.get(1).unwrap_or(&0) as usize;
+                let b2 = *chunk.get(2).unwrap_or(&0) as usize;
+                out.push(TAB[b0 >> 2] as char);
+                out.push(TAB[((b0 & 3) << 4) | (b1 >> 4)] as char);
+                out.push(if chunk.len() > 1 {
+                    TAB[((b1 & 0xf) << 2) | (b2 >> 6)] as char
+                } else {
+                    '='
+                });
+                out.push(if chunk.len() > 2 {
+                    TAB[b2 & 0x3f] as char
+                } else {
+                    '='
+                });
+            }
+            out
+        }
+        fn make_pem_cert(sig_oid_bytes: &[u8], not_after_utc: &[u8]) -> String {
+            let alg_seq = der_tlv(0x30, &der_tlv(0x06, sig_oid_bytes));
+            let serial = der_tlv(0x02, &[0x01]);
+            let issuer = der_tlv(0x30, &[]);
+            let validity = der_tlv(
+                0x30,
+                &[
+                    der_tlv(0x17, b"260101000000Z"),
+                    der_tlv(0x17, not_after_utc),
+                ]
+                .concat(),
+            );
+            let subject = der_tlv(0x30, &[]);
+            let tbs = der_tlv(
+                0x30,
+                &[serial, alg_seq.clone(), issuer, validity, subject].concat(),
+            );
+            let cert = der_tlv(0x30, &[tbs, alg_seq, der_tlv(0x03, &[0x00, 0xaa])].concat());
+            format!(
+                "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+                b64_encode(&cert)
+            )
+        }
+
+        // Leaf: ML-DSA-65 (2.16.840.1.101.3.4.3.18); Root CA: sha256WithRSAEncryption (1.2.840.113549.1.1.11)
+        let mldsa65_oid = [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x12];
+        let rsa_sha256_oid = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b];
+        let chain_pem = format!(
+            "{}{}",
+            make_pem_cert(&mldsa65_oid, b"300101000000Z"),
+            make_pem_cert(&rsa_sha256_oid, b"380101000000Z"),
+        );
+
+        // Per-function KDF isolation + multi-line HMAC SHA-256 + SecP256r1MLKEM768/FN-DSA-1024/HQC-192/BLAKE3 -> 0 FP!
+        let safe_src = r#"
+pub fn modern_pqc_suite() {
+    let kex = "SecP256r1MLKEM768";
+    let sig = "FN-DSA-1024";
+    let kem = "HQC-192";
+    let hash = "BLAKE3";
+    let mac = hmac_init(
+        key,
+        "SHA-256",
+    );
+}
+
+pub fn separate_pq_helper() {
+    let shared_secret = ml_kem_768_encaps();
+}
+"#;
+        let legacy_tls_src = r#"
+pub fn bad_tls() {
+    let min_ver = tls::VersionTLS12;
+}
+"#;
+        let files = vec![
+            mem_file("certs/chain.pem", Language::Config, &chain_pem),
+            mem_file("src/safe_modern.rs", Language::Rust, safe_src),
+            mem_file("src/legacy_tls.rs", Language::Rust, legacy_tls_src),
+        ];
+        let res = scan_pqc_repo(Path::new("sprint6-pqc"), &files, 3);
+
+        // X.509 chain link #1 (RSA CA beneath ML-DSA-65 leaf) MUST emit SMG-PQC-HNDL & CycloneDX "certificate"
+        assert_eq!(res.certificates.len(), 2);
+        assert_eq!(res.certificates[0].sig_algorithm, "ML-DSA-65");
+        assert_eq!(res.certificates[1].sig_algorithm, "SHA256-with-RSA");
+        assert_eq!(res.certificates[1].not_after_year, Some(2038));
+        assert!(
+            res.findings
+                .iter()
+                .any(|f| f.rule_id == "SMG-PQC-HNDL" && f.rel_path == "certs/chain.pem"),
+            "Weak RSA CA beneath PQC leaf must emit SMG-PQC-HNDL: {:#?}",
+            res.findings
+        );
+        assert!(
+            res.cbom_json.contains("\"assetType\": \"certificate\""),
+            "CBOM must include X.509 certificate components"
+        );
+
+        // Safe modern PQC + multi-line HMAC SHA-256 + separate functions -> 0 FP!
+        let safe_hits: Vec<_> = res
+            .findings
+            .iter()
+            .filter(|f| f.rel_path == "src/safe_modern.rs")
+            .collect();
+        assert!(
+            safe_hits.is_empty(),
+            "Modern PQC algos & multi-line HMAC SHA-256 must produce 0 FPs: {safe_hits:#?}"
+        );
+
+        // Legacy TLS 1.2 -> caught!
+        assert!(
+            res.findings
+                .iter()
+                .any(|f| f.rule_id == "SMG-PQC-DOWNGRADE" && f.rel_path == "src/legacy_tls.rs"),
+            "VersionTLS12 must emit SMG-PQC-DOWNGRADE: {:#?}",
+            res.findings
         );
     }
 }

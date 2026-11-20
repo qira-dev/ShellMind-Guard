@@ -6,11 +6,16 @@ pub mod svm_move;
 use context::{EvmSlotEntry, detect_proxy_storage_collisions, ingest_web3_context};
 use smg_core::{IndexedFile, Language};
 use smg_graph::LocalStaticFinding;
-use solidity::{ContractKind, analyze_solidity_file};
+use solidity::{
+    ContractKind, ParsedContract, analyze_solidity_file_with_bases, parse_solidity_file,
+};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use svm_move::{analyze_move_file, analyze_solana_rust_file, is_solana_rust_source};
+use svm_move::{
+    analyze_move_file, analyze_solana_rust_file_with_ctx, collect_solana_workspace_context,
+    is_solana_rust_source,
+};
 
 fn severity_rank(sev: &str) -> u8 {
     match sev {
@@ -73,13 +78,39 @@ pub fn scan_web3_repo(
     let mut proxies: Vec<(String, String, Vec<EvmSlotEntry>)> = Vec::new();
     let mut impls: Vec<(String, String, Vec<EvmSlotEntry>)> = Vec::new();
 
+    // Phase 13B (`P13-03`): Hoist workspace-wide Solidity base contracts for multi-file C3 inheritance
+    let mut workspace_sol_bases: HashMap<String, ParsedContract> = HashMap::new();
+    for f in files {
+        if f.language == Language::Solidity
+            && !smg_core::is_test_source_path(&f.rel_path)
+            && let Some(text) = read_indexed_text(f)
+        {
+            for c in parse_solidity_file(&f.rel_path, &text) {
+                workspace_sol_bases.insert(c.name.clone(), c);
+            }
+        }
+    }
+
+    // Phase 13B (`P13-04`): Hoist workspace-wide Solana/Anchor `#[derive(Accounts)]` context across split files
+    let solana_sources: Vec<(String, String)> = files
+        .iter()
+        .filter(|f| f.language == Language::Rust && !smg_core::is_test_source_path(&f.rel_path))
+        .filter_map(|f| read_indexed_text(f).map(|t| (f.rel_path.clone(), t)))
+        .collect();
+    let solana_ws_ctx = collect_solana_workspace_context(&solana_sources);
+
     for f in files {
         let Some(text) = read_indexed_text(f) else {
             continue;
         };
         match f.language {
             Language::Solidity => {
-                let (contracts, hits) = analyze_solidity_file(&f.rel_path, &text, &ctx);
+                let (contracts, hits) = analyze_solidity_file_with_bases(
+                    &f.rel_path,
+                    &text,
+                    &ctx,
+                    Some(&workspace_sol_bases),
+                );
                 all_findings.extend(hits);
                 if smg_core::is_test_source_path(&f.rel_path) {
                     continue;
@@ -115,7 +146,11 @@ pub fn scan_web3_repo(
                 all_findings.extend(analyze_move_file(&f.rel_path, &text));
             }
             Language::Rust => {
-                all_findings.extend(analyze_solana_rust_file(&f.rel_path, &text));
+                all_findings.extend(analyze_solana_rust_file_with_ctx(
+                    &f.rel_path,
+                    &text,
+                    Some(&solana_ws_ctx),
+                ));
             }
             _ => {}
         }
@@ -600,6 +635,110 @@ module vault::subtle_move {
                 .iter()
                 .any(|h| h.rule_id == "SMG-WEB3-MOVE" && h.symbol == "set_capacity"),
             "Must catch Move set_capacity(capacity: u64) without capability type: {subtle_hits:#?}"
+        );
+    }
+
+    #[test]
+    fn test_sprint6_p13_03_and_p13_04_multifile_c3_lib_linking_solana_split_and_move_abilities() {
+        let mk_file = |rel: &str, lang: Language, src: &str| IndexedFile {
+            rel_path: rel.into(),
+            abs_path: Path::new(rel).to_path_buf(),
+            language: lang,
+            blake3_hash: "0".into(),
+            mtime_ns: 0,
+            size_bytes: src.len() as u64,
+            cached_bytes: Some(src.as_bytes().to_vec()),
+        };
+        // 1. Solidity library placeholder linking (`__$34-hex$__`)
+        let linked =
+            context::decode_hex_bytecode("0x6000__$1234567890abcdef1234567890abcdef12$__00");
+        assert_eq!(linked.len(), 23);
+        assert_eq!(&linked[..2], &[0x60, 0x00]);
+        assert_eq!(linked[22], 0x00);
+
+        // 2. Multi-file C3 inheritance (Ownable in BaseOwnable.sol -> Treasury.sol uses custom `onlyAdmin`) -> 0 FP
+        let base_ownable = r#"
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+abstract contract BaseOwnable {
+    address public owner;
+    modifier onlyAdmin() {
+        require(msg.sender == owner, "not admin");
+        _;
+    }
+}
+"#;
+        let treasury = r#"
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+contract Treasury is BaseOwnable {
+    function setFeeRecipient(address next) external onlyAdmin {
+        owner = next;
+    }
+}
+"#;
+        // 3. Split Solana Anchor workspace (`state.rs` + `instructions.rs`) -> 0 FP
+        let sol_state = r#"
+use anchor_lang::prelude::*;
+#[derive(Accounts)]
+pub struct WithdrawAccounts<'info> {
+    pub authority: AccountInfo<'info>,
+}
+"#;
+        let sol_ix = r#"
+use anchor_lang::prelude::*;
+pub fn withdraw(ctx: Context<WithdrawAccounts>) -> Result<()> {
+    require!(ctx.accounts.authority.is_signer, ErrorCode::Unauthorized);
+    Ok(())
+}
+"#;
+        let safe_files = vec![
+            mk_file(
+                "contracts/BaseOwnable.sol",
+                Language::Solidity,
+                base_ownable,
+            ),
+            mk_file("contracts/Treasury.sol", Language::Solidity, treasury),
+            mk_file("programs/vault/src/state.rs", Language::Rust, sol_state),
+            mk_file("programs/vault/src/instructions.rs", Language::Rust, sol_ix),
+        ];
+        let safe_hits = scan_web3_repo(Path::new("/nonexistent"), &safe_files, true);
+        assert!(
+            safe_hits.is_empty(),
+            "Cross-file Ownable & split Anchor workspace must produce 0 FPs, got: {safe_hits:#?}"
+        );
+
+        // 4. Move `struct has <abilities>`: hot-potato `drop` + `*Cap` `store` caught, safe structs spared
+        let move_src = r#"
+module defi::pool {
+    public struct FlashLoanReceipt has drop { amount: u64 }
+    public struct AdminCap has key, store { id: u64 }
+    public struct SafeCap has key { id: u64 }
+    public struct SafeReceipt { amount: u64 }
+}
+"#;
+        let move_hits = scan_web3_repo(
+            Path::new("/nonexistent"),
+            &[mk_file("sources/pool.move", Language::Move, move_src)],
+            true,
+        );
+        assert!(
+            move_hits.iter().any(|h| h.rule_id == "SMG-WEB3-MOVE"
+                && h.symbol == "FlashLoanReceipt"
+                && h.severity == "CRITICAL"),
+            "Must catch hot-potato drop ability: {move_hits:#?}"
+        );
+        assert!(
+            move_hits
+                .iter()
+                .any(|h| h.rule_id == "SMG-WEB3-MOVE" && h.symbol == "AdminCap"),
+            "Must catch AdminCap store ability: {move_hits:#?}"
+        );
+        assert!(
+            !move_hits
+                .iter()
+                .any(|h| h.symbol == "SafeCap" || h.symbol == "SafeReceipt"),
+            "Safe Move structs must not be flagged: {move_hits:#?}"
         );
     }
 }

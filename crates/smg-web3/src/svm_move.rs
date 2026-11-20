@@ -54,8 +54,8 @@ pub fn is_solana_rust_source(source: &str) -> bool {
         || source.contains("ProgramResult")
 }
 
-#[derive(Default)]
-struct SolanaFileContext {
+#[derive(Default, Clone)]
+pub struct SolanaFileContext {
     /// Per `Context<StructName>` fields verified with `.is_signer` inside instructions using that `StructName`
     struct_signers: HashMap<String, HashSet<String>>,
     /// Per `Context<StructName>` fields verified with `.owner ==` inside instructions using that `StructName`
@@ -64,8 +64,43 @@ struct SolanaFileContext {
     structs_with_validated_program: HashSet<String>,
 }
 
+/// Workspace-wide Solana/Anchor context hoisted across split instruction & account files (`Phase 13B P13-04`).
+pub type SolanaWorkspaceContext = SolanaFileContext;
+
+/// Collects `#[derive(Accounts)]` and instruction signer/owner validations across all Solana Rust files in a workspace.
+pub fn collect_solana_workspace_context(sources: &[(String, String)]) -> SolanaWorkspaceContext {
+    let mut sctx = SolanaWorkspaceContext::default();
+    let mut parser = Parser::new();
+    if parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .is_err()
+    {
+        return sctx;
+    }
+    for (rel_path, source) in sources {
+        if smg_core::is_test_source_path(rel_path) || !is_solana_rust_source(source) {
+            continue;
+        }
+        let stripped = smg_graph::taint::strip_comments_simple(source);
+        if let Some(tree) = parser.parse(&stripped, None) {
+            collect_solana_file_context(tree.root_node(), stripped.as_bytes(), &mut sctx);
+        }
+    }
+    sctx
+}
+
 /// Analyzes Solana Anchor & native Rust SVM programs via Tree-sitter Rust AST.
 pub fn analyze_solana_rust_file(rel_path: &str, source: &str) -> Vec<LocalStaticFinding> {
+    analyze_solana_rust_file_with_ctx(rel_path, source, None)
+}
+
+/// Analyzes a Solana Anchor/native Rust file with an optional workspace-wide `SolanaWorkspaceContext`
+/// so split `instructions/*.rs` and `state/*.rs` handlers share `#[derive(Accounts)]` and signer proofs.
+pub fn analyze_solana_rust_file_with_ctx(
+    rel_path: &str,
+    source: &str,
+    workspace_ctx: Option<&SolanaWorkspaceContext>,
+) -> Vec<LocalStaticFinding> {
     if smg_core::is_test_source_path(rel_path) || !is_solana_rust_source(source) {
         return Vec::new();
     }
@@ -83,7 +118,7 @@ pub fn analyze_solana_rust_file(rel_path: &str, source: &str) -> Vec<LocalStatic
     let src = stripped.as_bytes();
     let mut findings = Vec::new();
 
-    let mut sctx = SolanaFileContext::default();
+    let mut sctx = workspace_ctx.cloned().unwrap_or_default();
     collect_solana_file_context(tree.root_node(), src, &mut sctx);
 
     walk_rust_solana(tree.root_node(), src, rel_path, &sctx, &mut findings);
@@ -453,6 +488,70 @@ pub fn analyze_move_file(rel_path: &str, source: &str) -> Vec<LocalStaticFinding
     let stripped = smg_graph::taint::strip_comments_simple(source);
     let mut findings = Vec::new();
     let lines: Vec<&str> = stripped.lines().collect();
+
+    // Phase 13B (`P13-04`): Parse Move `struct <Name> has <abilities>` for hot-potato & capability invariants
+    for (idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        let after_struct = trimmed
+            .strip_prefix("public struct ")
+            .or_else(|| trimmed.strip_prefix("struct "));
+        if let Some(rest) = after_struct
+            && let Some((name_part, ab_part)) = rest.split_once(" has ")
+        {
+            let sname = name_part.split(['<', ' ']).next().unwrap_or("").trim();
+            let abilities_raw = ab_part.split(['{', ';']).next().unwrap_or(ab_part);
+            let abilities: Vec<&str> = abilities_raw
+                .split([',', ' '])
+                .map(str::trim)
+                .filter(|a| !a.is_empty())
+                .collect();
+            let sname_low = sname.to_ascii_lowercase();
+
+            // 1. Hot-potato struct (`*Receipt`, `*FlashLoan`, `*Promise`, `*HotPotato`) must NOT have `drop` or `copy`
+            let is_hot_potato = sname_low.contains("receipt")
+                || sname_low.contains("flashloan")
+                || sname_low.contains("flash_loan")
+                || sname_low.contains("hotpotato")
+                || sname_low.contains("hot_potato")
+                || sname_low.contains("promise");
+            if is_hot_potato && (abilities.contains(&"drop") || abilities.contains(&"copy")) {
+                findings.push(LocalStaticFinding {
+                    rule_id: "SMG-WEB3-MOVE".into(),
+                    severity: "CRITICAL".into(),
+                    title: format!(
+                        "Move hot-potato struct `{sname}` declares `drop`/`copy` ability — callers can discard flash-loan repayment obligation"
+                    ),
+                    rel_path: rel_path.into(),
+                    line: idx + 1,
+                    symbol: sname.to_string(),
+                    sink_kind: SinkKind::AuthMutation,
+                    missing_guard: GuardKind::InputValidation,
+                    confidence: Confidence::Confirmed,
+                    remediation: "Remove `drop` and `copy` abilities from hot-potato receipts so Move's linear type system forces repayment inside the same transaction.".into(),
+                });
+            }
+
+            // 2. Capability struct (`*Cap`, `*AdminCap`, `*OwnerCap`) must NOT have `copy` or unrestricted `store`
+            let is_cap = sname.ends_with("Cap") || sname_low.ends_with("_cap");
+            if is_cap && (abilities.contains(&"copy") || abilities.contains(&"store")) {
+                findings.push(LocalStaticFinding {
+                    rule_id: "SMG-WEB3-MOVE".into(),
+                    severity: "HIGH".into(),
+                    title: format!(
+                        "Move capability struct `{sname}` declares `copy`/`store` ability — privilege object can be duplicated or freely transferred via `public_transfer`"
+                    ),
+                    rel_path: rel_path.into(),
+                    line: idx + 1,
+                    symbol: sname.to_string(),
+                    sink_kind: SinkKind::AuthMutation,
+                    missing_guard: GuardKind::Auth,
+                    confidence: Confidence::Confirmed,
+                    remediation: "Restrict admin/treasury capabilities to `has key` only (omit `copy` and `store`) and gate transfers through explicit module-owned rotation functions.".into(),
+                });
+            }
+        }
+    }
+
     let mut i = 0usize;
 
     while i < lines.len() {

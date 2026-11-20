@@ -41,6 +41,16 @@ pub fn evaluate_pq_strength(algo_token: &str) -> Option<PqSecurityStrength> {
     let low = algo_token.to_ascii_lowercase();
 
     // Post-Quantum / Hybrid standards
+    if low.contains("secp256r1mlkem768") || low.contains("p256_mlkem768") {
+        return Some(PqSecurityStrength {
+            algorithm: "SecP256r1MLKEM768",
+            oid: "1.3.6.1.4.1.2.267.12.4.5",
+            family: CryptoFamily::HybridKex,
+            classical_bits: 192,
+            quantum_bits: 192,
+            nist_category: 3,
+        });
+    }
     if low.contains("x25519mlkem768") || low.contains("x25519kyber768") {
         return Some(PqSecurityStrength {
             algorithm: "X25519MLKEM768",
@@ -49,6 +59,66 @@ pub fn evaluate_pq_strength(algo_token: &str) -> Option<PqSecurityStrength> {
             classical_bits: 192,
             quantum_bits: 192,
             nist_category: 3,
+        });
+    }
+    if low.contains("fn-dsa-1024") || low.contains("falcon-1024") || low.contains("falcon1024") {
+        return Some(PqSecurityStrength {
+            algorithm: "FN-DSA-1024",
+            oid: "1.3.9999.3.10",
+            family: CryptoFamily::PostQuantumSig,
+            classical_bits: 256,
+            quantum_bits: 256,
+            nist_category: 5,
+        });
+    }
+    if low.contains("fn-dsa-512") || low.contains("falcon-512") || low.contains("falcon512") {
+        return Some(PqSecurityStrength {
+            algorithm: "FN-DSA-512",
+            oid: "1.3.9999.3.6",
+            family: CryptoFamily::PostQuantumSig,
+            classical_bits: 128,
+            quantum_bits: 128,
+            nist_category: 1,
+        });
+    }
+    if low.contains("hqc-256") || low.contains("hqc256") {
+        return Some(PqSecurityStrength {
+            algorithm: "HQC-256",
+            oid: "1.3.6.1.4.1.2.267.14.5",
+            family: CryptoFamily::PostQuantumKem,
+            classical_bits: 256,
+            quantum_bits: 256,
+            nist_category: 5,
+        });
+    }
+    if low.contains("hqc-192") || low.contains("hqc192") {
+        return Some(PqSecurityStrength {
+            algorithm: "HQC-192",
+            oid: "1.3.6.1.4.1.2.267.14.3",
+            family: CryptoFamily::PostQuantumKem,
+            classical_bits: 192,
+            quantum_bits: 192,
+            nist_category: 3,
+        });
+    }
+    if low.contains("hqc-128") || low.contains("hqc128") {
+        return Some(PqSecurityStrength {
+            algorithm: "HQC-128",
+            oid: "1.3.6.1.4.1.2.267.14.1",
+            family: CryptoFamily::PostQuantumKem,
+            classical_bits: 128,
+            quantum_bits: 128,
+            nist_category: 1,
+        });
+    }
+    if low.contains("blake3") {
+        return Some(PqSecurityStrength {
+            algorithm: "BLAKE3",
+            oid: "1.3.6.1.4.1.54392.5.1286",
+            family: CryptoFamily::HashFunction,
+            classical_bits: 256,
+            quantum_bits: 128,
+            nist_category: 1,
         });
     }
     if low.contains("ml-kem-1024")

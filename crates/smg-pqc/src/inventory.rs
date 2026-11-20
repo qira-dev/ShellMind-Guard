@@ -157,6 +157,21 @@ fn token_candidates_in_line(line: &str) -> Vec<&'static str> {
         ("x25519", "X25519"),
         ("ed25519", "Ed25519"),
         ("ecdsa", "ECDSA"),
+        ("secp256r1mlkem768", "SecP256r1MLKEM768"),
+        ("p256_mlkem768", "SecP256r1MLKEM768"),
+        ("fn-dsa-1024", "FN-DSA-1024"),
+        ("falcon-1024", "FN-DSA-1024"),
+        ("falcon1024", "FN-DSA-1024"),
+        ("fn-dsa-512", "FN-DSA-512"),
+        ("falcon-512", "FN-DSA-512"),
+        ("falcon512", "FN-DSA-512"),
+        ("hqc-256", "HQC-256"),
+        ("hqc256", "HQC-256"),
+        ("hqc-192", "HQC-192"),
+        ("hqc192", "HQC-192"),
+        ("hqc-128", "HQC-128"),
+        ("hqc128", "HQC-128"),
+        ("blake3", "BLAKE3"),
         ("secp256k1", "secp256k1"),
         ("prime256v1", "prime256v1"),
         ("secp256r1", "secp256r1"),
@@ -232,64 +247,121 @@ fn check_pqc_hybrid_and_downgrade(
         .join("\n");
     let low = joined.to_ascii_lowercase();
 
-    // 1. Hybrid KDF combiner verification: when BOTH classic ECDH/X25519 and ML-KEM/Kyber appear
-    // in a handshake/kex file, verify that the KDF / shared_secret combiner lines themselves bind BOTH secrets.
-    let has_classic_kex = has_token_boundary(&low, "x25519") || has_token_boundary(&low, "ecdh");
-    let has_pqc_kex = low.contains("ml-kem")
-        || low.contains("ml_kem")
-        || low.contains("mlkem")
-        || has_token_boundary(&low, "kyber");
-    if has_classic_kex && has_pqc_kex && low.contains("shared_secret") {
-        let combiner_lines: String = filtered_lines
-            .iter()
-            .map(|(_, l)| l.to_ascii_lowercase())
-            .filter(|ll| {
-                ll.contains("shared_secret")
-                    || ll.contains("hkdf")
-                    || ll.contains("kdf(")
-                    || ll.contains("concat")
-                    || ll.contains("extend_from_slice")
-                    || ll.contains("append")
-                    || ll.contains("combine")
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+    // 1. Per-function Hybrid KDF combiner verification (Phase 13B P13-04):
+    // Split lines by top-level function headers so unrelated classical & PQC functions in the
+    // same file do not cross-contaminate hybrid KDF checks.
+    let mut fn_chunks: Vec<Vec<(usize, &str)>> = vec![Vec::new()];
+    for (ln, line) in filtered_lines {
+        let t = line.trim_start();
+        let is_fn_hdr = !line.starts_with("    ")
+            && !line.starts_with('\t')
+            && (t.starts_with("pub fn ")
+                || t.starts_with("pub async fn ")
+                || t.starts_with("fn ")
+                || t.starts_with("async fn ")
+                || t.starts_with("def ")
+                || t.starts_with("async def ")
+                || t.starts_with("func ")
+                || t.starts_with("function ")
+                || t.starts_with("async function ")
+                || t.starts_with("export function ")
+                || t.starts_with("export async function "));
+        if is_fn_hdr && !fn_chunks.last().is_none_or(Vec::is_empty) {
+            fn_chunks.push(Vec::new());
+        }
+        fn_chunks.last_mut().unwrap().push((*ln, line.as_str()));
+    }
 
-        let combiner_has_classic = combiner_lines.contains("classic")
-            || combiner_lines.contains("x25519")
-            || combiner_lines.contains("ecdh");
-        let combiner_has_pqc = combiner_lines.contains("pqc")
-            || combiner_lines.contains("kem")
-            || combiner_lines.contains("kyber")
-            || combiner_lines.contains("pq_");
-        let combiner_has_kdf_or_concat = combiner_lines.contains("concat")
-            || combiner_lines.contains("extend_from_slice")
-            || combiner_lines.contains("append")
-            || combiner_lines.contains("hkdf")
-            || combiner_lines.contains("sha3")
-            || combiner_lines.contains("kdf(");
-        let drops_one = low.contains("only classic")
-            || low.contains("ignore pqc")
-            || !combiner_has_classic
-            || !combiner_has_pqc;
-
-        if !combiner_has_kdf_or_concat || drops_one {
-            let line_no = filtered_lines
+    for chunk in &fn_chunks {
+        let c_joined: String = chunk.iter().map(|(_, l)| *l).collect::<Vec<_>>().join("\n");
+        let c_low = c_joined.to_ascii_lowercase();
+        let has_classic_kex =
+            has_token_boundary(&c_low, "x25519") || has_token_boundary(&c_low, "ecdh");
+        let has_pqc_kex = c_low.contains("ml-kem")
+            || c_low.contains("ml_kem")
+            || c_low.contains("mlkem")
+            || has_token_boundary(&c_low, "kyber");
+        if has_classic_kex && has_pqc_kex && c_low.contains("shared_secret") {
+            let combiner_lines: String = chunk
                 .iter()
-                .find(|(_, l)| l.to_ascii_lowercase().contains("shared_secret"))
-                .map(|(n, _)| *n)
-                .unwrap_or(1);
+                .map(|(_, l)| l.to_ascii_lowercase())
+                .filter(|ll| {
+                    ll.contains("shared_secret")
+                        || ll.contains("hkdf")
+                        || ll.contains("kdf(")
+                        || ll.contains("concat")
+                        || ll.contains("extend_from_slice")
+                        || ll.contains("append")
+                        || ll.contains("combine")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            let combiner_has_classic = combiner_lines.contains("classic")
+                || combiner_lines.contains("x25519")
+                || combiner_lines.contains("ecdh");
+            let combiner_has_pqc = combiner_lines.contains("pqc")
+                || combiner_lines.contains("kem")
+                || combiner_lines.contains("kyber")
+                || combiner_lines.contains("pq_");
+            let combiner_has_kdf_or_concat = combiner_lines.contains("concat")
+                || combiner_lines.contains("extend_from_slice")
+                || combiner_lines.contains("append")
+                || combiner_lines.contains("hkdf")
+                || combiner_lines.contains("sha3")
+                || combiner_lines.contains("kdf(");
+            let drops_one = c_low.contains("only classic")
+                || c_low.contains("ignore pqc")
+                || !combiner_has_classic
+                || !combiner_has_pqc;
+
+            if !combiner_has_kdf_or_concat || drops_one {
+                let line_no = chunk
+                    .iter()
+                    .find(|(_, l)| l.to_ascii_lowercase().contains("shared_secret"))
+                    .map(|(n, _)| *n)
+                    .unwrap_or(1);
+                findings.push(LocalStaticFinding {
+                    rule_id: "SMG-PQC-HYBRID".into(),
+                    severity: "HIGH".into(),
+                    title: "Hybrid post-quantum handshake does not bind both classical and ML-KEM shared secrets inside KDF".into(),
+                    rel_path: rel_path.into(),
+                    line: line_no,
+                    symbol: "hybrid_kdf_combiner".into(),
+                    sink_kind: SinkKind::Misconfiguration,
+                    missing_guard: GuardKind::ConfigPolicy,
+                    confidence: Confidence::Confirmed,
+                    remediation: "Derive session keys via domain-separated KDF(K_classic || K_pqc || ct_pqc || pk_pqc) combining both secrets.".into(),
+                });
+            }
+        }
+    }
+
+    // 1b. Legacy TLS <= 1.2 protocol pinning (TLS 1.2 lacks IETF hybrid ML-KEM key-share support)
+    for (line_no, line) in filtered_lines {
+        let ll = line.to_ascii_lowercase();
+        let is_legacy_tls = ll.contains("versiontls12")
+            || ll.contains("versiontls11")
+            || ll.contains("versiontls10")
+            || ll.contains("protocol_tlsv1_2")
+            || ll.contains("tlsv1.2")
+            || ll.contains("sslprotocol::tls1_2");
+        let is_disabled = ll.contains("disable")
+            || ll.contains("reject")
+            || ll.contains("forbid")
+            || ll.contains("= false");
+        if is_legacy_tls && !is_disabled {
             findings.push(LocalStaticFinding {
-                rule_id: "SMG-PQC-HYBRID".into(),
+                rule_id: "SMG-PQC-DOWNGRADE".into(),
                 severity: "HIGH".into(),
-                title: "Hybrid post-quantum handshake does not bind both classical and ML-KEM shared secrets inside KDF".into(),
+                title: "Legacy TLS <= 1.2 protocol configuration blocks hybrid post-quantum key exchange (`X25519MLKEM768` requires TLS 1.3)".into(),
                 rel_path: rel_path.into(),
-                line: line_no,
-                symbol: "hybrid_kdf_combiner".into(),
+                line: *line_no,
+                symbol: "legacy_tls_version".into(),
                 sink_kind: SinkKind::Misconfiguration,
                 missing_guard: GuardKind::ConfigPolicy,
                 confidence: Confidence::Confirmed,
-                remediation: "Derive session keys via domain-separated KDF(K_classic || K_pqc || ct_pqc || pk_pqc) combining both secrets.".into(),
+                remediation: "Enforce TLS 1.3 minimum (`TLSv1.3` / `VersionTLS13`) with hybrid `X25519MLKEM768` key agreement.".into(),
             });
         }
     }
@@ -398,8 +470,9 @@ pub fn analyze_pqc_inventory(
         let mut cfg_brace_depth: i32 = 0;
         let mut filtered_lines: Vec<(usize, String)> = Vec::new();
         let is_cargo_toml = f.rel_path.ends_with("Cargo.toml");
+        let lines: Vec<&str> = cleaned.lines().collect();
 
-        for (idx, line) in cleaned.lines().enumerate() {
+        for (idx, &line) in lines.iter().enumerate() {
             let trimmed = line.trim();
             if trimmed.starts_with("#[cfg(test)]") {
                 pending_cfg_test = true;
@@ -501,10 +574,14 @@ pub fn analyze_pqc_inventory(
                         remediation: "Migrate key exchange to FIPS 203 hybrid `X25519MLKEM768` / `ML-KEM-768` and signatures to FIPS 204 `ML-DSA-65`.".into(),
                     });
                 } else {
+                    // `±5`-line window for HMAC/HKDF/PBKDF2 SHA-256 PRF filter (Phase 13B P13-04)
+                    let win_start = idx.saturating_sub(5);
+                    let win_end = (idx + 6).min(lines.len());
+                    let hmac_ctx_low = lines[win_start..win_end].join(" ").to_ascii_lowercase();
                     let is_sha256_prf_or_digest = strength.algorithm == "SHA-256"
-                        && (line_low.contains("hmac")
-                            || line_low.contains("hkdf")
-                            || line_low.contains("pbkdf2")
+                        && (hmac_ctx_low.contains("hmac")
+                            || hmac_ctx_low.contains("hkdf")
+                            || hmac_ctx_low.contains("pbkdf2")
                             || line_low.contains("tls_aes_")
                             || line_low.contains("chacha20_poly1305_sha256")
                             || line_low.contains("sha256:")
@@ -577,7 +654,11 @@ pub fn analyze_pqc_inventory(
 
 /// Builds an honest partial CycloneDX 1.5 Static Source & Config Cryptography Inventory (CBOM),
 /// explicitly tagging unobserved runtime cipher negotiation, FIPS providers, and KMS/HSM keys as `runtime_unobserved`.
-pub fn build_static_cbom_cyclonedx(project_root: &Path, assets: &[CryptoAssetRecord]) -> String {
+pub fn build_static_cbom_cyclonedx(
+    project_root: &Path,
+    assets: &[CryptoAssetRecord],
+    certificates: &[crate::x509::X509CertRecord],
+) -> String {
     let proj_name = project_root
         .file_name()
         .and_then(|n| n.to_str())
@@ -589,9 +670,13 @@ pub fn build_static_cbom_cyclonedx(project_root: &Path, assets: &[CryptoAssetRec
         hasher.update(a.file.as_bytes());
         hasher.update(&a.line.to_le_bytes());
     }
+    for c in certificates {
+        hasher.update(c.sig_oid.as_bytes());
+        hasher.update(c.file.as_bytes());
+    }
     let digest = hasher.finalize().to_hex().to_string();
 
-    let components: Vec<serde_json::Value> = assets
+    let mut components: Vec<serde_json::Value> = assets
         .iter()
         .enumerate()
         .map(|(i, a)| {
@@ -624,6 +709,27 @@ pub fn build_static_cbom_cyclonedx(project_root: &Path, assets: &[CryptoAssetRec
             })
         })
         .collect();
+
+    for (i, c) in certificates.iter().enumerate() {
+        components.push(json!({
+            "type": "cryptographic-asset",
+            "bom-ref": format!("cert-{}-{}", i + 1, c.chain_index),
+            "name": format!("{}#{}", c.file, c.chain_index),
+            "cryptoProperties": {
+                "assetType": "certificate",
+                "oid": c.sig_oid,
+                "certificateProperties": {
+                    "signatureAlgorithmRef": c.sig_algorithm,
+                    "notValidAfterYear": c.not_after_year,
+                    "isCa": c.is_ca,
+                    "shorVulnerable": c.sig_is_shor_vulnerable
+                }
+            },
+            "evidence": {
+                "occurrences": [{ "location": c.file }]
+            }
+        }));
+    }
 
     serde_json::to_string_pretty(&json!({
         "bomFormat": "CycloneDX",
