@@ -15,10 +15,11 @@ pub use bwrap::{
     spawn_sandboxed_server, spawn_sandboxed_server_with_config,
 };
 pub use verifier::{
-    FuzzProbeHit, MockShimHandle, SandboxProbeConfig, VerificationStatus, VerifiedFinding,
+    FuzzProbeHit, MockShimHandle, SandboxProbeConfig, StatefulWorkflowConfig,
+    StatefulWorkflowResult, StatefulWorkflowViolation, VerificationStatus, VerifiedFinding,
     apply_wire_diff_corroboration, classify_boot_failure, mock_shim_env_vars,
     spawn_mock_shim_server, spawn_mock_shim_server_on_port, verify_finding,
-    verify_finding_with_config, verify_route_fuzz_with_config,
+    verify_finding_with_config, verify_route_fuzz_with_config, verify_stateful_http_workflow,
 };
 pub use wire_oracle::{
     OobSsrfCatcher, WireDiffProxy, capture_fs_digests, diff_fs_digests, synthesize_schema_poc_body,

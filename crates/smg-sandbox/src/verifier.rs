@@ -1869,6 +1869,160 @@ pub fn apply_wire_diff_corroboration(
     (verified, writes)
 }
 
+// ---------------------------------------------------------------------------
+// Phase 15D: Stateful Multi-Step Loopback HTTP Workflow & Isolation Verifier
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct StatefulWorkflowConfig {
+    pub collection_path: String,
+    pub create_body: String,
+    pub id_field: String,
+    pub user_a_header: Option<String>,
+    pub user_b_header: Option<String>,
+    pub use_tls: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatefulWorkflowViolation {
+    pub invariant: String,
+    pub step: String,
+    pub status_code: u16,
+    pub evidence: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct StatefulWorkflowResult {
+    pub violations: Vec<StatefulWorkflowViolation>,
+    pub steps_executed: usize,
+    pub created_resource_id: Option<String>,
+}
+
+/// Runs a deterministic multi-step API lifecycle & cross-session isolation check strictly against
+/// the local loopback server (`127.0.0.1:{port}`):
+/// 1. `POST` collection as `user_a` -> capture created resource ID.
+/// 2. `GET` created resource as `user_b` -> verify cross-session isolation (rejects unauthorized read).
+/// 3. `DELETE` created resource as `user_a`, then `GET` again -> verify no stale use-after-delete `200 OK`.
+pub async fn verify_stateful_http_workflow(
+    port: u16,
+    wf: &StatefulWorkflowConfig,
+) -> StatefulWorkflowResult {
+    let mut violations = Vec::new();
+    let mut steps_executed = 0usize;
+    let base = wf.collection_path.trim_end_matches('/');
+
+    // Step 1: Create resource as User A
+    steps_executed += 1;
+    let created_id = match send_http_probe_with_tls(
+        port,
+        "POST",
+        base,
+        wf.user_a_header.as_deref(),
+        Some(wf.create_body.as_bytes()),
+        wf.use_tls,
+    )
+    .await
+    {
+        Ok((code, body, is_html))
+            if (200..300).contains(&code) && !is_html && !is_failure_envelope(code, &body) =>
+        {
+            serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| {
+                    v.get(&wf.id_field).and_then(|idv| {
+                        idv.as_str()
+                            .map(|s| s.to_string())
+                            .or_else(|| idv.as_i64().map(|n| n.to_string()))
+                            .or_else(|| idv.as_u64().map(|n| n.to_string()))
+                    })
+                })
+        }
+        _ => None,
+    };
+
+    let Some(res_id) = created_id else {
+        return StatefulWorkflowResult {
+            violations,
+            steps_executed,
+            created_resource_id: None,
+        };
+    };
+
+    let item_path = format!("{}/{}", base, res_id);
+
+    // Step 2: Cross-session isolation check (User B attempts to read User A's newly created resource)
+    if let Some(user_b) = wf.user_b_header.as_deref() {
+        steps_executed += 1;
+        if let Ok((code, body, is_html)) =
+            send_http_probe_with_tls(port, "GET", &item_path, Some(user_b), None, wf.use_tls).await
+            && (200..300).contains(&code)
+            && !is_html
+            && !is_failure_envelope(code, &body)
+        {
+            violations.push(StatefulWorkflowViolation {
+                invariant: "CROSS_SESSION_ISOLATION".into(),
+                step: format!("GET {} (as user_b)", item_path),
+                status_code: code,
+                evidence: format!(
+                    "User B read User A's newly created resource `{}` with HTTP {}",
+                    res_id, code
+                ),
+            });
+        }
+    }
+
+    // Step 3: Lifecycle state-machine check (DELETE as User A, then GET must not return 2xx)
+    steps_executed += 1;
+    let deleted_ok = match send_http_probe_with_tls(
+        port,
+        "DELETE",
+        &item_path,
+        wf.user_a_header.as_deref(),
+        None,
+        wf.use_tls,
+    )
+    .await
+    {
+        Ok((code, body, is_html)) => {
+            (200..300).contains(&code) && !is_html && !is_failure_envelope(code, &body)
+        }
+        Err(_) => false,
+    };
+
+    if deleted_ok {
+        steps_executed += 1;
+        if let Ok((code, body, is_html)) = send_http_probe_with_tls(
+            port,
+            "GET",
+            &item_path,
+            wf.user_a_header.as_deref(),
+            None,
+            wf.use_tls,
+        )
+        .await
+            && (200..300).contains(&code)
+            && !is_html
+            && !is_failure_envelope(code, &body)
+        {
+            violations.push(StatefulWorkflowViolation {
+                invariant: "USE_AFTER_DELETE_STATE".into(),
+                step: format!("GET {} (after DELETE)", item_path),
+                status_code: code,
+                evidence: format!(
+                    "Deleted resource `{}` remained readable with HTTP {} after successful DELETE",
+                    res_id, code
+                ),
+            });
+        }
+    }
+
+    StatefulWorkflowResult {
+        violations,
+        steps_executed,
+        created_resource_id: Some(res_id),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2728,5 +2882,91 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(idor.status, VerificationStatus::Proven, "{idor:?}");
+    }
+
+    #[tokio::test]
+    async fn test_phase15d_stateful_http_workflow_catches_cross_session_and_use_after_delete() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        async fn spawn_mock_workflow_server(hardened: bool) -> u16 {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let deleted = Arc::new(AtomicBool::new(false));
+            tokio::spawn(async move {
+                while let Ok((mut sock, _)) = listener.accept().await {
+                    let del = deleted.clone();
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 4096];
+                        let n = sock.read(&mut buf).await.unwrap_or(0);
+                        let req = String::from_utf8_lossy(&buf[..n]);
+                        let first = req.lines().next().unwrap_or("");
+                        let is_user_b = req.contains("Bearer tok-b");
+
+                        let (status, body) = if first.starts_with("POST /api/orders ") {
+                            ("201 Created", r#"{"id":"ord-77","status":"created"}"#)
+                        } else if first.starts_with("DELETE /api/orders/ord-77 ") {
+                            del.store(true, Ordering::SeqCst);
+                            ("200 OK", r#"{"deleted":true}"#)
+                        } else if first.starts_with("GET /api/orders/ord-77 ") {
+                            if hardened && is_user_b {
+                                ("403 Forbidden", r#"{"error":"forbidden"}"#)
+                            } else if hardened && del.load(Ordering::SeqCst) {
+                                ("404 Not Found", r#"{"error":"not_found"}"#)
+                            } else {
+                                ("200 OK", r#"{"id":"ord-77","owner":"user_a"}"#)
+                            }
+                        } else {
+                            ("404 Not Found", r#"{"error":"unknown"}"#)
+                        };
+
+                        let resp = format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = sock.write_all(resp.as_bytes()).await;
+                    });
+                }
+            });
+            port
+        }
+
+        let wf = StatefulWorkflowConfig {
+            collection_path: "/api/orders".into(),
+            create_body: r#"{"item":"plan"}"#.into(),
+            id_field: "id".into(),
+            user_a_header: Some("Authorization: Bearer tok-a".into()),
+            user_b_header: Some("Authorization: Bearer tok-b".into()),
+            use_tls: false,
+        };
+
+        let vuln_port = spawn_mock_workflow_server(false).await;
+        let vuln_res = verify_stateful_http_workflow(vuln_port, &wf).await;
+        assert_eq!(vuln_res.created_resource_id.as_deref(), Some("ord-77"));
+        let invs: Vec<&str> = vuln_res
+            .violations
+            .iter()
+            .map(|v| v.invariant.as_str())
+            .collect();
+        assert!(
+            invs.contains(&"CROSS_SESSION_ISOLATION"),
+            "expected cross-session isolation violation, got: {:?}",
+            vuln_res.violations
+        );
+        assert!(
+            invs.contains(&"USE_AFTER_DELETE_STATE"),
+            "expected use-after-delete violation, got: {:?}",
+            vuln_res.violations
+        );
+
+        let safe_port = spawn_mock_workflow_server(true).await;
+        let safe_res = verify_stateful_http_workflow(safe_port, &wf).await;
+        assert!(
+            safe_res.violations.is_empty(),
+            "hardened workflow must have 0 violations, got: {:?}",
+            safe_res.violations
+        );
     }
 }

@@ -735,9 +735,305 @@ pub fn check_amm_spot_skew_bps(r0: u128, r1: u128, flash_dx: u128) -> u128 {
     u128::try_from(bps).unwrap_or(10_000)
 }
 
+// ---------------------------------------------------------------------------
+// Phase 15D: Stateful Multi-Tx `revm` Invariant Verifier & Sequence Shrinker
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvariantTxStep {
+    pub caller: Address,
+    pub selector: [u8; 4],
+    pub value_wei: U256,
+    pub calldata: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InvariantCampaignConfig {
+    pub seed: u64,
+    pub sequences: usize,
+    pub max_steps: usize,
+    pub initial_contract_wei: U256,
+    pub initial_storage: Vec<(U256, U256)>,
+    pub protected_slot: Option<(U256, U256)>,
+    pub selectors: Vec<[u8; 4]>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InvariantCampaignResult {
+    pub violated: bool,
+    pub invariant_name: Option<String>,
+    pub sequences_run: usize,
+    pub txs_executed: usize,
+    pub minimal_trace: Vec<InvariantTxStep>,
+    pub summary: String,
+}
+
+fn xorshift64(state: &mut u64) -> u64 {
+    let mut x = if *state == 0 {
+        0x9e37_79b9_7f4a_7c15
+    } else {
+        *state
+    };
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *state = x;
+    x
+}
+
+fn replay_invariant_sequence(
+    deployed_bytecode: &[u8],
+    cfg: &InvariantCampaignConfig,
+    trace: &[InvariantTxStep],
+) -> Option<String> {
+    let target = VICTIM_ADDR;
+    let mut db = InMemoryDB::default();
+    let actor_balance = U256::from(10_000_000_000_000_000_000u128);
+    for idx in 0..3u8 {
+        let addr = Address::new([
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x30, idx,
+        ]);
+        db.insert_account_info(
+            addr,
+            AccountInfo {
+                balance: actor_balance,
+                ..Default::default()
+            },
+        );
+    }
+    db.insert_account_info(
+        target,
+        AccountInfo {
+            balance: cfg.initial_contract_wei,
+            code: Some(Bytecode::new_raw(Bytes::from(deployed_bytecode.to_vec()))),
+            ..Default::default()
+        },
+    );
+    for &(slot, val) in &cfg.initial_storage {
+        let _ = db.insert_account_storage(target, slot, val);
+    }
+
+    let mut evm = Context::mainnet().with_db(db).build_mainnet();
+    let mut cumulative_deposits = U256::ZERO;
+
+    for (step_idx, step) in trace.iter().enumerate() {
+        let tx = TxEnv {
+            caller: step.caller,
+            kind: TxKind::Call(target),
+            gas_limit: 2_000_000,
+            value: step.value_wei,
+            data: Bytes::from(step.calldata.clone()),
+            ..Default::default()
+        };
+        if let Ok(ExecutionResult::Success { .. }) = evm.transact_commit(tx) {
+            cumulative_deposits = cumulative_deposits.saturating_add(step.value_wei);
+        }
+
+        let db_ref = &evm.ctx.journaled_state.database;
+        let current_bal = db_ref
+            .cache
+            .accounts
+            .get(&target)
+            .map(|a| a.info.balance)
+            .unwrap_or(U256::ZERO);
+
+        if current_bal < cfg.initial_contract_wei {
+            return Some(format!(
+                "SOLVENCY_BREACH at step {}: balance {} < initial reserve {} (deposited {})",
+                step_idx + 1,
+                current_bal,
+                cfg.initial_contract_wei,
+                cumulative_deposits
+            ));
+        }
+
+        if let Some((slot, expected)) = cfg.protected_slot {
+            let current_val = db_ref
+                .cache
+                .accounts
+                .get(&target)
+                .and_then(|a| a.storage.get(&slot).copied())
+                .unwrap_or(U256::ZERO);
+            if current_val != expected {
+                return Some(format!(
+                    "PROTECTED_SLOT_MUTATION at step {}: slot {} changed from {} to {}",
+                    step_idx + 1,
+                    slot,
+                    expected,
+                    current_val
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// Runs a deterministic seeded multi-transaction invariant verification campaign inside in-process
+/// `revm`, checking solvency and protected-slot invariants across stateful sequences, and shrinks
+/// any failing sequence down to a minimal reproducing trace.
+pub fn run_stateful_revm_invariant_campaign(
+    deployed_bytecode: &[u8],
+    cfg: &InvariantCampaignConfig,
+) -> InvariantCampaignResult {
+    if deployed_bytecode.is_empty() || cfg.selectors.is_empty() || cfg.sequences == 0 {
+        return InvariantCampaignResult {
+            violated: false,
+            invariant_name: None,
+            sequences_run: 0,
+            txs_executed: 0,
+            minimal_trace: Vec::new(),
+            summary: "empty bytecode, selectors, or sequence budget".into(),
+        };
+    }
+
+    let actors = [
+        Address::new([
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x30, 0x00,
+        ]),
+        Address::new([
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x30, 0x01,
+        ]),
+        Address::new([
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x30, 0x02,
+        ]),
+    ];
+
+    let mut rng = cfg.seed;
+    let mut txs_executed = 0usize;
+
+    for seq_idx in 0..cfg.sequences {
+        let step_count = cfg.max_steps.clamp(1, 64);
+        let mut trace = Vec::with_capacity(step_count);
+        for _ in 0..step_count {
+            let actor = actors[(xorshift64(&mut rng) as usize) % actors.len()];
+            let sel = cfg.selectors[(xorshift64(&mut rng) as usize) % cfg.selectors.len()];
+            let mut calldata = Vec::with_capacity(36);
+            calldata.extend_from_slice(&sel);
+            let arg_word = (xorshift64(&mut rng) % 4) as u8;
+            let mut word = [0u8; 32];
+            word[31] = arg_word;
+            calldata.extend_from_slice(&word);
+            trace.push(InvariantTxStep {
+                caller: actor,
+                selector: sel,
+                value_wei: U256::ZERO,
+                calldata,
+            });
+        }
+        txs_executed += trace.len();
+
+        if let Some(reason) = replay_invariant_sequence(deployed_bytecode, cfg, &trace) {
+            // Delta-debugging shrinker: iteratively drop unnecessary steps while preserving failure
+            let mut shrunk = trace;
+            let mut i = 0usize;
+            while i < shrunk.len() && shrunk.len() > 1 {
+                let mut cand = shrunk.clone();
+                cand.remove(i);
+                if replay_invariant_sequence(deployed_bytecode, cfg, &cand).is_some() {
+                    shrunk = cand;
+                } else {
+                    i += 1;
+                }
+            }
+            let inv_name = reason
+                .split_whitespace()
+                .next()
+                .unwrap_or("INVARIANT_BREACH")
+                .to_string();
+            return InvariantCampaignResult {
+                violated: true,
+                invariant_name: Some(inv_name),
+                sequences_run: seq_idx + 1,
+                txs_executed,
+                summary: format!(
+                    "Invariant violated in {} step(s) (shrunk): {}",
+                    shrunk.len(),
+                    reason
+                ),
+                minimal_trace: shrunk,
+            };
+        }
+    }
+
+    InvariantCampaignResult {
+        violated: false,
+        invariant_name: None,
+        sequences_run: cfg.sequences,
+        txs_executed,
+        minimal_trace: Vec::new(),
+        summary: format!(
+            "All invariants held across {} sequences ({} txs)",
+            cfg.sequences, txs_executed
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn revm_stateful_multi_tx_invariant_catches_two_step_unlock_and_shrinks() {
+        // Stateful 2-step vulnerable bytecode:
+        // - selector 0x11111111 -> SSTORE(slot 1, 1) ("arm")
+        // - selector 0x22222222 -> if SLOAD(slot 1) == 1, overwrite protected owner SSTORE(slot 0, 0xdead)
+        // Neither transaction alone can violate slot 0; only the 2-tx sequence `arm -> overwrite` does.
+        let mut vuln_code: Vec<u8> = vec![
+            0x60, 0x00, 0x35, 0x60, 0xe0, 0x1c, // selector = CALLDATALOAD(0) >> 224
+            0x80, 0x63, 0x11, 0x11, 0x11, 0x11, 0x14, // dup, == 0x11111111
+            0x60, 0x1d, 0x57, // JUMPI to arm_pc (0x1d)
+            0x63, 0x22, 0x22, 0x22, 0x22, 0x14, // == 0x22222222
+            0x60, 0x24, 0x57, // JUMPI to mutate_pc (0x24)
+            0x00, 0x00, 0x00, 0x00, // padding to 0x1d
+        ];
+        debug_assert_eq!(vuln_code.len(), 0x1d);
+        vuln_code.extend_from_slice(&[
+            0x5b, // 0x1d: JUMPDEST (arm)
+            0x60, 0x01, 0x60, 0x01, 0x55, // SSTORE(1, 1)
+            0x00, // STOP
+        ]);
+        debug_assert_eq!(vuln_code.len(), 0x24);
+        vuln_code.extend_from_slice(&[
+            0x5b, // 0x24: JUMPDEST (mutate)
+            0x60, 0x01, 0x54, // SLOAD(1)
+            0x60, 0x01, 0x14, // == 1
+            0x15, // ISZERO
+            0x60, 0x35, 0x57, // JUMPI done
+            0x61, 0xde, 0xad, 0x60, 0x00, 0x55, // SSTORE(0, 0xdead)
+            0x5b, 0x00, // 0x35: JUMPDEST, STOP
+        ]);
+
+        let cfg = InvariantCampaignConfig {
+            seed: 42,
+            sequences: 32,
+            max_steps: 8,
+            initial_contract_wei: U256::from(1_000_000_000_000_000_000u128),
+            initial_storage: vec![(U256::ZERO, U256::from(0xCAFEu64))],
+            protected_slot: Some((U256::ZERO, U256::from(0xCAFEu64))),
+            selectors: vec![[0x11, 0x11, 0x11, 0x11], [0x22, 0x22, 0x22, 0x22]],
+        };
+
+        let res = run_stateful_revm_invariant_campaign(&vuln_code, &cfg);
+        assert!(res.violated, "expected 2-tx violation: {:?}", res);
+        assert_eq!(
+            res.invariant_name.as_deref(),
+            Some("PROTECTED_SLOT_MUTATION")
+        );
+        assert_eq!(
+            res.minimal_trace.len(),
+            2,
+            "shrinker must reduce failing trace to minimal 2-tx sequence, got: {:?}",
+            res.minimal_trace
+        );
+        assert_eq!(res.minimal_trace[0].selector, [0x11, 0x11, 0x11, 0x11]);
+        assert_eq!(res.minimal_trace[1].selector, [0x22, 0x22, 0x22, 0x22]);
+
+        // Hardened contract: always reverts or stops without touching slot 0
+        let safe_code = vec![0x00];
+        let safe_res = run_stateful_revm_invariant_campaign(&safe_code, &cfg);
+        assert!(!safe_res.violated, "hardened contract must hold invariants");
+        assert_eq!(safe_res.sequences_run, 32);
+    }
 
     #[test]
     fn revm_concrete_reentrancy_proves_drain_and_cei_blocks_it() {
