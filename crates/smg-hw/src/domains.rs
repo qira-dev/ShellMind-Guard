@@ -147,6 +147,21 @@ pub struct WrappedInterval {
 }
 
 impl WrappedInterval {
+    pub fn join(self, other: Self) -> Self {
+        let width_bits = self.width_bits.max(other.width_bits);
+        let mut out = Self {
+            smin: self.smin.min(other.smin),
+            smax: self.smax.max(other.smax),
+            umin: self.umin.min(other.umin),
+            umax: self.umax.max(other.umax),
+            tnum: self.tnum.join(other.tnum).masked(width_bits),
+            signed_wrap: self.signed_wrap || other.signed_wrap,
+            width_bits,
+        };
+        out.reduce();
+        out
+    }
+
     pub fn constant_signed(val: i64, width_bits: u32) -> Self {
         let (sval, uval) = if width_bits == 32 {
             let v32 = val as i32;

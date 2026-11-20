@@ -261,12 +261,233 @@ fn extract_xml_tag(text: &str, tag: &str) -> Option<String> {
     (!val.is_empty() && !val.contains('<')).then(|| val.to_string())
 }
 
-fn c_define_int_re() -> &'static Regex {
+fn c_define_expr_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r#"(?m)^\s*#\s*define\s+([A-Za-z_][A-Za-z0-9_]*)\s+(0x[0-9a-fA-F]+|\d+)\b"#)
-            .expect("valid define int regex")
+        Regex::new(r#"(?m)^\s*#\s*define\s+([A-Za-z_][A-Za-z0-9_]*)[ \t]+([^\r\n\\]+)"#)
+            .expect("valid define expr regex")
     })
+}
+
+/// Evaluates composed C `#define` integer expressions (`+`, `-`, `*`, `/`, `<<`, `>>`, `|`, `&`,
+/// parentheses, hex/dec literals with `U`/`UL`/`ULL`/`L` suffixes, and previously resolved macros).
+fn eval_define_expr(raw: &str, env: &HashMap<String, i64>) -> Option<i64> {
+    let no_comment = raw
+        .split("//")
+        .next()
+        .unwrap_or(raw)
+        .split("/*")
+        .next()
+        .unwrap_or(raw)
+        .trim();
+    if no_comment.is_empty() || no_comment.contains('"') || no_comment.contains('\'') {
+        return None;
+    }
+
+    #[derive(Clone, Debug)]
+    enum Tok {
+        Num(i64),
+        LParen,
+        RParen,
+        Plus,
+        Minus,
+        Star,
+        Slash,
+        Shl,
+        Shr,
+        BitOr,
+        BitAnd,
+    }
+
+    let bytes = no_comment.as_bytes();
+    let mut toks = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        match b {
+            b'(' => {
+                toks.push(Tok::LParen);
+                i += 1;
+            }
+            b')' => {
+                toks.push(Tok::RParen);
+                i += 1;
+            }
+            b'+' => {
+                toks.push(Tok::Plus);
+                i += 1;
+            }
+            b'-' => {
+                toks.push(Tok::Minus);
+                i += 1;
+            }
+            b'*' => {
+                toks.push(Tok::Star);
+                i += 1;
+            }
+            b'/' => {
+                toks.push(Tok::Slash);
+                i += 1;
+            }
+            b'|' => {
+                if bytes.get(i + 1) == Some(&b'|') {
+                    return None;
+                }
+                toks.push(Tok::BitOr);
+                i += 1;
+            }
+            b'&' => {
+                if bytes.get(i + 1) == Some(&b'&') {
+                    return None;
+                }
+                toks.push(Tok::BitAnd);
+                i += 1;
+            }
+            b'<' if bytes.get(i + 1) == Some(&b'<') => {
+                toks.push(Tok::Shl);
+                i += 2;
+            }
+            b'>' if bytes.get(i + 1) == Some(&b'>') => {
+                toks.push(Tok::Shr);
+                i += 2;
+            }
+            b'0'..=b'9' => {
+                let start = i;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                let word = no_comment[start..i]
+                    .trim_end_matches(['u', 'U', 'l', 'L'])
+                    .replace('_', "");
+                let val = parse_hex_or_dec_u64(&word).and_then(|v| i64::try_from(v).ok())?;
+                toks.push(Tok::Num(val));
+            }
+            b'A'..=b'Z' | b'a'..=b'z' | b'_' => {
+                let start = i;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                let ident = &no_comment[start..i];
+                let val = *env.get(ident)?;
+                toks.push(Tok::Num(val));
+            }
+            _ => return None,
+        }
+    }
+    if toks.is_empty() {
+        return None;
+    }
+
+    fn parse_bitor(toks: &[Tok], pos: &mut usize) -> Option<i64> {
+        let mut lhs = parse_bitand(toks, pos)?;
+        while matches!(toks.get(*pos), Some(Tok::BitOr)) {
+            *pos += 1;
+            lhs |= parse_bitand(toks, pos)?;
+        }
+        Some(lhs)
+    }
+    fn parse_bitand(toks: &[Tok], pos: &mut usize) -> Option<i64> {
+        let mut lhs = parse_shift(toks, pos)?;
+        while matches!(toks.get(*pos), Some(Tok::BitAnd)) {
+            *pos += 1;
+            lhs &= parse_shift(toks, pos)?;
+        }
+        Some(lhs)
+    }
+    fn parse_shift(toks: &[Tok], pos: &mut usize) -> Option<i64> {
+        let mut lhs = parse_add(toks, pos)?;
+        while let Some(op) = toks.get(*pos) {
+            match op {
+                Tok::Shl => {
+                    *pos += 1;
+                    let r = parse_add(toks, pos)?;
+                    if !(0..63).contains(&r) {
+                        return None;
+                    }
+                    lhs = lhs.checked_shl(r as u32)?;
+                }
+                Tok::Shr => {
+                    *pos += 1;
+                    let r = parse_add(toks, pos)?;
+                    if !(0..63).contains(&r) {
+                        return None;
+                    }
+                    lhs = lhs.checked_shr(r as u32)?;
+                }
+                _ => break,
+            }
+        }
+        Some(lhs)
+    }
+    fn parse_add(toks: &[Tok], pos: &mut usize) -> Option<i64> {
+        let mut lhs = parse_mul(toks, pos)?;
+        while let Some(op) = toks.get(*pos) {
+            match op {
+                Tok::Plus => {
+                    *pos += 1;
+                    lhs = lhs.checked_add(parse_mul(toks, pos)?)?;
+                }
+                Tok::Minus => {
+                    *pos += 1;
+                    lhs = lhs.checked_sub(parse_mul(toks, pos)?)?;
+                }
+                _ => break,
+            }
+        }
+        Some(lhs)
+    }
+    fn parse_mul(toks: &[Tok], pos: &mut usize) -> Option<i64> {
+        let mut lhs = parse_atom(toks, pos)?;
+        while let Some(op) = toks.get(*pos) {
+            match op {
+                Tok::Star => {
+                    *pos += 1;
+                    lhs = lhs.checked_mul(parse_atom(toks, pos)?)?;
+                }
+                Tok::Slash => {
+                    *pos += 1;
+                    let r = parse_atom(toks, pos)?;
+                    if r == 0 {
+                        return None;
+                    }
+                    lhs = lhs.checked_div(r)?;
+                }
+                _ => break,
+            }
+        }
+        Some(lhs)
+    }
+    fn parse_atom(toks: &[Tok], pos: &mut usize) -> Option<i64> {
+        match toks.get(*pos)? {
+            Tok::Num(n) => {
+                let v = *n;
+                *pos += 1;
+                Some(v)
+            }
+            Tok::Minus => {
+                *pos += 1;
+                parse_atom(toks, pos)?.checked_neg()
+            }
+            Tok::LParen => {
+                *pos += 1;
+                let v = parse_bitor(toks, pos)?;
+                if !matches!(toks.get(*pos), Some(Tok::RParen)) {
+                    return None;
+                }
+                *pos += 1;
+                Some(v)
+            }
+            _ => None,
+        }
+    }
+
+    let mut pos = 0;
+    let val = parse_bitor(&toks, &mut pos)?;
+    (pos == toks.len()).then_some(val)
 }
 
 pub fn parse_linker_or_svd_regions(rel_path: &str, content: &str) -> Vec<MemoryRegion> {
@@ -335,6 +556,7 @@ pub fn parse_linker_or_svd_regions(rel_path: &str, content: &str) -> Vec<MemoryR
             }
 
             let mut ro_regs: Vec<(String, u64, u64)> = Vec::new();
+            let mut reg_max: Option<u64> = None;
             for reg_cap in svd_register_re().captures_iter(body) {
                 let rbody = &reg_cap[1];
                 if let Some(roff) =
@@ -344,32 +566,33 @@ pub fn parse_linker_or_svd_regions(rel_path: &str, content: &str) -> Vec<MemoryR
                         .and_then(|s| parse_hex_or_dec_u64(&s))
                         .unwrap_or(32);
                     let rbytes = (rbits / 8).max(4);
+                    // Honor SVD `<dim>` and `<dimIncrement>` register arrays (Phase 13A P13-02)
+                    let dim = extract_xml_tag(rbody, "dim")
+                        .and_then(|s| parse_hex_or_dec_u64(&s))
+                        .unwrap_or(1)
+                        .max(1);
+                    let dim_inc = extract_xml_tag(rbody, "dimIncrement")
+                        .and_then(|s| parse_hex_or_dec_u64(&s))
+                        .unwrap_or(rbytes)
+                        .max(rbytes);
+                    let span_bytes = if dim > 1 {
+                        (dim - 1).saturating_mul(dim_inc).saturating_add(rbytes)
+                    } else {
+                        rbytes
+                    };
+                    let end = roff.saturating_add(span_bytes);
+                    reg_max = Some(reg_max.map_or(end, |prev| prev.max(end)));
                     if extract_xml_tag(rbody, "access")
                         .is_some_and(|a| a.eq_ignore_ascii_case("read-only"))
                     {
                         let rname = extract_xml_tag(rbody, "name")
                             .unwrap_or_else(|| format!("REG_0x{:X}", roff));
-                        ro_regs.push((rname, base.saturating_add(roff), rbytes));
+                        ro_regs.push((rname, base.saturating_add(roff), span_bytes));
                     }
                 }
             }
 
             if max_span.is_none() {
-                // Check `<registers>` offsets if `<addressBlock>` was omitted
-                let mut reg_max: Option<u64> = None;
-                for reg_cap in svd_register_re().captures_iter(body) {
-                    let rbody = &reg_cap[1];
-                    if let Some(roff) = extract_xml_tag(rbody, "addressOffset")
-                        .and_then(|s| parse_hex_or_dec_u64(&s))
-                    {
-                        let rbits = extract_xml_tag(rbody, "size")
-                            .and_then(|s| parse_hex_or_dec_u64(&s))
-                            .unwrap_or(32);
-                        let rbytes = (rbits / 8).max(4);
-                        let end = roff.saturating_add(rbytes);
-                        reg_max = Some(reg_max.map_or(end, |prev| prev.max(end)));
-                    }
-                }
                 if let Some(rm) = reg_max {
                     max_span = Some(rm);
                 } else if let Some(top_sz) =
@@ -382,6 +605,8 @@ pub fn parse_linker_or_svd_regions(rel_path: &str, content: &str) -> Vec<MemoryR
                         top_sz
                     });
                 }
+            } else if let Some(rm) = reg_max {
+                max_span = Some(max_span.unwrap_or(0).max(rm));
             }
 
             let access_str = extract_xml_tag(&header_only, "access").or(block_access);
@@ -636,6 +861,7 @@ pub fn ingest_firmware_context(
         }
     }
 
+    let mut pending_defines: Vec<(String, String)> = Vec::new();
     for (rel, content) in c_sources {
         let low = rel.to_ascii_lowercase();
         if low.ends_with(".ld") || low.ends_with(".lds") || low.ends_with(".svd") {
@@ -645,17 +871,29 @@ pub fn ingest_firmware_context(
             }
             continue;
         }
-        for cap in c_define_int_re().captures_iter(content) {
-            if let Some(val) = parse_hex_or_dec_u64(&cap[2])
-                && let Ok(iv) = i64::try_from(val)
-            {
-                ctx.global_defines.insert(cap[1].to_string(), iv);
-            }
+        for cap in c_define_expr_re().captures_iter(content) {
+            pending_defines.push((cap[1].to_string(), cap[2].trim().to_string()));
         }
         if !ctx.has_compile_commands
             && (content.contains("#ifdef ") || content.contains("#if defined("))
         {
             ctx.unresolved_ifdef_files.insert(rel.clone());
+        }
+    }
+    // Bounded 4-pass fixed-point evaluation for composed `#define` arithmetic & bit-shifts
+    for _pass in 0..4 {
+        let mut changed = false;
+        for (name, expr) in &pending_defines {
+            if ctx.global_defines.contains_key(name) {
+                continue;
+            }
+            if let Some(iv) = eval_define_expr(expr, &ctx.global_defines) {
+                ctx.global_defines.insert(name.clone(), iv);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
         }
     }
 
@@ -734,5 +972,57 @@ MEMORY
 
         assert_eq!(svd_regs[2].name, "OTP_ROM");
         assert!(!svd_regs[2].writable);
+    }
+
+    #[test]
+    fn test_sprint5_p13_02_composed_defines_and_svd_dim_arrays() {
+        let hdr = r#"
+#define PERIPH_BASE 0x40000000UL
+#define UART_SHIFT  (1 << 10)
+#define UART_CTRL   (PERIPH_BASE + UART_SHIFT)
+#define DMA_BUF_CAP (64 * 4)
+#define MASKED_CAP  ((DMA_BUF_CAP >> 1) | 0x0F)
+"#;
+        let ctx = ingest_firmware_context(Path::new("/nonexistent"), &[("fw/regs.h".into(), hdr)]);
+        assert_eq!(ctx.global_defines.get("PERIPH_BASE"), Some(&0x4000_0000));
+        assert_eq!(ctx.global_defines.get("UART_SHIFT"), Some(&1024));
+        assert_eq!(ctx.global_defines.get("UART_CTRL"), Some(&0x4000_0400));
+        assert_eq!(ctx.global_defines.get("DMA_BUF_CAP"), Some(&256));
+        assert_eq!(ctx.global_defines.get("MASKED_CAP"), Some(&(128 | 0x0F)));
+
+        let svd_dim = r#"
+<device>
+  <peripherals>
+    <peripheral>
+      <name>DMA0</name>
+      <baseAddress>0x50000000</baseAddress>
+      <registers>
+        <register>
+          <name>CH_STATUS[%s]</name>
+          <addressOffset>0x10</addressOffset>
+          <size>32</size>
+          <dim>16</dim>
+          <dimIncrement>0x4</dimIncrement>
+          <access>read-only</access>
+        </register>
+      </registers>
+    </peripheral>
+  </peripherals>
+</device>
+"#;
+        let regs = parse_linker_or_svd_regions("dma.svd", svd_dim);
+        let ro = regs
+            .iter()
+            .find(|r| r.name.contains("CH_STATUS"))
+            .expect("dim read-only register array must be extracted");
+        assert_eq!(ro.base, 0x5000_0010);
+        assert_eq!(ro.size, 64); // 16 * 4 bytes
+        assert!(!ro.writable);
+
+        let periph = regs
+            .iter()
+            .find(|r| r.name == "DMA0")
+            .expect("DMA0 peripheral region expected");
+        assert_eq!(periph.size, 0x10 + 64);
     }
 }

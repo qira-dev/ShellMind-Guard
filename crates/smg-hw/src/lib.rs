@@ -487,4 +487,109 @@ pub mod prod_fw {
 
         let _ = fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn test_sprint5_p13_01_and_p13_02_tnum_octagon_opaque_dst_and_interproc_isr() {
+        let dir = std::env::temp_dir().join("smg_hw_sprint5_test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // 1. Safe cases: uint8_t exact bit-width in buf[512], opaque char *dst (no 256 guess),
+        //    and ISR -> helper using GFP_ATOMIC + spin_lock_irqsave in task
+        let safe_c = r#"
+void copy_u8_safe(uint8_t off, uint8_t len, const char *src) {
+    char buf[512];
+    memcpy(buf + off, src, len);
+}
+
+void copy_opaque_dst_safe(char *dst, uint32_t off, uint32_t len, const char *src) {
+    memcpy(dst + off, src, len);
+}
+
+static void safe_rx_helper(void) {
+    void *p = kmalloc(64, GFP_ATOMIC);
+    spin_lock(&safe_lock);
+    spin_unlock(&safe_lock);
+    kfree(p);
+}
+
+void SAFE_IRQHandler(void) {
+    safe_rx_helper();
+}
+
+void safe_task_worker(void) {
+    unsigned long flags;
+    spin_lock_irqsave(&safe_lock, flags);
+    spin_unlock_irqrestore(&safe_lock, flags);
+}
+"#;
+        let sf = mk_mem_file("fw/safe_s5.c", Language::C, safe_c);
+        let safe_hits = scan_hardware_repo(&dir, &[sf], true);
+        assert!(
+            safe_hits.is_empty(),
+            "Sprint 5 safe firmware cases must produce 0 FPs, got: {:?}",
+            safe_hits
+        );
+
+        // 2. Vulnerable cases: real OOB on known dst[128], indirect ISR -> helper -> spin_lock
+        //    self-deadlock, and indirect ISR -> helper -> kmalloc(GFP_KERNEL) sleeping-in-ISR
+        let vuln_c = r#"
+void copy_oob_known_cap(uint32_t off, uint32_t len, const char *src) {
+    char dst[128];
+    memcpy(dst + off, src, len);
+}
+
+static void ring_push_helper(void) {
+    spin_lock(&dev_ring_lock);
+    spin_unlock(&dev_ring_lock);
+}
+
+void DMA_IRQHandler(void) {
+    ring_push_helper();
+}
+
+void dev_worker_task(void) {
+    spin_lock(&dev_ring_lock);
+    spin_unlock(&dev_ring_lock);
+}
+
+static void alloc_rx_pkt(void) {
+    void *buf = kmalloc(64, GFP_KERNEL);
+    kfree(buf);
+}
+
+void UART_IRQHandler(void) {
+    alloc_rx_pkt();
+}
+"#;
+        let vf = mk_mem_file("fw/vuln_s5.c", Language::C, vuln_c);
+        let vuln_hits = scan_hardware_repo(&dir, &[vf], true);
+        assert!(
+            vuln_hits
+                .iter()
+                .any(|h| h.rule_id == "SMG-HW-BOUNDS" && h.symbol == "copy_oob_known_cap"),
+            "Must catch real OOB on known dst[128]: {:?}",
+            vuln_hits
+        );
+        assert!(
+            vuln_hits.iter().any(|h| {
+                h.rule_id == "SMG-HW-IRQ"
+                    && h.title.contains("Self-Deadlock")
+                    && h.title.contains("dev_ring_lock")
+            }),
+            "Must catch indirect ISR -> helper -> spin_lock self-deadlock: {:?}",
+            vuln_hits
+        );
+        assert!(
+            vuln_hits.iter().any(|h| {
+                h.rule_id == "SMG-HW-IRQ"
+                    && h.title.contains("Sleeping allocation")
+                    && h.title.contains("UART_IRQHandler")
+            }),
+            "Must catch indirect ISR -> helper -> kmalloc(GFP_KERNEL) sleeping-in-ISR: {:?}",
+            vuln_hits
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

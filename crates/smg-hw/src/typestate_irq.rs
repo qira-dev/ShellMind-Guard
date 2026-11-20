@@ -136,6 +136,16 @@ pub struct HardwareFunctionLockSummary {
     pub acquired_locks: Vec<String>,
     pub lock_irq_saved: HashMap<String, bool>,
     pub held_lock_pairs: Vec<(String, String)>,
+    /// Phase 13A (`P13-02`): direct callee names for bounded (`<= 4` hop) inter-procedural summary propagation.
+    pub callees: Vec<String>,
+    /// True if function calls a sleeping allocator or blocking primitive (`kmalloc(..., GFP_KERNEL)`, `mutex_lock`, `msleep`).
+    pub calls_sleeping_alloc: bool,
+    pub sleeping_alloc_line: Option<usize>,
+}
+
+fn hw_fn_call_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(").expect("valid fn call regex"))
 }
 
 fn hex_addr_re() -> &'static Regex {
@@ -404,6 +414,9 @@ fn extract_function_lock_summary(
     let mut currently_held: Vec<String> = Vec::new();
     let mut held_lock_pairs: Vec<(String, String)> = Vec::new();
     let mut lock_irq_saved: HashMap<String, bool> = HashMap::new();
+    let mut callees: Vec<String> = Vec::new();
+    let mut calls_sleeping_alloc = false;
+    let mut sleeping_alloc_line: Option<usize> = None;
     let mut dead_branch_depth: Option<i32> = None;
     let mut brace_depth: i32 = 0;
 
@@ -441,6 +454,47 @@ fn extract_function_lock_summary(
                 dead_branch_depth = None;
             }
             continue;
+        }
+
+        // Detect sleeping allocations / blocking primitives forbidden in ISR / atomic context
+        if ((low.contains("kmalloc(") || low.contains("kzalloc(") || low.contains("kcalloc("))
+            && low.contains("gfp_kernel"))
+            || low.contains("vmalloc(")
+            || low.contains("vzalloc(")
+            || low.contains("mutex_lock(")
+            || low.contains("msleep(")
+            || low.contains("ssleep(")
+        {
+            calls_sleeping_alloc = true;
+            if sleeping_alloc_line.is_none() {
+                sleeping_alloc_line = Some(ln);
+            }
+        }
+
+        // Collect direct function callees (skipping header line & keywords)
+        if ln > fn_start {
+            for cap in hw_fn_call_re().captures_iter(t) {
+                let cname = &cap[1];
+                if cname != fn_name
+                    && !matches!(
+                        cname,
+                        "if" | "for"
+                            | "while"
+                            | "switch"
+                            | "return"
+                            | "sizeof"
+                            | "typeof"
+                            | "defined"
+                            | "spin_lock"
+                            | "spin_unlock"
+                            | "spin_lock_irqsave"
+                            | "spin_unlock_irqrestore"
+                    )
+                    && !callees.iter().any(|c| c == cname)
+                {
+                    callees.push(cname.to_string());
+                }
+            }
         }
 
         if low.contains("disable_irq")
@@ -493,12 +547,13 @@ fn extract_function_lock_summary(
         brace_depth -= t.chars().filter(|&c| c == '}').count() as i32;
     }
 
-    if acquired.is_empty() {
+    if acquired.is_empty() && !is_isr && !calls_sleeping_alloc && callees.is_empty() {
         return None;
     }
-    let all_irq_saved = acquired
-        .iter()
-        .all(|l| lock_irq_saved.get(l).copied().unwrap_or(false));
+    let all_irq_saved = !acquired.is_empty()
+        && acquired
+            .iter()
+            .all(|l| lock_irq_saved.get(l).copied().unwrap_or(false));
 
     Some(HardwareFunctionLockSummary {
         fn_name: fn_name.to_string(),
@@ -509,6 +564,9 @@ fn extract_function_lock_summary(
         acquired_locks: acquired,
         lock_irq_saved,
         held_lock_pairs,
+        callees,
+        calls_sleeping_alloc,
+        sleeping_alloc_line,
     })
 }
 
@@ -607,11 +665,50 @@ struct TypestateBranchFrame {
     entry_depth: i32,
     pre_if_states: HashMap<String, (HwTypestate, usize)>,
     pre_if_nulls: HashSet<String>,
+    pre_if_intervals: HashMap<String, WrappedInterval>,
+    pre_if_tnums: HashMap<String, Tnum>,
+    pre_if_pos_guards: HashSet<String>,
     then_states: Option<HashMap<String, (HwTypestate, usize)>>,
     then_nulls: Option<HashSet<String>>,
+    then_intervals: Option<HashMap<String, WrappedInterval>>,
+    then_tnums: Option<HashMap<String, Tnum>>,
+    then_pos_guards: Option<HashSet<String>>,
     then_returned: bool,
     in_else: bool,
     branch_returned: bool,
+}
+
+fn merge_interval_maps(
+    a: &HashMap<String, WrappedInterval>,
+    b: &HashMap<String, WrappedInterval>,
+) -> HashMap<String, WrappedInterval> {
+    let mut out = HashMap::new();
+    for (k, va) in a {
+        if let Some(vb) = b.get(k) {
+            out.insert(k.clone(), va.join(*vb));
+        } else {
+            out.insert(k.clone(), *va);
+        }
+    }
+    for (k, vb) in b {
+        out.entry(k.clone()).or_insert(*vb);
+    }
+    out
+}
+
+fn merge_tnum_maps(a: &HashMap<String, Tnum>, b: &HashMap<String, Tnum>) -> HashMap<String, Tnum> {
+    let mut out = HashMap::new();
+    for (k, va) in a {
+        if let Some(vb) = b.get(k) {
+            out.insert(k.clone(), va.join(*vb));
+        } else {
+            out.insert(k.clone(), *va);
+        }
+    }
+    for (k, vb) in b {
+        out.entry(k.clone()).or_insert(*vb);
+    }
+    out
 }
 
 fn merge_typestate_maps(
@@ -804,6 +901,8 @@ fn analyze_single_hw_function(
 
     let fn_low = fn_body.to_ascii_lowercase();
     let mut intervals: HashMap<String, WrappedInterval> = HashMap::new();
+    let mut tnums: HashMap<String, Tnum> = HashMap::new();
+    let mut unsigned_params: HashSet<String> = HashSet::new();
     let mut typestates: HashMap<String, (HwTypestate, usize)> = HashMap::new();
     let mut null_ptrs: HashSet<String> = HashSet::new();
     let mut aliases = PointerAliasUnionFind::default();
@@ -814,6 +913,9 @@ fn analyze_single_hw_function(
     // Seed global integer constants from firmware `#define` macros and file CompileUnitContext
     for (k, v) in &ctx.global_defines {
         intervals.insert(k.clone(), WrappedInterval::constant_signed(*v, width_bits));
+        if *v >= 0 {
+            tnums.insert(k.clone(), Tnum::constant(*v as u64));
+        }
     }
     if let Some(cu) = ctx.lookup_compile_unit(rel_path) {
         for (k, v_str) in &cu.defines {
@@ -821,11 +923,12 @@ fn analyze_single_hw_function(
                 && let Ok(iv) = i64::try_from(val)
             {
                 intervals.insert(k.clone(), WrappedInterval::constant_signed(iv, width_bits));
+                tnums.insert(k.clone(), Tnum::constant(val));
             }
         }
     }
 
-    // Seed function parameter intervals strictly from inside `(...)` of the signature header, skipping pointers
+    // Seed function parameter intervals with exact bit-widths (Phase 13A P13-01)
     let params_slice = extract_sig_params_slice(fn_body);
     for part in params_slice.split(',') {
         let ptrim = part.trim();
@@ -838,36 +941,57 @@ fn analyze_single_hw_function(
             .last()
             .map(|c| c[1].to_string());
         if let Some(pvar) = last_ident {
-            let has_signed_kw = plow
+            let tokens: Vec<&str> = plow
                 .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-                .any(|w| {
-                    matches!(
-                        w,
-                        "int"
-                            | "int32_t"
-                            | "int16_t"
-                            | "int64_t"
-                            | "ssize_t"
-                            | "i32"
-                            | "i64"
-                            | "isize"
-                    )
-                });
-            let has_unsigned_kw = plow.contains("uint")
-                || plow.contains("size_t")
-                || plow.contains("usize")
-                || plow.contains("unsigned")
-                || plow.contains("u32")
-                || plow.contains("u64")
-                || plow.contains("u16")
-                || plow.contains("u8");
-            if has_signed_kw && !has_unsigned_kw {
+                .filter(|w| !w.is_empty())
+                .collect();
+            let has_tok = |t: &str| tokens.contains(&t);
+            let is_unsigned = has_tok("unsigned");
+
+            if has_tok("uint8_t") || has_tok("u8") || (is_unsigned && has_tok("char")) {
+                intervals.insert(pvar.clone(), WrappedInterval::from_u64_bounds(0, 255, 8));
+                tnums.insert(pvar.clone(), Tnum::unknown_with_width(8));
+                unsigned_params.insert(pvar);
+            } else if has_tok("int8_t") || has_tok("i8") {
+                intervals.insert(pvar, WrappedInterval::signed_range(-128, 127, 8));
+            } else if has_tok("uint16_t") || has_tok("u16") || (is_unsigned && has_tok("short")) {
+                intervals.insert(pvar.clone(), WrappedInterval::from_u64_bounds(0, 65535, 16));
+                tnums.insert(pvar.clone(), Tnum::unknown_with_width(16));
+                unsigned_params.insert(pvar);
+            } else if has_tok("int16_t") || has_tok("i16") || has_tok("short") {
+                intervals.insert(pvar, WrappedInterval::signed_range(-32768, 32767, 16));
+            } else if has_tok("uint32_t")
+                || has_tok("u32")
+                || (is_unsigned && has_tok("int"))
+                || is_unsigned
+            {
+                intervals.insert(
+                    pvar.clone(),
+                    WrappedInterval::from_u64_bounds(0, u32::MAX as u64, 32),
+                );
+                tnums.insert(pvar.clone(), Tnum::unknown_with_width(32));
+                unsigned_params.insert(pvar);
+            } else if has_tok("size_t") || has_tok("usize") || has_tok("uint64_t") || has_tok("u64")
+            {
+                let max_u = Tnum::width_mask(width_bits);
+                intervals.insert(
+                    pvar.clone(),
+                    WrappedInterval::from_u64_bounds(0, max_u, width_bits),
+                );
+                tnums.insert(pvar.clone(), Tnum::unknown_with_width(width_bits));
+                unsigned_params.insert(pvar);
+            } else if has_tok("int")
+                || has_tok("int32_t")
+                || has_tok("i32")
+                || has_tok("int64_t")
+                || has_tok("i64")
+                || has_tok("ssize_t")
+                || has_tok("isize")
+            {
                 intervals.insert(
                     pvar,
-                    WrappedInterval::signed_range(-32768, 65535, width_bits),
+                    WrappedInterval::signed_range(i32::MIN as i64, i32::MAX as i64, width_bits),
                 );
-            } else if has_unsigned_kw {
-                intervals.insert(pvar, WrappedInterval::from_u64_bounds(0, 65535, width_bits));
             }
         }
     }
@@ -1098,11 +1222,11 @@ fn analyze_single_hw_function(
     let mut branch_stack: Vec<TypestateBranchFrame> = Vec::new();
     let mut brace_depth: i32 = 0;
 
-    for &(ln, raw) in &fn_lines {
+    for (line_pos, &(ln, raw)) in fn_lines.iter().enumerate() {
         let trimmed = raw.trim();
         let low = trimmed.to_ascii_lowercase();
 
-        // Update typestate branch stack on `}` / `else if` / `else` transitions before analyzing line
+        // Update typestate + abstract-domain branch stack on `}` / `else if` / `else` transitions
         let starts_with_close = trimmed.starts_with('}');
         let is_else_if = low.contains("else if");
         let has_else_transition = starts_with_close
@@ -1122,11 +1246,29 @@ fn analyze_single_hw_function(
                     Some(prev) => prev.intersection(&null_ptrs).cloned().collect(),
                     None => null_ptrs.clone(),
                 };
+                let accum_ivs = match top.then_intervals.take() {
+                    Some(prev) => merge_interval_maps(&prev, &intervals),
+                    None => intervals.clone(),
+                };
+                let accum_tnums = match top.then_tnums.take() {
+                    Some(prev) => merge_tnum_maps(&prev, &tnums),
+                    None => tnums.clone(),
+                };
+                let accum_pg = match top.then_pos_guards.take() {
+                    Some(prev) => prev.intersection(&positive_guards).cloned().collect(),
+                    None => positive_guards.clone(),
+                };
                 top.then_states = Some(accum_then);
                 top.then_nulls = Some(accum_nulls);
+                top.then_intervals = Some(accum_ivs);
+                top.then_tnums = Some(accum_tnums);
+                top.then_pos_guards = Some(accum_pg);
                 top.then_returned = top.then_returned && top.branch_returned;
                 typestates = top.pre_if_states.clone();
                 null_ptrs = top.pre_if_nulls.clone();
+                intervals = top.pre_if_intervals.clone();
+                tnums = top.pre_if_tnums.clone();
+                positive_guards = top.pre_if_pos_guards.clone();
                 top.in_else = !is_else_if;
                 top.branch_returned = false;
             }
@@ -1138,19 +1280,35 @@ fn analyze_single_hw_function(
             if frame.in_else {
                 let then_st = frame.then_states.unwrap_or(frame.pre_if_states.clone());
                 let then_nl = frame.then_nulls.unwrap_or(frame.pre_if_nulls.clone());
+                let then_iv = frame
+                    .then_intervals
+                    .unwrap_or(frame.pre_if_intervals.clone());
+                let then_tn = frame.then_tnums.unwrap_or(frame.pre_if_tnums.clone());
+                let then_pg = frame
+                    .then_pos_guards
+                    .unwrap_or(frame.pre_if_pos_guards.clone());
                 match (frame.then_returned, frame.branch_returned) {
                     (true, false) => {}
                     (false, true) => {
                         typestates = then_st;
                         null_ptrs = then_nl;
+                        intervals = then_iv;
+                        tnums = then_tn;
+                        positive_guards = then_pg;
                     }
                     (true, true) => {
                         typestates = frame.pre_if_states;
                         null_ptrs = frame.pre_if_nulls;
+                        intervals = frame.pre_if_intervals;
+                        tnums = frame.pre_if_tnums;
+                        positive_guards = frame.pre_if_pos_guards;
                     }
                     (false, false) => {
                         typestates = merge_typestate_maps(&then_st, &typestates);
                         null_ptrs = then_nl.intersection(&null_ptrs).cloned().collect();
+                        intervals = merge_interval_maps(&then_iv, &intervals);
+                        tnums = merge_tnum_maps(&then_tn, &tnums);
+                        positive_guards = then_pg.intersection(&positive_guards).cloned().collect();
                     }
                 }
             } else if frame.branch_returned {
@@ -1159,6 +1317,13 @@ fn analyze_single_hw_function(
                 null_ptrs = frame.pre_if_nulls;
             } else {
                 typestates = merge_typestate_maps(&frame.pre_if_states, &typestates);
+                intervals = merge_interval_maps(&frame.pre_if_intervals, &intervals);
+                tnums = merge_tnum_maps(&frame.pre_if_tnums, &tnums);
+                positive_guards = frame
+                    .pre_if_pos_guards
+                    .intersection(&positive_guards)
+                    .cloned()
+                    .collect();
             }
         }
 
@@ -1171,8 +1336,14 @@ fn analyze_single_hw_function(
                 entry_depth: brace_depth,
                 pre_if_states: typestates.clone(),
                 pre_if_nulls: null_ptrs.clone(),
+                pre_if_intervals: intervals.clone(),
+                pre_if_tnums: tnums.clone(),
+                pre_if_pos_guards: positive_guards.clone(),
                 then_states: None,
                 then_nulls: None,
+                then_intervals: None,
+                then_tnums: None,
+                then_pos_guards: None,
                 then_returned: false,
                 in_else: false,
                 branch_returned: false,
@@ -1301,13 +1472,33 @@ fn analyze_single_hw_function(
                     secret_key_bufs.push((lv.clone(), ln));
                 }
 
-                // Tnum mask narrowing: `idx = raw & 0xFF;`
-                if let Some((_, rhs_mask)) = r_trim.split_once('&')
+                // Tnum + WrappedInterval arithmetic: `&`, `|`, `<<`, `>>`, `+` (Phase 13A P13-01)
+                let lookup_tnum = |tok: &str,
+                                   tmap: &HashMap<String, Tnum>,
+                                   imap: &HashMap<String, WrappedInterval>|
+                 -> Tnum {
+                    let t = tok.trim();
+                    if let Some(c) = parse_hex_or_dec_u64(t) {
+                        return Tnum::constant(c);
+                    }
+                    if let Some(tn) = tmap.get(t) {
+                        return *tn;
+                    }
+                    if let Some(iv) = imap.get(t)
+                        && iv.smin >= 0
+                    {
+                        return Tnum::from_range(iv.umin, iv.umax);
+                    }
+                    Tnum::unknown_with_width(width_bits)
+                };
+
+                if let Some((lhs_op, rhs_mask)) = r_trim.split_once('&')
                     && !r_trim.contains("&&")
                     && let Some(mask_val) = parse_hex_or_dec_u64(rhs_mask.trim())
                 {
-                    let narrowed =
-                        Tnum::unknown_with_width(width_bits).tnum_and(Tnum::constant(mask_val));
+                    let base_tn = lookup_tnum(lhs_op, &tnums, &intervals);
+                    let narrowed = base_tn.tnum_and(Tnum::constant(mask_val));
+                    tnums.insert(lv.clone(), narrowed);
                     intervals.insert(
                         lv.clone(),
                         WrappedInterval::from_u64_bounds(
@@ -1317,10 +1508,85 @@ fn analyze_single_hw_function(
                         ),
                     );
                     positive_guards.insert(lv.clone());
+                } else if let Some((lhs_op, rhs_or)) = r_trim.split_once('|')
+                    && !r_trim.contains("||")
+                    && let Some(or_val) = parse_hex_or_dec_u64(rhs_or.trim())
+                {
+                    let base_tn = lookup_tnum(lhs_op, &tnums, &intervals);
+                    let res_tn = base_tn.tnum_or(Tnum::constant(or_val)).masked(width_bits);
+                    tnums.insert(lv.clone(), res_tn);
+                    intervals.insert(
+                        lv.clone(),
+                        WrappedInterval::from_u64_bounds(
+                            res_tn.min_u64(),
+                            res_tn.max_u64(),
+                            width_bits,
+                        ),
+                    );
+                    positive_guards.insert(lv.clone());
+                } else if let Some((lhs_op, rhs_sh)) = r_trim.split_once("<<")
+                    && let Some(sh) = parse_hex_or_dec_u64(rhs_sh.trim())
+                    && sh < 64
+                {
+                    let base_tn = lookup_tnum(lhs_op, &tnums, &intervals);
+                    let res_tn = base_tn.tnum_lshift(sh as u32).masked(width_bits);
+                    tnums.insert(lv.clone(), res_tn);
+                    intervals.insert(
+                        lv.clone(),
+                        WrappedInterval::from_u64_bounds(
+                            res_tn.min_u64(),
+                            res_tn.max_u64(),
+                            width_bits,
+                        ),
+                    );
+                    positive_guards.insert(lv.clone());
+                } else if let Some((lhs_op, rhs_sh)) = r_trim.split_once(">>")
+                    && let Some(sh) = parse_hex_or_dec_u64(rhs_sh.trim())
+                    && sh < 64
+                {
+                    let base_tn = lookup_tnum(lhs_op, &tnums, &intervals);
+                    let res_tn = base_tn.tnum_rshift(sh as u32);
+                    tnums.insert(lv.clone(), res_tn);
+                    intervals.insert(
+                        lv.clone(),
+                        WrappedInterval::from_u64_bounds(
+                            res_tn.min_u64(),
+                            res_tn.max_u64(),
+                            width_bits,
+                        ),
+                    );
+                    positive_guards.insert(lv.clone());
+                } else if let Some((lhs_add, rhs_add)) = r_trim.split_once('+')
+                    && !r_trim.contains("++")
+                    && !r_trim.contains('"')
+                {
+                    let a_tok = lhs_add.trim();
+                    let b_tok = rhs_add.trim();
+                    let a_iv = parse_hex_or_dec_u64(a_tok)
+                        .and_then(|v| i64::try_from(v).ok())
+                        .map(|v| WrappedInterval::constant_signed(v, width_bits))
+                        .or_else(|| intervals.get(a_tok).copied());
+                    let b_iv = parse_hex_or_dec_u64(b_tok)
+                        .and_then(|v| i64::try_from(v).ok())
+                        .map(|v| WrappedInterval::constant_signed(v, width_bits))
+                        .or_else(|| intervals.get(b_tok).copied());
+                    if let (Some(ia), Some(ib)) = (a_iv, b_iv) {
+                        let sum_iv = ia.signed_add(ib);
+                        let sum_tn = lookup_tnum(a_tok, &tnums, &intervals)
+                            .tnum_add_width(lookup_tnum(b_tok, &tnums, &intervals), width_bits);
+                        tnums.insert(lv.clone(), sum_tn);
+                        intervals.insert(lv.clone(), sum_iv);
+                        if !sum_iv.signed_wrap && sum_iv.smin >= 0 {
+                            positive_guards.insert(lv.clone());
+                        }
+                    }
                 } else if r_trim.contains("(size_t)") || r_trim.contains(" as usize") {
                     for cap in ident_re().captures_iter(r_trim) {
                         if let Some(prev_iv) = intervals.get(&cap[1]).copied() {
                             intervals.insert(lv.clone(), prev_iv);
+                            if let Some(prev_tn) = tnums.get(&cap[1]).copied() {
+                                tnums.insert(lv.clone(), prev_tn);
+                            }
                             if positive_guards.contains(&cap[1]) {
                                 positive_guards.insert(lv.clone());
                             }
@@ -1332,6 +1598,7 @@ fn analyze_single_hw_function(
                     && let Ok(iv) = i64::try_from(const_v)
                 {
                     intervals.insert(lv.clone(), WrappedInterval::constant_signed(iv, width_bits));
+                    tnums.insert(lv.clone(), Tnum::constant(const_v));
                 }
             }
         }
@@ -1340,9 +1607,25 @@ fn analyze_single_hw_function(
         if low.starts_with("if ") || low.starts_with("if(") {
             let has_abort_on_line =
                 low.contains("return") || low.contains("goto ") || low.contains("break");
-            let is_early_reject = has_abort_on_line
-                || (fn_low.contains("return")
-                    && (low.contains("< 0") || low.contains("> ") || low.contains(">= ")));
+            // Look ahead strictly inside this `if`'s body (up to 3 lines before `}`) instead of whole-fn `return`
+            let mut body_aborts = false;
+            if !has_abort_on_line {
+                for &(_, next_raw) in fn_lines.iter().skip(line_pos + 1).take(3) {
+                    let nl = next_raw.trim().to_ascii_lowercase();
+                    if nl.starts_with('}') {
+                        break;
+                    }
+                    if nl.contains("return") || nl.contains("goto ") || nl.contains("break") {
+                        body_aborts = true;
+                        break;
+                    }
+                    if !trimmed.ends_with('{') {
+                        // Single-statement `if (...) \n return;`
+                        break;
+                    }
+                }
+            }
+            let is_early_reject = has_abort_on_line || body_aborts;
 
             for cap in sum_guard_re().captures_iter(trimmed) {
                 let va = cap[1].to_string();
@@ -1421,7 +1704,7 @@ fn analyze_single_hw_function(
                             } else {
                                 bval
                             };
-                            if has_unsigned_cast {
+                            if has_unsigned_cast || unsigned_params.contains(v) {
                                 iv.smin = iv.smin.max(0);
                                 iv.umin = 0;
                                 iv.signed_wrap = false;
@@ -1758,6 +2041,7 @@ fn analyze_single_hw_function(
                 if let Some(iv) = intervals.get(id).copied()
                     && (iv.can_wrap_negative_to_large_size() || iv.signed_wrap)
                     && !positive_guards.contains(id)
+                    && !unsigned_params.contains(id)
                 {
                     found_wrap_var = Some((id.to_string(), iv));
                     break;
@@ -1787,66 +2071,97 @@ fn analyze_single_hw_function(
                 && !low.contains("checked_add")
                 && !low.contains("cap")
             {
-                let mut off_max = 512i64;
-                let mut len_max = 512i64;
-                let mut off_name = String::new();
-                let mut len_name = String::new();
-                for cap in ident_re().captures_iter(trimmed) {
-                    let id = &cap[1];
-                    let id_low = id.to_ascii_lowercase();
-                    if id_low.contains("off") {
-                        off_name = id.to_string();
-                        if let Some(iv) = intervals.get(id) {
-                            off_max = iv.smax.clamp(0, 65535);
-                        }
-                    } else if id_low.contains("len") || id_low.contains("size") || id_low == "n" {
-                        len_name = id.to_string();
-                        if let Some(iv) = intervals.get(id) {
-                            len_max = iv.smax.clamp(0, 65535);
-                        }
-                    }
-                }
-                let dst_cap = ident_re()
+                // Phase 13A P13-01: Require concrete destination capacity from `local_caps`
+                // (never fabricate a hardcoded `256`-byte guess for opaque `char *dst` parameters).
+                let dst_cap_opt = ident_re()
                     .find_iter(trimmed)
                     .filter_map(|m| local_caps.get(m.as_str()).copied())
                     .min()
                     .or_else(|| local_caps.values().copied().min())
-                    .and_then(|v| i64::try_from(v).ok())
-                    .unwrap_or(256);
+                    .and_then(|v| i64::try_from(v).ok());
 
-                let mut oct = SparseOctagon::new(2);
-                oct.add_lower_bound(0, 0);
-                oct.add_upper_bound(0, off_max);
-                oct.add_lower_bound(1, 0);
-                oct.add_upper_bound(1, len_max);
-                for (va, vb, lim) in &relational_sum_limits {
-                    if (va == &off_name && vb == &len_name)
-                        || (va == &len_name && vb == &off_name)
-                        || va == &off_name
-                        || vb == &off_name
-                    {
-                        oct.add_sum_le(0, 1, *lim);
+                if let Some(dst_cap) = dst_cap_opt {
+                    // Build multi-variable `OctVarMap` (up to `MAX_OCTAGON_VARS = 12`)
+                    let mut oct_vars: Vec<String> = Vec::new();
+                    let mut oct_idx = |name: &str| -> Option<usize> {
+                        if name.is_empty() {
+                            return None;
+                        }
+                        if let Some(pos) = oct_vars.iter().position(|v| v == name) {
+                            return Some(pos);
+                        }
+                        if oct_vars.len() < crate::domains::MAX_OCTAGON_VARS {
+                            oct_vars.push(name.to_string());
+                            return Some(oct_vars.len() - 1);
+                        }
+                        None
+                    };
+
+                    let mut off_name = String::new();
+                    let mut len_name = String::new();
+                    for cap in ident_re().captures_iter(trimmed) {
+                        let id = &cap[1];
+                        let id_low = id.to_ascii_lowercase();
+                        if id_low.contains("off") && off_name.is_empty() {
+                            off_name = id.to_string();
+                        } else if (id_low.contains("len")
+                            || id_low.contains("size")
+                            || id_low == "n")
+                            && len_name.is_empty()
+                        {
+                            len_name = id.to_string();
+                        }
                     }
-                }
-                if oct.close()
-                    && !oct.proves_sum_le(0, 1, dst_cap)
-                    && let Some(hit) = mk_hw_finding(
-                        "SMG-HW-BOUNDS",
-                        "HIGH",
-                        SoundinessTier::Likely,
-                        format!(
-                            "Buffer `offset + len` arithmetic in `{}` lacks relational capacity guard against overflow",
-                            fn_name
-                        ),
-                        rel_path,
-                        ln,
-                        fn_name,
-                        SinkKind::MemorySafety,
-                        GuardKind::MemoryBounds,
-                        "Check overflow-safe relational invariant (`if (off > cap || len > cap - off) return -EINVAL;`) before pointer offset + copy.",
-                    )
-                {
-                    findings.push(hit);
+
+                    if let (Some(i_off), Some(i_len)) = (oct_idx(&off_name), oct_idx(&len_name)) {
+                        for (va, vb, _) in &relational_sum_limits {
+                            let _ = oct_idx(va);
+                            let _ = oct_idx(vb);
+                        }
+                        let mut oct = SparseOctagon::new(oct_vars.len().max(2));
+                        for (idx_v, vname) in oct_vars.iter().enumerate() {
+                            if let Some(iv) = intervals.get(vname) {
+                                if unsigned_params.contains(vname) {
+                                    oct.add_lower_bound(idx_v, 0);
+                                    let hi = iv.umax.min(i32::MAX as u64) as i64;
+                                    oct.add_upper_bound(idx_v, hi);
+                                } else {
+                                    oct.add_lower_bound(idx_v, iv.smin.max(0));
+                                    oct.add_upper_bound(idx_v, iv.smax.clamp(0, i32::MAX as i64));
+                                }
+                            } else {
+                                oct.add_lower_bound(idx_v, 0);
+                            }
+                        }
+                        for (va, vb, lim) in &relational_sum_limits {
+                            if let (Some(ia), Some(ib)) = (
+                                oct_vars.iter().position(|v| v == va),
+                                oct_vars.iter().position(|v| v == vb),
+                            ) {
+                                oct.add_sum_le(ia, ib, *lim);
+                            }
+                        }
+                        if oct.close()
+                            && !oct.proves_sum_le(i_off, i_len, dst_cap)
+                            && let Some(hit) = mk_hw_finding(
+                                "SMG-HW-BOUNDS",
+                                "HIGH",
+                                SoundinessTier::Likely,
+                                format!(
+                                    "Buffer `offset + len` arithmetic in `{}` lacks relational capacity guard against overflow (dst cap = {})",
+                                    fn_name, dst_cap
+                                ),
+                                rel_path,
+                                ln,
+                                fn_name,
+                                SinkKind::MemorySafety,
+                                GuardKind::MemoryBounds,
+                                "Check overflow-safe relational invariant (`if (off > cap || len > cap - off) return -EINVAL;`) before pointer offset + copy.",
+                            )
+                        {
+                            findings.push(hit);
+                        }
+                    }
                 }
             }
         }
@@ -1973,21 +2288,139 @@ fn analyze_single_hw_function(
     }
 }
 
-/// Solves cross-function RTOS interrupt priority & lock-order partial-order deadlocks (`SMG-HW-IRQ`).
+/// Solves cross-function RTOS interrupt priority, sleeping-in-ISR, and lock-order partial-order
+/// deadlocks (`SMG-HW-IRQ`) via bounded (`<= 4` hop) `HardwareFunctionLockSummary` fixed-point
+/// inter-procedural propagation (Phase 13A `P13-02`).
 pub fn check_cross_fn_irq_deadlocks(
     summaries: &[HardwareFunctionLockSummary],
 ) -> Vec<LocalStaticFinding> {
+    const MAX_HW_SUMMARY_HOPS: usize = 4;
+
+    // Clone into working table and build unique function name index for sound inter-procedural resolution
+    let mut work: Vec<HardwareFunctionLockSummary> = summaries.to_vec();
+    let mut name_counts: HashMap<&str, usize> = HashMap::new();
+    for s in summaries {
+        *name_counts.entry(s.fn_name.as_str()).or_insert(0) += 1;
+    }
+    let mut unique_name_idx: HashMap<String, usize> = HashMap::new();
+    for (idx, s) in summaries.iter().enumerate() {
+        if name_counts.get(s.fn_name.as_str()).copied() == Some(1) {
+            unique_name_idx.insert(s.fn_name.clone(), idx);
+        }
+    }
+
+    // Bounded <= 4-hop fixed-point propagation of locks, lock pairs, and sleeping-alloc effects
+    for _hop in 0..MAX_HW_SUMMARY_HOPS {
+        let mut changed = false;
+        let snapshot = work.clone();
+        for caller in &mut work {
+            for callee_name in &caller.callees {
+                let Some(&ci) = unique_name_idx.get(callee_name) else {
+                    continue;
+                };
+                let callee = &snapshot[ci];
+                if callee.calls_sleeping_alloc && !caller.calls_sleeping_alloc {
+                    caller.calls_sleeping_alloc = true;
+                    caller.sleeping_alloc_line = caller.sleeping_alloc_line.or(Some(caller.line));
+                    changed = true;
+                }
+                for l in &callee.acquired_locks {
+                    let callee_saved = callee
+                        .lock_irq_saved
+                        .get(l)
+                        .copied()
+                        .unwrap_or(callee.irq_saved);
+                    let eff_saved = callee_saved || caller.irq_saved;
+                    if !caller.acquired_locks.contains(l) {
+                        caller.acquired_locks.push(l.clone());
+                        caller.lock_irq_saved.insert(l.clone(), eff_saved);
+                        changed = true;
+                    } else if let Some(prev) = caller.lock_irq_saved.get_mut(l)
+                        && *prev
+                        && !eff_saved
+                    {
+                        *prev = false;
+                        changed = true;
+                    }
+                }
+                for pair in &callee.held_lock_pairs {
+                    if !caller.held_lock_pairs.contains(pair) {
+                        caller.held_lock_pairs.push(pair.clone());
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // Track which functions are called from ISR vs non-ISR contexts so ISR-only helpers
+    // (like `static void safe_rx_helper(void)` invoked solely by an ISR) are not misclassified as tasks.
+    let mut called_from_isr: HashSet<usize> = HashSet::new();
+    let mut called_from_non_isr: HashSet<usize> = HashSet::new();
+    for s in &work {
+        for cname in &s.callees {
+            if let Some(&ci) = unique_name_idx.get(cname) {
+                if s.is_isr {
+                    called_from_isr.insert(ci);
+                } else {
+                    called_from_non_isr.insert(ci);
+                }
+            }
+        }
+    }
+    // Transitive ISR-only helper closure (up to MAX_HW_SUMMARY_HOPS)
+    for _ in 0..MAX_HW_SUMMARY_HOPS {
+        let mut added = false;
+        let cur: Vec<usize> = called_from_isr.iter().copied().collect();
+        for ci in cur {
+            for cname in &work[ci].callees {
+                if let Some(&sub) = unique_name_idx.get(cname)
+                    && called_from_isr.insert(sub)
+                {
+                    added = true;
+                }
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+
     let mut out = Vec::new();
     let mut isr_locks: HashSet<&str> = HashSet::new();
-    for s in summaries {
+    for s in &work {
         if s.is_isr {
             for l in &s.acquired_locks {
                 isr_locks.insert(l.as_str());
             }
+            if s.calls_sleeping_alloc
+                && let Some(hit) = mk_hw_finding(
+                    "SMG-HW-IRQ",
+                    "CRITICAL",
+                    SoundinessTier::Verified,
+                    format!(
+                        "Sleeping allocation or blocking call reachable from ISR `{}` (forbidden in atomic/interrupt context)",
+                        s.fn_name
+                    ),
+                    &s.rel_path,
+                    s.sleeping_alloc_line.unwrap_or(s.line),
+                    &s.fn_name,
+                    SinkKind::ConcurrencyHazard,
+                    GuardKind::LockOrdering,
+                    "Use `GFP_ATOMIC` / lock-free ring buffers inside ISRs and defer sleeping work to a workqueue or task thread.",
+                )
+            {
+                out.push(hit);
+            }
         }
     }
-    for s in summaries {
-        if !s.is_isr {
+    for (idx, s) in work.iter().enumerate() {
+        let is_isr_only_helper =
+            called_from_isr.contains(&idx) && !called_from_non_isr.contains(&idx);
+        if !s.is_isr && !is_isr_only_helper {
             for l in &s.acquired_locks {
                 let saved_for_l = s.lock_irq_saved.get(l).copied().unwrap_or(s.irq_saved);
                 if !saved_for_l
@@ -2015,10 +2448,10 @@ pub fn check_cross_fn_irq_deadlocks(
     }
 
     // Check ABBA inversion pairs across all simultaneously held lock pairs `(l1, l2)`
-    for i in 0..summaries.len() {
-        for j in (i + 1)..summaries.len() {
-            let pairs_a = &summaries[i].held_lock_pairs;
-            let pairs_b = &summaries[j].held_lock_pairs;
+    for i in 0..work.len() {
+        for j in (i + 1)..work.len() {
+            let pairs_a = &work[i].held_lock_pairs;
+            let pairs_b = &work[j].held_lock_pairs;
             let mut reported_pair = false;
             for (a0, a1) in pairs_a {
                 if reported_pair {
@@ -2034,11 +2467,11 @@ pub fn check_cross_fn_irq_deadlocks(
                             SoundinessTier::Verified,
                             format!(
                                 "ABBA Lock Inversion across `{}` ({} -> {}) and `{}` ({} -> {})",
-                                summaries[i].fn_name, a0, a1, summaries[j].fn_name, b0, b1
+                                work[i].fn_name, a0, a1, work[j].fn_name, b0, b1
                             ),
-                            &summaries[i].rel_path,
-                            summaries[i].line,
-                            &summaries[i].fn_name,
+                            &work[i].rel_path,
+                            work[i].line,
+                            &work[i].fn_name,
                             SinkKind::ConcurrencyHazard,
                             GuardKind::LockOrdering,
                             "Enforce a single strict global lock acquisition hierarchy across all driver tasks and ISRs.",
