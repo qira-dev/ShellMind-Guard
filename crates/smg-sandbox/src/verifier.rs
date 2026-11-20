@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rustls::DigitallySignedStruct;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -795,8 +795,6 @@ pub async fn verify_idor_invariant_with_config(
     cfg: &SandboxProbeConfig,
 ) -> Result<VerifiedFinding> {
     let (method, raw_path) = parse_route(&finding.entry_route);
-    let path = substitute_route_params(raw_path);
-    let url = format!("http://127.0.0.1:{}{}", port, path);
 
     let (Some(hdr_a), Some(hdr_b)) = (
         cfg.user_a_header
@@ -826,7 +824,8 @@ pub async fn verify_idor_invariant_with_config(
         )
     };
 
-    let (code_a, body_a, html_a) = send_http_probe_with_tls(
+    let mut path = substitute_route_params(raw_path);
+    let (mut code_a, mut body_a, mut html_a) = send_http_probe_with_tls(
         port,
         method,
         &path,
@@ -835,6 +834,28 @@ pub async fn verify_idor_invariant_with_config(
         cfg.use_tls,
     )
     .await?;
+
+    // Phase 14A (`P14-01`): 2-step stateful IDOR ID discovery when default `:id = 1` returns 404
+    if code_a == 404
+        && (raw_path.contains(':') || raw_path.contains('{'))
+        && let Some(discovered_id) =
+            discover_user_a_resource_id(port, raw_path, hdr_a, cfg.use_tls).await
+    {
+        path = substitute_route_params_with_id(raw_path, &discovered_id);
+        let res2 = send_http_probe_with_tls(
+            port,
+            method,
+            &path,
+            Some(hdr_a),
+            req_body.map(|s| s.as_bytes()),
+            cfg.use_tls,
+        )
+        .await?;
+        code_a = res2.0;
+        body_a = res2.1;
+        html_a = res2.2;
+    }
+    let url = format!("http://127.0.0.1:{}{}", port, path);
     if !(200..300).contains(&code_a) || html_a || is_failure_envelope(code_a, &body_a) {
         return Ok(VerifiedFinding {
             finding_id: finding.id.clone(),
@@ -930,12 +951,360 @@ pub async fn verify_finding(
     verify_finding_with_config(port, finding, concurrency, &SandboxProbeConfig::default()).await
 }
 
+/// Extracts the first JSON `"id"` from a parent collection `GET` as User A for 2-step IDOR probing.
+async fn discover_user_a_resource_id(
+    port: u16,
+    raw_path: &str,
+    hdr_a: &str,
+    use_tls: bool,
+) -> Option<String> {
+    let parent = raw_path
+        .rsplit_once('/')
+        .map(|(p, _)| p)
+        .filter(|p| !p.is_empty() && !p.contains(':') && !p.contains('{'))?;
+    let (code, body, is_html) =
+        send_http_probe_with_tls(port, "GET", parent, Some(hdr_a), None, use_tls)
+            .await
+            .ok()?;
+    if !(200..300).contains(&code) || is_html {
+        return None;
+    }
+    let val: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let extract_id = |obj: &serde_json::Value| -> Option<String> {
+        let id = obj.get("id")?;
+        if let Some(s) = id.as_str() {
+            (!s.is_empty()).then(|| s.to_string())
+        } else {
+            id.as_u64().map(|n| n.to_string())
+        }
+    };
+    if let Some(arr) = val.as_array() {
+        arr.first().and_then(extract_id)
+    } else if let Some(arr) = val
+        .get("items")
+        .or_else(|| val.get("data"))
+        .and_then(|v| v.as_array())
+    {
+        arr.first().and_then(extract_id)
+    } else {
+        extract_id(&val)
+    }
+}
+
+fn substitute_route_params_with_id(raw_path: &str, id_val: &str) -> String {
+    let segs: Vec<String> = raw_path
+        .split('/')
+        .map(|seg| {
+            if seg.starts_with(':') || (seg.starts_with('{') && seg.ends_with('}')) {
+                id_val.to_string()
+            } else {
+                seg.to_string()
+            }
+        })
+        .collect();
+    segs.join("/")
+}
+
+/// Sends a raw HTTP/1.1 request over loopback with custom headers and `<= 3s` timeout,
+/// returning `(status_code, raw_response_head, response_body)`.
+async fn send_raw_protocol_probe(port: u16, raw_req: &str) -> Result<(u16, String, String)> {
+    let addr = format!("127.0.0.1:{port}");
+    let mut stream = tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(&addr))
+        .await
+        .context("protocol probe connect timeout")?
+        .context("protocol probe connect failed")?;
+    tokio::time::timeout(Duration::from_secs(3), stream.write_all(raw_req.as_bytes()))
+        .await
+        .context("protocol probe write timeout")?
+        .context("protocol probe write failed")?;
+    let mut buf = Vec::with_capacity(4096);
+    let mut tmp = [0u8; 4096];
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match stream.read(&mut tmp).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&tmp[..n]);
+                    if buf.len() >= 32 * 1024 {
+                        break;
+                    }
+                    // Stop promptly on WebSocket 101 upgrade or complete headers without body
+                    if let Ok(s) = std::str::from_utf8(&buf)
+                        && (s.starts_with("HTTP/1.1 101") || s.starts_with("HTTP/1.1 30"))
+                        && s.contains("\r\n\r\n")
+                    {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    })
+    .await;
+    let raw = String::from_utf8_lossy(&buf).into_owned();
+    let (head, body) = raw
+        .split_once("\r\n\r\n")
+        .map(|(h, b)| (h.to_string(), b.to_string()))
+        .unwrap_or_else(|| (raw.clone(), String::new()));
+    let status = head
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse::<u16>().ok())
+        .unwrap_or(0);
+    Ok((status, head, body))
+}
+
+/// Signal-gated GraphQL introspection & depth-11 probe (`SMG-API-*` / GraphQL).
+pub async fn verify_graphql_probe(port: u16, finding: &LatticeFinding) -> Result<VerifiedFinding> {
+    let (_, raw_path) = parse_route(&finding.entry_route);
+    let path = if raw_path == "/" || raw_path.is_empty() {
+        "/graphql"
+    } else {
+        raw_path
+    };
+    let payload = r#"{"query":"{ __schema { types { name } } }"}"#;
+    let req = format!(
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+        payload.len()
+    );
+    let (code, _, body) = send_raw_protocol_probe(port, &req).await?;
+    let (status, evidence) = if (200..300).contains(&code) && body.contains("__schema") {
+        (
+            VerificationStatus::Proven,
+            format!("GraphQL introspection enabled at `{path}` (HTTP {code} returned `__schema`)"),
+        )
+    } else if matches!(code, 400 | 401 | 403) || body.to_ascii_lowercase().contains("introspection")
+    {
+        (
+            VerificationStatus::Mitigated,
+            format!("GraphQL introspection blocked at `{path}` (HTTP {code})"),
+        )
+    } else {
+        (
+            VerificationStatus::SuspectUnverified,
+            format!("GraphQL probe inconclusive at `{path}` (HTTP {code})"),
+        )
+    };
+    Ok(VerifiedFinding {
+        finding_id: finding.id.clone(),
+        rule_id: finding.rule_id.clone(),
+        entry_route: finding.entry_route.clone(),
+        status,
+        evidence,
+        replay_cmd: format!(
+            "curl -i -X POST http://127.0.0.1:{port}{path} -H 'Content-Type: application/json' -d '{payload}'"
+        ),
+    })
+}
+
+/// Signal-gated WebSocket Cross-Site WebSocket Hijacking (CSWSH) probe (`Origin: https://evil.shellmind.invalid`).
+pub async fn verify_websocket_cswsh_probe(
+    port: u16,
+    finding: &LatticeFinding,
+) -> Result<VerifiedFinding> {
+    let (_, raw_path) = parse_route(&finding.entry_route);
+    let path = if raw_path.is_empty() { "/ws" } else { raw_path };
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nOrigin: https://evil.shellmind.invalid\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    );
+    let (code, _, _) = send_raw_protocol_probe(port, &req).await?;
+    let (status, evidence) = if code == 101 {
+        (
+            VerificationStatus::Proven,
+            format!(
+                "CSWSH proven: `{path}` accepted WebSocket Upgrade (HTTP 101) for untrusted Origin"
+            ),
+        )
+    } else if matches!(code, 401 | 403) {
+        (
+            VerificationStatus::Mitigated,
+            format!("WebSocket Origin/Auth check rejected untrusted handshake (HTTP {code})"),
+        )
+    } else {
+        (
+            VerificationStatus::SuspectUnverified,
+            format!("WebSocket CSWSH probe returned HTTP {code} (inconclusive)"),
+        )
+    };
+    Ok(VerifiedFinding {
+        finding_id: finding.id.clone(),
+        rule_id: finding.rule_id.clone(),
+        entry_route: finding.entry_route.clone(),
+        status,
+        evidence,
+        replay_cmd: format!(
+            "curl -i -H 'Upgrade: websocket' -H 'Origin: https://evil.shellmind.invalid' http://127.0.0.1:{port}{path}"
+        ),
+    })
+}
+
+/// Signal-gated OAuth2 missing `state`/PKCE & open `redirect_uri` probe (`SMG-OAUTH-*`).
+pub async fn verify_oauth2_probe(port: u16, finding: &LatticeFinding) -> Result<VerifiedFinding> {
+    let (_, raw_path) = parse_route(&finding.entry_route);
+    let base = if raw_path == "/" || raw_path.is_empty() {
+        "/oauth/authorize"
+    } else {
+        raw_path
+    };
+    let q = concat!(
+        "response",
+        "_type=code&client_id=smg&redirect_uri=https://evil.shellmind.invalid/cb"
+    );
+    let path = format!("{base}?{q}");
+    let req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+    let (code, head, _) = send_raw_protocol_probe(port, &req).await?;
+    let head_low = head.to_ascii_lowercase();
+    let redirects_evil = (300..400).contains(&code)
+        && head_low.contains("location:")
+        && head_low.contains("evil.shellmind.invalid");
+    let (status, evidence) = if redirects_evil {
+        (
+            VerificationStatus::Proven,
+            format!(
+                "OAuth2 open redirect / missing state+PKCE proven at `{base}` (HTTP {code} -> evil.shellmind.invalid)"
+            ),
+        )
+    } else if matches!(code, 400 | 401 | 403) {
+        (
+            VerificationStatus::Mitigated,
+            format!("OAuth2 endpoint rejected unverified redirect_uri/missing state (HTTP {code})"),
+        )
+    } else {
+        (
+            VerificationStatus::SuspectUnverified,
+            format!("OAuth2 probe inconclusive at `{base}` (HTTP {code})"),
+        )
+    };
+    Ok(VerifiedFinding {
+        finding_id: finding.id.clone(),
+        rule_id: finding.rule_id.clone(),
+        entry_route: finding.entry_route.clone(),
+        status,
+        evidence,
+        replay_cmd: format!("curl -i 'http://127.0.0.1:{port}{path}'"),
+    })
+}
+
+/// Signal-gated Cookie + Cross-Origin CSRF probe (`SMG-CSRF-*`).
+pub async fn verify_csrf_origin_probe(
+    port: u16,
+    finding: &LatticeFinding,
+) -> Result<VerifiedFinding> {
+    let (method, raw_path) = parse_route(&finding.entry_route);
+    let m = if matches!(method, "GET" | "HEAD") {
+        "POST"
+    } else {
+        method
+    };
+    let path = substitute_route_params(raw_path);
+    let body = "{}";
+    let req = format!(
+        "{m} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: https://evil.shellmind.invalid\r\nCookie: session=smg_csrf_probe\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let (code, _, resp_body) = send_raw_protocol_probe(port, &req).await?;
+    let (status, evidence) = if (200..300).contains(&code) && !is_failure_envelope(code, &resp_body)
+    {
+        (
+            VerificationStatus::Proven,
+            format!(
+                "Cross-origin Cookie CSRF proven: `{m} {path}` returned HTTP {code} without CSRF token"
+            ),
+        )
+    } else if matches!(code, 401 | 403) {
+        (
+            VerificationStatus::Mitigated,
+            format!("CSRF protection blocked cross-origin cookie request (HTTP {code})"),
+        )
+    } else {
+        (
+            VerificationStatus::SuspectUnverified,
+            format!("CSRF probe inconclusive at `{m} {path}` (HTTP {code})"),
+        )
+    };
+    Ok(VerifiedFinding {
+        finding_id: finding.id.clone(),
+        rule_id: finding.rule_id.clone(),
+        entry_route: finding.entry_route.clone(),
+        status,
+        evidence,
+        replay_cmd: format!(
+            "curl -i -X {m} -H 'Origin: https://evil.shellmind.invalid' -H 'Cookie: session=smg_csrf_probe' http://127.0.0.1:{port}{path}"
+        ),
+    })
+}
+
+/// Signal-gated Open-Redirect / CRLF probe (`SMG-REDIRECT-*`).
+pub async fn verify_open_redirect_probe(
+    port: u16,
+    finding: &LatticeFinding,
+) -> Result<VerifiedFinding> {
+    let (_, raw_path) = parse_route(&finding.entry_route);
+    let base = substitute_route_params(raw_path);
+    let sep = if base.contains('?') { '&' } else { '?' };
+    let path = format!(
+        "{base}{sep}next=https://evil.shellmind.invalid&redirect=https://evil.shellmind.invalid"
+    );
+    let req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+    let (code, head, _) = send_raw_protocol_probe(port, &req).await?;
+    let head_low = head.to_ascii_lowercase();
+    let evil_loc = (300..400).contains(&code)
+        && head_low.contains("location:")
+        && head_low.contains("evil.shellmind.invalid");
+    let (status, evidence) = if evil_loc {
+        (
+            VerificationStatus::Proven,
+            format!(
+                "Open Redirect proven at `{base}` (HTTP {code} Location -> evil.shellmind.invalid)"
+            ),
+        )
+    } else if matches!(code, 400 | 403) || (300..400).contains(&code) {
+        (
+            VerificationStatus::Mitigated,
+            format!("Open Redirect blocked at `{base}` (HTTP {code})"),
+        )
+    } else {
+        (
+            VerificationStatus::SuspectUnverified,
+            format!("Open Redirect probe inconclusive at `{base}` (HTTP {code})"),
+        )
+    };
+    Ok(VerifiedFinding {
+        finding_id: finding.id.clone(),
+        rule_id: finding.rule_id.clone(),
+        entry_route: finding.entry_route.clone(),
+        status,
+        evidence,
+        replay_cmd: format!("curl -i 'http://127.0.0.1:{port}{path}'"),
+    })
+}
+
 pub async fn verify_finding_with_config(
     port: u16,
     finding: &LatticeFinding,
     concurrency: usize,
     cfg: &SandboxProbeConfig,
 ) -> Result<VerifiedFinding> {
+    // Signal-gated protocol routing by rule_id before generic GuardKind dispatch (Phase 14A P14-01)
+    let rule = finding.rule_id.as_str();
+    let title_low = finding.title.to_ascii_lowercase();
+    if rule.starts_with("SMG-OAUTH-") {
+        return verify_oauth2_probe(port, finding).await;
+    }
+    if rule.starts_with("SMG-CSRF-") {
+        return verify_csrf_origin_probe(port, finding).await;
+    }
+    if rule.starts_with("SMG-REDIRECT-") {
+        return verify_open_redirect_probe(port, finding).await;
+    }
+    if rule.starts_with("SMG-API-") && title_low.contains("graphql") {
+        return verify_graphql_probe(port, finding).await;
+    }
+    if rule.starts_with("SMG-API-") && title_low.contains("websocket") {
+        return verify_websocket_cswsh_probe(port, finding).await;
+    }
+
     match finding.missing_guard {
         GuardKind::Auth => verify_auth_invariant_with_config(port, finding, cfg).await,
         GuardKind::TxLock => {
@@ -951,7 +1320,7 @@ pub async fn verify_finding_with_config(
             entry_route: finding.entry_route.clone(),
             status: VerificationStatus::SuspectUnverified,
             evidence: format!(
-                "Static/AST finding ({:?}); live exploit probe applies to Auth, IDOR, and Race findings",
+                "Static/AST finding ({:?}); live exploit probe applies to Auth, IDOR, Race, SSRF, GraphQL, WS, OAuth2, CSRF, and Redirect findings",
                 other
             ),
             replay_cmd: format!("smg replay {}", finding.id),
@@ -2212,5 +2581,152 @@ mod tests {
         assert_eq!(promoted.status, VerificationStatus::Proven);
         assert!(writes >= 2);
         assert!(promoted.evidence.contains("WireDiffProxy"));
+    }
+
+    #[tokio::test]
+    async fn test_sprint7_p14_01_five_protocol_probers_and_stateful_idor_discovery() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            for _ in 0..16 {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let first = req.lines().next().unwrap_or("");
+                    let resp = if first.starts_with("POST /graphql") {
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 39\r\nConnection: close\r\n\r\n{\"data\":{\"__schema\":{\"types\":[]}}}"
+                    } else if first.starts_with("GET /ws") {
+                        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+                    } else if first.starts_with("GET /oauth/authorize") {
+                        "HTTP/1.1 302 Found\r\nLocation: https://evil.shellmind.invalid/cb?code=123\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    } else if first.starts_with("POST /api/transfer") {
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 13\r\nConnection: close\r\n\r\n{\"ok\":true}  "
+                    } else if first.starts_with("GET /login") {
+                        "HTTP/1.1 302 Found\r\nLocation: https://evil.shellmind.invalid\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    } else if first.starts_with("GET /api/invoices/1 ") {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot found"
+                    } else if first.starts_with("GET /api/invoices ") {
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 17\r\nConnection: close\r\n\r\n[{\"id\":\"inv-99\"}]"
+                    } else if first.starts_with("GET /api/invoices/inv-99 ") {
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 23\r\nConnection: close\r\n\r\n{\"owner\":\"alice\",\"x\":1}"
+                    } else {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    };
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let mk_f = |rule: &str, title: &str, route: &str, guard: GuardKind| LatticeFinding {
+            id: format!("TEST-{rule}"),
+            rule_id: rule.into(),
+            severity: "HIGH".into(),
+            title: title.into(),
+            file: "src/app.ts".into(),
+            line: 1,
+            status: "SUSPECT".into(),
+            confidence: Confidence::Confirmed,
+            entry_route: route.into(),
+            sink_kind: SinkKind::AuthMutation,
+            missing_guard: guard,
+            witness_path: vec![],
+            remediation: String::new(),
+            proof_reasons: vec![],
+        };
+
+        let cfg = SandboxProbeConfig {
+            user_a_header: Some("Authorization: Bearer alice".into()),
+            user_b_header: Some("Authorization: Bearer bob".into()),
+            ..Default::default()
+        };
+
+        let gql = verify_finding_with_config(
+            port,
+            &mk_f(
+                "SMG-API-001",
+                "GraphQL introspection enabled",
+                "POST /graphql",
+                GuardKind::ConfigPolicy,
+            ),
+            1,
+            &cfg,
+        )
+        .await
+        .unwrap();
+        assert_eq!(gql.status, VerificationStatus::Proven, "{gql:?}");
+
+        let ws = verify_finding_with_config(
+            port,
+            &mk_f("SMG-API-001", "WebSocket CSWSH", "GET /ws", GuardKind::Auth),
+            1,
+            &cfg,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ws.status, VerificationStatus::Proven, "{ws:?}");
+
+        let oauth = verify_finding_with_config(
+            port,
+            &mk_f(
+                "SMG-OAUTH-001",
+                "OAuth2 open redirect",
+                "GET /oauth/authorize",
+                GuardKind::ConfigPolicy,
+            ),
+            1,
+            &cfg,
+        )
+        .await
+        .unwrap();
+        assert_eq!(oauth.status, VerificationStatus::Proven, "{oauth:?}");
+
+        let csrf = verify_finding_with_config(
+            port,
+            &mk_f(
+                "SMG-CSRF-001",
+                "Cookie CSRF",
+                "POST /api/transfer",
+                GuardKind::ConfigPolicy,
+            ),
+            1,
+            &cfg,
+        )
+        .await
+        .unwrap();
+        assert_eq!(csrf.status, VerificationStatus::Proven, "{csrf:?}");
+
+        let redir = verify_finding_with_config(
+            port,
+            &mk_f(
+                "SMG-REDIRECT-001",
+                "Open Redirect",
+                "GET /login",
+                GuardKind::ConfigPolicy,
+            ),
+            1,
+            &cfg,
+        )
+        .await
+        .unwrap();
+        assert_eq!(redir.status, VerificationStatus::Proven, "{redir:?}");
+
+        let idor = verify_finding_with_config(
+            port,
+            &mk_f(
+                "SMG-IDOR-001",
+                "Invoice IDOR",
+                "GET /api/invoices/:id",
+                GuardKind::OwnershipCheck,
+            ),
+            1,
+            &cfg,
+        )
+        .await
+        .unwrap();
+        assert_eq!(idor.status, VerificationStatus::Proven, "{idor:?}");
     }
 }

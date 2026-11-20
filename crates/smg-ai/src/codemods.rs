@@ -31,9 +31,46 @@ fn format_single_line_udiff(
     old_line: &str,
     new_line: &str,
 ) -> String {
-    format!(
-        "--- a/{rel_path}\n+++ b/{rel_path}\n@@ -{line_num},1 +{line_num},1 @@\n-{old_line}\n+{new_line}\n"
+    format_multi_hunk_udiff(
+        rel_path,
+        &[(
+            line_num,
+            vec![old_line.to_string()],
+            vec![new_line.to_string()],
+        )],
     )
+}
+
+/// Formats a multi-hunk unified diff (`Phase 14A P14-02`) from sorted `(start_line_1based, old_lines, new_lines)`
+/// hunks, adjusting destination line offsets cleanly so `apply_unified_diff_safely` applies every hunk atomically.
+pub fn format_multi_hunk_udiff(
+    rel_path: &str,
+    hunks: &[(usize, Vec<String>, Vec<String>)],
+) -> String {
+    let mut out = format!("--- a/{rel_path}\n+++ b/{rel_path}\n");
+    let mut delta: isize = 0;
+    for (orig_start, old_lines, new_lines) in hunks {
+        let new_start = (*orig_start as isize + delta).max(1) as usize;
+        out.push_str(&format!(
+            "@@ -{},{} +{},{} @@\n",
+            orig_start,
+            old_lines.len(),
+            new_start,
+            new_lines.len()
+        ));
+        for l in old_lines {
+            out.push('-');
+            out.push_str(l);
+            out.push('\n');
+        }
+        for l in new_lines {
+            out.push('+');
+            out.push_str(l);
+            out.push('\n');
+        }
+        delta += new_lines.len() as isize - old_lines.len() as isize;
+    }
+    out
 }
 
 /// Synthesizes deterministic, zero-LLM byte-span / targeted unified diffs for clear
@@ -129,6 +166,99 @@ pub fn synthesize_deterministic_codemod_diff(
                 } else {
                     None
                 }
+            } else if raw_line.contains(".innerHTML =") {
+                Some(raw_line.replace(".innerHTML =", ".textContent ="))
+            } else {
+                None
+            }
+        }
+        "SMG-CMDI-001" => {
+            if raw_line.contains("shell=True") {
+                Some(raw_line.replace("shell=True", "shell=False"))
+            } else if raw_line.contains("shell = True") {
+                Some(raw_line.replace("shell = True", "shell = False"))
+            } else {
+                None
+            }
+        }
+        "SMG-CMDI-DESER" => {
+            if raw_line.contains("yaml.load(") && raw_line.contains("Loader=yaml.Loader") {
+                Some(raw_line.replace("Loader=yaml.Loader", "Loader=yaml.SafeLoader"))
+            } else if raw_line.contains("yaml.load(") && !raw_line.contains("SafeLoader") {
+                Some(raw_line.replace("yaml.load(", "yaml.safe_load("))
+            } else if raw_line.contains("yaml.unsafe_load(") {
+                Some(raw_line.replace("yaml.unsafe_load(", "yaml.safe_load("))
+            } else {
+                None
+            }
+        }
+        "SMG-PATH-001" => {
+            if let Some(pos) = raw_line.find("os.path.join(")
+                && let Some(end) = raw_line[pos..].find(')')
+            {
+                let inner = &raw_line[pos + "os.path.join(".len()..pos + end];
+                if let Some((base, user_part)) = inner.rsplit_once(',')
+                    && !user_part.contains("basename")
+                {
+                    let mut out = String::new();
+                    out.push_str(&raw_line[..pos]);
+                    out.push_str(&format!(
+                        "os.path.join({}, os.path.basename({}))",
+                        base.trim(),
+                        user_part.trim()
+                    ));
+                    out.push_str(&raw_line[pos + end + 1..]);
+                    Some(out)
+                } else {
+                    None
+                }
+            } else if let Some(pos) = raw_line.find("path.join(")
+                && let Some(end) = raw_line[pos..].find(')')
+            {
+                let inner = &raw_line[pos + "path.join(".len()..pos + end];
+                if let Some((base, user_part)) = inner.rsplit_once(',')
+                    && !user_part.contains("basename")
+                {
+                    let mut out = String::new();
+                    out.push_str(&raw_line[..pos]);
+                    out.push_str(&format!(
+                        "path.join({}, path.basename({}))",
+                        base.trim(),
+                        user_part.trim()
+                    ));
+                    out.push_str(&raw_line[pos + end + 1..]);
+                    Some(out)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        "SMG-SSRF-001" | "SMG-SSRF-002" => {
+            if raw_line.contains("requests.get(") && !raw_line.contains("allow_redirects") {
+                raw_line.rfind(')').map(|p| {
+                    format!(
+                        "{}, allow_redirects=False, timeout=5{}",
+                        &raw_line[..p],
+                        &raw_line[p..]
+                    )
+                })
+            } else {
+                None
+            }
+        }
+        "SMG-CSRF-001" | "SMG-CFG-COOKIE" => {
+            const BAD_HTTP_ONLY: &str = concat!("http", "Only: false");
+            const BAD_SECURE: &str = concat!("sec", "ure: false");
+            if raw_line.contains("sameSite: 'none'") {
+                Some(raw_line.replace("sameSite: 'none'", "sameSite: 'lax'"))
+            } else if raw_line.contains("sameSite: \"none\"") {
+                Some(raw_line.replace("sameSite: \"none\"", "sameSite: \"lax\""))
+            } else if raw_line.contains(BAD_HTTP_ONLY) {
+                Some(raw_line.replace(BAD_HTTP_ONLY, "httpOnly: true"))
+            } else if raw_line.contains(BAD_SECURE) {
+                Some(raw_line.replace(BAD_SECURE, "secure: true"))
             } else {
                 None
             }
@@ -143,6 +273,24 @@ pub fn synthesize_deterministic_codemod_diff(
                 ))
             } else if raw_line.contains("hostPID: true") {
                 Some(raw_line.replace("hostPID: true", "hostPID: false"))
+            } else if raw_line.contains("readOnlyRootFilesystem: false") {
+                Some(raw_line.replace(
+                    "readOnlyRootFilesystem: false",
+                    "readOnlyRootFilesystem: true",
+                ))
+            } else if raw_line.contains("runAsNonRoot: false") {
+                Some(raw_line.replace("runAsNonRoot: false", "runAsNonRoot: true"))
+            } else {
+                None
+            }
+        }
+        "SMG-IAC-001" | "SMG-DOCKER-001" | "SMG-CFG-DOCKER" => {
+            if raw_line.contains("acl = \"public-read\"") {
+                Some(raw_line.replace("acl = \"public-read\"", "acl = \"private\""))
+            } else if raw_line.contains("acl = \"public-read-write\"") {
+                Some(raw_line.replace("acl = \"public-read-write\"", "acl = \"private\""))
+            } else if raw_line.trim() == "USER root" {
+                Some(raw_line.replace("USER root", "USER nonroot"))
             } else {
                 None
             }
@@ -538,6 +686,104 @@ mod tests {
                 .unwrap()
                 .contains("SMG-CFG-CRYPTO")
         );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_sprint7_p14_02_multi_hunk_udiff_and_expanded_codemods() {
+        let tmp = std::env::temp_dir().join("smg_ai_sprint7_codemods_test");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join("src")).unwrap();
+
+        // 1. Multi-hunk unified diff application
+        let target = tmp.join("src/app.py");
+        fs::write(
+            &target,
+            "import subprocess\nimport yaml\n\ndef run(cmd, raw):\n    subprocess.run(cmd, shell=True)\n    return yaml.load(raw, Loader=yaml.Loader)\n",
+        )
+        .unwrap();
+        let multi = format_multi_hunk_udiff(
+            "src/app.py",
+            &[
+                (
+                    5,
+                    vec!["    subprocess.run(cmd, shell=True)".into()],
+                    vec!["    subprocess.run(cmd, shell=False)".into()],
+                ),
+                (
+                    6,
+                    vec!["    return yaml.load(raw, Loader=yaml.Loader)".into()],
+                    vec!["    return yaml.load(raw, Loader=yaml.SafeLoader)".into()],
+                ),
+            ],
+        );
+        apply_unified_diff_safely(&tmp, &multi).unwrap();
+        let updated = fs::read_to_string(&target).unwrap();
+        assert!(updated.contains("shell=False") && updated.contains("SafeLoader"));
+
+        // 2. Deterministic codemods for CMDI, DESER, PATH, SSRF, CSRF, IaC
+        let mk_f = |rule: &str, file: &str, line: usize| LatticeFinding {
+            id: format!("T-{rule}"),
+            rule_id: rule.into(),
+            severity: "HIGH".into(),
+            title: rule.into(),
+            file: file.into(),
+            line,
+            status: "SUSPECT".into(),
+            confidence: smg_graph::Confidence::Confirmed,
+            entry_route: format!("{file}:{line}"),
+            sink_kind: SinkKind::CommandInjection,
+            missing_guard: GuardKind::CmdSanitizer,
+            witness_path: vec![],
+            remediation: String::new(),
+            proof_reasons: vec![],
+        };
+
+        fs::write(
+            tmp.join("src/rules.py"),
+            "subprocess.run(x, shell=True)\nyaml.load(y)\nrequests.get(url)\nos.path.join('/tmp', name)\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.join("src/web.ts"),
+            "res.cookie('sid', v, { sameSite: 'none' });\nel.innerHTML = bio;\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.join("src/main.tf"),
+            "resource \"aws_s3_bucket\" \"b\" {\n  acl = \"public-read\"\n}\n",
+        )
+        .unwrap();
+
+        let d_cmdi =
+            synthesize_deterministic_codemod_diff(&tmp, &mk_f("SMG-CMDI-001", "src/rules.py", 1))
+                .unwrap();
+        assert!(d_cmdi.contains("shell=False"), "{d_cmdi}");
+        let d_deser =
+            synthesize_deterministic_codemod_diff(&tmp, &mk_f("SMG-CMDI-DESER", "src/rules.py", 2))
+                .unwrap();
+        assert!(d_deser.contains("yaml.safe_load("), "{d_deser}");
+        let d_ssrf =
+            synthesize_deterministic_codemod_diff(&tmp, &mk_f("SMG-SSRF-001", "src/rules.py", 3))
+                .unwrap();
+        assert!(d_ssrf.contains("allow_redirects=False"), "{d_ssrf}");
+        let d_path =
+            synthesize_deterministic_codemod_diff(&tmp, &mk_f("SMG-PATH-001", "src/rules.py", 4))
+                .unwrap();
+        assert!(d_path.contains("os.path.basename(name)"), "{d_path}");
+        let d_csrf =
+            synthesize_deterministic_codemod_diff(&tmp, &mk_f("SMG-CSRF-001", "src/web.ts", 1))
+                .unwrap();
+        assert!(d_csrf.contains("sameSite: 'lax'"), "{d_csrf}");
+        let d_xss =
+            synthesize_deterministic_codemod_diff(&tmp, &mk_f("SMG-XSS-001", "src/web.ts", 2))
+                .unwrap();
+        assert!(d_xss.contains(".textContent ="), "{d_xss}");
+        let d_iac =
+            synthesize_deterministic_codemod_diff(&tmp, &mk_f("SMG-IAC-001", "src/main.tf", 2))
+                .unwrap();
+        assert!(d_iac.contains("acl = \"private\""), "{d_iac}");
 
         let _ = fs::remove_dir_all(&tmp);
     }

@@ -620,16 +620,22 @@ mod imp {
             if let Some(exe_dir) = self_exe.parent() {
                 extra_ro.push(exe_dir);
             }
-            let shim_port = if probe_cfg.mock_shims {
-                vec![
+            let mut extra_ports = Vec::new();
+            if probe_cfg.mock_shims {
+                extra_ports.push(
                     port.checked_add(1)
                         .unwrap_or_else(|| port.saturating_sub(1)),
-                ]
-            } else {
-                Vec::new()
-            };
+                );
+            }
+            // Phase 14A (`P14-01`): Allow Seatbelt loopback OobSsrfCatcher callback port
+            if let Some(oob_port) = port.checked_add(2) {
+                extra_ports.push(oob_port);
+            }
             let profile = super::build_macos_seatbelt_profile_with_extras(
-                &abs_root, port, &extra_ro, &shim_port,
+                &abs_root,
+                port,
+                &extra_ro,
+                &extra_ports,
             );
             let boot_log_path = probe_dir.join("boot.log");
             let mut c = Command::new("/usr/bin/sandbox-exec");
