@@ -365,13 +365,33 @@ fn scan_ai_prompt_and_agent_tools(
         let trimmed = line.trim();
         let low = trimmed.to_ascii_lowercase();
 
-        // Track variables assigned directly from LLM completion / tool call output / RAG snippet
+        // Scope reset at top-level function / method boundaries so sibling functions never leak AI taint
+        if (low.starts_with("function ")
+            || low.starts_with("async function ")
+            || low.starts_with("export function ")
+            || low.starts_with("export async function ")
+            || low.starts_with("def ")
+            || low.starts_with("async def ")
+            || low.starts_with("func ")
+            || low.starts_with("pub fn ")
+            || low.starts_with("fn "))
+            && !line.starts_with("    ")
+            && !line.starts_with('\t')
+        {
+            ai_vars.clear();
+        }
+
+        // SSA-style multi-hop def-use propagation & kill for LLM completion / tool call output / RAG snippet
         if let Some((lhs, rhs)) = trimmed.split_once('=')
             && !lhs.contains("==")
             && !lhs.contains("!=")
+            && !lhs.ends_with('<')
+            && !lhs.ends_with('>')
+            && !rhs.starts_with('=')
+            && !rhs.starts_with('>')
         {
             let rhs_low = rhs.to_ascii_lowercase();
-            let is_ai_rhs = rhs_low.contains("choices[0].message")
+            let is_direct_ai_rhs = rhs_low.contains("choices[0].message")
                 || rhs_low.contains("completion.")
                 || rhs_low.contains("chat.completions")
                 || rhs_low.contains("messages.create")
@@ -381,6 +401,9 @@ fn scan_ai_prompt_and_agent_tools(
                 || rhs_low.contains("toolcall.function.arguments")
                 || rhs_low.contains("airesponse")
                 || rhs_low.contains("ragcontext");
+            let is_derived_ai_rhs = ai_ident_re()
+                .captures_iter(rhs)
+                .any(|cap| ai_vars.contains(&cap[1]));
             let is_sanitized_rhs = rhs_low.contains("allowlist")
                 || rhs_low.contains("allowed_tools")
                 || rhs_low.contains("allowedtools")
@@ -393,9 +416,10 @@ fn scan_ai_prompt_and_agent_tools(
                 .map(|v| v.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_'))
                 && !var.is_empty()
             {
-                if is_ai_rhs && !is_sanitized_rhs {
+                if (is_direct_ai_rhs || is_derived_ai_rhs) && !is_sanitized_rhs {
                     ai_vars.insert(var.to_string());
-                } else if is_sanitized_rhs {
+                } else {
+                    // Kill taint on safe/constant reassignment or sanitized assignment
                     ai_vars.remove(var);
                 }
             }
@@ -468,7 +492,8 @@ fn scan_ai_prompt_and_agent_tools(
             continue;
         }
 
-        let win_low = block_window(lines, idx, 5, 2).to_ascii_lowercase();
+        // Only preceding guards dominate the sink — never allow post-sink lines to suppress
+        let win_low = block_window(lines, idx, 5, 0).to_ascii_lowercase();
         let has_guard = win_low.contains("allowlist")
             || win_low.contains("allowed_tools")
             || win_low.contains("allowedtools")

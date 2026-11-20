@@ -22,13 +22,19 @@ pub struct AdvisoryRecord {
     pub updated_at: i64,
 }
 
-/// Normalizes ecosystem strings to canonical OSV names (`npm`, `crates.io`, `Go`, `PyPI`).
+/// Normalizes ecosystem strings to canonical OSV names
+/// (`npm`, `crates.io`, `Go`, `PyPI`, `Maven`, `Packagist`, `RubyGems`, `Pub`, `NuGet`).
 pub fn canonical_ecosystem(raw: &str) -> Option<&'static str> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "npm" => Some("npm"),
         "cargo" | "crates.io" | "rust" => Some("crates.io"),
         "go" | "golang" => Some("Go"),
         "pypi" | "python" | "pip" => Some("PyPI"),
+        "maven" | "java" | "gradle" => Some("Maven"),
+        "packagist" | "composer" | "php" => Some("Packagist"),
+        "rubygems" | "ruby" | "gem" => Some("RubyGems"),
+        "pub" | "dart" | "flutter" => Some("Pub"),
+        "nuget" | "dotnet" | "csharp" | "c#" => Some("NuGet"),
         _ => None,
     }
 }

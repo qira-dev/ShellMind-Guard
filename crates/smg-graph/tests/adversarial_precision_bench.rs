@@ -2198,6 +2198,89 @@ app.get('/api/user', requireAuth, async (req, res) => {
                 },
             ],
         },
+        // ------------------------------------------------------------------
+        // Phase 12B Sprint 4: Multi-Hop AI SSA Def-Use & Post-Sink Dominance
+        // ------------------------------------------------------------------
+        AdversarialCase {
+            id: "sprint4_ai_multihop_prompt_to_exec_vuln",
+            family: "AI",
+            expected_prefix: "SMG-AI",
+            expect_finding: true,
+            trap_kind: TrapKind::OneHopWrapperTrap,
+            files: vec![BenchFile {
+                rel_path: "src/agent/runner.ts",
+                lang: Language::TypeScript,
+                code: r#"
+export async function runAgent(openai: any, prompt: string) {
+    const completion = await openai.chat.completions.create({ model: 'gpt-4o', messages: [{ role: 'user', content: prompt }] });
+    const raw = completion.choices[0].message.content;
+    const cmd = raw.trim();
+    execSync(cmd);
+}
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "sprint4_ai_sibling_fn_scope_isolation_safe",
+            family: "AI",
+            expected_prefix: "SMG-AI",
+            expect_finding: false,
+            trap_kind: TrapKind::ScopeCollisionTrap,
+            files: vec![BenchFile {
+                rel_path: "src/agent/isolated.ts",
+                lang: Language::TypeScript,
+                code: r#"
+export async function askLlm(openai: any, prompt: string) {
+    const completion = await openai.chat.completions.create({ model: 'gpt-4o', messages: [{ role: 'user', content: prompt }] });
+    const cmd = completion.choices[0].message.content;
+    return cmd;
+}
+export function runStaticCheck() {
+    const cmd = "echo ok";
+    execSync(cmd);
+}
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "sprint4_ai_post_sink_allowlist_trap_vuln",
+            family: "AI",
+            expected_prefix: "SMG-AI",
+            expect_finding: true,
+            trap_kind: TrapKind::DominatorGuardTrap,
+            files: vec![BenchFile {
+                rel_path: "src/agent/post_guard.ts",
+                lang: Language::TypeScript,
+                code: r#"
+export async function runTool(openai: any, prompt: string) {
+    const completion = await openai.chat.completions.create({ model: 'gpt-4o', messages: [{ role: 'user', content: prompt }] });
+    const cmd = completion.choices[0].message.content;
+    execSync(cmd);
+    const verified = allowlist.has(cmd);
+    return verified;
+}
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "sprint4_ai_reassigned_safe_constant_kill_safe",
+            family: "AI",
+            expected_prefix: "SMG-AI",
+            expect_finding: false,
+            trap_kind: TrapKind::CheckedBoundsTrap,
+            files: vec![BenchFile {
+                rel_path: "src/agent/killed_taint.ts",
+                lang: Language::TypeScript,
+                code: r#"
+export async function runSafe(openai: any, prompt: string) {
+    const completion = await openai.chat.completions.create({ model: 'gpt-4o', messages: [{ role: 'user', content: prompt }] });
+    let cmd = completion.choices[0].message.content;
+    cmd = "uptime";
+    execSync(cmd);
+}
+"#,
+            }],
+        },
     ]
 }
 

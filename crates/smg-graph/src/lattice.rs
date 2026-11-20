@@ -2006,15 +2006,57 @@ pub fn solve_guard_lattice_with_public(
     }
 
     let mut deduped: Vec<LatticeFinding> = best_by_key.into_values().collect();
-    let reachable_pkgs = crate::deps::compute_reachable_packages(summaries);
-    for finding in &mut deduped {
-        if let Some(reach) = crate::deps::assess_dependency_reachability(finding, &reachable_pkgs) {
-            match reach {
-                crate::deps::ReachableVulnStatus::Reachable => {
-                    finding.proof_reasons.push("ReachableImport".into());
-                }
-                crate::deps::ReachableVulnStatus::DeclaredUnused => {
-                    finding.proof_reasons.push("DeclaredUnusedVEX".into());
+    // Phase 12B (`P12-04`): Reverse-seeded CVE-only VEX reachability solver.
+    // Only build `PackageImportIndex` and route-reachable symbol set when at least one `SMG-DEP-*`
+    // advisory finding exists — wasting 0 work on clean lockfile dependencies.
+    let has_dep_finding = deduped.iter().any(|f| f.rule_id.starts_with("SMG-DEP-"));
+    if has_dep_finding {
+        let pkg_index = crate::deps::build_package_import_index(summaries);
+        let mut route_reachable_sym_ids: HashSet<String> = HashSet::new();
+        for n in graph.node_indices() {
+            if route_parents
+                .root
+                .get(n.index())
+                .copied()
+                .flatten()
+                .is_some()
+            {
+                route_reachable_sym_ids.insert(graph[n].id.clone());
+            }
+        }
+        for finding in &mut deduped {
+            if let Some(tier) = crate::deps::assess_dependency_vex_tier(
+                finding,
+                &pkg_index,
+                &route_reachable_sym_ids,
+            ) {
+                match tier {
+                    crate::deps::VexReachabilityTier::ProvenRouteSymbol => {
+                        finding.confidence = Confidence::Confirmed;
+                        finding.proof_reasons.push("ProvenRouteSymbolVEX".into());
+                        finding.proof_reasons.push("ReachableImport".into());
+                    }
+                    crate::deps::VexReachabilityTier::ImportedSafeApiOnly => {
+                        if finding.confidence != Confidence::Proven {
+                            finding.confidence = Confidence::Heuristic;
+                        }
+                        finding.proof_reasons.push("ImportedSafeApiOnlyVEX".into());
+                    }
+                    crate::deps::VexReachabilityTier::ImportedUnprovenSymbol => {
+                        if finding.confidence != Confidence::Proven {
+                            finding.confidence = Confidence::Heuristic;
+                        }
+                        finding
+                            .proof_reasons
+                            .push("ImportedUnprovenSymbolVEX".into());
+                        finding.proof_reasons.push("ReachableImport".into());
+                    }
+                    crate::deps::VexReachabilityTier::DeclaredUnused => {
+                        if finding.confidence != Confidence::Proven {
+                            finding.confidence = Confidence::Heuristic;
+                        }
+                        finding.proof_reasons.push("DeclaredUnusedVEX".into());
+                    }
                 }
             }
         }

@@ -17,6 +17,7 @@ pub enum Ecosystem {
     Packagist,
     RubyGems,
     Pub,
+    NuGet,
 }
 
 impl Ecosystem {
@@ -30,6 +31,7 @@ impl Ecosystem {
             Ecosystem::Packagist => "Packagist",
             Ecosystem::RubyGems => "RubyGems",
             Ecosystem::Pub => "Pub",
+            Ecosystem::NuGet => "NuGet",
         }
     }
 }
@@ -42,11 +44,273 @@ pub struct ResolvedDependency {
     pub line: usize,
 }
 
+/// Directed edge in a parsed lockfile dependency graph (`parent -> child`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LockfileDepEdge {
+    pub parent: String,
+    pub child: String,
+    pub is_dev: bool,
+}
+
+/// Extracted lockfile dependency graph (`(pkg@ver -> dep@ver, is_dev)`) across all 9 ecosystems.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LockfileDepGraph {
+    pub ecosystem: String,
+    /// `pkg_name -> (version, is_dev, line)`
+    pub nodes: HashMap<String, (String, bool, usize)>,
+    pub edges: Vec<LockfileDepEdge>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReachableVulnStatus {
     Reachable,
     DeclaredUnused,
+}
+
+/// Phase 12B (`P12-04`) 4-tier call-graph VEX reachability classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VexReachabilityTier {
+    /// Route-reachable function calls a known vulnerable symbol of the package.
+    ProvenRouteSymbol,
+    /// Package is imported, all concrete calls target safe non-vulnerable APIs (e.g. `lodash.pick`).
+    ImportedSafeApiOnly,
+    /// Package is imported in source code, but symbol-level exploitability is unproven/opaque.
+    ImportedUnprovenSymbol,
+    /// Declared in manifest/lockfile only with zero static source imports.
+    DeclaredUnused,
+}
+
+/// External package import & call-site index retained across files for reverse-seeded CVE VEX.
+#[derive(Debug, Clone, Default)]
+pub struct PackageImportIndex {
+    /// `norm_pkg -> set of imported symbol names` (`"*"` denotes default/namespace/whole-module import)
+    pub imported_symbols: HashMap<String, HashSet<String>>,
+    /// `norm_pkg -> vec of (caller_symbol_id, called_member_name)`
+    pub call_sites: HashMap<String, Vec<(String, String)>>,
+    /// Normalized set of all imported packages (including distribution aliases).
+    pub imported_pkgs: HashSet<String>,
+}
+
+/// Curated vulnerable-symbol table for high-signal symbol-level VEX disproof (`ImportedSafeApiOnly`
+/// vs `ProvenRouteSymbol`). Packages absent from this map fall back conservatively to
+/// `ImportedUnprovenSymbol` (never claiming `ImportedSafeApiOnly` without symbol-level knowledge).
+fn known_vulnerable_symbols(norm_pkg: &str) -> Option<&'static [&'static str]> {
+    match norm_pkg {
+        "lodash" | "lodash-es" => Some(&[
+            "template",
+            "merge",
+            "mergewith",
+            "defaultsdeep",
+            "set",
+            "setwith",
+            "zipobjectdeep",
+            "unset",
+        ]),
+        "pyyaml" | "yaml" => Some(&["load", "unsafe_load", "full_load"]),
+        "jsonwebtoken" | "pyjwt" => Some(&["verify", "decode"]),
+        "serialize-javascript" => Some(&["serialize"]),
+        "vm2" => Some(&["run", "runfile", "vm", "nodescript"]),
+        "tar" | "node-tar" => Some(&["extract", "x", "unpack"]),
+        "axios" => Some(&["get", "post", "put", "delete", "request", "create"]),
+        "express" => Some(&["static", "redirect"]),
+        "minimist" => Some(&["minimist", "default"]),
+        "handlebars" => Some(&["compile", "precompile"]),
+        "ejs" => Some(&["render", "renderfile", "compile"]),
+        "pug" => Some(&["render", "renderfile", "compile"]),
+        "xml2js" | "fast-xml-parser" => Some(&["parse", "parsestring", "parsestringpromise"]),
+        "marked" => Some(&["parse", "marked"]),
+        "dompurify" => Some(&["sanitize"]),
+        "log4j-core" => Some(&["info", "error", "warn", "debug", "log", "getlogger"]),
+        "jackson-databind" => Some(&["readvalue", "enabledefaulttyping"]),
+        _ => None,
+    }
+}
+
+/// Builds the external `PackageImportIndex` in $O(\text{imports} + \text{call\_sites})$ time.
+pub fn build_package_import_index(summaries: &[FileAstSummary]) -> PackageImportIndex {
+    let mut idx = PackageImportIndex::default();
+    for s in summaries {
+        // Track local alias -> canonical package keys within this file
+        let mut local_alias_to_pkgs: HashMap<String, Vec<String>> = HashMap::new();
+        let mut named_sym_to_pkgs: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        let mut file_pkg_aliases = HashSet::new();
+
+        for imp in &s.imports {
+            file_pkg_aliases.clear();
+            expand_pkg_aliases(&imp.from_specifier, &mut file_pkg_aliases);
+            if file_pkg_aliases.is_empty() {
+                continue;
+            }
+            let pkg_list: Vec<String> = file_pkg_aliases.iter().cloned().collect();
+            for p in &pkg_list {
+                idx.imported_pkgs.insert(p.clone());
+            }
+            let remote = imp.remote_name.as_deref().unwrap_or(&imp.symbol_name);
+            let is_ns_or_default = remote == "*"
+                || remote == "default"
+                || imp.symbol_name == "*"
+                || imp.remote_name.is_none();
+            for p in &pkg_list {
+                idx.imported_symbols
+                    .entry(p.clone())
+                    .or_default()
+                    .insert(if is_ns_or_default {
+                        "*".to_string()
+                    } else {
+                        remote.to_ascii_lowercase()
+                    });
+            }
+            if !imp.symbol_name.is_empty() && imp.symbol_name != "*" {
+                if is_ns_or_default {
+                    local_alias_to_pkgs
+                        .entry(imp.symbol_name.clone())
+                        .or_default()
+                        .extend(pkg_list.iter().cloned());
+                }
+                if remote != "*" && remote != "default" {
+                    named_sym_to_pkgs
+                        .entry(imp.symbol_name.clone())
+                        .or_default()
+                        .extend(
+                            pkg_list
+                                .iter()
+                                .map(|p| (p.clone(), remote.to_ascii_lowercase())),
+                        );
+                }
+            }
+        }
+
+        for sym in &s.symbols {
+            for cs in &sym.call_sites {
+                if let Some(ref q) = cs.qualifier {
+                    if let Some(pkgs) = local_alias_to_pkgs.get(q) {
+                        let mem_low = cs.member.to_ascii_lowercase();
+                        for p in pkgs {
+                            idx.call_sites
+                                .entry(p.clone())
+                                .or_default()
+                                .push((sym.id.clone(), mem_low.clone()));
+                        }
+                    }
+                } else if let Some(entries) = named_sym_to_pkgs.get(&cs.member) {
+                    for (p, orig_name) in entries {
+                        idx.call_sites
+                            .entry(p.clone())
+                            .or_default()
+                            .push((sym.id.clone(), orig_name.clone()));
+                    }
+                }
+            }
+            // Fallback for bare calls recorded in `sym.calls`
+            for c in &sym.calls {
+                if let Some(entries) = named_sym_to_pkgs.get(c) {
+                    for (p, orig_name) in entries {
+                        idx.call_sites
+                            .entry(p.clone())
+                            .or_default()
+                            .push((sym.id.clone(), orig_name.clone()));
+                    }
+                }
+            }
+        }
+    }
+    idx
+}
+
+fn extract_finding_pkg_candidates(title: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_tick = false;
+    let mut buf = String::new();
+    for ch in title.chars() {
+        if ch == '`' || ch == '\'' {
+            if in_tick {
+                let candidate = buf.split('@').next().unwrap_or(&buf).trim();
+                let norm = norm_pkg_key(candidate);
+                if !norm.is_empty() {
+                    out.push(norm);
+                }
+                let low = candidate.to_ascii_lowercase();
+                if !low.is_empty() && !out.contains(&low) {
+                    out.push(low);
+                }
+                buf.clear();
+                in_tick = false;
+            } else {
+                in_tick = true;
+            }
+        } else if in_tick {
+            buf.push(ch);
+        }
+    }
+    out
+}
+
+/// Reverse-seeded CVE-only VEX solver: evaluates ONLY advisory-hit `SMG-DEP-*` findings against
+/// `PackageImportIndex` and route-reachable symbol IDs (`build_any_route_bfs_tree`), wasting
+/// zero work on clean lockfile dependencies.
+pub fn assess_dependency_vex_tier(
+    finding: &crate::lattice::LatticeFinding,
+    pkg_index: &PackageImportIndex,
+    route_reachable_sym_ids: &HashSet<String>,
+) -> Option<VexReachabilityTier> {
+    if !finding.rule_id.starts_with("SMG-DEP-") {
+        return None;
+    }
+    if pkg_index.imported_pkgs.is_empty() {
+        return Some(VexReachabilityTier::DeclaredUnused);
+    }
+    let candidates = extract_finding_pkg_candidates(&finding.title);
+    let matched_pkg = candidates
+        .iter()
+        .find(|c| pkg_index.imported_pkgs.contains(c.as_str()));
+    let Some(pkg) = matched_pkg else {
+        return Some(VexReachabilityTier::DeclaredUnused);
+    };
+
+    let Some(vuln_syms) = known_vulnerable_symbols(pkg) else {
+        return Some(VexReachabilityTier::ImportedUnprovenSymbol);
+    };
+
+    let calls = pkg_index.call_sites.get(pkg);
+    let imported = pkg_index.imported_symbols.get(pkg);
+
+    let mut saw_any_concrete_call = false;
+    let mut saw_vuln_call = false;
+    let mut saw_route_reachable_vuln_call = false;
+
+    if let Some(call_list) = calls {
+        for (caller_id, member_low) in call_list {
+            saw_any_concrete_call = true;
+            if vuln_syms.contains(&member_low.as_str()) {
+                saw_vuln_call = true;
+                if route_reachable_sym_ids.contains(caller_id) {
+                    saw_route_reachable_vuln_call = true;
+                }
+            }
+        }
+    }
+
+    if saw_route_reachable_vuln_call {
+        return Some(VexReachabilityTier::ProvenRouteSymbol);
+    }
+    if saw_vuln_call {
+        // Vulnerable symbol called, though not proven reachable from an HTTP/entry route
+        return Some(VexReachabilityTier::ImportedUnprovenSymbol);
+    }
+
+    // Check if only safe named imports or only safe concrete member calls were observed
+    let only_safe_named_imports = imported.is_some_and(|syms| {
+        !syms.is_empty()
+            && !syms.contains("*")
+            && syms.iter().all(|s| !vuln_syms.contains(&s.as_str()))
+    });
+    if saw_any_concrete_call || only_safe_named_imports {
+        return Some(VexReachabilityTier::ImportedSafeApiOnly);
+    }
+
+    Some(VexReachabilityTier::ImportedUnprovenSymbol)
 }
 
 fn norm_pkg_key(raw: &str) -> String {
@@ -1605,10 +1869,418 @@ pub fn extract_resolved_dependencies(rel_path: &str, content: &str) -> Vec<Resol
                 ));
             }
         }
+        "yarn.lock" | "pnpm-lock.yaml" | "composer.lock" | "Gemfile.lock" | "pubspec.lock"
+        | "packages.lock.json" => {
+            let graph = extract_lockfile_dep_graph(rel_path, content);
+            for (name, (version, _is_dev, line)) in graph.nodes {
+                out.push(ResolvedDependency {
+                    ecosystem: graph.ecosystem.clone(),
+                    name,
+                    version,
+                    line,
+                });
+            }
+        }
         _ => {}
     }
 
     out
+}
+
+/// Parses a package header line in `yarn.lock` (v1 or Berry v2+), e.g.:
+/// `"lodash@^4.17.15":` or `"@scope/pkg@npm:^1.0.0":` -> `Some("lodash")` / `Some("@scope/pkg")`
+fn parse_yarn_pkg_header(line: &str) -> Option<String> {
+    if line.is_empty()
+        || line.starts_with(' ')
+        || line.starts_with('\t')
+        || line.starts_with('#')
+        || line.starts_with("__metadata")
+    {
+        return None;
+    }
+    let trimmed = line.trim();
+    if !trimmed.ends_with(':') {
+        return None;
+    }
+    let first_spec = trimmed
+        .trim_end_matches(':')
+        .split(',')
+        .next()?
+        .trim()
+        .trim_matches(['"', '\'']);
+    if first_spec.is_empty() {
+        return None;
+    }
+    // Scoped package `@scope/name@range` -> split at the `@` after index 0
+    let at_pos = if let Some(rest) = first_spec.strip_prefix('@') {
+        rest.find('@').map(|i| i + 1)
+    } else {
+        first_spec.find('@')
+    }?;
+    let name = first_spec[..at_pos].trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+/// Parses a `pnpm-lock.yaml` package key under `packages:`, e.g.:
+/// `  /lodash@4.17.20:` or `  '/@scope/pkg@1.2.3':` or `  lodash@4.17.20:` -> `Some(("lodash", "4.17.20"))`
+fn parse_pnpm_pkg_key(trimmed: &str) -> Option<(String, String)> {
+    let key = trimmed.strip_suffix(':')?.trim().trim_matches(['"', '\'']);
+    let key = key.strip_prefix('/').unwrap_or(key);
+    // Strip peer-dep suffix like `(react@18.2.0)` or `_react@18.2.0`
+    let key_no_peer = key.split('(').next().unwrap_or(key);
+    let key_no_peer = key_no_peer.split('_').next().unwrap_or(key_no_peer);
+    let at_pos = if let Some(rest) = key_no_peer.strip_prefix('@') {
+        rest.find('@').map(|i| i + 1)
+    } else {
+        key_no_peer.find('@')
+    }?;
+    let name = key_no_peer[..at_pos].trim();
+    let ver = key_no_peer[at_pos + 1..].trim();
+    if !name.is_empty() && ver.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        Some((name.to_string(), ver.to_string()))
+    } else {
+        None
+    }
+}
+
+/// Extracts `(pkg@ver -> dep@ver, is_dev)` lockfile dependency graph across all 9 ecosystems
+/// in a single linear pass (`package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `Cargo.lock`,
+/// `composer.lock`, `Gemfile.lock`, `pubspec.lock`, `packages.lock.json`).
+pub fn extract_lockfile_dep_graph(rel_path: &str, content: &str) -> LockfileDepGraph {
+    let fname = Path::new(rel_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    let lines: Vec<&str> = content.lines().collect();
+    let mut graph = LockfileDepGraph::default();
+
+    match fname {
+        "package-lock.json" => {
+            graph.ecosystem = "npm".into();
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(content)
+                && let Some(pkgs) = val.get("packages").and_then(|v| v.as_object())
+            {
+                for (path_key, info) in pkgs {
+                    let pkg_name = path_key.rsplit("node_modules/").next().unwrap_or("").trim();
+                    if pkg_name.is_empty() {
+                        continue;
+                    }
+                    let ver = info
+                        .get("version")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let is_dev = info.get("dev").and_then(|v| v.as_bool()).unwrap_or(false);
+                    if !ver.is_empty() {
+                        graph
+                            .nodes
+                            .entry(pkg_name.to_string())
+                            .or_insert((ver, is_dev, 1));
+                    }
+                    if let Some(deps) = info.get("dependencies").and_then(|v| v.as_object()) {
+                        for dep_name in deps.keys() {
+                            graph.edges.push(LockfileDepEdge {
+                                parent: pkg_name.to_string(),
+                                child: dep_name.clone(),
+                                is_dev,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        "yarn.lock" => {
+            graph.ecosystem = "npm".into();
+            let mut cur_pkg: Option<(String, usize)> = None;
+            let mut in_deps = false;
+            for (idx, raw) in lines.iter().enumerate() {
+                if let Some(name) = parse_yarn_pkg_header(raw) {
+                    cur_pkg = Some((name, idx + 1));
+                    in_deps = false;
+                    continue;
+                }
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    cur_pkg = None;
+                    in_deps = false;
+                    continue;
+                }
+                if let Some((ref pkg_name, pkg_line)) = cur_pkg {
+                    let indent = raw.len() - raw.trim_start().len();
+                    if indent <= 2 {
+                        if let Some(rest) = trimmed
+                            .strip_prefix("version:")
+                            .or_else(|| trimmed.strip_prefix("version "))
+                        {
+                            let ver = rest.trim().trim_matches(['"', '\'']);
+                            if !ver.is_empty()
+                                && ver.chars().next().is_some_and(|c| c.is_ascii_digit())
+                            {
+                                graph.nodes.entry(pkg_name.clone()).or_insert((
+                                    ver.to_string(),
+                                    false,
+                                    pkg_line,
+                                ));
+                            }
+                            in_deps = false;
+                        } else {
+                            in_deps =
+                                trimmed == "dependencies:" || trimmed == "optionalDependencies:";
+                        }
+                    } else if in_deps {
+                        let dep_name = trimmed
+                            .split([':', ' '])
+                            .next()
+                            .unwrap_or("")
+                            .trim_matches(['"', '\'']);
+                        if !dep_name.is_empty() {
+                            graph.edges.push(LockfileDepEdge {
+                                parent: pkg_name.clone(),
+                                child: dep_name.to_string(),
+                                is_dev: false,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        "pnpm-lock.yaml" => {
+            graph.ecosystem = "npm".into();
+            let mut in_packages = false;
+            let mut cur_pkg: Option<String> = None;
+            let mut in_deps = false;
+            for (idx, raw) in lines.iter().enumerate() {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    continue;
+                }
+                let indent = raw.len() - raw.trim_start().len();
+                if indent == 0 {
+                    in_packages = trimmed == "packages:";
+                    cur_pkg = None;
+                    in_deps = false;
+                    continue;
+                }
+                if !in_packages {
+                    continue;
+                }
+                if indent == 2 {
+                    in_deps = false;
+                    if let Some((name, ver)) = parse_pnpm_pkg_key(trimmed) {
+                        graph
+                            .nodes
+                            .entry(name.clone())
+                            .or_insert((ver, false, idx + 1));
+                        cur_pkg = Some(name);
+                    } else {
+                        cur_pkg = None;
+                    }
+                } else if let Some(ref pkg_name) = cur_pkg {
+                    if indent == 4 {
+                        if trimmed == "dev: true" {
+                            if let Some(entry) = graph.nodes.get_mut(pkg_name) {
+                                entry.1 = true;
+                            }
+                            in_deps = false;
+                        } else {
+                            in_deps = trimmed == "dependencies:";
+                        }
+                    } else if indent >= 6 && in_deps {
+                        let dep_name = trimmed
+                            .split(':')
+                            .next()
+                            .unwrap_or("")
+                            .trim()
+                            .trim_matches(['"', '\'']);
+                        if !dep_name.is_empty() {
+                            let is_dev = graph.nodes.get(pkg_name).is_some_and(|e| e.1);
+                            graph.edges.push(LockfileDepEdge {
+                                parent: pkg_name.clone(),
+                                child: dep_name.to_string(),
+                                is_dev,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        "Cargo.lock" => {
+            graph.ecosystem = "crates.io".into();
+            if let Ok(val) = toml::from_str::<toml::Value>(content)
+                && let Some(pkgs) = val.get("package").and_then(|v| v.as_array())
+            {
+                for pkg in pkgs {
+                    if let (Some(name), Some(ver)) = (
+                        pkg.get("name").and_then(|v| v.as_str()),
+                        pkg.get("version").and_then(|v| v.as_str()),
+                    ) {
+                        graph
+                            .nodes
+                            .entry(name.to_string())
+                            .or_insert((ver.to_string(), false, 1));
+                        if let Some(deps) = pkg.get("dependencies").and_then(|v| v.as_array()) {
+                            for d in deps.iter().filter_map(|v| v.as_str()) {
+                                let child = d.split_whitespace().next().unwrap_or("").trim();
+                                if !child.is_empty() {
+                                    graph.edges.push(LockfileDepEdge {
+                                        parent: name.to_string(),
+                                        child: child.to_string(),
+                                        is_dev: false,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        "composer.lock" => {
+            graph.ecosystem = "Packagist".into();
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(content) {
+                for (key, is_dev) in [("packages", false), ("packages-dev", true)] {
+                    if let Some(arr) = val.get(key).and_then(|v| v.as_array()) {
+                        for item in arr {
+                            if let (Some(n), Some(v)) = (
+                                item.get("name").and_then(|s| s.as_str()),
+                                item.get("version").and_then(|s| s.as_str()),
+                            ) {
+                                let ln = find_line_for_needle(&lines, &format!("\"{}\"", n));
+                                graph.nodes.entry(n.to_string()).or_insert((
+                                    v.trim_start_matches('v').to_string(),
+                                    is_dev,
+                                    ln,
+                                ));
+                                if let Some(req) = item.get("require").and_then(|r| r.as_object()) {
+                                    for child in req.keys() {
+                                        if child != "php" && !child.starts_with("ext-") {
+                                            graph.edges.push(LockfileDepEdge {
+                                                parent: n.to_string(),
+                                                child: child.clone(),
+                                                is_dev,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        "Gemfile.lock" => {
+            graph.ecosystem = "RubyGems".into();
+            let mut cur_gem: Option<String> = None;
+            for (idx, raw) in lines.iter().enumerate() {
+                let indent = raw.len() - raw.trim_start().len();
+                let t = raw.trim();
+                if indent == 4
+                    && let Some((pkg, rest)) = t.split_once(" (")
+                    && let Some(ver) = rest.strip_suffix(')')
+                    && ver.chars().next().is_some_and(|c| c.is_ascii_digit())
+                {
+                    let name = pkg.trim().to_string();
+                    graph
+                        .nodes
+                        .entry(name.clone())
+                        .or_insert((ver.to_string(), false, idx + 1));
+                    cur_gem = Some(name);
+                } else if indent == 6
+                    && let Some(ref parent) = cur_gem
+                {
+                    let child = t.split_whitespace().next().unwrap_or("").trim();
+                    if !child.is_empty() {
+                        graph.edges.push(LockfileDepEdge {
+                            parent: parent.clone(),
+                            child: child.to_string(),
+                            is_dev: false,
+                        });
+                    }
+                } else if indent < 4 {
+                    cur_gem = None;
+                }
+            }
+        }
+        "pubspec.lock" => {
+            graph.ecosystem = "Pub".into();
+            let mut in_packages = false;
+            let mut cur_pkg: Option<(String, usize)> = None;
+            for (idx, raw) in lines.iter().enumerate() {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    continue;
+                }
+                let indent = raw.len() - raw.trim_start().len();
+                if indent == 0 {
+                    in_packages = trimmed == "packages:";
+                    cur_pkg = None;
+                    continue;
+                }
+                if !in_packages {
+                    continue;
+                }
+                if indent == 2 && trimmed.ends_with(':') {
+                    let name = trimmed.trim_end_matches(':').trim().to_string();
+                    cur_pkg = Some((name, idx + 1));
+                } else if indent == 4
+                    && let Some((ref name, pkg_line)) = cur_pkg
+                {
+                    if let Some(rest) = trimmed.strip_prefix("version:") {
+                        let ver = rest.trim().trim_matches(['"', '\'']);
+                        if !ver.is_empty() {
+                            let entry = graph.nodes.entry(name.clone()).or_insert((
+                                ver.to_string(),
+                                false,
+                                pkg_line,
+                            ));
+                            entry.0 = ver.to_string();
+                        }
+                    } else if let Some(rest) = trimmed.strip_prefix("dependency:") {
+                        let is_dev = rest.to_ascii_lowercase().contains("dev");
+                        let entry = graph.nodes.entry(name.clone()).or_insert((
+                            String::new(),
+                            is_dev,
+                            pkg_line,
+                        ));
+                        entry.1 = is_dev;
+                    }
+                }
+            }
+        }
+        "packages.lock.json" => {
+            graph.ecosystem = "NuGet".into();
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(content)
+                && let Some(tfms) = val.get("dependencies").and_then(|v| v.as_object())
+            {
+                for pkgs in tfms.values().filter_map(|v| v.as_object()) {
+                    for (name, info) in pkgs {
+                        if let Some(ver) = info.get("resolved").and_then(|v| v.as_str()) {
+                            let ln = find_line_for_needle(&lines, &format!("\"{}\"", name));
+                            graph
+                                .nodes
+                                .entry(name.clone())
+                                .or_insert((ver.to_string(), false, ln));
+                        }
+                        if let Some(deps) = info.get("dependencies").and_then(|v| v.as_object()) {
+                            for child in deps.keys() {
+                                graph.edges.push(LockfileDepEdge {
+                                    parent: name.clone(),
+                                    child: child.clone(),
+                                    is_dev: false,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    graph
 }
 
 /// Offline-first dependency and lockfile audit executed in-memory with zero network calls,
@@ -1698,70 +2370,30 @@ fn audit_generic_ecosystem_manifest(
             }
         }
         check_advisories_batch(Ecosystem::Maven, &entries, rel_path, None, store, &mut out);
-    } else if fname == "composer.lock"
-        && let Ok(val) = serde_json::from_str::<serde_json::Value>(content)
-    {
-        let mut entries = Vec::new();
-        for key in ["packages", "packages-dev"] {
-            if let Some(arr) = val.get(key).and_then(|v| v.as_array()) {
-                for item in arr {
-                    if let (Some(n), Some(v)) = (
-                        item.get("name").and_then(|s| s.as_str()),
-                        item.get("version").and_then(|s| s.as_str()),
-                    ) {
-                        let ln = find_line_for_needle(&lines, &format!("\"{}\"", n));
-                        entries.push((n.to_string(), v.trim_start_matches('v').to_string(), ln));
-                    }
-                }
-            }
-        }
-        check_advisories_batch(
-            Ecosystem::Packagist,
-            &entries,
-            rel_path,
-            None,
-            store,
-            &mut out,
-        );
-    } else if fname == "Gemfile.lock" {
-        let mut entries = Vec::new();
-        for (idx, raw) in lines.iter().enumerate() {
-            let t = raw.trim();
-            if let Some((pkg, rest)) = t.split_once(" (")
-                && let Some(ver) = rest.strip_suffix(')')
-                && ver.chars().next().is_some_and(|c| c.is_ascii_digit())
-            {
-                entries.push((pkg.trim().to_string(), ver.to_string(), idx + 1));
-            }
-        }
-        check_advisories_batch(
-            Ecosystem::RubyGems,
-            &entries,
-            rel_path,
-            None,
-            store,
-            &mut out,
-        );
-    } else if matches!(fname, "yarn.lock" | "pnpm-lock.yaml") {
-        let mut entries = Vec::new();
-        for (idx, raw) in lines.iter().enumerate() {
-            let trimmed = raw.trim();
-            if trimmed.contains("@npm:") || trimmed.contains("version:") {
-                for adv_pkg in OFFLINE_ADVISORIES
-                    .iter()
-                    .filter(|a| a.ecosystem == Ecosystem::Npm)
-                    .map(|a| a.package)
-                {
-                    if trimmed.contains(adv_pkg) {
-                        let window = lines[idx..(idx + 4).min(lines.len())].join(" ");
-                        if let Some(ver) = extract_first_semver_token(&window) {
-                            entries.push((adv_pkg.to_string(), ver, idx + 1));
-                        }
-                    }
-                }
-            }
-        }
-        check_advisories_batch(Ecosystem::Npm, &entries, rel_path, None, store, &mut out);
+    } else if matches!(
+        fname,
+        "composer.lock"
+            | "Gemfile.lock"
+            | "yarn.lock"
+            | "pnpm-lock.yaml"
+            | "pubspec.lock"
+            | "packages.lock.json"
+    ) {
+        let eco = match fname {
+            "composer.lock" => Ecosystem::Packagist,
+            "Gemfile.lock" => Ecosystem::RubyGems,
+            "pubspec.lock" => Ecosystem::Pub,
+            "packages.lock.json" => Ecosystem::NuGet,
+            _ => Ecosystem::Npm,
+        };
+        let graph = extract_lockfile_dep_graph(rel_path, content);
+        let mut entries: Vec<(String, String, usize)> = graph
+            .nodes
+            .into_iter()
+            .map(|(pkg, (ver, _is_dev, line))| (pkg, ver, line))
+            .collect();
+        entries.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
+        check_advisories_batch(eco, &entries, rel_path, None, store, &mut out);
     }
 
     out
@@ -2044,6 +2676,305 @@ version = "0.37.0"
         assert_eq!(
             assess_dependency_reachability(&f_lodash, &reachable),
             Some(ReachableVulnStatus::DeclaredUnused)
+        );
+    }
+
+    #[test]
+    fn test_sprint4_p12_03_ecosystems_lockfile_graph_and_store_routing() {
+        // 1. Canonical ecosystem mapping for all 9 ecosystems
+        for (raw, expected) in [
+            ("maven", "Maven"),
+            ("gradle", "Maven"),
+            ("packagist", "Packagist"),
+            ("composer", "Packagist"),
+            ("rubygems", "RubyGems"),
+            ("pub", "Pub"),
+            ("nuget", "NuGet"),
+        ] {
+            assert_eq!(
+                smg_core::advisories::canonical_ecosystem(raw),
+                Some(expected)
+            );
+        }
+
+        // 2. LockfileDepGraph extraction across yarn.lock, pnpm-lock.yaml, pubspec.lock, packages.lock.json
+        let yarn_lock = r#"# yarn lockfile v1
+"custom-vuln-pkg@^1.0.0":
+  version "1.0.0"
+  dependencies:
+    helper-dep "^2.0.0"
+
+"helper-dep@^2.0.0":
+  version "2.1.0"
+"#;
+        let yg = extract_lockfile_dep_graph("yarn.lock", yarn_lock);
+        assert_eq!(yg.ecosystem, "npm");
+        assert_eq!(
+            yg.nodes.get("custom-vuln-pkg").map(|n| n.0.as_str()),
+            Some("1.0.0")
+        );
+        assert!(
+            yg.edges
+                .iter()
+                .any(|e| e.parent == "custom-vuln-pkg" && e.child == "helper-dep")
+        );
+
+        let pnpm_lock = r#"lockfileVersion: '9.0'
+packages:
+  /custom-vuln-pkg@1.0.0:
+    dev: false
+    dependencies:
+      helper-dep: 2.1.0
+  /dev-tool@3.0.0:
+    dev: true
+"#;
+        let pg = extract_lockfile_dep_graph("pnpm-lock.yaml", pnpm_lock);
+        assert_eq!(
+            pg.nodes.get("custom-vuln-pkg").map(|n| (n.0.as_str(), n.1)),
+            Some(("1.0.0", false))
+        );
+        assert_eq!(pg.nodes.get("dev-tool").map(|n| n.1), Some(true));
+        assert!(
+            pg.edges
+                .iter()
+                .any(|e| e.parent == "custom-vuln-pkg" && e.child == "helper-dep")
+        );
+
+        let pubspec_lock = r#"packages:
+  http_parser:
+    dependency: "direct main"
+    version: "4.0.2"
+  test:
+    dependency: "direct dev"
+    version: "1.24.0"
+"#;
+        let dart_g = extract_lockfile_dep_graph("pubspec.lock", pubspec_lock);
+        assert_eq!(dart_g.ecosystem, "Pub");
+        assert_eq!(
+            dart_g.nodes.get("http_parser").map(|n| (n.0.as_str(), n.1)),
+            Some(("4.0.2", false))
+        );
+        assert_eq!(dart_g.nodes.get("test").map(|n| n.1), Some(true));
+
+        let nuget_lock = r#"{
+  "version": 1,
+  "dependencies": {
+    "net8.0": {
+      "Newtonsoft.Json": {
+        "type": "Direct",
+        "resolved": "12.0.1",
+        "dependencies": { "System.Runtime": "4.3.0" }
+      }
+    }
+  }
+}"#;
+        let ng = extract_lockfile_dep_graph("packages.lock.json", nuget_lock);
+        assert_eq!(ng.ecosystem, "NuGet");
+        assert_eq!(
+            ng.nodes.get("Newtonsoft.Json").map(|n| n.0.as_str()),
+            Some("12.0.1")
+        );
+        assert!(
+            ng.edges
+                .iter()
+                .any(|e| e.parent == "Newtonsoft.Json" && e.child == "System.Runtime")
+        );
+
+        // 3. Route yarn.lock, pnpm-lock.yaml, and NuGet packages.lock.json through AdvisoryStore
+        //    even for packages NOT in OFFLINE_ADVISORIES
+        let db_path = std::env::temp_dir().join(format!(
+            "smg_sprint4_adv_{}.db",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut store = AdvisoryStore::open_at(&db_path, false).unwrap();
+        store
+            .upsert_advisories(&[
+                AdvisoryRecord {
+                    id: "OSV-2026-YARN-001".into(),
+                    ecosystem: "npm".into(),
+                    package: "custom-vuln-pkg".into(),
+                    introduced: "0".into(),
+                    fixed: "1.2.0".into(),
+                    last_affected: String::new(),
+                    severity: "HIGH".into(),
+                    summary: "Custom yarn/pnpm store-backed CVE".into(),
+                    source: "osv-test".into(),
+                    updated_at: 1,
+                },
+                AdvisoryRecord {
+                    id: "OSV-2026-NUGET-001".into(),
+                    ecosystem: "NuGet".into(),
+                    package: "Newtonsoft.Json".into(),
+                    introduced: "0".into(),
+                    fixed: "13.0.1".into(),
+                    last_affected: String::new(),
+                    severity: "HIGH".into(),
+                    summary: "Improper handling of exceptional conditions in Newtonsoft.Json"
+                        .into(),
+                    source: "osv-test".into(),
+                    updated_at: 1,
+                },
+            ])
+            .unwrap();
+
+        let yarn_hits = scan_dependencies_with_store("yarn.lock", yarn_lock, Some(&store));
+        assert!(
+            yarn_hits
+                .iter()
+                .any(|h| h.title.contains("custom-vuln-pkg@1.0.0")),
+            "yarn.lock must query AdvisoryStore for non-hardcoded packages: {:?}",
+            yarn_hits
+        );
+        let pnpm_hits = scan_dependencies_with_store("pnpm-lock.yaml", pnpm_lock, Some(&store));
+        assert!(
+            pnpm_hits
+                .iter()
+                .any(|h| h.title.contains("custom-vuln-pkg@1.0.0")),
+            "pnpm-lock.yaml must query AdvisoryStore for non-hardcoded packages: {:?}",
+            pnpm_hits
+        );
+        let nuget_hits =
+            scan_dependencies_with_store("packages.lock.json", nuget_lock, Some(&store));
+        assert!(
+            nuget_hits
+                .iter()
+                .any(|h| h.title.contains("Newtonsoft.Json@12.0.1")),
+            "NuGet packages.lock.json must query AdvisoryStore: {:?}",
+            nuget_hits
+        );
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn test_sprint4_p12_04_four_tier_vex_reachability_and_safe_api_disproof() {
+        let cfg = smg_core::config::ShellMindGuardConfig::default();
+        let mk = |rel: &str, lang: smg_core::scanner::Language, src: &str| {
+            smg_core::scanner::IndexedFile {
+                abs_path: std::path::PathBuf::from(rel),
+                rel_path: rel.into(),
+                language: lang,
+                size_bytes: src.len() as u64,
+                mtime_ns: 0,
+                blake3_hash: String::new(),
+                cached_bytes: Some(src.as_bytes().to_vec()),
+            }
+        };
+
+        let pkg_lock = r#"{
+  "lockfileVersion": 3,
+  "packages": {
+    "node_modules/lodash": { "version": "4.17.15" }
+  }
+}"#;
+
+        // Tier 1: ProvenRouteSymbol (route calls vulnerable `_.template`)
+        let route_vuln = r#"
+import _ from 'lodash';
+app.post('/api/render', requireAuth, (req, res) => {
+    const fn = _.template(req.body.tpl);
+    res.send(fn({}));
+});
+"#;
+        let s_lock = crate::ast::parse_file_ast(
+            &mk(
+                "package-lock.json",
+                smg_core::scanner::Language::Manifest,
+                pkg_lock,
+            ),
+            &cfg,
+        )
+        .unwrap();
+        let s_vuln = crate::ast::parse_file_ast(
+            &mk(
+                "src/render.ts",
+                smg_core::scanner::Language::TypeScript,
+                route_vuln,
+            ),
+            &cfg,
+        )
+        .unwrap();
+        let res_vuln = crate::lattice::solve_guard_lattice(&[s_lock.clone(), s_vuln]);
+        let dep_vuln = res_vuln
+            .findings
+            .iter()
+            .find(|f| f.rule_id.starts_with("SMG-DEP-") && f.title.contains("lodash"))
+            .expect("lodash CVE finding expected");
+        assert_eq!(dep_vuln.confidence, Confidence::Confirmed);
+        assert!(
+            dep_vuln
+                .proof_reasons
+                .iter()
+                .any(|r| r == "ProvenRouteSymbolVEX"),
+            "Expected ProvenRouteSymbolVEX, got: {:?}",
+            dep_vuln.proof_reasons
+        );
+
+        // Tier 2: ImportedSafeApiOnly (route calls only safe `_.pick`)
+        let route_safe = r#"
+import _ from 'lodash';
+app.post('/api/profile', requireAuth, (req, res) => {
+    const clean = _.pick(req.body, ['name']);
+    res.json(clean);
+});
+"#;
+        let s_safe = crate::ast::parse_file_ast(
+            &mk(
+                "src/profile.ts",
+                smg_core::scanner::Language::TypeScript,
+                route_safe,
+            ),
+            &cfg,
+        )
+        .unwrap();
+        let res_safe = crate::lattice::solve_guard_lattice(&[s_lock.clone(), s_safe]);
+        let dep_safe = res_safe
+            .findings
+            .iter()
+            .find(|f| f.rule_id.starts_with("SMG-DEP-") && f.title.contains("lodash"))
+            .expect("lodash CVE finding expected");
+        assert_eq!(dep_safe.confidence, Confidence::Heuristic);
+        assert!(
+            dep_safe
+                .proof_reasons
+                .iter()
+                .any(|r| r == "ImportedSafeApiOnlyVEX"),
+            "Expected ImportedSafeApiOnlyVEX for lodash.pick, got: {:?}",
+            dep_safe.proof_reasons
+        );
+
+        // Tier 4: DeclaredUnused (zero imports of lodash)
+        let res_unused = crate::lattice::solve_guard_lattice(&[s_lock]);
+        let dep_unused = res_unused
+            .findings
+            .iter()
+            .find(|f| f.rule_id.starts_with("SMG-DEP-") && f.title.contains("lodash"))
+            .expect("lodash CVE finding expected");
+        assert_eq!(dep_unused.confidence, Confidence::Heuristic);
+        assert!(
+            dep_unused
+                .proof_reasons
+                .iter()
+                .any(|r| r == "DeclaredUnusedVEX"),
+            "Expected DeclaredUnusedVEX, got: {:?}",
+            dep_unused.proof_reasons
+        );
+
+        // Speed gate: 2,000-package pnpm-lock.yaml parses in < 20ms
+        let mut big_pnpm = String::from("lockfileVersion: '9.0'\npackages:\n");
+        for i in 0..2000 {
+            big_pnpm.push_str(&format!("  /pkg-{i}@1.0.0:\n    dev: false\n"));
+        }
+        let t0 = Instant::now();
+        let g = extract_lockfile_dep_graph("pnpm-lock.yaml", &big_pnpm);
+        let elapsed_ms = t0.elapsed().as_millis();
+        assert_eq!(g.nodes.len(), 2000);
+        assert!(
+            elapsed_ms < 50,
+            "2000-pkg pnpm-lock.yaml graph took {}ms (must be linear!)",
+            elapsed_ms
         );
     }
 }

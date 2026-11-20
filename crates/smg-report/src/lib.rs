@@ -193,9 +193,24 @@ pub fn to_sarif_json(findings: &[LatticeFinding], verified: &[VerifiedFinding]) 
     serde_json::to_string_pretty(&sarif).unwrap_or_else(|_| "{}".into())
 }
 
-/// Exports a combined CycloneDX 1.5 SBOM + VEX document tagging `SMG-DEP-*` vulnerabilities as
-/// `exploitable` (import-reachable) vs `not_affected` (`code_not_reachable`, declared in lockfile only),
-/// sealed with a deterministic BLAKE3 policy/findings digest.
+fn purl_ecosystem(eco: &str) -> &str {
+    match eco.trim().to_ascii_lowercase().as_str() {
+        "npm" => "npm",
+        "crates.io" | "cargo" | "rust" => "cargo",
+        "go" | "golang" => "golang",
+        "pypi" | "python" | "pip" => "pypi",
+        "maven" | "java" | "gradle" => "maven",
+        "packagist" | "composer" | "php" => "composer",
+        "rubygems" | "ruby" | "gem" => "gem",
+        "pub" | "dart" | "flutter" => "pub",
+        "nuget" | "dotnet" | "csharp" => "nuget",
+        _ => eco,
+    }
+}
+
+/// Exports a combined CycloneDX 1.5 SBOM + VEX document tagging `SMG-DEP-*` vulnerabilities with
+/// 4-tier call-graph VEX provenance (`ProvenRouteSymbol`, `ImportedSafeApiOnly`,
+/// `ImportedUnprovenSymbol`, `DeclaredUnused`), sealed with a deterministic BLAKE3 digest.
 pub fn to_cyclonedx_vex_json(
     project_name: &str,
     deps: &[ResolvedDependency],
@@ -209,14 +224,7 @@ pub fn to_cyclonedx_vex_json(
     let components: Vec<serde_json::Value> = deps
         .iter()
         .map(|d| {
-            let eco_low = d.ecosystem.to_ascii_lowercase();
-            let purl_eco = match eco_low.as_str() {
-                "npm" => "npm",
-                "crates.io" | "cargo" => "cargo",
-                "go" | "golang" => "golang",
-                "pypi" => "pypi",
-                other => other,
-            };
+            let purl_eco = purl_ecosystem(&d.ecosystem);
             json!({
                 "type": "library",
                 "bom-ref": format!("pkg:{}/{}@{}", purl_eco, d.name, d.version),
@@ -233,28 +241,50 @@ pub fn to_cyclonedx_vex_json(
         .map(|f| {
             let v_opt = ver_map.get(f.id.as_str()).copied();
             let is_declared_unused = f.proof_reasons.iter().any(|r| r == "DeclaredUnusedVEX");
+            let is_safe_api_only = f
+                .proof_reasons
+                .iter()
+                .any(|r| r == "ImportedSafeApiOnlyVEX");
+            let is_proven_route_sym = f.proof_reasons.iter().any(|r| r == "ProvenRouteSymbolVEX");
             let is_proven = v_opt.is_some_and(|v| v.status == VerificationStatus::Proven)
                 || f.confidence == Confidence::Proven;
             let (state, justification, detail) = if is_proven {
-                ("exploitable", "requires_configuration", "Verified exploitable inside isolated sandbox")
+                (
+                    "exploitable",
+                    "requires_configuration",
+                    "Verified exploitable inside isolated sandbox",
+                )
+            } else if is_proven_route_sym {
+                (
+                    "exploitable",
+                    "requires_configuration",
+                    "Route-reachable call path invokes vulnerable package symbol",
+                )
+            } else if is_safe_api_only {
+                (
+                    "not_affected",
+                    "vulnerable_code_not_in_execute_path",
+                    "Package imported in codebase, but only non-vulnerable safe APIs are invoked",
+                )
             } else if is_declared_unused {
-                ("not_affected", "code_not_reachable", "Declared in manifest/lockfile with zero static source imports")
+                (
+                    "not_affected",
+                    "code_not_reachable",
+                    "Declared in manifest/lockfile with zero static source imports",
+                )
             } else {
-                ("in_triage", "requires_environment", "Package imported or referenced in codebase")
+                (
+                    "in_triage",
+                    "requires_environment",
+                    "Package imported in codebase; vulnerable symbol usage is unconfirmed",
+                )
             };
             let root_ref = format!("pkg:generic/{project_name}");
             let matched_comp_ref = deps
                 .iter()
                 .find(|d| f.title.contains(&d.name))
                 .map(|d| {
-                    let eco_low = d.ecosystem.to_ascii_lowercase();
-                    let purl_eco = match eco_low.as_str() {
-                        "npm" => "npm",
-                        "crates.io" | "cargo" => "cargo",
-                        "go" | "golang" => "golang",
-                        "pypi" => "pypi",
-                        other => other,
-                    };
+                    let purl_eco = purl_ecosystem(&d.ecosystem);
                     format!("pkg:{}/{}@{}", purl_eco, d.name, d.version)
                 })
                 .unwrap_or(root_ref);
@@ -583,5 +613,90 @@ mod tests {
         assert!(vex.contains("not_affected"));
         assert!(vex.contains("code_not_reachable"));
         assert!(vex.contains("smg:blake3_digest"));
+    }
+
+    #[test]
+    fn test_sprint4_cyclonedx_9_ecosystem_purls_and_4_tier_vex() {
+        let deps = vec![
+            ResolvedDependency {
+                ecosystem: "Maven".into(),
+                name: "log4j-core".into(),
+                version: "2.14.1".into(),
+                line: 10,
+            },
+            ResolvedDependency {
+                ecosystem: "Packagist".into(),
+                name: "symfony/http-kernel".into(),
+                version: "5.4.0".into(),
+                line: 12,
+            },
+            ResolvedDependency {
+                ecosystem: "RubyGems".into(),
+                name: "rack".into(),
+                version: "2.2.3".into(),
+                line: 14,
+            },
+            ResolvedDependency {
+                ecosystem: "Pub".into(),
+                name: "http_parser".into(),
+                version: "4.0.2".into(),
+                line: 16,
+            },
+            ResolvedDependency {
+                ecosystem: "NuGet".into(),
+                name: "Newtonsoft.Json".into(),
+                version: "12.0.1".into(),
+                line: 18,
+            },
+            ResolvedDependency {
+                ecosystem: "npm".into(),
+                name: "lodash".into(),
+                version: "4.17.15".into(),
+                line: 20,
+            },
+        ];
+        let findings = vec![
+            LatticeFinding {
+                id: "SMG-DEP-PROVEN".into(),
+                rule_id: "SMG-DEP-001".into(),
+                severity: "CRITICAL".into(),
+                title: "Vulnerable dependency `log4j-core@2.14.1`".into(),
+                file: "pom.xml".into(),
+                line: 10,
+                status: "SUSPECT".into(),
+                confidence: Confidence::Confirmed,
+                entry_route: "pom.xml:10".into(),
+                sink_kind: smg_graph::SinkKind::DependencyRisk,
+                missing_guard: smg_graph::GuardKind::DependencyPolicy,
+                witness_path: Vec::new(),
+                remediation: "Upgrade log4j-core.".into(),
+                proof_reasons: vec!["ProvenRouteSymbolVEX".into()],
+            },
+            LatticeFinding {
+                id: "SMG-DEP-SAFEAPI".into(),
+                rule_id: "SMG-DEP-001".into(),
+                severity: "HIGH".into(),
+                title: "Vulnerable dependency `lodash@4.17.15`".into(),
+                file: "package-lock.json".into(),
+                line: 20,
+                status: "SUSPECT".into(),
+                confidence: Confidence::Heuristic,
+                entry_route: "package-lock.json:20".into(),
+                sink_kind: smg_graph::SinkKind::DependencyRisk,
+                missing_guard: smg_graph::GuardKind::DependencyPolicy,
+                witness_path: Vec::new(),
+                remediation: "Upgrade lodash.".into(),
+                proof_reasons: vec!["ImportedSafeApiOnlyVEX".into()],
+            },
+        ];
+
+        let vex = to_cyclonedx_vex_json("polyglot-app", &deps, &findings, &[]);
+        assert!(vex.contains("pkg:maven/log4j-core@2.14.1"));
+        assert!(vex.contains("pkg:composer/symfony/http-kernel@5.4.0"));
+        assert!(vex.contains("pkg:gem/rack@2.2.3"));
+        assert!(vex.contains("pkg:pub/http_parser@4.0.2"));
+        assert!(vex.contains("pkg:nuget/Newtonsoft.Json@12.0.1"));
+        assert!(vex.contains("\"state\": \"exploitable\""));
+        assert!(vex.contains("vulnerable_code_not_in_execute_path"));
     }
 }
