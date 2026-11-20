@@ -474,7 +474,23 @@ fn analyze_function_locks(
             }
         }
 
-        // 3. Check manual lock left un-unlocked on early return path (`C` / `C++` / `Go`)
+        // 3. Handle unlocks / explicit drops BEFORE early-return check and new acquisitions on same line
+        for cap in rust_drop_re().captures_iter(trimmed) {
+            let var = cap[1].trim();
+            guards.retain(|g| g.guard_var.as_deref() != Some(var));
+        }
+        for cap in pthread_unlock_re().captures_iter(trimmed) {
+            let norm = norm_lock_name(&cap[1]);
+            guards.retain(|g| g.norm_name != norm);
+        }
+        if !trimmed.starts_with("defer ") {
+            for cap in method_unlock_re().captures_iter(trimmed) {
+                let norm = norm_lock_name(&cap[1]);
+                guards.retain(|g| g.norm_name != norm);
+            }
+        }
+
+        // 4. Check manual lock left un-unlocked on early return path (`C` / `C++` / `Go`)
         let is_return_stmt = trimmed.starts_with("return ")
             || trimmed == "return;"
             || trimmed == "return"
@@ -504,7 +520,7 @@ fn analyze_function_locks(
             }
         }
 
-        // 4. Record calls made while locks are held (for cross-function lock-order graph)
+        // 5. Record calls made while locks are held (for cross-function lock-order graph)
         if !guards.is_empty()
             && let Some(sym) = sym_opt.as_deref_mut()
         {
@@ -519,22 +535,6 @@ fn analyze_function_locks(
                         });
                     }
                 }
-            }
-        }
-
-        // 5. Handle unlocks / explicit drops BEFORE new acquisitions on same line
-        for cap in rust_drop_re().captures_iter(trimmed) {
-            let var = cap[1].trim();
-            guards.retain(|g| g.guard_var.as_deref() != Some(var));
-        }
-        for cap in pthread_unlock_re().captures_iter(trimmed) {
-            let norm = norm_lock_name(&cap[1]);
-            guards.retain(|g| g.norm_name != norm);
-        }
-        if !trimmed.starts_with("defer ") {
-            for cap in method_unlock_re().captures_iter(trimmed) {
-                let norm = norm_lock_name(&cap[1]);
-                guards.retain(|g| g.norm_name != norm);
             }
         }
 
@@ -659,7 +659,20 @@ fn analyze_function_locks(
 fn is_generic_short_lock_name(name: &str) -> bool {
     matches!(
         name,
-        "m" | "mu" | "mtx" | "lock" | "mutex" | "rw" | "guard" | "l" | "s"
+        "m" | "mu"
+            | "mtx"
+            | "lock"
+            | "mutex"
+            | "rw"
+            | "guard"
+            | "l"
+            | "s"
+            | "state"
+            | "data"
+            | "cache"
+            | "inner"
+            | "store"
+            | "pool"
     )
 }
 
@@ -672,7 +685,19 @@ fn scopes_compatible(
     if a_edge.file == b_edge.file {
         return true;
     }
-    lock_a.len() >= 4
+    let ext_a = std::path::Path::new(&a_edge.file)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    let ext_b = std::path::Path::new(&b_edge.file)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    let same_lang_family = ext_a == ext_b
+        || (matches!(ext_a, "c" | "h" | "cc" | "cpp" | "cxx" | "hpp")
+            && matches!(ext_b, "c" | "h" | "cc" | "cpp" | "cxx" | "hpp"));
+    same_lang_family
+        && lock_a.len() >= 4
         && lock_b.len() >= 4
         && !is_generic_short_lock_name(lock_a)
         && !is_generic_short_lock_name(lock_b)

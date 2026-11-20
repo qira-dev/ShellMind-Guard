@@ -198,8 +198,10 @@ fn scan_cicd_workflow(rel_path: &str, content: &str, out: &mut Vec<LocalStaticFi
 
     let has_pr_target = has_untrusted_pr_trigger(&lines);
 
+    let mut in_jobs_block = false;
     let mut in_run_block_indent: Option<usize> = None;
     let mut saw_unsafe_checkout = false;
+    let mut tainted_workflow_envs: HashSet<String> = HashSet::new();
     for (idx, raw) in lines.iter().enumerate() {
         let ln = idx + 1;
         let code = strip_yaml_comment(raw);
@@ -208,6 +210,34 @@ fn scan_cicd_workflow(rel_path: &str, content: &str, out: &mut Vec<LocalStaticFi
             continue;
         }
         let indent = code.len() - code.trim_start().len();
+        if indent == 0 {
+            in_jobs_block = trimmed == "jobs:";
+            if !in_jobs_block {
+                saw_unsafe_checkout = false;
+            }
+        } else if in_jobs_block
+            && indent == 2
+            && trimmed.ends_with(':')
+            && !trimmed.starts_with('-')
+        {
+            // Entering a new job under `jobs:` resets per-job unsafe checkout taint
+            saw_unsafe_checkout = false;
+            in_run_block_indent = None;
+        }
+
+        // Track `ENV_NAME: ${{ github.event.* }}` bindings for workflow-to-shell taint correlation
+        if let Some((ek, ev)) = trimmed.split_once(':') {
+            let ek_clean = ek.trim().trim_start_matches("- ").trim();
+            if !ek_clean.is_empty()
+                && ek_clean
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && !matches!(ek_clean, "run" | "script" | "if" | "name" | "uses" | "with")
+                && untrusted_gha_expr_re().is_match(ev)
+            {
+                tainted_workflow_envs.insert(ek_clean.to_string());
+            }
+        }
 
         // Permissions: write-all check
         if trimmed.eq_ignore_ascii_case("permissions: write-all")
@@ -287,15 +317,36 @@ fn scan_cicd_workflow(rel_path: &str, content: &str, out: &mut Vec<LocalStaticFi
                 }
             }
         }
-        let _ = saw_unsafe_checkout;
+        let line_sinks_tainted_env = |shell_line: &str| -> bool {
+            if tainted_workflow_envs.is_empty() {
+                return false;
+            }
+            let sl = shell_line.to_ascii_lowercase();
+            let has_dangerous_shell_sink = sl.contains("eval ")
+                || sl.contains("sh -c")
+                || sl.contains("bash -c")
+                || shell_line.contains(">> $GITHUB_ENV")
+                || shell_line.contains(">> \"$GITHUB_ENV\"")
+                || shell_line.contains(">> ${GITHUB_ENV}")
+                || shell_line.contains(">> $GITHUB_PATH")
+                || shell_line.contains(">> \"$GITHUB_PATH\"");
+            if !has_dangerous_shell_sink {
+                return false;
+            }
+            tainted_workflow_envs.iter().any(|var| {
+                shell_line.contains(&format!("${}", var))
+                    || shell_line.contains(&format!("${{{}}}", var))
+            })
+        };
 
         if let Some(run_indent) = in_run_block_indent {
             if indent <= run_indent {
                 in_run_block_indent = None;
-            } else if (has_pr_target
+            } else if ((has_pr_target
                 || trimmed.contains("GITHUB_ENV")
                 || trimmed.contains("GITHUB_PATH"))
-                && untrusted_gha_expr_re().is_match(code)
+                && untrusted_gha_expr_re().is_match(code))
+                || line_sinks_tainted_env(code)
             {
                 out.push(mk_finding(
                     "SMG-CICD-001",
@@ -314,10 +365,38 @@ fn scan_cicd_workflow(rel_path: &str, content: &str, out: &mut Vec<LocalStaticFi
         let after_dash = trimmed.strip_prefix("- ").unwrap_or(trimmed).trim_start();
         if let Some(after_run) = after_dash.strip_prefix("run:") {
             let rest = after_run.trim();
+            let rest_low = rest.to_ascii_lowercase();
+            let runs_checked_out_code = rest_low.contains("npm ci")
+                || rest_low.contains("npm install")
+                || rest_low.contains("npm test")
+                || rest_low.contains("npm run")
+                || rest_low.contains("yarn ")
+                || rest_low.contains("pnpm ")
+                || rest_low.contains("cargo ")
+                || rest_low.contains("make")
+                || rest_low.contains("pytest")
+                || rest_low.contains("go test")
+                || rest_low.contains("./");
+            if has_pr_target && saw_unsafe_checkout && runs_checked_out_code {
+                out.push(mk_finding(
+                    "SMG-CICD-001",
+                    "CRITICAL",
+                    "GitHub Actions `pull_request_target` executes untrusted build/script after checking out PR head".into(),
+                    rel_path,
+                    ln,
+                    "pull_request_target",
+                    SinkKind::Misconfiguration,
+                    GuardKind::ConfigPolicy,
+                    "Do not execute build scripts (`npm`, `make`, `./script`) after checking out PR head in `pull_request_target`.",
+                ));
+            }
             if rest.starts_with('|') || rest.starts_with('>') {
                 in_run_block_indent = Some(indent);
-            } else if (has_pr_target || rest.contains("GITHUB_ENV") || rest.contains("GITHUB_PATH"))
-                && untrusted_gha_expr_re().is_match(rest)
+            } else if ((has_pr_target
+                || rest.contains("GITHUB_ENV")
+                || rest.contains("GITHUB_PATH"))
+                && untrusted_gha_expr_re().is_match(rest))
+                || line_sinks_tainted_env(rest)
             {
                 out.push(mk_finding(
                     "SMG-CICD-001",
@@ -353,12 +432,10 @@ fn scan_cicd_workflow(rel_path: &str, content: &str, out: &mut Vec<LocalStaticFi
 }
 
 fn scan_kubernetes_manifest(rel_path: &str, content: &str, out: &mut Vec<LocalStaticFinding>) {
-    // Split multi-document YAML (`---`) keeping accurate line numbers
-    let mut line_offset = 0usize;
-    for doc in content.split("\n---") {
+    // Split multi-document YAML (`---` / `...`) keeping exact 1-based line alignment via smg-core::yaml
+    for doc in smg_core::yaml::split_yaml_documents_preserving_lines(content) {
         let doc_lines: Vec<&str> = doc.lines().collect();
-        analyze_k8s_doc(rel_path, line_offset, &doc_lines, out);
-        line_offset += doc_lines.len();
+        analyze_k8s_doc(rel_path, 0, &doc_lines, out);
     }
 }
 
@@ -481,15 +558,67 @@ fn analyze_k8s_doc(
     }
 
     if is_rbac {
+        let mut rule_item_indent: Option<usize> = None;
         let mut wildcard_line: Option<usize> = None;
         let mut has_wildcard_resources = false;
         let mut has_wildcard_verbs = false;
+
+        let flush_rbac_rule = |out: &mut Vec<LocalStaticFinding>,
+                               has_res: &mut bool,
+                               has_verbs: &mut bool,
+                               w_line: &mut Option<usize>| {
+            if *has_res && *has_verbs {
+                out.push(mk_finding(
+                    "SMG-K8S-002",
+                    "CRITICAL",
+                    format!(
+                        "Kubernetes `{}` grants wildcard RBAC permissions (`*` verbs on `*`/secrets)",
+                        k_str
+                    ),
+                    rel_path,
+                    w_line.unwrap_or(base_line + 1),
+                    k_str,
+                    SinkKind::Misconfiguration,
+                    GuardKind::ConfigPolicy,
+                    "Scope RBAC `resources` and `verbs` strictly to specific resource names and minimal verbs (`get`, `list`).",
+                ));
+            }
+            *has_res = false;
+            *has_verbs = false;
+            *w_line = None;
+        };
+
         for (idx, raw) in lines.iter().enumerate() {
             let ln = base_line + idx + 1;
-            let trimmed = raw.split('#').next().unwrap_or("").trim();
+            let code = strip_yaml_comment(raw);
+            let trimmed = code.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let indent = code.len() - code.trim_start().len();
             let low = trimmed.to_ascii_lowercase();
-            if low.starts_with("resources:")
-                && (low.contains("'*'") || low.contains("\"*\"") || low.contains("secrets"))
+
+            // Detect start of a new `- ` PolicyRule entry under `rules:`
+            if trimmed.starts_with("- ")
+                && (low.contains("apigroups:")
+                    || low.contains("resources:")
+                    || low.contains("verbs:")
+                    || rule_item_indent == Some(indent))
+            {
+                rule_item_indent = Some(indent);
+                flush_rbac_rule(
+                    out,
+                    &mut has_wildcard_resources,
+                    &mut has_wildcard_verbs,
+                    &mut wildcard_line,
+                );
+            }
+
+            let field_low = low.strip_prefix("- ").unwrap_or(&low).trim_start();
+            if field_low.starts_with("resources:")
+                && (field_low.contains("'*'")
+                    || field_low.contains("\"*\"")
+                    || field_low.contains("secrets"))
             {
                 has_wildcard_resources = true;
                 wildcard_line.get_or_insert(ln);
@@ -499,32 +628,28 @@ fn analyze_k8s_doc(
                     if pl.contains("resources:") {
                         has_wildcard_resources = true;
                         wildcard_line.get_or_insert(ln);
-                    } else if pl.contains("verbs:") {
+                    } else if pl.contains("verbs:") && !low.contains("secrets") {
                         has_wildcard_verbs = true;
                         wildcard_line.get_or_insert(ln);
                     }
                 }
-            } else if low.starts_with("verbs:") && (low.contains("'*'") || low.contains("\"*\"")) {
+            } else if field_low.starts_with("verbs:")
+                && (field_low.contains("'*'")
+                    || field_low.contains("\"*\"")
+                    || field_low.contains("escalate")
+                    || field_low.contains("impersonate")
+                    || field_low.contains("bind"))
+            {
                 has_wildcard_verbs = true;
                 wildcard_line.get_or_insert(ln);
             }
         }
-        if has_wildcard_resources && has_wildcard_verbs {
-            out.push(mk_finding(
-                "SMG-K8S-002",
-                "CRITICAL",
-                format!(
-                    "Kubernetes `{}` grants wildcard RBAC permissions (`*` verbs on `*`/secrets)",
-                    k_str
-                ),
-                rel_path,
-                wildcard_line.unwrap_or(base_line + 1),
-                k_str,
-                SinkKind::Misconfiguration,
-                GuardKind::ConfigPolicy,
-                "Scope RBAC `resources` and `verbs` strictly to specific resource names and minimal verbs (`get`, `list`).",
-            ));
-        }
+        flush_rbac_rule(
+            out,
+            &mut has_wildcard_resources,
+            &mut has_wildcard_verbs,
+            &mut wildcard_line,
+        );
     }
 }
 
@@ -699,37 +824,48 @@ fn scan_zipslip_patterns(
     out: &mut Vec<LocalStaticFinding>,
 ) {
     let low_all = content.to_ascii_lowercase();
-    let has_path_containment = low_all.contains("commonpath")
-        || low_all.contains("commonprefix")
-        || low_all.contains("enclosed_name")
-        || low_all.contains("getcanonicalpath")
-        || low_all.contains("filepath.islocal")
-        || low_all.contains("filter=\"data\"")
-        || low_all.contains("filter='data'")
-        || (low_all.contains("starts_with")
-            && (low_all.contains("canonicalize")
-                || low_all.contains("dest")
-                || low_all.contains("target")
-                || low_all.contains("root")))
-        || (low_all.contains("startswith")
-            && (low_all.contains("realpath")
-                || low_all.contains("abspath")
-                || low_all.contains("dest")
-                || low_all.contains("target")
-                || low_all.contains("root")))
-        || (low_all.contains("hasprefix")
-            && (low_all.contains("clean(") || low_all.contains("dest")));
+    let lines: Vec<&str> = content.lines().collect();
+    let has_local_path_containment = |win_low: &str| -> bool {
+        win_low.contains("commonpath")
+            || win_low.contains("commonprefix")
+            || win_low.contains("getcanonicalpath")
+            || win_low.contains("..\" in ")
+            || win_low.contains("..' in ")
+            || win_low.contains("contains(\"..\")")
+            || win_low.contains("contains('..')")
+            || win_low.contains("filepath.islocal(")
+            || win_low.contains("filter=\"data\"")
+            || win_low.contains("filter='data'")
+            || win_low.contains("filter=\"tar\"")
+            || win_low.contains("filter='tar'")
+            || win_low.contains("enclosed_name(")
+            || (win_low.contains("starts_with")
+                && (win_low.contains("canonicalize")
+                    || win_low.contains("dest")
+                    || win_low.contains("target")
+                    || win_low.contains("root")))
+            || (win_low.contains("startswith")
+                && (win_low.contains("realpath")
+                    || win_low.contains("abspath")
+                    || win_low.contains("dest")
+                    || win_low.contains("target")
+                    || win_low.contains("root")))
+            || (win_low.contains("hasprefix")
+                && (win_low.contains("clean(") || win_low.contains("dest")))
+    };
 
-    if has_path_containment {
-        return;
-    }
-
-    for (idx, line) in content.lines().enumerate() {
+    for (idx, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
         if trimmed.starts_with("//") || trimmed.starts_with('#') {
             continue;
         }
         let low = trimmed.to_ascii_lowercase();
+        let local_win = lines[idx.saturating_sub(15)..(idx + 15).min(lines.len())]
+            .join("\n")
+            .to_ascii_lowercase();
+        if has_local_path_containment(&local_win) {
+            continue;
+        }
         let is_vuln_extract = match language {
             Language::Python => {
                 ((low.contains(".extractall(") || low.contains(".extract("))
@@ -988,12 +1124,17 @@ fn scan_async_queue_context(rel_path: &str, content: &str, out: &mut Vec<LocalSt
             || window.contains("db.query(")
             || window.contains("debit")
             || window.contains("transfer");
+        let has_schema_parse = window.match_indices(".parse(").any(|(pos, _)| {
+            let prefix = &window[..pos];
+            !(prefix.ends_with("json") || prefix.ends_with("date") || prefix.ends_with("url"))
+        });
         let has_tenant_or_schema_guard = window.contains("tenantid")
             || window.contains("tenant_id")
             || window.contains("userid")
             || window.contains("user_id")
             || window.contains("zod")
-            || window.contains("parse(")
+            || has_schema_parse
+            || window.contains(".safeparse(")
             || window.contains("validate")
             || window.contains("idempotency");
 

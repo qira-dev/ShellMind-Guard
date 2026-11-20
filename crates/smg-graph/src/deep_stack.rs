@@ -125,7 +125,7 @@ pub fn scan_sql_file(rel_path: &str, content: &str) -> Vec<LocalStaticFinding> {
             ));
         }
 
-        // 2. PostgreSQL RLS disablement
+        // 2. PostgreSQL RLS disablement & permissive `USING (true)` write policies
         if low.contains("disable row level security") || low.contains("no force row level security")
         {
             findings.push(make_deep_finding(
@@ -139,6 +139,22 @@ pub fn scan_sql_file(rel_path: &str, content: &str) -> Vec<LocalStaticFinding> {
                 GuardKind::ConfigPolicy,
                 Confidence::Confirmed,
                 "Keep `ENABLE ROW LEVEL SECURITY` / `FORCE ROW LEVEL SECURITY` enforced on multi-tenant tables.",
+            ));
+        } else if low.contains("create policy")
+            && (low.contains("using (true)") || low.contains("with check (true)"))
+            && !low.contains("for select")
+        {
+            findings.push(make_deep_finding(
+                "SMG-CFG-SQL-RLS",
+                "HIGH",
+                "Permissive PostgreSQL RLS policy (`USING (true)` / `WITH CHECK (true)`) bypasses tenant isolation".into(),
+                rel_path,
+                ln,
+                &format!("{}:{}", rel_path, ln),
+                SinkKind::Misconfiguration,
+                GuardKind::ConfigPolicy,
+                Confidence::Confirmed,
+                "Scope RLS `USING (...)` / `WITH CHECK (...)` expressions to `auth.uid()` or `current_setting('app.tenant_id')`.",
             ));
         }
 
@@ -542,37 +558,56 @@ fn scan_backend_and_db_deep(
         let mut raw_obj_vars: HashSet<String> = HashSet::new();
         let mut scalar_taint_vars: HashSet<String> = HashSet::new();
         // Exclude `JSON.parse(`, `Date.parse(`, `URL.parse(` etc. from schema-validation credit (`F-87`).
-        let has_schema_parse_call = block_low.match_indices(".parse(").any(|(pos, _)| {
-            let prefix = &block_low[..pos];
-            !(prefix.ends_with("json")
-                || prefix.ends_with("date")
-                || prefix.ends_with("url")
-                || prefix.ends_with("path")
-                || prefix.ends_with("querystring"))
-        });
-        let has_schema_validation = has_schema_parse_call
-            || block_low.contains(".safeparse(")
-            || block_low.contains("joi.")
-            || block_low.contains("mongosanitize")
-            || block_low.contains("mongo_sanitize")
-            || block_low.contains(".permit(")
-            || block_low.contains("validatedata")
-            || block_low.contains("pydantic");
-        let has_proto_guard = block_low.contains("object.hasown")
-            || block_low.contains("hasownproperty")
-            || block_low.contains("object.create(null)")
-            || (block_low.contains("__proto__")
-                && (block_low.contains("===")
-                    || block_low.contains("!==")
-                    || block_low.contains("includes(")
-                    || block_low.contains("continue")
-                    || block_low.contains("return")
-                    || block_low.contains("throw")));
-        let has_redirect_guard = block_low.contains("allowed_hosts")
-            || block_low.contains("allowedhosts")
-            || block_low.contains("url_has_allowed_host_and_scheme")
-            || ((block_low.contains("startswith(\"/\")") || block_low.contains("startswith('/')"))
-                && (block_low.contains("\"//\"") || block_low.contains("'//'")));
+        let line_has_schema_validation = |l_low: &str| -> bool {
+            let has_parse = l_low.match_indices(".parse(").any(|(pos, _)| {
+                let prefix = &l_low[..pos];
+                !(prefix.ends_with("json")
+                    || prefix.ends_with("date")
+                    || prefix.ends_with("url")
+                    || prefix.ends_with("path")
+                    || prefix.ends_with("querystring"))
+            });
+            has_parse
+                || l_low.contains(".safeparse(")
+                || l_low.contains("joi.")
+                || l_low.contains("mongosanitize")
+                || l_low.contains("mongo_sanitize")
+                || l_low.contains(".permit(")
+                || l_low.contains("validatedata")
+                || l_low.contains("pydantic")
+        };
+        let line_has_proto_guard = |l_low: &str| -> bool {
+            l_low.contains("object.hasown")
+                || l_low.contains("hasownproperty")
+                || l_low.contains("object.create(null)")
+                || (l_low.contains("__proto__")
+                    && (l_low.contains("===")
+                        || l_low.contains("!==")
+                        || l_low.contains("includes(")
+                        || l_low.contains("continue")
+                        || l_low.contains("return")
+                        || l_low.contains("throw")))
+        };
+        let line_has_redirect_guard = |l_low: &str| -> bool {
+            l_low.contains("allowed_hosts")
+                || l_low.contains("allowedhosts")
+                || l_low.contains("url_has_allowed_host_and_scheme")
+                || ((l_low.contains("startswith(\"/\")") || l_low.contains("startswith('/')"))
+                    && (l_low.contains("\"//\"") || l_low.contains("'//'")))
+        };
+        // Track prefix-dominated guards up to the current statement (so guards placed strictly
+        // AFTER a sink do not suppress an earlier vulnerable sink).
+        let mut seen_schema_validation = false;
+        let mut seen_proto_guard = false;
+        let mut seen_redirect_guard = false;
+        // Also honor multi-line `__proto__` guard blocks within the function when an `if (...__proto__...)` terminates
+        let block_has_early_proto_guard = block_low.contains("__proto__")
+            && (block_low.contains("continue")
+                || block_low.contains("return")
+                || block_low.contains("throw"));
+        let block_has_early_redirect_guard = (block_low.contains("startswith(\"/\")")
+            || block_low.contains("startswith('/')"))
+            && (block_low.contains("\"//\"") || block_low.contains("'//'"));
 
         let existing_hit_keys: HashSet<(String, usize)> = sym
             .local_taint_hits
@@ -587,6 +622,18 @@ fn scan_backend_and_db_deep(
                 continue;
             }
             let low = trimmed.to_ascii_lowercase();
+            if line_has_schema_validation(&low) {
+                seen_schema_validation = true;
+            }
+            if line_has_proto_guard(&low) {
+                seen_proto_guard = true;
+            }
+            if line_has_redirect_guard(&low) {
+                seen_redirect_guard = true;
+            }
+            let has_schema_validation = seen_schema_validation;
+            let has_proto_guard = seen_proto_guard || block_has_early_proto_guard;
+            let has_redirect_guard = seen_redirect_guard || block_has_early_redirect_guard;
 
             // Track assignments (`const filter = req.body;`, `data = request.json`, `tpl = req.query.tpl`)
             if let Some((lhs, rhs)) = split_simple_assign(&trimmed) {

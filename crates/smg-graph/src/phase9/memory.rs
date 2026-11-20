@@ -156,37 +156,90 @@ fn has_preceding_bounds_check(preceding_code: &str, len_expr: &str) -> bool {
 
     let prec_low = preceding_code.to_ascii_lowercase();
     for v in &vars {
+        let mut verified = false;
+        let mut depth: i32 = 0;
+        let mut guard_if_depth: Option<i32> = None;
+        let mut guard_if_exits = false;
+
         for line in prec_low.lines() {
             let trimmed = line.trim();
-            let has_word_v = ident_tok_re().find_iter(trimmed).any(|m| m.as_str() == v);
-            if !has_word_v {
+            if trimmed.is_empty() {
                 continue;
             }
-            if (trimmed.contains("if ") || trimmed.contains("if(") || trimmed.contains("assert"))
-                && (trimmed.contains('<')
+            let has_word_v = ident_tok_re().find_iter(trimmed).any(|m| m.as_str() == v);
+            let line_exits = trimmed.contains("return")
+                || trimmed.contains("break")
+                || trimmed.contains("continue")
+                || trimmed.contains("goto ")
+                || trimmed.contains("exit(")
+                || trimmed.contains("abort(")
+                || trimmed.contains("throw ");
+
+            if guard_if_depth.is_some() && line_exits {
+                guard_if_exits = true;
+            }
+
+            if has_word_v {
+                let is_if_or_assert = trimmed.contains("if ")
+                    || trimmed.contains("if(")
+                    || trimmed.contains("assert");
+                let has_bound_op = trimmed.contains('<')
                     || trimmed.contains("<=")
                     || trimmed.contains('>')
                     || trimmed.contains(">=")
                     || trimmed.contains("sizeof")
                     || trimmed.contains("max")
-                    || trimmed.contains("cap"))
-            {
-                return true;
+                    || trimmed.contains("cap");
+                if trimmed.contains("assert") && has_bound_op {
+                    verified = true;
+                } else if is_if_or_assert && has_bound_op {
+                    verified = true;
+                    if !line_exits && trimmed.contains('{') && !trimmed.contains('}') {
+                        guard_if_depth = Some(depth);
+                        guard_if_exits = false;
+                    }
+                } else if trimmed.contains(&format!("{} =", v))
+                    || trimmed.contains(&format!("{}+=", v))
+                    || trimmed.contains(&format!("{} +=", v))
+                {
+                    if trimmed.contains("min(") || trimmed.contains("std::min") {
+                        verified = true;
+                    } else {
+                        // Intervening re-assignment invalidates prior bounds checks on `v`
+                        verified = false;
+                    }
+                } else if trimmed.contains(&format!("malloc({})", v))
+                    || trimmed.contains(&format!("malloc({} +", v))
+                    || trimmed.contains(&format!("calloc({},", v))
+                    || trimmed.contains(&format!("[{}]", v))
+                    || trimmed.contains(&format!(".resize({})", v))
+                    || (trimmed.contains("realloc(") && trimmed.contains(v.as_str()))
+                {
+                    verified = true;
+                }
             }
-            if trimmed.contains(&format!("{} =", v))
-                && (trimmed.contains("min(") || trimmed.contains("std::min"))
-            {
-                return true;
+
+            for ch in trimmed.chars() {
+                if ch == '{' {
+                    depth += 1;
+                } else if ch == '}' {
+                    depth = (depth - 1).max(0);
+                }
             }
-            if trimmed.contains(&format!("malloc({})", v))
-                || trimmed.contains(&format!("malloc({} +", v))
-                || trimmed.contains(&format!("calloc({},", v))
-                || trimmed.contains(&format!("[{}]", v))
-                || trimmed.contains(&format!(".resize({})", v))
-                || (trimmed.contains("realloc(") && trimmed.contains(v.as_str()))
+
+            if let Some(gd) = guard_if_depth
+                && depth <= gd
             {
-                return true;
+                // A non-exiting `if (v < cap) { ... }` block that already closed before our sink
+                // only guarded statements *inside* that `if`, not statements after `}`!
+                if !guard_if_exits {
+                    verified = false;
+                }
+                guard_if_depth = None;
             }
+        }
+        if verified {
+            return true;
         }
     }
     false
@@ -627,11 +680,29 @@ fn walk_rust_unsafe_block_lines(
         let ln = start_ln + idx;
         let trimmed = raw_line.trim();
 
-        if trimmed.contains("mem::uninitialized(")
+        let mut is_uninit_ub = trimmed.contains("mem::uninitialized(")
             || (trimmed.contains("MaybeUninit::uninit().assume_init(")
                 && !enclosing_fn_code.contains(".write(")
-                && !enclosing_fn_code.contains("as_mut_ptr"))
+                && !enclosing_fn_code.contains("as_mut_ptr"));
+        // Also track named `let [mut] x = MaybeUninit...::uninit(); ... x.assume_init()` without `.write(`/`.as_mut_ptr()`
+        if !is_uninit_ub
+            && let Some(recv) = trimmed.split(".assume_init(").next().map(|s| {
+                s.rsplit([' ', '=', '(', '{', ';'])
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+            })
+            && !recv.is_empty()
+            && recv.chars().all(|c| c.is_alphanumeric() || c == '_')
+            && enclosing_fn_code.contains("MaybeUninit")
+            && enclosing_fn_code.contains("::uninit(")
+            && !enclosing_fn_code.contains(&format!("{}.write(", recv))
+            && !enclosing_fn_code.contains(&format!("{}.as_mut_ptr(", recv))
+            && !enclosing_fn_code.contains(&format!("&mut {}", recv))
         {
+            is_uninit_ub = true;
+        }
+        if is_uninit_ub {
             out.push(make_phase9_finding(
                 "SMG-MEM-BOUNDS",
                 "CRITICAL",

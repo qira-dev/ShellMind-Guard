@@ -336,16 +336,18 @@ pub fn analyze_mobile_ast(
 fn scan_android_code(
     rel_path: &str,
     lines: &[&str],
-    full_low: &str,
+    _full_low: &str,
     out: &mut Vec<LocalStaticFinding>,
 ) {
-    let has_encrypted_prefs = full_low.contains("encryptedsharedpreferences");
-    let has_keystore = full_low.contains("androidkeystore") || full_low.contains("keystore");
-
     for (idx, line) in lines.iter().enumerate() {
         let ln = idx + 1;
         let trimmed = line.trim();
         let low = trimmed.to_ascii_lowercase();
+        let local_win = lines[idx.saturating_sub(20)..(idx + 12).min(lines.len())]
+            .join("\n")
+            .to_ascii_lowercase();
+        let has_encrypted_prefs = local_win.contains("encryptedsharedpreferences");
+        let has_keystore = local_win.contains("androidkeystore") || local_win.contains("masterkey");
 
         // 1. SMG-MOB-STORAGE: Unencrypted SharedPreferences storing sensitive tokens/secrets or world-readable mode
         if low.contains("mode_world_readable") || low.contains("mode_world_writeable") {
@@ -439,27 +441,27 @@ fn scan_android_code(
             ));
         }
 
-        if low.contains("registerreceiver(")
-            && !low.contains("localbroadcastmanager")
-            && !low.contains("receiver_not_exported")
-            && trimmed.matches(',').count() <= 2
-            && !lines[idx..lines.len().min(idx + 3)]
+        if low.contains("registerreceiver(") && !low.contains("localbroadcastmanager") {
+            let call_win = lines[idx..lines.len().min(idx + 6)]
                 .join(" ")
-                .to_ascii_lowercase()
-                .contains("receiver_not_exported")
-        {
-            out.push(make_phase9_finding(
-                "SMG-MOB-IPC",
-                "MEDIUM",
-                "Dynamic `registerReceiver()` without `RECEIVER_NOT_EXPORTED` or signature permission".into(),
-                rel_path,
-                ln,
-                "registerReceiver",
-                SinkKind::MobileSecurity,
-                GuardKind::MobilePolicy,
-                Confidence::Confirmed,
-                "Pass `Context.RECEIVER_NOT_EXPORTED` (Android 13+) or specify a signature broadcast permission.",
-            ));
+                .to_ascii_lowercase();
+            let call_span = call_win.split(';').next().unwrap_or(&call_win);
+            let has_export_flag = call_span.contains("receiver_not_exported")
+                || call_span.contains("receiver_exported");
+            if !has_export_flag && call_span.matches(',').count() <= 2 {
+                out.push(make_phase9_finding(
+                    "SMG-MOB-IPC",
+                    "MEDIUM",
+                    "Dynamic `registerReceiver()` without `RECEIVER_NOT_EXPORTED` or signature permission".into(),
+                    rel_path,
+                    ln,
+                    "registerReceiver",
+                    SinkKind::MobileSecurity,
+                    GuardKind::MobilePolicy,
+                    Confidence::Confirmed,
+                    "Pass `Context.RECEIVER_NOT_EXPORTED` (Android 13+) or specify a signature broadcast permission.",
+                ));
+            }
         }
 
         if (low.contains("sendbroadcast(") || low.contains("startservice("))

@@ -2,25 +2,84 @@ use crate::ast::{
     Confidence, GuardKind, ImportRef, LocalStaticFinding, SinkKind, SymbolInfo, SymbolKind,
     node_text,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tree_sitter::Node;
 
 use super::{ExtractContext, strip_quotes};
 
 const SENSITIVE_PORTS: &[u16] = &[22, 23, 445, 1433, 3306, 3389, 5432, 6379, 9200, 27017];
 
-pub(crate) fn extract(root: Node, ctx: &mut ExtractContext<'_>) {
-    walk_hcl_blocks(root, ctx);
+#[derive(Default)]
+struct HclFileGraph {
+    /// `var.<name>` and `local.<name>` resolved default/literal values.
+    var_defaults: HashMap<String, String>,
+    /// S3 bucket resource names protected by an `aws_s3_bucket_public_access_block` with all 4 flags = true.
+    protected_s3_buckets: HashSet<String>,
 }
 
-fn walk_hcl_blocks(node: Node, ctx: &mut ExtractContext<'_>) {
+pub(crate) fn extract(root: Node, ctx: &mut ExtractContext<'_>) {
+    let mut graph = HclFileGraph::default();
+    collect_hcl_file_graph(root, ctx.src, &mut graph);
+    walk_hcl_blocks(root, ctx, &graph);
+}
+
+fn collect_hcl_file_graph(node: Node, src: &[u8], graph: &mut HclFileGraph) {
     if node.kind() == "block" {
-        analyze_top_block(node, ctx);
+        let (btype, labels) = block_header(node, src);
+        if let Some(body) = find_block_body(node) {
+            let raw_attrs = collect_body_attrs(body, src);
+            if btype == "variable"
+                && let Some(vname) = labels.first()
+                && let Some(def_val) = raw_attrs.get("default")
+            {
+                graph.var_defaults.insert(
+                    format!("var.{}", vname.to_ascii_lowercase()),
+                    def_val.clone(),
+                );
+            } else if btype == "locals" {
+                for (k, v) in raw_attrs {
+                    graph.var_defaults.insert(format!("local.{}", k), v);
+                }
+            } else if btype == "resource"
+                && labels.first().map(String::as_str) == Some("aws_s3_bucket_public_access_block")
+            {
+                let all_four_true = [
+                    "block_public_acls",
+                    "block_public_policy",
+                    "ignore_public_acls",
+                    "restrict_public_buckets",
+                ]
+                .iter()
+                .all(|k| attr_is_bool(&raw_attrs, k, true));
+                if all_four_true && let Some(bkt_ref) = raw_attrs.get("bucket") {
+                    // Extract `my_bkt` from `aws_s3_bucket.my_bkt.id` or `"my_bkt"`
+                    let clean = strip_quotes(bkt_ref);
+                    if let Some(rest) = clean.strip_prefix("aws_s3_bucket.")
+                        && let Some(bname) = rest.split('.').next()
+                    {
+                        graph.protected_s3_buckets.insert(bname.to_string());
+                    } else if !clean.is_empty() {
+                        graph.protected_s3_buckets.insert(clean);
+                    }
+                }
+            }
+        }
         return;
     }
     let mut c = node.walk();
     for ch in node.children(&mut c) {
-        walk_hcl_blocks(ch, ctx);
+        collect_hcl_file_graph(ch, src, graph);
+    }
+}
+
+fn walk_hcl_blocks(node: Node, ctx: &mut ExtractContext<'_>, graph: &HclFileGraph) {
+    if node.kind() == "block" {
+        analyze_top_block(node, ctx, graph);
+        return;
+    }
+    let mut c = node.walk();
+    for ch in node.children(&mut c) {
+        walk_hcl_blocks(ch, ctx, graph);
     }
 }
 
@@ -101,12 +160,19 @@ fn collect_nested_blocks(body: Node) -> Vec<Node> {
     out
 }
 
-fn analyze_top_block(block: Node, ctx: &mut ExtractContext<'_>) {
+fn analyze_top_block(block: Node, ctx: &mut ExtractContext<'_>, graph: &HclFileGraph) {
     let (block_type, labels) = block_header(block, ctx.src);
     let Some(body) = find_block_body(block) else {
         return;
     };
-    let attrs = collect_body_attrs(body, ctx.src);
+    let mut attrs = collect_body_attrs(body, ctx.src);
+    // Resolve `var.<name>` and `local.<name>` references in attribute values
+    for val in attrs.values_mut() {
+        let key_low = val.trim().to_ascii_lowercase();
+        if let Some(resolved) = graph.var_defaults.get(&key_low) {
+            *val = resolved.clone();
+        }
+    }
     let line = block.start_position().row + 1;
     let end_line = block.end_position().row + 1;
 
@@ -154,6 +220,25 @@ fn analyze_top_block(block: Node, ctx: &mut ExtractContext<'_>) {
         format!("{}.{}", res_type, res_name)
     };
 
+    // Extract cross-resource reference edges (`aws_security_group.web`, `aws_s3_bucket.logs`, `module.vpc`)
+    let mut ref_calls = Vec::new();
+    for v in attrs.values() {
+        for tok in v.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '.') {
+            let parts: Vec<&str> = tok.split('.').collect();
+            if parts.len() >= 2
+                && (parts[0].starts_with("aws_")
+                    || parts[0].starts_with("google_")
+                    || parts[0].starts_with("azurerm_")
+                    || parts[0] == "module")
+            {
+                let target = format!("{}.{}", parts[0], parts[1]);
+                if target != sym_name && !ref_calls.contains(&target) {
+                    ref_calls.push(target);
+                }
+            }
+        }
+    }
+
     ctx.symbols.push(SymbolInfo {
         id: format!("hcl:{}:{}:{}", ctx.rel_path, sym_name, line),
         rel_path: ctx.rel_path.to_string(),
@@ -161,11 +246,14 @@ fn analyze_top_block(block: Node, ctx: &mut ExtractContext<'_>) {
         kind: SymbolKind::Function,
         line_start: line,
         line_end: end_line,
+        calls: ref_calls,
         ..Default::default()
     });
 
     // 1. Public Storage / Database Exposure (`SMG-CFG-IAC-PUBLIC`)
-    check_public_exposure(ctx, &res_type, &sym_name, line, body, &attrs);
+    check_public_exposure(
+        ctx, &res_type, &res_name, &sym_name, line, body, &attrs, graph,
+    );
 
     // 2. Public Network Ingress (`SMG-CFG-IAC-NET`)
     check_network_exposure(ctx, &res_type, &sym_name, line, body, &attrs);
@@ -226,13 +314,16 @@ fn attr_is_bool(attrs: &HashMap<String, String>, key: &str, expected: bool) -> b
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn check_public_exposure(
     ctx: &mut ExtractContext<'_>,
     res_type: &str,
+    res_name: &str,
     sym_name: &str,
     line: usize,
     body: Node,
     attrs: &HashMap<String, String>,
+    graph: &HclFileGraph,
 ) {
     if res_type == "aws_lambda_function_url"
         && attrs
@@ -355,10 +446,20 @@ fn check_public_exposure(
         && let Some(acl) = attrs.get("acl")
     {
         let clean = strip_quotes(acl).to_ascii_lowercase();
-        if matches!(
-            clean.as_str(),
-            "public-read" | "public-read-write" | "authenticated-read"
-        ) {
+        let blocked_by_companion = graph.protected_s3_buckets.contains(res_name)
+            || attrs.get("bucket").is_some_and(|b| {
+                let cb = strip_quotes(b);
+                cb.strip_prefix("aws_s3_bucket.")
+                    .and_then(|r| r.split('.').next())
+                    .is_some_and(|bn| graph.protected_s3_buckets.contains(bn))
+                    || graph.protected_s3_buckets.contains(&cb)
+            });
+        if !blocked_by_companion
+            && matches!(
+                clean.as_str(),
+                "public-read" | "public-read-write" | "authenticated-read"
+            )
+        {
             push_iac_finding(
                 ctx,
                 "SMG-CFG-IAC-PUBLIC",

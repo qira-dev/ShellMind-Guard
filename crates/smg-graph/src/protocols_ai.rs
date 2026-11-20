@@ -112,8 +112,52 @@ pub fn scan_protocols_ai_and_workflow(
 }
 
 fn block_window(lines: &[&str], center_idx: usize, before: usize, after: usize) -> String {
-    let start = center_idx.saturating_sub(before);
-    let end = (center_idx + after + 1).min(lines.len());
+    function_bounded_window(lines, center_idx, before, after)
+}
+
+fn function_bounded_window(
+    lines: &[&str],
+    center_idx: usize,
+    before: usize,
+    after: usize,
+) -> String {
+    let min_start = center_idx.saturating_sub(before);
+    let mut start = center_idx;
+    while start > min_start {
+        let prev_trim = lines[start - 1].trim_start();
+        if prev_trim.starts_with("function ")
+            || prev_trim.starts_with("async function ")
+            || prev_trim.starts_with("export function ")
+            || prev_trim.starts_with("export async function ")
+            || prev_trim.starts_with("def ")
+            || prev_trim.starts_with("async def ")
+            || prev_trim.starts_with("func ")
+            || prev_trim.starts_with("pub fn ")
+            || prev_trim.starts_with("pub async fn ")
+        {
+            start -= 1;
+            break;
+        }
+        start -= 1;
+    }
+    let max_end = (center_idx + after + 1).min(lines.len());
+    let mut end = center_idx + 1;
+    while end < max_end {
+        let next_trim = lines[end].trim_start();
+        if next_trim.starts_with("function ")
+            || next_trim.starts_with("async function ")
+            || next_trim.starts_with("export function ")
+            || next_trim.starts_with("export async function ")
+            || next_trim.starts_with("def ")
+            || next_trim.starts_with("async def ")
+            || next_trim.starts_with("func ")
+            || next_trim.starts_with("pub fn ")
+            || next_trim.starts_with("pub async fn ")
+        {
+            break;
+        }
+        end += 1;
+    }
     lines[start..end].join("\n")
 }
 

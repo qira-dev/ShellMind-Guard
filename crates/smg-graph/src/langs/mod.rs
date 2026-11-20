@@ -343,6 +343,116 @@ pub(crate) fn detect_text_guards(
     guards
 }
 
+/// Filters body-detected guards so guards that only appear inside a non-exiting side branch
+/// (`if (debug) { requireAuth(); }`) or strictly after the first state-mutating sink do not
+/// falsely dominate the function.
+fn filter_dominating_body_guards(
+    body_code: &str,
+    raw_body_guards: HashSet<GuardKind>,
+    cfg: &ShellMindGuardConfig,
+    profile: &LangProfile,
+) -> HashSet<GuardKind> {
+    if raw_body_guards.is_empty() {
+        return raw_body_guards;
+    }
+    let mut dominated = HashSet::new();
+    // CSRF and OwnershipCheck are structural predicate checks preserved from body analysis
+    for g in [GuardKind::CsrfProtection, GuardKind::OwnershipCheck] {
+        if raw_body_guards.contains(&g) {
+            dominated.insert(g);
+        }
+    }
+
+    let lines: Vec<&str> = body_code.lines().collect();
+    let mut brace_depth: i32 = 0;
+    let mut cond_entry_depth: Option<i32> = None;
+    let mut cond_block_guards = HashSet::new();
+    let mut cond_block_exits = false;
+    let mut cond_has_else = false;
+    let mut seen_sink = false;
+
+    for raw in &lines {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let low = trimmed.to_ascii_lowercase();
+        let line_guards = detect_text_guards(trimmed, cfg, profile);
+        let line_is_sink = classify_sink_with_profile("", trimmed, profile).is_some()
+            || contains_sink_ci(&low, profile.sql_sinks)
+            || contains_sink_ci(&low, profile.cmd_sinks)
+            || contains_sink_ci(&low, profile.path_sinks)
+            || contains_sink_ci(&low, profile.ssrf_sinks);
+        let line_exits = low.starts_with("return")
+            || low.contains(" return ")
+            || low.contains(" return;")
+            || low.starts_with("throw ")
+            || low.contains(" throw ")
+            || low.starts_with("raise ")
+            || low.contains("abort(")
+            || low.contains("exit(")
+            || low.contains("die(");
+
+        let is_if_head = low.starts_with("if ") || low.starts_with("if(");
+        if is_if_head && cond_entry_depth.is_none() && !seen_sink {
+            cond_entry_depth = Some(brace_depth);
+            cond_block_guards.extend(line_guards.iter().copied());
+            if line_exits {
+                cond_block_exits = true;
+            }
+        } else if cond_entry_depth.is_some() {
+            if low.starts_with("} else") || low.starts_with("else") || low.starts_with("elsif") {
+                cond_has_else = true;
+            }
+            cond_block_guards.extend(line_guards.iter().copied());
+            if line_exits {
+                cond_block_exits = true;
+            }
+        } else if !seen_sink {
+            // Top-level statement before any sink dominates all subsequent statements
+            dominated.extend(line_guards.iter().copied());
+        }
+
+        for ch in trimmed.chars() {
+            if ch == '{' {
+                brace_depth += 1;
+            } else if ch == '}' {
+                brace_depth = (brace_depth - 1).max(0);
+            }
+        }
+
+        if let Some(ed) = cond_entry_depth
+            && brace_depth <= ed
+        {
+            if cond_block_exits || cond_has_else {
+                dominated.extend(cond_block_guards.iter().copied());
+            }
+            cond_entry_depth = None;
+            cond_block_guards.clear();
+            cond_block_exits = false;
+            cond_has_else = false;
+        }
+
+        if line_is_sink && cond_entry_depth.is_none() {
+            seen_sink = true;
+        }
+    }
+
+    // For languages without `{}` blocks (Python/Ruby `if ... end`), fall back to pre-sink check
+    if !body_code.contains('{') {
+        for raw in &lines {
+            let trimmed = raw.trim();
+            let line_guards = detect_text_guards(trimmed, cfg, profile);
+            dominated.extend(line_guards);
+            if classify_sink_with_profile("", trimmed, profile).is_some() {
+                break;
+            }
+        }
+    }
+
+    dominated
+}
+
 pub(crate) fn classify_sink_with_profile(
     name: &str,
     body: &str,
@@ -632,11 +742,19 @@ pub(crate) fn build_analyzed_symbol(
         .unwrap_or_else(|| fn_code.clone());
     let combined_guard_text = format!("{}\n{}", attr_text, body_code);
 
-    let mut guards = detect_text_guards(&combined_guard_text, ctx.cfg, profile);
-    // Attribute-only guards should always grant Auth/TxLock if declared on controller/method
+    let body_raw_guards = detect_text_guards(&body_code, ctx.cfg, profile);
+    let mut guards = filter_dominating_body_guards(&body_code, body_raw_guards, ctx.cfg, profile);
+    guards.extend(crate::cfg::compute_cfg_guard_dominance(
+        full_node, ctx.src, ctx.cfg,
+    ));
+    // Attribute-only and signature guards always dominate the handler
     guards.extend(detect_text_guards(attr_text, ctx.cfg, profile));
+    guards.extend(detect_text_guards(params_text, ctx.cfg, profile));
     if kind == SymbolKind::Route {
         guards.extend(ctx.file_middleware_guards.iter().copied());
+    }
+    if has_auth_opt_out_annotation(&combined_guard_text) {
+        guards.remove(&GuardKind::Auth);
     }
 
     // Ownership filter check for IDOR (active non-literal principals + scoped query filter)

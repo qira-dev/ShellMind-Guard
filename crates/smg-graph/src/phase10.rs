@@ -129,23 +129,43 @@ fn infer_param_type(name: &str, schema_type: Option<&str>) -> ParamTypeHint {
 
 fn has_positive_bound_for(code_low: &str, param_name: &str) -> bool {
     let p = param_name.to_ascii_lowercase();
-    let has_nan_safe_neg = code_low.contains("isfinite(")
-        || code_low.contains("is_finite(")
-        || code_low.contains("isnan(")
-        || code_low.contains("is_nan(");
-    code_low.contains(&format!("{p} > 0"))
-        || code_low.contains(&format!("{p} >= 1"))
-        || code_low.contains(&format!("0 < {p}"))
+    // Slice code up to the first financial mutation sink so post-sink checks never suppress pre-sink risks.
+    let mut pre_sink = String::new();
+    for line in code_low.lines() {
+        let t = line.trim();
+        let is_mutation_sink = t.contains("balance -=")
+            || t.contains("balance-=")
+            || t.contains("charges.create(")
+            || t.contains("paymentintents.create(")
+            || (t.contains("update ") && t.contains(" set "));
+        if is_mutation_sink {
+            break;
+        }
+        pre_sink.push_str(line);
+        pre_sink.push('\n');
+    }
+    let scope = if pre_sink.trim().is_empty() {
+        code_low
+    } else {
+        pre_sink.as_str()
+    };
+    let has_nan_safe_neg = scope.contains("isfinite(")
+        || scope.contains("is_finite(")
+        || scope.contains("isnan(")
+        || scope.contains("is_nan(");
+    scope.contains(&format!("{p} > 0"))
+        || scope.contains(&format!("{p} >= 1"))
+        || scope.contains(&format!("0 < {p}"))
         || (has_nan_safe_neg
-            && (code_low.contains(&format!("{p} <= 0"))
-                || code_low.contains(&format!("{p} < 1"))
-                || code_low.contains(&format!("{p} < 0"))))
-        || code_low.contains(".positive(")
-        || code_low.contains("gt=0")
-        || code_low.contains("ge=1")
-        || code_low.contains("@min(1")
-        || code_low.contains("@positive")
-        || code_low.contains("nonzero")
+            && (scope.contains(&format!("{p} <= 0"))
+                || scope.contains(&format!("{p} < 1"))
+                || scope.contains(&format!("{p} < 0"))))
+        || scope.contains(".positive(")
+        || scope.contains("gt=0")
+        || scope.contains("ge=1")
+        || scope.contains("@min(1")
+        || scope.contains("@positive")
+        || scope.contains("nonzero")
 }
 
 fn add_unique_param(params: &mut Vec<RouteParamSpec>, cand: RouteParamSpec) {

@@ -1927,6 +1927,130 @@ export async function syncData(id: string) {
                 code: "import fs from 'fs';\nimport path from 'path';\napp.get('/api/switch-file', (req, res) => {\n  let p = req.query.file;\n  switch (req.query.mode) {\n    case 'safe':\n      p = path.basename(p);\n      break;\n    case 'raw':\n      fs.readFileSync(p);\n      break;\n  }\n});\n",
             }],
         },
+        // ------------------------------------------------------------------
+        // Phase 11 (Sprint 2): Per-Rule K8s RBAC, CI Checkout/Env Taint, HCL InfraGraph,
+        // Memory Closed-If Dominance, Inline Unlock, Named MaybeUninit & Post-Sink DeepStack
+        // ------------------------------------------------------------------
+        AdversarialCase {
+            id: "sprint2_k8s_sibling_rbac_rules_safe",
+            family: "K8S",
+            expected_prefix: "SMG-K8S",
+            expect_finding: false,
+            trap_kind: TrapKind::ScopeCollisionTrap,
+            files: vec![BenchFile {
+                rel_path: "k8s/role_safe.yaml",
+                lang: Language::Config,
+                code: "apiVersion: rbac.authorization.k8s.io/v1\nkind: Role\nmetadata:\n  name: reader\nrules:\n  - apiGroups: [\"\"]\n    resources: [\"secrets\"]\n    verbs: [\"get\"]\n  - apiGroups: [\"\"]\n    resources: [\"configmaps\"]\n    verbs: [\"*\"]\n",
+            }],
+        },
+        AdversarialCase {
+            id: "sprint2_k8s_single_rule_wildcard_rbac_vuln",
+            family: "K8S",
+            expected_prefix: "SMG-K8S",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "k8s/cluster_role_vuln.yaml",
+                lang: Language::Config,
+                code: "apiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRole\nmetadata:\n  name: admin\nrules:\n  - apiGroups: [\"\"]\n    resources: [\"secrets\"]\n    verbs: [\"*\"]\n",
+            }],
+        },
+        AdversarialCase {
+            id: "sprint2_cicd_unsafe_checkout_exec_vuln",
+            family: "CICD",
+            expected_prefix: "SMG-CICD",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: ".github/workflows/pr_build.yml",
+                lang: Language::Config,
+                code: "on:\n  pull_request_target:\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n        with:\n          ref: ${{ github.event.pull_request.head.sha }}\n      - run: npm test\n",
+            }],
+        },
+        AdversarialCase {
+            id: "sprint2_cicd_env_to_eval_taint_vuln",
+            family: "CICD",
+            expected_prefix: "SMG-CICD",
+            expect_finding: true,
+            trap_kind: TrapKind::OneHopWrapperTrap,
+            files: vec![BenchFile {
+                rel_path: ".github/workflows/pr_eval.yml",
+                lang: Language::Config,
+                code: "on:\n  pull_request:\njobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - env:\n          PR_TITLE: ${{ github.event.pull_request.title }}\n        run: eval \"$PR_TITLE\"\n",
+            }],
+        },
+        AdversarialCase {
+            id: "sprint2_hcl_var_public_s3_acl_vuln",
+            family: "CFG",
+            expected_prefix: "SMG-CFG-IAC",
+            expect_finding: true,
+            trap_kind: TrapKind::OneHopWrapperTrap,
+            files: vec![BenchFile {
+                rel_path: "infra/s3_var.tf",
+                lang: Language::Hcl,
+                code: "variable \"bkt_acl\" {\n  default = \"public-read\"\n}\nresource \"aws_s3_bucket\" \"data\" {\n  bucket = \"corp-data\"\n  acl = var.bkt_acl\n}\n",
+            }],
+        },
+        AdversarialCase {
+            id: "sprint2_hcl_companion_public_access_block_safe",
+            family: "CFG",
+            expected_prefix: "SMG-CFG-IAC",
+            expect_finding: false,
+            trap_kind: TrapKind::DominatorGuardTrap,
+            files: vec![BenchFile {
+                rel_path: "infra/s3_blocked.tf",
+                lang: Language::Hcl,
+                code: "resource \"aws_s3_bucket\" \"data\" {\n  bucket = \"corp-data\"\n  acl = \"public-read\"\n}\nresource \"aws_s3_bucket_public_access_block\" \"data_block\" {\n  bucket = aws_s3_bucket.data.id\n  block_public_acls = true\n  block_public_policy = true\n  ignore_public_acls = true\n  restrict_public_buckets = true\n}\n",
+            }],
+        },
+        AdversarialCase {
+            id: "sprint2_c_closed_if_bounds_not_dominating_vuln",
+            family: "MEM",
+            expected_prefix: "SMG-MEM",
+            expect_finding: true,
+            trap_kind: TrapKind::DominatorGuardTrap,
+            files: vec![BenchFile {
+                rel_path: "native/copy_bug.c",
+                lang: Language::C,
+                code: "#include <string.h>\nvoid copy_pkt(char *dst, const char *src, size_t n) {\n    if (n < 64) {\n        log_small(n);\n    }\n    memcpy(dst, src, n);\n}\n",
+            }],
+        },
+        AdversarialCase {
+            id: "sprint2_c_inline_unlock_before_return_safe",
+            family: "RACE",
+            expected_prefix: "SMG-ENG",
+            expect_finding: false,
+            trap_kind: TrapKind::DominatorGuardTrap,
+            files: vec![BenchFile {
+                rel_path: "native/lock_ok.c",
+                lang: Language::C,
+                code: "#include <pthread.h>\nint update_val(pthread_mutex_t *g_mu, int err) {\n    pthread_mutex_lock(g_mu);\n    if (err) { pthread_mutex_unlock(g_mu); return -1; }\n    pthread_mutex_unlock(g_mu);\n    return 0;\n}\n",
+            }],
+        },
+        AdversarialCase {
+            id: "sprint2_rust_named_maybeuninit_assume_init_vuln",
+            family: "MEM",
+            expected_prefix: "SMG-MEM",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "native/uninit_bug.rs",
+                lang: Language::Rust,
+                code: "use std::mem::MaybeUninit;\npub fn bad_uninit() -> u64 {\n    let buf: MaybeUninit<u64> = MaybeUninit::uninit();\n    unsafe { buf.assume_init() }\n}\n",
+            }],
+        },
+        AdversarialCase {
+            id: "sprint2_deep_stack_post_sink_schema_parse_vuln",
+            family: "SQLI",
+            expected_prefix: "SMG-SQLI",
+            expect_finding: true,
+            trap_kind: TrapKind::DominatorGuardTrap,
+            files: vec![BenchFile {
+                rel_path: "src/mongo_order.ts",
+                lang: Language::TypeScript,
+                code: "export async function findUsers(req: any, db: any) {\n  const rows = await db.users.find(req.body);\n  AuditSchema.parse(req.headers);\n  return rows;\n}\n",
+            }],
+        },
     ]
 }
 
