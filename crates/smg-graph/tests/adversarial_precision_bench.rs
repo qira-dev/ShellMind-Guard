@@ -2281,6 +2281,224 @@ export async function runSafe(openai: any, prompt: string) {
 "#,
             }],
         },
+        // ------------------------------------------------------------------
+        // Phase 14B Sprint 8: Multi-Domain Real-World Open-Source Mega-Corpus
+        // ------------------------------------------------------------------
+        AdversarialCase {
+            id: "mega_cpp_bounded_memcpy_safe",
+            family: "MEM",
+            expected_prefix: "SMG-MEM",
+            expect_finding: false,
+            trap_kind: TrapKind::CheckedBoundsTrap,
+            files: vec![BenchFile {
+                rel_path: "native/packet_safe.cpp",
+                lang: Language::Cpp,
+                code: r#"
+#include <cstring>
+void copy_hdr(const char *src, size_t n) {
+    char dst[64];
+    if (n > sizeof(dst)) return;
+    memcpy(dst, src, n);
+}
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "mega_cpp_unbounded_strcpy_vuln",
+            family: "MEM",
+            expected_prefix: "SMG-MEM",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "native/packet_vuln.cpp",
+                lang: Language::Cpp,
+                code: r#"
+#include <cstring>
+void copy_name(const char *user_in) {
+    char dst[32];
+    strcpy(dst, user_in);
+}
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "mega_k8s_hardened_pod_safe",
+            family: "K8S",
+            expected_prefix: "SMG-K8S",
+            expect_finding: false,
+            trap_kind: TrapKind::BaselineSafe,
+            files: vec![BenchFile {
+                rel_path: "k8s/deployment_safe.yaml",
+                lang: Language::Config,
+                code: r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  template:
+    spec:
+      containers:
+        - name: api
+          image: ghcr.io/org/api:1.2.3
+          securityContext:
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            privileged: false
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "mega_k8s_privileged_pod_vuln",
+            family: "K8S",
+            expected_prefix: "SMG-K8S",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "k8s/deployment_vuln.yaml",
+                lang: Language::Config,
+                code: r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+spec:
+  template:
+    spec:
+      hostPID: true
+      containers:
+        - name: worker
+          image: ghcr.io/org/worker:latest
+          securityContext:
+            privileged: true
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "mega_terraform_s3_private_with_pab_safe",
+            family: "IAC",
+            expected_prefix: "SMG-CFG-IAC",
+            expect_finding: false,
+            trap_kind: TrapKind::BaselineSafe,
+            files: vec![BenchFile {
+                rel_path: "infra/s3_safe.tf",
+                lang: Language::Hcl,
+                code: r#"
+resource "aws_s3_bucket" "logs" {
+  bucket = "prod-audit-logs"
+}
+resource "aws_s3_bucket_public_access_block" "logs" {
+  bucket                  = aws_s3_bucket.logs.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "mega_terraform_s3_public_read_vuln",
+            family: "IAC",
+            expected_prefix: "SMG-CFG-IAC",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "infra/s3_vuln.tf",
+                lang: Language::Hcl,
+                code: r#"
+resource "aws_s3_bucket" "uploads" {
+  bucket = "prod-uploads"
+  acl    = "public-read"
+}
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "mega_cicd_pinned_sha_readonly_safe",
+            family: "CICD",
+            expected_prefix: "SMG-CICD",
+            expect_finding: false,
+            trap_kind: TrapKind::BaselineSafe,
+            files: vec![BenchFile {
+                rel_path: ".github/workflows/release_safe.yml",
+                lang: Language::Config,
+                code: r#"
+name: Release
+on: push
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - run: echo "clean build"
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "mega_cicd_write_all_script_injection_vuln",
+            family: "CICD",
+            expected_prefix: "SMG-CICD",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: ".github/workflows/pr_vuln.yml",
+                lang: Language::Config,
+                code: r#"
+name: PR Check
+on: pull_request_target
+permissions: write-all
+jobs:
+  greet:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "${{ github.event.pull_request.title }}"
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "mega_rust_safe_mutex_drop_safe",
+            family: "ENG",
+            expected_prefix: "SMG-ENG",
+            expect_finding: false,
+            trap_kind: TrapKind::BaselineSafe,
+            files: vec![BenchFile {
+                rel_path: "engine/sync_safe.rs",
+                lang: Language::Rust,
+                code: r#"
+use std::sync::Mutex;
+pub async fn update_counter(m: &Mutex<u64>) {
+    {
+        let mut g = m.lock().unwrap();
+        *g += 1;
+    }
+    tokio::task::yield_now().await;
+}
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "mega_rust_mutex_held_across_await_vuln",
+            family: "ENG",
+            expected_prefix: "SMG-ENG",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "engine/sync_vuln.rs",
+                lang: Language::Rust,
+                code: r#"
+use std::sync::Mutex;
+pub async fn bad_update(m: &Mutex<u64>) {
+    let mut g = m.lock().unwrap();
+    tokio::task::yield_now().await;
+    *g += 1;
+}
+"#,
+            }],
+        },
     ]
 }
 

@@ -142,6 +142,26 @@ pub fn to_sarif_json(findings: &[LatticeFinding], verified: &[VerifiedFinding]) 
                 f.rule_id, raw_file, start_line, f.entry_route
             ));
 
+            let vex_tier = if f.proof_reasons.iter().any(|r| r == "ProvenRouteSymbolVEX") {
+                Some("ProvenRouteSymbol")
+            } else if f
+                .proof_reasons
+                .iter()
+                .any(|r| r == "ImportedSafeApiOnlyVEX")
+            {
+                Some("ImportedSafeApiOnly")
+            } else if f
+                .proof_reasons
+                .iter()
+                .any(|r| r == "ImportedUnprovenSymbolVEX")
+            {
+                Some("ImportedUnprovenSymbol")
+            } else if f.proof_reasons.iter().any(|r| r == "DeclaredUnusedVEX") {
+                Some("DeclaredUnused")
+            } else {
+                None
+            };
+
             json!({
                 "ruleId": f.rule_id,
                 "ruleIndex": seen_rules.get(&f.rule_id).copied().unwrap_or(0),
@@ -151,6 +171,8 @@ pub fn to_sarif_json(findings: &[LatticeFinding], verified: &[VerifiedFinding]) 
                     "confidence": conf_tag,
                     "verificationStatus": status_tag,
                     "missingGuard": format!("{:?}", f.missing_guard),
+                    "vexProvenance": vex_tier,
+                    "proofReasons": f.proof_reasons,
                 },
                 "partialFingerprints": {
                     "primaryLocationLineHash": fingerprint
@@ -698,5 +720,8 @@ mod tests {
         assert!(vex.contains("pkg:nuget/Newtonsoft.Json@12.0.1"));
         assert!(vex.contains("\"state\": \"exploitable\""));
         assert!(vex.contains("vulnerable_code_not_in_execute_path"));
+        let sarif = to_sarif_json(&findings, &[]);
+        assert!(sarif.contains("\"vexProvenance\": \"ProvenRouteSymbol\""));
+        assert!(sarif.contains("\"vexProvenance\": \"ImportedSafeApiOnly\""));
     }
 }

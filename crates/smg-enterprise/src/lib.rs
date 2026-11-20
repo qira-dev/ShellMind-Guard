@@ -12,6 +12,115 @@ pub use tee::{
     probe_local_tee_hardware, sign_tee_quote, validate_tee_endpoint, verify_tee_attestation_quote,
 };
 
+use anyhow::{Context, Result, bail};
+use ring::signature::{ED25519, Ed25519KeyPair, UnparsedPublicKey};
+use serde::{Deserialize, Serialize};
+
+/// Signed airgapped enterprise verification bundle (`Phase 14B P14-03`) binding a scan's
+/// BLAKE3 report digest, organization ID, and expiry under an offline Ed25519 signature.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AirgappedVerificationBundle {
+    pub org_id: String,
+    pub report_blake3_digest: String,
+    pub binary_blake3: String,
+    pub issued_at_unix: u64,
+    pub expires_at_unix: u64,
+    pub signature_hex: String,
+}
+
+fn airgapped_bundle_signing_bytes(
+    org_id: &str,
+    report_blake3_digest: &str,
+    binary_blake3: &str,
+    issued_at_unix: u64,
+    expires_at_unix: u64,
+) -> Vec<u8> {
+    format!(
+        "smg-airgapped-v1\norg={org_id}\nreport={report_blake3_digest}\nbin={binary_blake3}\niss={issued_at_unix}\nexp={expires_at_unix}"
+    )
+    .into_bytes()
+}
+
+pub fn sign_airgapped_bundle(
+    pkcs8_der: &[u8],
+    org_id: &str,
+    report_blake3_digest: &str,
+    binary_blake3: &str,
+    issued_at_unix: u64,
+    expires_at_unix: u64,
+) -> Result<AirgappedVerificationBundle> {
+    let kp = Ed25519KeyPair::from_pkcs8(pkcs8_der)
+        .map_err(|_| anyhow::anyhow!("invalid Ed25519 PKCS#8 key"))?;
+    let payload = airgapped_bundle_signing_bytes(
+        org_id,
+        report_blake3_digest,
+        binary_blake3,
+        issued_at_unix,
+        expires_at_unix,
+    );
+    let sig = kp.sign(&payload);
+    Ok(AirgappedVerificationBundle {
+        org_id: org_id.to_string(),
+        report_blake3_digest: report_blake3_digest.to_string(),
+        binary_blake3: binary_blake3.to_string(),
+        issued_at_unix,
+        expires_at_unix,
+        signature_hex: encode_hex(sig.as_ref()),
+    })
+}
+
+fn ct_eq_bytes(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Verifies an airgapped verification bundle strictly offline (zero network I/O, fail-closed on
+/// signature tamper, expiry, or report/binary BLAKE3 mismatch).
+pub fn verify_airgapped_bundle_fail_closed(
+    bundle: &AirgappedVerificationBundle,
+    authority_pubkey_32: &[u8; 32],
+    expected_report_digest: &str,
+    expected_binary_blake3: &str,
+    now_unix: u64,
+) -> Result<()> {
+    if bundle.org_id.trim().is_empty() {
+        bail!("airgapped bundle missing org_id");
+    }
+    if now_unix > bundle.expires_at_unix {
+        bail!("airgapped verification bundle expired");
+    }
+    if !ct_eq_bytes(
+        bundle.report_blake3_digest.as_bytes(),
+        expected_report_digest.as_bytes(),
+    ) {
+        bail!("airgapped bundle report BLAKE3 digest mismatch");
+    }
+    if !ct_eq_bytes(
+        bundle.binary_blake3.as_bytes(),
+        expected_binary_blake3.as_bytes(),
+    ) {
+        bail!("airgapped bundle binary BLAKE3 mismatch");
+    }
+    let sig_bytes = hex::decode(&bundle.signature_hex).context("invalid signature_hex")?;
+    let payload = airgapped_bundle_signing_bytes(
+        &bundle.org_id,
+        &bundle.report_blake3_digest,
+        &bundle.binary_blake3,
+        bundle.issued_at_unix,
+        bundle.expires_at_unix,
+    );
+    UnparsedPublicKey::new(&ED25519, authority_pubkey_32)
+        .verify(&payload, &sig_bytes)
+        .map_err(|_| anyhow::anyhow!("airgapped bundle Ed25519 signature verification failed"))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,5 +226,52 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err_many.contains("exceeds 256-file enclave payload limit"));
+    }
+
+    #[test]
+    fn test_sprint8_airgapped_verification_bundle_fail_closed() {
+        let (pkcs8, pubkey) = generate_ed25519_keypair().unwrap();
+        let report_digest = "a".repeat(64);
+        let bin_hash = "b".repeat(64);
+        let now = 1_750_000_000u64;
+        let bundle = sign_airgapped_bundle(
+            &pkcs8,
+            "acme-defense-corp",
+            &report_digest,
+            &bin_hash,
+            now - 60,
+            now + 3600,
+        )
+        .unwrap();
+
+        // Valid airgapped bundle passes strictly offline
+        verify_airgapped_bundle_fail_closed(&bundle, &pubkey, &report_digest, &bin_hash, now)
+            .expect("valid airgapped bundle must verify");
+
+        // Tampered report digest fails closed
+        assert!(
+            verify_airgapped_bundle_fail_closed(&bundle, &pubkey, &"c".repeat(64), &bin_hash, now)
+                .is_err()
+        );
+
+        // Expired bundle fails closed
+        assert!(
+            verify_airgapped_bundle_fail_closed(
+                &bundle,
+                &pubkey,
+                &report_digest,
+                &bin_hash,
+                now + 7200
+            )
+            .is_err()
+        );
+
+        // Tampered org_id fails Ed25519 signature check
+        let mut tampered = bundle.clone();
+        tampered.org_id = "evil-org".into();
+        assert!(
+            verify_airgapped_bundle_fail_closed(&tampered, &pubkey, &report_digest, &bin_hash, now)
+                .is_err()
+        );
     }
 }

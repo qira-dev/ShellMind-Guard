@@ -291,7 +291,7 @@ struct ScanCmdArgs {
     #[arg(
         long,
         value_delimiter = ',',
-        help = "Filter active layers (auth,race,taint,sqli,cmdi,path,ssrf,xss,csrf,idor,secrets,config,deps,frontend,engine,memory,mobile,hw,web3,pqc,deep)"
+        help = "Filter active layers (auth,race,concurrency,taint,sqli,cmdi,path,ssrf,xss,csrf,idor,secrets,config,deps,frontend,cicd,k8s,dos,zip,crypto,queue,api,ai,oauth,smuggle,state,engine,memory,mobile,hw,web3,pqc,deep)"
     )]
     layers: Vec<String>,
     #[arg(

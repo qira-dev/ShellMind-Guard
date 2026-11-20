@@ -156,7 +156,7 @@ fn tool_definitions() -> Value {
                     "layers": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Optional layer filters: auth, race, taint, sqli, cmdi, path, ssrf, xss, csrf, idor, secrets, config, deps, frontend, cicd, k8s, dos, zip, crypto, queue, api, ai, oauth, smuggle, state, engine, memory, mobile, hw, web3, pqc, deep"
+                        "description": "Optional layer filters: auth, race, concurrency, taint, sqli, cmdi, path, ssrf, xss, csrf, idor, secrets, config, deps, frontend, cicd, k8s, dos, zip, crypto, queue, api, ai, oauth, smuggle, state, engine, memory, mobile, hw, web3, pqc, deep"
                     },
                     "min_confidence": {
                         "type": "string",
