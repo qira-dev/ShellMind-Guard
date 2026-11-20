@@ -88,10 +88,34 @@ pub struct CompiledContractArtifact {
 #[derive(Debug, Clone, Default)]
 pub struct Web3Context {
     pub artifacts: HashMap<String, CompiledContractArtifact>,
+    /// Keyed by `(rel_path, contract_name)` so identically named contracts across directories never collide.
+    pub artifacts_by_path: HashMap<(String, String), CompiledContractArtifact>,
     pub is_foundry: bool,
     pub is_hardhat: bool,
     pub is_anchor: bool,
     pub is_move: bool,
+}
+
+impl Web3Context {
+    /// Looks up a compiled contract artifact preferring exact `(rel_path, name)` match,
+    /// then suffix match on `rel_path`, falling back to `artifacts.get(name)`.
+    pub fn lookup_artifact(&self, rel_path: &str, name: &str) -> Option<&CompiledContractArtifact> {
+        let norm = rel_path.replace('\\', "/");
+        if let Some(a) = self
+            .artifacts_by_path
+            .get(&(norm.clone(), name.to_string()))
+        {
+            return Some(a);
+        }
+        if let Some((_, a)) = self
+            .artifacts_by_path
+            .iter()
+            .find(|((p, n), _)| n == name && (p.ends_with(&norm) || norm.ends_with(p.as_str())))
+        {
+            return Some(a);
+        }
+        self.artifacts.get(name)
+    }
 }
 
 /// Returns EVM byte width for common Solidity primitive/reference storage types.
@@ -410,7 +434,13 @@ pub fn ingest_web3_context(project_root: &Path, files: &[IndexedFile]) -> Web3Co
     for dir in ["out", "artifacts", "build/contracts"] {
         let p = project_root.join(dir);
         if p.is_dir() {
-            collect_json_artifacts(&p, project_root, &mut ctx.artifacts, 0);
+            collect_json_artifacts(
+                &p,
+                project_root,
+                &mut ctx.artifacts,
+                &mut ctx.artifacts_by_path,
+                0,
+            );
         }
     }
     ctx
@@ -420,6 +450,7 @@ fn collect_json_artifacts(
     dir: &Path,
     root: &Path,
     out: &mut HashMap<String, CompiledContractArtifact>,
+    out_by_path: &mut HashMap<(String, String), CompiledContractArtifact>,
     depth: usize,
 ) {
     if depth > 4 || out.len() >= 128 {
@@ -436,7 +467,7 @@ fn collect_json_artifacts(
         }
         let p = ent.path();
         if p.is_dir() {
-            collect_json_artifacts(&p, root, out, depth + 1);
+            collect_json_artifacts(&p, root, out, out_by_path, depth + 1);
             continue;
         }
         if p.extension().and_then(|e| e.to_str()) != Some("json") {
@@ -455,6 +486,7 @@ fn collect_json_artifacts(
             continue;
         };
         if let Some(art) = parse_foundry_or_hardhat_artifact(&p, root, &val) {
+            out_by_path.insert((art.rel_path.clone(), art.name.clone()), art.clone());
             out.insert(art.name.clone(), art);
         }
     }

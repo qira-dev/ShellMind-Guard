@@ -143,7 +143,7 @@ impl Language {
             "sol" => Some(Language::Solidity),
             "move" => Some(Language::Move),
             "dockerfile" | "yml" | "yaml" | "toml" | "json" | "ini" | "cfg" | "conf"
-            | "properties" | "pem" | "key" => Some(Language::Config),
+            | "properties" | "pem" | "crt" | "cer" | "key" => Some(Language::Config),
             _ => None,
         }
     }

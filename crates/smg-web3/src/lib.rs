@@ -127,8 +127,7 @@ pub fn scan_web3_repo(
                     }
                     // Prefer compiler `storageLayout` from Foundry/Hardhat when present
                     let slots = ctx
-                        .artifacts
-                        .get(&c.name)
+                        .lookup_artifact(&f.rel_path, &c.name)
                         .filter(|a| !a.storage_slots.is_empty())
                         .map(|a| a.storage_slots.clone())
                         .unwrap_or(c.packed_slots);

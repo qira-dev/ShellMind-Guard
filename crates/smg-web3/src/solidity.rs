@@ -1083,8 +1083,9 @@ pub fn analyze_solidity_file_with_bases(
                 remediation: "Move all mutable state variables into the ERC-7201 namespaced struct (`@custom:storage-location erc7201:...`) so slot 0 remains untouched across upgrades.".into(),
             });
         }
-        let mut stale_vars_exposed_after_call: HashMap<String, usize> = HashMap::new();
-        let artifact = ctx.artifacts.get(&c.name);
+        let mut stale_vars_exposed_after_call: HashMap<String, (usize, String, String)> =
+            HashMap::new();
+        let artifact = ctx.lookup_artifact(rel_path, &c.name);
 
         for f in &c.functions {
             if f.is_constructor || matches!(f.visibility.as_str(), "internal" | "private") {
@@ -1155,7 +1156,9 @@ pub fn analyze_solidity_file_with_bases(
                                 let call_line = call_site.line;
                                 stale_vars_exposed_after_call
                                     .entry(var.clone())
-                                    .or_insert(call_line);
+                                    .or_insert_with(|| {
+                                        (call_line, f.name.clone(), f.params_text.clone())
+                                    });
                                 let mut conf = Confidence::Confirmed;
                                 let mut proof_note = String::new();
                                 if let Some(art) = artifact
@@ -1277,21 +1280,40 @@ pub fn analyze_solidity_file_with_bases(
                 }
                 for op in &vf.ops {
                     if let EffectOp::ReadState { var, .. } = op
-                        && stale_vars_exposed_after_call.contains_key(var)
+                        && let Some((_, mut_name, mut_params)) =
+                            stale_vars_exposed_after_call.get(var)
                     {
+                        let mut conf = Confidence::Confirmed;
+                        let mut proof_note = String::new();
+                        if let Some(art) = artifact
+                            && !art.deployed_bytecode.is_empty()
+                        {
+                            let mut_cd = build_withdraw_probe_calldata(mut_name, mut_params, art);
+                            let view_cd =
+                                build_withdraw_probe_calldata(&vf.name, &vf.params_text, art);
+                            let vres = crate::evm_oracle::probe_view_reentrancy_in_revm(
+                                &art.deployed_bytecode,
+                                &mut_cd,
+                                &view_cd,
+                            );
+                            if vres.proven {
+                                conf = Confidence::Proven;
+                                proof_note = format!(" [{}]", vres.summary);
+                            }
+                        }
                         findings.push(LocalStaticFinding {
                             rule_id: "SMG-WEB3-REENTRANCY".into(),
                             severity: "HIGH".into(),
                             title: format!(
-                                "Read-only reentrancy exposure: view `{}.{}` reads `{}` without lock check while mutator leaves state stale across callback",
-                                c.name, vf.name, var
+                                "Read-only reentrancy exposure: view `{}.{}` reads `{}` without lock check while mutator leaves state stale across callback{}",
+                                c.name, vf.name, var, proof_note
                             ),
                             rel_path: rel_path.into(),
                             line: vf.start_line,
                             symbol: format!("{}.{}", c.name, vf.name),
                             sink_kind: SinkKind::BalanceUpdate,
                             missing_guard: GuardKind::TxLock,
-                            confidence: Confidence::Confirmed,
+                            confidence: conf,
                             remediation: "Protect dependent pricing views with a non-reentrant lock check (e.g. `_reentrancyGuardEntered()` revert) and enforce CEI.".into(),
                         });
                         break;
