@@ -35,6 +35,13 @@ pub fn canonical_ecosystem(raw: &str) -> Option<&'static str> {
         "rubygems" | "ruby" | "gem" => Some("RubyGems"),
         "pub" | "dart" | "flutter" => Some("Pub"),
         "nuget" | "dotnet" | "csharp" | "c#" => Some("NuGet"),
+        "hex" | "elixir" | "mix" => Some("Hex"),
+        "debian" => Some("Debian"),
+        "alpine" => Some("Alpine"),
+        "ubuntu" => Some("Ubuntu"),
+        "rocky linux" | "rocky" => Some("Rocky Linux"),
+        "almalinux" | "alma" => Some("AlmaLinux"),
+        "red hat" | "rhel" => Some("Red Hat"),
         _ => None,
     }
 }

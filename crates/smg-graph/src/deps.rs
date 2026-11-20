@@ -1888,10 +1888,149 @@ pub fn extract_resolved_dependencies(rel_path: &str, content: &str) -> Vec<Resol
                 });
             }
         }
+        "go.sum" => {
+            let mut seen_go: HashSet<(String, String)> = HashSet::new();
+            for (idx, line) in content.lines().enumerate() {
+                let mut parts = line.split_whitespace();
+                let (Some(mod_path), Some(raw_ver)) = (parts.next(), parts.next()) else {
+                    continue;
+                };
+                if raw_ver.ends_with("/go.mod") {
+                    continue;
+                }
+                let ver = raw_ver.trim_start_matches('v').to_string();
+                if is_floating_version(&ver) || is_go_pseudo_version(&ver) {
+                    continue;
+                }
+                if seen_go.insert((mod_path.to_string(), ver.clone())) {
+                    out.push(ResolvedDependency {
+                        ecosystem: "Go".into(),
+                        name: mod_path.to_string(),
+                        version: ver,
+                        line: idx + 1,
+                    });
+                }
+            }
+        }
+        "Pipfile.lock" => {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(content) {
+                for sec in ["default", "develop"] {
+                    if let Some(obj) = val.get(sec).and_then(|v| v.as_object()) {
+                        for (name, info) in obj {
+                            if let Some(raw_ver) = info.get("version").and_then(|v| v.as_str())
+                                && let Some(ver) = clean_semver_str(raw_ver)
+                            {
+                                out.push(ResolvedDependency {
+                                    ecosystem: "PyPI".into(),
+                                    name: name.clone(),
+                                    version: ver,
+                                    line: 1,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        "mix.lock" => {
+            // Elixir Hex lockfile: `"phoenix": {:hex, :phoenix, "1.7.14", ...}`
+            for (idx, line) in content.lines().enumerate() {
+                let trimmed = line.trim();
+                if let Some((_, rest)) = trimmed.split_once(":hex,") {
+                    let mut parts = rest.split(',');
+                    let name_part = parts.next().unwrap_or("").trim().trim_start_matches(':');
+                    let ver_part = parts.next().unwrap_or("").trim().trim_matches('"');
+                    if !name_part.is_empty() && !ver_part.is_empty() {
+                        out.push(ResolvedDependency {
+                            ecosystem: "Hex".into(),
+                            name: name_part.to_string(),
+                            version: ver_part.to_string(),
+                            line: idx + 1,
+                        });
+                    }
+                }
+            }
+        }
+        "gradle.lockfile" => {
+            // `group:artifact:version=configurations`
+            for (idx, line) in content.lines().enumerate() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("empty=") {
+                    continue;
+                }
+                let coord = trimmed.split('=').next().unwrap_or("").trim();
+                let parts: Vec<&str> = coord.split(':').collect();
+                if parts.len() >= 3 && !parts[0].is_empty() && !parts[1].is_empty() && !parts[2].is_empty() {
+                    out.push(ResolvedDependency {
+                        ecosystem: "Maven".into(),
+                        name: format!("{}:{}", parts[0], parts[1]),
+                        version: parts[2].to_string(),
+                        line: idx + 1,
+                    });
+                }
+            }
+        }
+        "pom.xml" => {
+            // Lightweight deterministic `<dependency>` extractor for Maven `pom.xml`
+            let mut in_dep = false;
+            let mut cur_group = String::new();
+            let mut cur_artifact = String::new();
+            let mut cur_version = String::new();
+            let mut dep_line = 1usize;
+            for (idx, line) in content.lines().enumerate() {
+                let t = line.trim();
+                if t.contains("<dependency>") {
+                    in_dep = true;
+                    cur_group.clear();
+                    cur_artifact.clear();
+                    cur_version.clear();
+                    dep_line = idx + 1;
+                    continue;
+                }
+                if in_dep {
+                    if let Some(v) = extract_xml_tag_value(t, "groupId") {
+                        cur_group = v;
+                    } else if let Some(v) = extract_xml_tag_value(t, "artifactId") {
+                        cur_artifact = v;
+                    } else if let Some(v) = extract_xml_tag_value(t, "version") {
+                        cur_version = v;
+                    }
+                    if t.contains("</dependency>") {
+                        in_dep = false;
+                        if !cur_group.is_empty()
+                            && !cur_artifact.is_empty()
+                            && !cur_version.is_empty()
+                            && !cur_version.contains("${")
+                        {
+                            out.push(ResolvedDependency {
+                                ecosystem: "Maven".into(),
+                                name: format!("{cur_group}:{cur_artifact}"),
+                                version: cur_version.clone(),
+                                line: dep_line,
+                            });
+                        }
+                    }
+                }
+            }
+        }
         _ => {}
     }
 
     out
+}
+
+fn extract_xml_tag_value(line: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = line.find(&open)? + open.len();
+    let rest = &line[start..];
+    let end = rest.find(&close)?;
+    let val = rest[..end].trim();
+    if val.is_empty() {
+        None
+    } else {
+        Some(val.to_string())
+    }
 }
 
 /// Parses a package header line in `yarn.lock` (v1 or Berry v2+), e.g.:
@@ -2995,5 +3134,39 @@ app.post('/api/profile', requireAuth, (req, res) => {
             "2000-pkg pnpm-lock.yaml graph took {}ms (must be linear!)",
             elapsed_ms
         );
+    }
+
+    #[test]
+    fn test_phase22_extended_lockfile_parsers() {
+        let gosum = "github.com/gin-gonic/gin v1.9.1 h1:abc=\ngithub.com/gin-gonic/gin v1.9.1/go.mod h1:def=\n";
+        let go_deps = extract_resolved_dependencies("go.sum", gosum);
+        assert_eq!(go_deps.len(), 1);
+        assert_eq!(go_deps[0].ecosystem, "Go");
+        assert_eq!(go_deps[0].name, "github.com/gin-gonic/gin");
+        assert_eq!(go_deps[0].version, "1.9.1");
+
+        let pipfile = r#"{"default":{"requests":{"version":"==2.31.0"}},"develop":{"pytest":{"version":"==8.2.0"}}}"#;
+        let py_deps = extract_resolved_dependencies("Pipfile.lock", pipfile);
+        assert_eq!(py_deps.len(), 2);
+        assert!(py_deps.iter().any(|d| d.name == "requests" && d.version == "2.31.0"));
+
+        let mix = r#"%{ "phoenix": {:hex, :phoenix, "1.7.14", "hash", [:mix], [], "hexpm", "hash2"} }"#;
+        let hex_deps = extract_resolved_dependencies("mix.lock", mix);
+        assert_eq!(hex_deps.len(), 1);
+        assert_eq!(hex_deps[0].ecosystem, "Hex");
+        assert_eq!(hex_deps[0].name, "phoenix");
+        assert_eq!(hex_deps[0].version, "1.7.14");
+
+        let gradle = "# comment\norg.apache.logging.log4j:log4j-core:2.14.1=compileClasspath\nempty=\n";
+        let grad_deps = extract_resolved_dependencies("gradle.lockfile", gradle);
+        assert_eq!(grad_deps.len(), 1);
+        assert_eq!(grad_deps[0].ecosystem, "Maven");
+        assert_eq!(grad_deps[0].name, "org.apache.logging.log4j:log4j-core");
+
+        let pom = "<dependencies><dependency>\n<groupId>com.fasterxml.jackson.core</groupId>\n<artifactId>jackson-databind</artifactId>\n<version>2.13.4</version>\n</dependency></dependencies>";
+        let pom_deps = extract_resolved_dependencies("pom.xml", pom);
+        assert_eq!(pom_deps.len(), 1);
+        assert_eq!(pom_deps[0].name, "com.fasterxml.jackson.core:jackson-databind");
+        assert_eq!(pom_deps[0].version, "2.13.4");
     }
 }

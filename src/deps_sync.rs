@@ -84,6 +84,18 @@ fn to_osv_ecosystem(eco: &str) -> &str {
         "pypi" | "pip" | "python" => "PyPI",
         "crates.io" | "cargo" | "rust" => "crates.io",
         "go" | "golang" => "Go",
+        "maven" | "gradle" | "java" => "Maven",
+        "packagist" | "composer" | "php" => "Packagist",
+        "rubygems" | "ruby" => "RubyGems",
+        "pub" | "dart" | "flutter" => "Pub",
+        "nuget" | "dotnet" | "csharp" => "NuGet",
+        "hex" | "elixir" | "mix" => "Hex",
+        "debian" => "Debian",
+        "alpine" => "Alpine",
+        "ubuntu" => "Ubuntu",
+        "rocky linux" | "rocky" => "Rocky Linux",
+        "almalinux" | "alma" => "AlmaLinux",
+        "red hat" | "rhel" => "Red Hat",
         _ => eco.trim(),
     }
 }

@@ -90,6 +90,7 @@ impl Language {
                 | "Package.resolved"
                 | "pubspec.yaml"
                 | "pubspec.lock"
+                | "mix.lock"
                 | ".npmrc"
         ) {
             return Some(Language::Manifest);

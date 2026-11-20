@@ -1,6 +1,7 @@
 mod deps_sync;
 mod live_verify;
 mod mcp;
+mod oci_image;
 mod rules_catalog;
 
 use anyhow::Context;
@@ -426,6 +427,11 @@ struct ScanCmdArgs {
         help = "When combined with --verify-live, keep only confirmed-live secrets (mirrors trufflehog --only-verified)"
     )]
     only_verified: bool,
+    #[arg(
+        long,
+        help = "Opt-in live OSV.dev advisory sync before scanning dependencies (OSV-Scanner live parity; OFF by default)"
+    )]
+    online_osv: bool,
     #[arg(long)]
     html: Option<PathBuf>,
     #[arg(long)]
@@ -571,6 +577,26 @@ enum Commands {
     Deps {
         #[command(subcommand)]
         action: DepsAction,
+    },
+    /// Scan an OCI/Docker container image (.tar/.tar.gz) or unpacked rootfs for OS (dpkg/apk) & app CVEs (Trivy parity)
+    Image {
+        /// Path to OCI/Docker image tar archive or unpacked rootfs directory
+        target: PathBuf,
+        #[arg(
+            long,
+            help = "Sync live OSV.dev advisories for extracted OS & app packages before matching"
+        )]
+        online_osv: bool,
+        #[arg(long, default_value = deps_sync::DEFAULT_OSV_BASE_URL)]
+        osv_url: String,
+        #[arg(long, help = "Emit machine-readable JSON report")]
+        json: bool,
+        #[arg(
+            long,
+            value_enum,
+            help = "Exit non-zero if any image vulnerability meets this severity"
+        )]
+        fail_on: Option<FailSeverity>,
     },
     /// Confidential Compute Remote TEE Attestation & Commercial Ed25519 License Management
     Enterprise {
@@ -1837,6 +1863,7 @@ pub fn run_cli() -> Result<ExitCode> {
                 gitleaks_config,
                 verify_live,
                 only_verified,
+                online_osv,
                 html,
                 patch,
                 unsafe_host_fallback,
@@ -1862,6 +1889,24 @@ pub fn run_cli() -> Result<ExitCode> {
                     "[SMG] Scanning {} with live sandbox exploit verification...",
                     path.display()
                 );
+            }
+            if online_osv {
+                let smg_cfg = ShellMindGuardConfig::load_from_dir(&path)?;
+                let deps = deps_sync::extract_project_dependencies(&path, &smg_cfg)?;
+                if !deps.is_empty() {
+                    let mut adv_store = smg_core::AdvisoryStore::open_default()?;
+                    let sync_sum = deps_sync::sync_osv_to_store(
+                        deps_sync::DEFAULT_OSV_BASE_URL,
+                        &deps,
+                        &mut adv_store,
+                    )?;
+                    if std::io::stderr().is_terminal() {
+                        eprintln!(
+                            "[SMG] --online-osv synced {} package(s) -> {} unique vuln(s)",
+                            sync_sum.dependencies_queried, sync_sum.unique_vulns_fetched
+                        );
+                    }
+                }
             }
             let mut outcome = execute_scan_pipeline_full(
                 ScanRunOptions {
@@ -1896,6 +1941,13 @@ pub fn run_cli() -> Result<ExitCode> {
                 only_verified,
                 &mut outcome,
             )?;
+            if let Some(trivy_ignore) = oci_image::TrivyIgnore::load(&path) {
+                outcome.graph.findings.retain(|f| {
+                    !(f.rule_id.starts_with("SMG-DEP-")
+                        && (trivy_ignore.is_ignored(&f.title)
+                            || trivy_ignore.is_ignored(&f.rule_id)))
+                });
+            }
             let mut verified_list: Vec<VerifiedFinding> = outcome
                 .sandbox
                 .as_ref()
@@ -2520,6 +2572,61 @@ pub fn run_cli() -> Result<ExitCode> {
                 return handle_claude_pre_commit();
             }
         },
+        Commands::Image {
+            target,
+            online_osv,
+            osv_url,
+            json,
+            fail_on,
+        } => {
+            let report = oci_image::scan_oci_image(&target, online_osv, &osv_url)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "ShellMind Guard Image | {} | OS: {} {} | Packages: {} | Vulns: {}",
+                    report.target,
+                    report.os_family,
+                    report.os_version,
+                    report.packages_scanned,
+                    report.findings.len()
+                );
+                for f in &report.findings {
+                    let fix = f.fixed_version.as_deref().unwrap_or("none");
+                    println!(
+                        "  [{}] {} ({}) {}@{} -> fixed: {} [{}]",
+                        f.severity,
+                        f.advisory_id,
+                        f.ecosystem,
+                        f.package,
+                        f.installed_version,
+                        fix,
+                        f.source_layer
+                    );
+                }
+            }
+            if let Some(threshold) = fail_on {
+                let threshold_rank = match threshold {
+                    FailSeverity::Critical => 4,
+                    FailSeverity::High => 3,
+                    FailSeverity::Medium => 2,
+                    FailSeverity::Low => 1,
+                };
+                let failed = report.findings.iter().any(|f| {
+                    let rank = match f.severity.to_ascii_uppercase().as_str() {
+                        "CRITICAL" => 4,
+                        "HIGH" => 3,
+                        "MEDIUM" => 2,
+                        "LOW" => 1,
+                        _ => 0,
+                    };
+                    rank >= threshold_rank
+                });
+                if failed {
+                    return Ok(ExitCode::from(1));
+                }
+            }
+        }
         Commands::Deps { action } => match action {
             DepsAction::Sync {
                 path,
