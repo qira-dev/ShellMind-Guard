@@ -2392,7 +2392,11 @@ pub fn check_cross_fn_irq_deadlocks(
     let mut out = Vec::new();
     let mut isr_locks: HashSet<&str> = HashSet::new();
     for s in &work {
-        if s.is_isr {
+        let path_low = s.rel_path.replace('\\', "/").to_ascii_lowercase();
+        let is_hosted_sim_port = path_low.contains("/posix/")
+            || path_low.contains("/mingw")
+            || path_low.contains("/msvc");
+        if s.is_isr && !is_hosted_sim_port {
             for l in &s.acquired_locks {
                 isr_locks.insert(l.as_str());
             }

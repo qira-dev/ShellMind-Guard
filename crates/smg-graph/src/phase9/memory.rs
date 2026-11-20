@@ -556,7 +556,9 @@ fn scan_c_cpp_function(
                     let tok = &c[1];
                     tok != "sizeof"
                         && tok != "strlen"
-                        && !tok.chars().all(|ch| ch.is_ascii_uppercase() || ch == '_')
+                        && !tok
+                            .chars()
+                            .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
                 });
                 if has_arith
                     && non_const

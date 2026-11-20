@@ -51,7 +51,7 @@ fn load_or_parse_summaries_cached(
     let cfg_json = serde_json::to_string(&cfg.guards).unwrap_or_default();
     let adv_stamp = smg_core::advisories_db_stamp();
     let versioned_cfg = format!(
-        "v28-phase18-c-memory-{}|{}|{}|{}",
+        "v29-phase20a-hw-{}|{}|{}|{}",
         env!("CARGO_PKG_VERSION"),
         adv_stamp,
         cfg.scan.deep_audit,

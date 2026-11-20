@@ -491,6 +491,8 @@ void safe_hash_and_alloc(const char *host, size_t hlen, const char *dom, size_t 
     if (!buf) return;
     memcpy(buf, host, hlen);
     memcpy(buf + hlen, dom, dlen);
+    void *stk = malloc(sizeof(int) * TASK1_STACK_SIZE);
+    free(stk);
     free(buf);
 }
 "#;
@@ -499,8 +501,8 @@ void safe_hash_and_alloc(const char *host, size_t hlen, const char *dom, size_t 
         !safe_res
             .findings
             .iter()
-            .any(|f| f.rule_id == "SMG-MEM-BOUNDS"),
-        "Compile-time macro and multi-field calloc-sized memcpy must not FP, got: {:#?}",
+            .any(|f| matches!(f.rule_id.as_str(), "SMG-MEM-BOUNDS" | "SMG-ENG-INT")),
+        "Compile-time macro (including digits like TASK1_STACK_SIZE) and multi-field calloc-sized memcpy must not FP, got: {:#?}",
         safe_res.findings
     );
 
