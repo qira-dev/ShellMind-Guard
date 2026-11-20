@@ -277,6 +277,11 @@ impl WrappedInterval {
         self.tnum = self.tnum.masked(self.width_bits);
         self.umin &= wmask;
         self.umax &= wmask;
+        if self.umin > self.umax {
+            // Normalize inverted/empty interval (e.g. conflicting guard tightening or width-mask wrap)
+            // so `clamp(self.umin, self.umax)` can never panic.
+            self.umax = self.umin;
+        }
 
         for _ in 0..4 {
             let prev = (self.umin, self.umax, self.tnum);
@@ -587,5 +592,20 @@ mod tests {
         // Beyond MAX_OCTAGON_VARS=12 degrades safely without blowup
         let capped = SparseOctagon::new(MAX_OCTAGON_VARS + 1);
         assert!(capped.overflowed_pack_cap);
+    }
+
+    #[test]
+    fn inverted_interval_reduce_never_panics() {
+        let mut s = WrappedInterval {
+            smin: 60,
+            smax: 59,
+            umin: 60,
+            umax: 59,
+            tnum: Tnum::constant(0),
+            signed_wrap: false,
+            width_bits: 32,
+        };
+        s.reduce();
+        assert!(s.umin <= s.umax);
     }
 }
