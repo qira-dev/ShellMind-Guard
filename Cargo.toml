@@ -23,16 +23,22 @@ description = "Deterministic multi-file AST Guard-Set Lattice & Bubblewrap PoC v
 
 [workspace.dependencies]
 anyhow = "1.0"
+base64 = "0.22"
 blake3 = "1.5"
 clap = { version = "4.5", features = ["derive"] }
 ignore = "0.4"
+md-5 = "0.10"
 petgraph = "0.6"
 rayon = "1.10"
+regex = "1"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls-no-provider", "charset", "http2"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+serde_yaml_ng = "0.10"
+sha1 = "0.10"
+sha2 = "0.10"
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -75,11 +81,18 @@ test = false
 
 [dependencies]
 anyhow.workspace = true
+base64.workspace = true
+blake3.workspace = true
 clap.workspace = true
+md-5.workspace = true
+regex.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml_ng.workspace = true
+sha1.workspace = true
+sha2.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 smg-core = { path = "crates/smg-core" }

@@ -1,4 +1,5 @@
 mod palette;
+pub mod proxy_tui;
 mod session;
 mod views;
 

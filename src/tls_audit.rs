@@ -355,7 +355,10 @@ pub fn run_tls_audit(target: &str) -> Result<TlsAuditReport> {
                 "Weak/deprecated cipher accepted: {}",
                 cipher_suite_name(sh.cipher_suite)
             ),
-            detail: format!("Server accepted weak cipher suite 0x{:04x}", sh.cipher_suite),
+            detail: format!(
+                "Server accepted weak cipher suite 0x{:04x}",
+                sh.cipher_suite
+            ),
             remediation: "Remove RC4, 3DES, EXPORT, NULL, and non-FS CBC suites from TLS config."
                 .into(),
         });

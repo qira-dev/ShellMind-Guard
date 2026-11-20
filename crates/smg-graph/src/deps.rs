@@ -1960,7 +1960,11 @@ pub fn extract_resolved_dependencies(rel_path: &str, content: &str) -> Vec<Resol
                 }
                 let coord = trimmed.split('=').next().unwrap_or("").trim();
                 let parts: Vec<&str> = coord.split(':').collect();
-                if parts.len() >= 3 && !parts[0].is_empty() && !parts[1].is_empty() && !parts[2].is_empty() {
+                if parts.len() >= 3
+                    && !parts[0].is_empty()
+                    && !parts[1].is_empty()
+                    && !parts[2].is_empty()
+                {
                     out.push(ResolvedDependency {
                         ecosystem: "Maven".into(),
                         name: format!("{}:{}", parts[0], parts[1]),
@@ -3148,16 +3152,22 @@ app.post('/api/profile', requireAuth, (req, res) => {
         let pipfile = r#"{"default":{"requests":{"version":"==2.31.0"}},"develop":{"pytest":{"version":"==8.2.0"}}}"#;
         let py_deps = extract_resolved_dependencies("Pipfile.lock", pipfile);
         assert_eq!(py_deps.len(), 2);
-        assert!(py_deps.iter().any(|d| d.name == "requests" && d.version == "2.31.0"));
+        assert!(
+            py_deps
+                .iter()
+                .any(|d| d.name == "requests" && d.version == "2.31.0")
+        );
 
-        let mix = r#"%{ "phoenix": {:hex, :phoenix, "1.7.14", "hash", [:mix], [], "hexpm", "hash2"} }"#;
+        let mix =
+            r#"%{ "phoenix": {:hex, :phoenix, "1.7.14", "hash", [:mix], [], "hexpm", "hash2"} }"#;
         let hex_deps = extract_resolved_dependencies("mix.lock", mix);
         assert_eq!(hex_deps.len(), 1);
         assert_eq!(hex_deps[0].ecosystem, "Hex");
         assert_eq!(hex_deps[0].name, "phoenix");
         assert_eq!(hex_deps[0].version, "1.7.14");
 
-        let gradle = "# comment\norg.apache.logging.log4j:log4j-core:2.14.1=compileClasspath\nempty=\n";
+        let gradle =
+            "# comment\norg.apache.logging.log4j:log4j-core:2.14.1=compileClasspath\nempty=\n";
         let grad_deps = extract_resolved_dependencies("gradle.lockfile", gradle);
         assert_eq!(grad_deps.len(), 1);
         assert_eq!(grad_deps[0].ecosystem, "Maven");
@@ -3166,7 +3176,10 @@ app.post('/api/profile', requireAuth, (req, res) => {
         let pom = "<dependencies><dependency>\n<groupId>com.fasterxml.jackson.core</groupId>\n<artifactId>jackson-databind</artifactId>\n<version>2.13.4</version>\n</dependency></dependencies>";
         let pom_deps = extract_resolved_dependencies("pom.xml", pom);
         assert_eq!(pom_deps.len(), 1);
-        assert_eq!(pom_deps[0].name, "com.fasterxml.jackson.core:jackson-databind");
+        assert_eq!(
+            pom_deps[0].name,
+            "com.fasterxml.jackson.core:jackson-databind"
+        );
         assert_eq!(pom_deps[0].version, "2.13.4");
     }
 }

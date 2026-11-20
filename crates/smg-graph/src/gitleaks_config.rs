@@ -273,7 +273,10 @@ impl GitleaksConfig {
                     continue;
                 }
                 let desc = if rule.description.is_empty() {
-                    format!("Custom `.gitleaks.toml` rule `{}` matched credential", rule.id)
+                    format!(
+                        "Custom `.gitleaks.toml` rule `{}` matched credential",
+                        rule.id
+                    )
                 } else {
                     format!("{} (custom rule `{}`)", rule.description, rule.id)
                 };
@@ -347,10 +350,25 @@ entropy = 3.0
         let cfg = GitleaksConfig::parse_toml(toml).expect("valid gitleaks toml");
         assert!(cfg.is_allowed("tests/fixtures/a.py", None, "k = 1", "tok"));
         assert!(cfg.is_allowed("src/app.py", Some("deadbeef1234567890"), "k = 1", "tok"));
-        assert!(cfg.is_allowed("src/app.py", None, "k = 'example_dummy_999'", "example_dummy_999"));
-        assert!(cfg.is_allowed("docs/guide.md", None, "DEMO_TOKEN_12345", "DEMO_TOKEN_12345"));
+        assert!(cfg.is_allowed(
+            "src/app.py",
+            None,
+            "k = 'example_dummy_999'",
+            "example_dummy_999"
+        ));
+        assert!(cfg.is_allowed(
+            "docs/guide.md",
+            None,
+            "DEMO_TOKEN_12345",
+            "DEMO_TOKEN_12345"
+        ));
         assert!(!cfg.is_allowed("src/app.rs", None, "DEMO_TOKEN_12345", "DEMO_TOKEN_12345"));
-        assert!(cfg.is_allowed("src/app.rs", None, "let x = 'abc'; // gitleaks:allow", "abc"));
+        assert!(cfg.is_allowed(
+            "src/app.rs",
+            None,
+            "let x = 'abc'; // gitleaks:allow",
+            "abc"
+        ));
 
         let hits = cfg.scan_custom_rules_line(
             "src/client.rs",

@@ -151,7 +151,10 @@ pub fn parse_dpkg_status(content: &str, ecosystem: &str) -> Vec<ResolvedDependen
     let mut ver = String::new();
     let mut installed = true;
 
-    let flush = |pkg: &mut String, ver: &mut String, installed: &mut bool, out: &mut Vec<ResolvedDependency>| {
+    let flush = |pkg: &mut String,
+                 ver: &mut String,
+                 installed: &mut bool,
+                 out: &mut Vec<ResolvedDependency>| {
         if *installed && !pkg.is_empty() && !ver.is_empty() {
             out.push(ResolvedDependency {
                 ecosystem: ecosystem.to_string(),
@@ -230,10 +233,7 @@ where
         }
         let name_end = header[0..100].iter().position(|&b| b == 0).unwrap_or(100);
         let name = String::from_utf8_lossy(&header[0..name_end]).to_string();
-        let prefix_end = header[345..500]
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(155);
+        let prefix_end = header[345..500].iter().position(|&b| b == 0).unwrap_or(155);
         let prefix = String::from_utf8_lossy(&header[345..345 + prefix_end]).to_string();
         let full_name = if prefix.is_empty() {
             name
@@ -332,9 +332,16 @@ fn inspect_layer_tar(
             for dep in extract_resolved_dependencies(norm, &text) {
                 collected.push((dep, format!("{layer_name}:{norm}")));
             }
-        } else if norm.ends_with(".tar") || norm.ends_with(".tar.gz") || norm.starts_with("blobs/sha256/") {
+        } else if norm.ends_with(".tar")
+            || norm.ends_with(".tar.gz")
+            || norm.starts_with("blobs/sha256/")
+        {
             // Nested Docker/OCI layer blob inside `docker save` archive
-            if data.len() >= 512 && (norm.ends_with("layer.tar") || norm.ends_with(".tar") || norm.ends_with(".tar.gz")) {
+            if data.len() >= 512
+                && (norm.ends_with("layer.tar")
+                    || norm.ends_with(".tar")
+                    || norm.ends_with(".tar.gz"))
+            {
                 inspect_layer_tar(norm, data, os_family, os_version, collected);
             }
         }
@@ -378,7 +385,13 @@ pub fn scan_oci_image(
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("image.tar");
-        inspect_layer_tar(label, &bytes, &mut os_family, &mut os_version, &mut raw_collected);
+        inspect_layer_tar(
+            label,
+            &bytes,
+            &mut os_family,
+            &mut os_version,
+            &mut raw_collected,
+        );
     } else if target.is_dir() {
         // Unpacked rootfs or OCI layout directory
         for rel in ["etc/os-release", "usr/lib/os-release"] {
@@ -491,7 +504,8 @@ mod tests {
     fn make_tar_entry(name: &str, content: &[u8]) -> Vec<u8> {
         let mut header = [0u8; 512];
         let name_bytes = name.as_bytes();
-        header[..name_bytes.len().min(100)].copy_from_slice(&name_bytes[..name_bytes.len().min(100)]);
+        header[..name_bytes.len().min(100)]
+            .copy_from_slice(&name_bytes[..name_bytes.len().min(100)]);
         header[100..108].copy_from_slice(b"0000644\0");
         header[108..116].copy_from_slice(b"0000000\0");
         header[116..124].copy_from_slice(b"0000000\0");
@@ -537,10 +551,20 @@ mod tests {
 
         assert_eq!(os_fam, "Debian");
         assert_eq!(os_ver, "12");
-        assert!(collected.iter().any(|(d, _)| d.ecosystem == "Debian" && d.name == "openssl" && d.version == "3.0.11-1~deb12u2"));
+        assert!(collected.iter().any(|(d, _)| d.ecosystem == "Debian"
+            && d.name == "openssl"
+            && d.version == "3.0.11-1~deb12u2"));
         assert!(!collected.iter().any(|(d, _)| d.name == "removed-pkg"));
-        assert!(collected.iter().any(|(d, _)| d.ecosystem == "Alpine" && d.name == "busybox"));
-        assert!(collected.iter().any(|(d, _)| d.ecosystem == "Alpine" && d.name == "musl"));
+        assert!(
+            collected
+                .iter()
+                .any(|(d, _)| d.ecosystem == "Alpine" && d.name == "busybox")
+        );
+        assert!(
+            collected
+                .iter()
+                .any(|(d, _)| d.ecosystem == "Alpine" && d.name == "musl")
+        );
     }
 
     #[test]

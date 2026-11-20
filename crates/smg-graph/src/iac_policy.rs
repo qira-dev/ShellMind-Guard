@@ -804,7 +804,9 @@ pub fn evaluate_hcl_resource_policies(res: &HclResourceView<'_>) -> Vec<LocalSta
 }
 
 /// Parses an optional custom user IaC policy pack from JSON.
-pub fn parse_custom_policy_pack_json(json_str: &str) -> Result<Vec<IacPolicySpec>, serde_json::Error> {
+pub fn parse_custom_policy_pack_json(
+    json_str: &str,
+) -> Result<Vec<IacPolicySpec>, serde_json::Error> {
     serde_json::from_str(json_str)
 }
 

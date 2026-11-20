@@ -68,8 +68,8 @@ pub struct IdorAuditReport {
 }
 
 pub fn is_lab_or_loopback_url(base_url: &str) -> Result<bool> {
-    let parsed = reqwest::Url::parse(base_url)
-        .with_context(|| format!("Invalid base_url '{base_url}'"))?;
+    let parsed =
+        reqwest::Url::parse(base_url).with_context(|| format!("Invalid base_url '{base_url}'"))?;
     let host = parsed
         .host_str()
         .ok_or_else(|| anyhow::anyhow!("base_url is missing host"))?;
@@ -117,7 +117,10 @@ pub fn run_idor_audit_config(cfg: &IdorTestConfig, allow_remote: bool) -> Result
         let method = reqwest::Method::from_bytes(chk.method.trim().to_ascii_uppercase().as_bytes())
             .unwrap_or(reqwest::Method::GET);
         // Strictly restrict to non-destructive read methods in automated regression mode
-        if !matches!(method, reqwest::Method::GET | reqwest::Method::HEAD | reqwest::Method::OPTIONS) {
+        if !matches!(
+            method,
+            reqwest::Method::GET | reqwest::Method::HEAD | reqwest::Method::OPTIONS
+        ) {
             outcomes.push(IdorCheckOutcome {
                 name: chk.name.clone(),
                 method: chk.method.clone(),
@@ -126,7 +129,9 @@ pub fn run_idor_audit_config(cfg: &IdorTestConfig, allow_remote: bool) -> Result
                 user_b_status: 0,
                 unauth_status: 0,
                 verdict: "INCONCLUSIVE".into(),
-                detail: "Skipped non-read HTTP method in safe regression mode (GET/HEAD/OPTIONS only).".into(),
+                detail:
+                    "Skipped non-read HTTP method in safe regression mode (GET/HEAD/OPTIONS only)."
+                        .into(),
             });
             continue;
         }
@@ -234,7 +239,9 @@ mod tests {
         // Handle 6 requests (2 endpoints x 3 identities: user_a, user_b, unauth)
         thread::spawn(move || {
             for _ in 0..6 {
-                let Ok((mut stream, _)) = listener.accept() else { break };
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
                 let mut buf = [0u8; 2048];
                 let n = stream.read(&mut buf).unwrap_or(0);
                 let req = String::from_utf8_lossy(&buf[..n]);

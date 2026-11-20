@@ -7,7 +7,9 @@
 
 use reqwest::blocking::Client;
 use reqwest::redirect::Policy;
-use smg_graph::{Confidence, LatticeFinding, SecretCandidate, extract_aws_secret_near, extract_tokens_from_line};
+use smg_graph::{
+    Confidence, LatticeFinding, SecretCandidate, extract_aws_secret_near, extract_tokens_from_line,
+};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -473,7 +475,10 @@ fn verify_aws_sts(
         sha256_hex(canonical_request.as_bytes())
     );
 
-    let k_date = hmac_sha256(format!("AWS4{aws_signing_cred}").as_bytes(), date_stamp.as_bytes());
+    let k_date = hmac_sha256(
+        format!("AWS4{aws_signing_cred}").as_bytes(),
+        date_stamp.as_bytes(),
+    );
     let k_region = hmac_sha256(&k_date, region.as_bytes());
     let k_service = hmac_sha256(&k_region, service.as_bytes());
     let k_signing = hmac_sha256(&k_service, b"aws4_request");
@@ -868,7 +873,13 @@ mod tests {
 
         let rl_url = spawn_one_shot_http("429 Too Many Requests", r#"{"message":"rate limit"}"#);
         let st3 = verify_single_token(&client, &fake_gh, None, Some(&rl_url));
-        assert!(matches!(st3, LiveVerifyStatus::Unverified { provider: "GitHub", .. }));
+        assert!(matches!(
+            st3,
+            LiveVerifyStatus::Unverified {
+                provider: "GitHub",
+                ..
+            }
+        ));
     }
 
     #[test]

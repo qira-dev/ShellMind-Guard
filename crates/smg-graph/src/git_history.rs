@@ -373,10 +373,7 @@ mod tests {
 
     #[test]
     fn detects_deleted_secret_in_git_history_and_respects_gitleaks_allowlist() {
-        let tmp = std::env::temp_dir().join(format!(
-            "smg_githist_test_{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("smg_githist_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
 
@@ -398,7 +395,11 @@ mod tests {
         run_git(&["init", "-b", "main"]);
         // Commit 1: leak a real-shaped GitHub PAT (synthetic, high entropy)
         let fake_pat = ["ghp_", "9kLm2nPq7rSt4vWx8yZa3bCd6eFg1hIj5kLm"].concat();
-        fs::write(tmp.join("config.py"), format!("GITHUB_TOKEN = \"{fake_pat}\"\n")).unwrap();
+        fs::write(
+            tmp.join("config.py"),
+            format!("GITHUB_TOKEN = \"{fake_pat}\"\n"),
+        )
+        .unwrap();
         run_git(&["add", "."]);
         run_git(&["commit", "-m", "initial commit with leaked token"]);
 
@@ -411,7 +412,11 @@ mod tests {
         let commit1_sha = String::from_utf8_lossy(&sha_out.stdout).trim().to_string();
 
         // Commit 2: remove the leaked token from working tree!
-        fs::write(tmp.join("config.py"), "GITHUB_TOKEN = os.environ['GITHUB_TOKEN']\n").unwrap();
+        fs::write(
+            tmp.join("config.py"),
+            "GITHUB_TOKEN = os.environ['GITHUB_TOKEN']\n",
+        )
+        .unwrap();
         run_git(&["add", "."]);
         run_git(&["commit", "-m", "remove leaked token"]);
 
@@ -419,7 +424,9 @@ mod tests {
         let res = scan_git_history(&tmp, None, None, false).unwrap();
         assert_eq!(res.commits_scanned, 2);
         assert!(
-            res.findings.iter().any(|f| f.rule_id == "SMG-SEC-GITHUB" && f.rel_path == "config.py"),
+            res.findings
+                .iter()
+                .any(|f| f.rule_id == "SMG-SEC-GITHUB" && f.rel_path == "config.py"),
             "expected SMG-SEC-GITHUB in git history, got {:?}",
             res.findings
         );
@@ -427,10 +434,9 @@ mod tests {
         assert_eq!(res.candidates[0].raw_token, fake_pat);
 
         // With `.gitleaks.toml` allowlisting commit1_sha: MUST suppress cleanly!
-        let cfg = GitleaksConfig::parse_toml(&format!(
-            "[allowlist]\ncommits = [\"{commit1_sha}\"]\n"
-        ))
-        .unwrap();
+        let cfg =
+            GitleaksConfig::parse_toml(&format!("[allowlist]\ncommits = [\"{commit1_sha}\"]\n"))
+                .unwrap();
         let res2 = scan_git_history(&tmp, None, Some(&cfg), false).unwrap();
         assert!(
             res2.findings.is_empty(),

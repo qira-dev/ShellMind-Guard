@@ -1,9 +1,13 @@
+mod dast_audit;
 mod deps_sync;
 mod idor_audit;
 mod live_verify;
 mod mcp;
 mod oci_image;
+mod proxy;
 mod rules_catalog;
+mod sqli_audit;
+mod templates_audit;
 mod tls_audit;
 
 use anyhow::Context;
@@ -35,9 +39,12 @@ use smg_tui::{TuiLaunchConfig, run_tui};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{IsTerminal, Write};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
-use std::time::Instant;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Default)]
 enum OutputFormat {
@@ -625,6 +632,131 @@ enum Commands {
         allow_remote: bool,
         #[arg(long, help = "Emit machine-readable JSON report")]
         json: bool,
+    },
+    /// Run Nuclei-compatible YAML detection templates against a lab target (Nuclei-class parity)
+    Templates {
+        /// Target http(s)://host[:port] or host[:port]
+        target: String,
+        #[arg(
+            long,
+            value_name = "DIR",
+            help = "Nuclei templates directory (default: ./nuclei-templates)"
+        )]
+        templates: Option<PathBuf>,
+        #[arg(
+            long,
+            value_delimiter = ',',
+            help = "Only run templates with these severities (critical,high,medium,low,info)"
+        )]
+        severity: Vec<String>,
+        #[arg(
+            long,
+            value_delimiter = ',',
+            help = "Only run templates tagged with any of these tags"
+        )]
+        tags: Vec<String>,
+        #[arg(long, default_value_t = 5_000, value_name = "N")]
+        max_templates: usize,
+        #[arg(long, default_value_t = 8_000, value_name = "MS")]
+        timeout_ms: u64,
+        #[arg(
+            long,
+            help = "Allow targeting a non-loopback staging URL (default restricts to loopback/private lab hosts)"
+        )]
+        allow_remote: bool,
+        #[arg(long, help = "Emit machine-readable JSON report")]
+        json: bool,
+        #[arg(
+            long,
+            value_enum,
+            help = "Exit non-zero if any template match meets this severity"
+        )]
+        fail_on: Option<FailSeverity>,
+    },
+    /// Non-destructive SQL injection detection/prover for your own lab endpoints (sqlmap-class detection)
+    Sqli {
+        /// Target URL with the parameter(s) to probe, e.g. http://127.0.0.1:8080/item?id=1
+        url: String,
+        #[arg(long, default_value = "GET", help = "GET or POST (urlencoded)")]
+        method: String,
+        #[arg(
+            long,
+            value_name = "BODY",
+            help = "urlencoded POST body, e.g. \"user=a&pass=b\""
+        )]
+        data: Option<String>,
+        #[arg(
+            long,
+            value_delimiter = ',',
+            help = "Only probe these parameters (default: all query params)"
+        )]
+        param: Vec<String>,
+        #[arg(
+            long,
+            value_delimiter = ',',
+            value_name = "K=V",
+            help = "Extra request headers, e.g. Authorization=Bearer\\ x"
+        )]
+        header: Vec<String>,
+        #[arg(
+            long,
+            default_value_t = 3,
+            value_name = "SECS",
+            help = "Time-based payload delay in seconds"
+        )]
+        delay: u64,
+        #[arg(long, help = "Skip time-based blind probing")]
+        skip_timing: bool,
+        #[arg(
+            long,
+            help = "Allow targeting a non-loopback staging URL (default restricts to loopback/private lab hosts)"
+        )]
+        allow_remote: bool,
+        #[arg(long, help = "Emit machine-readable JSON report")]
+        json: bool,
+    },
+    /// Crawl & audit a lab web app: passive security headers + proof-based active checks (ZAP-class)
+    Dast {
+        /// Seed URL, e.g. http://127.0.0.1:3000
+        url: String,
+        #[arg(long, default_value_t = 30, value_name = "N")]
+        max_pages: usize,
+        #[arg(long, default_value_t = 3, value_name = "N")]
+        max_depth: usize,
+        #[arg(long, help = "Disable active proof checks (passive header audit only)")]
+        passive_only: bool,
+        #[arg(
+            long,
+            value_delimiter = ',',
+            value_name = "K=V",
+            help = "Extra request headers, e.g. Authorization=Bearer\\ x"
+        )]
+        header: Vec<String>,
+        #[arg(
+            long,
+            help = "Allow targeting a non-loopback staging URL (default restricts to loopback/private lab hosts)"
+        )]
+        allow_remote: bool,
+        #[arg(long, help = "Emit machine-readable JSON report")]
+        json: bool,
+    },
+    /// Localhost HTTP inspection proxy: live TUI history, Repeater replay, decoder & wordlist fuzzer (Burp CE-class)
+    Proxy {
+        #[arg(long, default_value = "127.0.0.1:8099", value_name = "ADDR")]
+        listen: String,
+        #[arg(long, help = "Run headless (no TUI), streaming JSONL entries to --log")]
+        no_tui: bool,
+        #[arg(
+            long,
+            value_name = "FILE",
+            help = "Append every captured entry as JSONL to this file"
+        )]
+        log: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "Allow binding a non-loopback address (proxy is loopback-only by default)"
+        )]
+        allow_remote_bind: bool,
     },
     /// Confidential Compute Remote TEE Attestation & Commercial Ed25519 License Management
     Enterprise {
@@ -1336,10 +1468,7 @@ fn apply_phase21_secrets_extensions(
             let content = file_cache
                 .entry(f.file.clone())
                 .or_insert_with(|| fs::read_to_string(repo_root.join(&f.file)).unwrap_or_default());
-            let line_str = content
-                .lines()
-                .nth(f.line.saturating_sub(1))
-                .unwrap_or("");
+            let line_str = content.lines().nth(f.line.saturating_sub(1)).unwrap_or("");
             if smg_graph::has_inline_allow_marker(line_str) {
                 return false;
             }
@@ -2669,10 +2798,7 @@ pub fn run_cli() -> Result<ExitCode> {
                     report.host,
                     report.port,
                     report.protocols_supported.join(", "),
-                    report
-                        .pqc_group_negotiated
-                        .as_deref()
-                        .unwrap_or("none"),
+                    report.pqc_group_negotiated.as_deref().unwrap_or("none"),
                     report.cert_chain_len,
                     report.findings.len()
                 );
@@ -2727,13 +2853,300 @@ pub fn run_cli() -> Result<ExitCode> {
                 for o in &report.outcomes {
                     println!(
                         "  [{}] {} {} {} (A={}, B={}, unauth={}) — {}",
-                        o.verdict, o.name, o.method, o.path, o.user_a_status, o.user_b_status, o.unauth_status, o.detail
+                        o.verdict,
+                        o.name,
+                        o.method,
+                        o.path,
+                        o.user_a_status,
+                        o.user_b_status,
+                        o.unauth_status,
+                        o.detail
                     );
                 }
             }
             if report.failures > 0 {
                 return Ok(ExitCode::from(1));
             }
+        }
+        Commands::Templates {
+            target,
+            templates,
+            severity,
+            tags,
+            max_templates,
+            timeout_ms,
+            allow_remote,
+            json,
+            fail_on,
+        } => {
+            let dir = templates.unwrap_or_else(|| PathBuf::from("nuclei-templates"));
+            let report =
+                templates_audit::run_template_audit(&templates_audit::TemplateRunConfig {
+                    target: target.clone(),
+                    templates_dir: dir,
+                    severity_filter: severity.iter().map(|s| s.trim().to_string()).collect(),
+                    tag_filter: tags.iter().map(|s| s.trim().to_string()).collect(),
+                    max_templates,
+                    timeout: Duration::from_millis(timeout_ms),
+                    allow_remote,
+                })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "ShellMind Guard Templates | {} | Loaded: {} | Executed: {} | Matched: {} | Skipped: {} | ParseErrors: {} | {}ms",
+                    report.target,
+                    report.loaded,
+                    report.executed,
+                    report.matched_count,
+                    report.skipped.len(),
+                    report.parse_errors,
+                    report.elapsed_ms
+                );
+                for m in &report.matches {
+                    println!(
+                        "  [{}] {} ({}) — {} | matchers: {} | {}",
+                        m.severity.to_ascii_uppercase(),
+                        m.template_id,
+                        m.engine,
+                        m.template_name,
+                        m.matcher_types.join("+"),
+                        m.template_path
+                    );
+                    for ev in &m.evidence {
+                        println!("      {ev}");
+                    }
+                    for (name, val) in &m.extracted {
+                        println!("      extracted {name}: {val}");
+                    }
+                }
+                if std::env::var("SMG_VERBOSE").as_deref() == Ok("1") {
+                    for s in &report.skipped {
+                        println!("  [SKIPPED] {} ({}) — {}", s.id, s.path, s.reason);
+                    }
+                }
+            }
+            if let Some(threshold) = fail_on {
+                let threshold_rank = match threshold {
+                    FailSeverity::Critical => 4,
+                    FailSeverity::High => 3,
+                    FailSeverity::Medium => 2,
+                    FailSeverity::Low => 1,
+                };
+                let failed = report.matches.iter().any(|m| {
+                    let rank = match m.severity.to_ascii_uppercase().as_str() {
+                        "CRITICAL" => 4,
+                        "HIGH" => 3,
+                        "MEDIUM" => 2,
+                        "LOW" => 1,
+                        _ => 0,
+                    };
+                    rank >= threshold_rank
+                });
+                if failed {
+                    return Ok(ExitCode::from(1));
+                }
+            }
+        }
+        Commands::Sqli {
+            url,
+            method,
+            data,
+            param,
+            header,
+            delay,
+            skip_timing,
+            allow_remote,
+            json,
+        } => {
+            let headers: HashMap<String, String> = header
+                .iter()
+                .filter_map(|h| h.split_once('='))
+                .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+                .collect();
+            let report = sqli_audit::run_sqli_audit(&sqli_audit::SqliAuditConfig {
+                url: url.clone(),
+                method: method.clone(),
+                headers,
+                body: data,
+                params: param,
+                delay_secs: delay,
+                skip_timing,
+                allow_remote,
+            })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "ShellMind Guard SQLi | {} ({}) | Params: {} | Vulnerable: {} | {}ms",
+                    report.url,
+                    report.method,
+                    report.params_tested,
+                    report.vulnerable_params,
+                    report.elapsed_ms
+                );
+                for r in &report.results {
+                    println!(
+                        "  [{}] param '{}' — error: {} | boolean: {} | time: {} | union-columns: {}",
+                        r.verdict,
+                        r.param,
+                        r.error_based.is_some(),
+                        r.boolean_based.is_some(),
+                        r.time_based.is_some(),
+                        r.union_columns
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "-".into())
+                    );
+                    if let Some(ev) = &r.error_based {
+                        println!(
+                            "      error-based: {} ({})",
+                            ev.evidence,
+                            ev.db.as_deref().unwrap_or("?")
+                        );
+                    }
+                    if let Some(ev) = &r.boolean_based {
+                        println!("      boolean-blind: {}", ev.evidence);
+                    }
+                    if let Some(ev) = &r.time_based {
+                        println!(
+                            "      time-based: {} ({})",
+                            ev.evidence,
+                            ev.db.as_deref().unwrap_or("?")
+                        );
+                    }
+                }
+            }
+            if report.vulnerable_params > 0 {
+                return Ok(ExitCode::from(1));
+            }
+        }
+        Commands::Dast {
+            url,
+            max_pages,
+            max_depth,
+            passive_only,
+            header,
+            allow_remote,
+            json,
+        } => {
+            let headers: HashMap<String, String> = header
+                .iter()
+                .filter_map(|h| h.split_once('='))
+                .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+                .collect();
+            let report = dast_audit::run_dast_audit(&dast_audit::DastConfig {
+                seed_url: url.clone(),
+                headers,
+                max_pages,
+                max_depth,
+                active: !passive_only,
+                timeout: Duration::from_secs(8),
+                allow_remote,
+            })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "ShellMind Guard DAST | {} | Pages: {} | Active targets: {} | Findings: {} | {}ms",
+                    report.seed_url,
+                    report.pages_crawled,
+                    report.targets_tested,
+                    report.findings.len(),
+                    report.elapsed_ms
+                );
+                for f in &report.findings {
+                    let payload_note = if f.payload.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" payload={:?}", f.payload)
+                    };
+                    println!(
+                        "  [{}] {} {} {}{} — {}",
+                        f.severity.to_ascii_uppercase(),
+                        f.id,
+                        f.url,
+                        f.param.as_deref().unwrap_or("-"),
+                        payload_note,
+                        f.evidence
+                    );
+                }
+            }
+            let blocking = report
+                .findings
+                .iter()
+                .any(|f| matches!(f.severity.as_str(), "critical" | "high"));
+            if blocking {
+                return Ok(ExitCode::from(1));
+            }
+        }
+        Commands::Proxy {
+            listen,
+            no_tui,
+            log,
+            allow_remote_bind,
+        } => {
+            let bind_addr: SocketAddr = listen
+                .parse()
+                .with_context(|| format!("Invalid --listen address '{listen}'"))?;
+            let handle = proxy::start_proxy(proxy::ProxyConfig {
+                bind_addr,
+                capture_limit: proxy::DEFAULT_CAPTURE_LIMIT,
+                allow_remote_bind,
+                jsonl_log: log,
+            })?;
+            let bind = handle.bound_addr;
+            println!(
+                "ShellMind Guard Proxy | listening on http://{bind} (HTTP intercepted · HTTPS CONNECT logged & tunneled transparently)"
+            );
+            println!(
+                "  Point your app/browser proxy at {bind} — TUI keys: j/k select · Tab focus · r replay · d decode · i intruder · e export · q quit"
+            );
+            if no_tui {
+                if std::io::stdin().is_terminal() {
+                    println!(
+                        "  Headless mode: JSONL entries streaming to log; press Ctrl+D or type 'q' + Enter to stop."
+                    );
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        match std::io::stdin().read_line(&mut line) {
+                            Ok(0) => break,
+                            Ok(_) => {
+                                if line.trim() == "q" {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                } else {
+                    // Non-interactive context (CI/service/background): run
+                    // until the process is stopped externally.
+                    println!(
+                        "  Headless mode (non-interactive stdin): running until stopped; JSONL entries streaming to log."
+                    );
+                    loop {
+                        if handle.stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                }
+            } else {
+                smg_tui::proxy_tui::run_proxy_tui(
+                    Arc::clone(&handle.entries),
+                    Arc::clone(&handle.summary),
+                )?;
+            }
+            handle.stop.store(true, Ordering::Relaxed);
+            if let Some(t) = handle.listener_thread {
+                let _ = t.join();
+            }
+            let summary = handle.summary.lock().map(|s| s.clone()).unwrap_or_default();
+            println!(
+                "  Stopped | HTTP: {} | TLS tunnels: {} | Errors: {}",
+                summary.http_intercepted, summary.https_tunneled, summary.errors
+            );
         }
         Commands::Deps { action } => match action {
             DepsAction::Sync {

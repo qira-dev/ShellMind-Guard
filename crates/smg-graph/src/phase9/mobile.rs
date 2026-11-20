@@ -591,7 +591,9 @@ fn scan_android_code(
             ));
         }
         if low.contains("ivparameterspec(")
-            && (low.contains(".getbytes(") || low.contains("new byte[]{") || low.contains("bytearrayof("))
+            && (low.contains(".getbytes(")
+                || low.contains("new byte[]{")
+                || low.contains("bytearrayof("))
         {
             out.push(make_phase9_finding(
                 "SMG-MOB-STORAGE",
@@ -626,7 +628,8 @@ fn scan_android_code(
             out.push(make_phase9_finding(
                 "SMG-MOB-IPC",
                 "MEDIUM",
-                "Android `WebView.setWebContentsDebuggingEnabled(true)` enabled unconditionally".into(),
+                "Android `WebView.setWebContentsDebuggingEnabled(true)` enabled unconditionally"
+                    .into(),
                 rel_path,
                 ln,
                 "WebView",
@@ -826,7 +829,8 @@ fn scan_swift_mobile(
             out.push(make_phase9_finding(
                 "SMG-MOB-STORAGE",
                 "HIGH",
-                "iOS file protection disabled (`NSFileProtectionNone` / `FileProtectionType.none`)".into(),
+                "iOS file protection disabled (`NSFileProtectionNone` / `FileProtectionType.none`)"
+                    .into(),
                 rel_path,
                 ln,
                 "FileProtectionType",
@@ -976,7 +980,8 @@ fn scan_dart_mobile(
             out.push(make_phase9_finding(
                 "SMG-MOB-STORAGE",
                 "HIGH",
-                "Flutter `sqflite` raw SQL call interpolates dynamic input (local SQL injection)".into(),
+                "Flutter `sqflite` raw SQL call interpolates dynamic input (local SQL injection)"
+                    .into(),
                 rel_path,
                 ln,
                 "sqflite",
