@@ -3,9 +3,11 @@ pub mod evm_oracle;
 pub mod solidity;
 pub mod svm_move;
 
-use context::{EvmSlotEntry, detect_proxy_storage_collisions, ingest_web3_context};
+use context::{EvmSlotEntry, abi_selector, detect_proxy_storage_collisions, ingest_web3_context};
+use evm_oracle::{InvariantCampaignConfig, run_stateful_revm_invariant_campaign};
+use revm::primitives::U256;
 use smg_core::{IndexedFile, Language};
-use smg_graph::LocalStaticFinding;
+use smg_graph::{Confidence, GuardKind, LocalStaticFinding, SinkKind};
 use solidity::{
     ContractKind, ParsedContract, analyze_solidity_file_with_bases, parse_solidity_file,
 };
@@ -69,6 +71,17 @@ pub fn scan_web3_repo(
     files: &[IndexedFile],
     force_web3: bool,
 ) -> Vec<LocalStaticFinding> {
+    scan_web3_repo_with_options(project_root, files, force_web3, false)
+}
+
+/// Scans Web3 repositories with optional Phase 16A `--deep-audit` stateful multi-tx `revm`
+/// invariant campaigns on compiled Foundry/Hardhat artifacts.
+pub fn scan_web3_repo_with_options(
+    project_root: &Path,
+    files: &[IndexedFile],
+    force_web3: bool,
+    deep_audit: bool,
+) -> Vec<LocalStaticFinding> {
     if !force_web3 && !repo_has_web3_indicators(project_root, files) {
         return Vec::new();
     }
@@ -124,6 +137,69 @@ pub fn scan_web3_repo(
                     ) || c.has_erc7201_namespace
                     {
                         continue;
+                    }
+                    // Phase 16A: Auto-wired `--deep-audit` stateful multi-tx `revm` invariant campaign
+                    if deep_audit
+                        && let Some(art) = ctx.lookup_artifact(&f.rel_path, &c.name)
+                        && !art.deployed_bytecode.is_empty()
+                        && !art.abi_functions.is_empty()
+                    {
+                        let selectors: Vec<[u8; 4]> = art
+                            .abi_functions
+                            .iter()
+                            .take(12)
+                            .map(|sig| abi_selector(sig))
+                            .collect();
+                        let has_owner_slot0 = c.packed_slots.iter().any(|s| {
+                            s.slot == 0
+                                && matches!(
+                                    s.var_name.to_ascii_lowercase().as_str(),
+                                    "owner" | "admin" | "governance" | "guardian"
+                                )
+                        });
+                        let protected_val = U256::from(0xCAFEu64);
+                        let inv_cfg = InvariantCampaignConfig {
+                            seed: 0x16A0_15D0,
+                            sequences: 24,
+                            max_steps: 6,
+                            initial_contract_wei: U256::from(1_000_000_000_000_000_000u128),
+                            initial_storage: if has_owner_slot0 {
+                                vec![(U256::ZERO, protected_val)]
+                            } else {
+                                Vec::new()
+                            },
+                            protected_slot: has_owner_slot0.then_some((U256::ZERO, protected_val)),
+                            selectors,
+                        };
+                        let inv_res =
+                            run_stateful_revm_invariant_campaign(&art.deployed_bytecode, &inv_cfg);
+                        if inv_res.violated {
+                            let is_solvency =
+                                inv_res.invariant_name.as_deref() == Some("SOLVENCY_BREACH");
+                            all_findings.push(LocalStaticFinding {
+                                rule_id: if is_solvency {
+                                    "SMG-WEB3-REENTRANCY".into()
+                                } else {
+                                    "SMG-WEB3-ACCESS".into()
+                                },
+                                severity: "CRITICAL".into(),
+                                title: format!(
+                                    "[revm PROVEN multi-tx invariant] `{}` violated {}",
+                                    c.name, inv_res.summary
+                                ),
+                                rel_path: f.rel_path.clone(),
+                                line: c.start_line.max(1),
+                                symbol: c.name.clone(),
+                                sink_kind: if is_solvency {
+                                    SinkKind::BalanceUpdate
+                                } else {
+                                    SinkKind::AuthMutation
+                                },
+                                missing_guard: GuardKind::Auth,
+                                confidence: Confidence::Proven,
+                                remediation: "Enforce caller authorization and protocol solvency invariants across all multi-transaction call sequences.".into(),
+                            });
+                        }
                     }
                     // Prefer compiler `storageLayout` from Foundry/Hardhat when present
                     let slots = ctx

@@ -1849,6 +1849,95 @@ pub async fn verify_route_fuzz_with_config(
             });
         }
     }
+
+    // 4. Phase 16A: Auto-wired stateful multi-step lifecycle & cross-session isolation checks
+    // on discovered `POST` collection routes (strictly loopback 127.0.0.1).
+    let mut workflow_checked = 0usize;
+    for route in routes {
+        if workflow_checked >= 6 || tokio::time::Instant::now() >= overall_deadline {
+            break;
+        }
+        let method = if route.method.is_empty() {
+            "POST"
+        } else {
+            route.method.as_str()
+        };
+        if method != "POST" || route.path.contains(':') || route.path.contains('{') {
+            continue;
+        }
+        workflow_checked += 1;
+        let wf = StatefulWorkflowConfig {
+            collection_path: route.path.clone(),
+            create_body: serde_json::Value::Object(build_baseline_json(route)).to_string(),
+            id_field: "id".into(),
+            user_a_header: cfg.user_a_header.clone(),
+            user_b_header: cfg.user_b_header.clone(),
+            use_tls: cfg.use_tls,
+        };
+        let wf_res = verify_stateful_http_workflow(port, &wf).await;
+        for v in wf_res.violations {
+            let (rule_id, sink_kind, missing_guard, title, remediation) = if v.invariant
+                == "CROSS_SESSION_ISOLATION"
+            {
+                (
+                    "SMG-IDOR-001",
+                    SinkKind::IdorDbAccess,
+                    GuardKind::OwnershipCheck,
+                    format!(
+                        "Stateful cross-session IDOR on `{}`: User B read User A's created resource (HTTP {})",
+                        route.path, v.status_code
+                    ),
+                    "Enforce per-user ownership checks (`resource.owner_id == req.user.id`) on GET/PUT/DELETE item routes.",
+                )
+            } else {
+                (
+                    "SMG-FUZZ-SCHEMA",
+                    SinkKind::SchemaTampering,
+                    GuardKind::InputValidation,
+                    format!(
+                        "Stateful use-after-delete lifecycle violation on `{}` (HTTP {})",
+                        route.path, v.status_code
+                    ),
+                    "Ensure deleted resources return HTTP 404/410 and invalidate caches immediately after DELETE.",
+                )
+            };
+            if !seen_route_rule.insert((format!("STATEFUL {}", route.path), v.invariant.clone())) {
+                continue;
+            }
+            let fid = format!("SMG-FUZZ-{:03}", hits.len() + 1);
+            hits.push(FuzzProbeHit {
+                finding: LatticeFinding {
+                    id: fid.clone(),
+                    rule_id: rule_id.into(),
+                    severity: "CRITICAL".into(),
+                    title,
+                    file: route.source_file.clone(),
+                    line: route.line.max(1),
+                    status: "PROVEN".into(),
+                    confidence: Confidence::Proven,
+                    entry_route: v.step.clone(),
+                    sink_kind,
+                    missing_guard,
+                    witness_path: vec![TraceHop {
+                        file: route.source_file.clone(),
+                        symbol: v.step.clone(),
+                        line: route.line.max(1),
+                    }],
+                    remediation: remediation.into(),
+                    proof_reasons: vec![format!("StatefulWorkflow:{}", v.invariant)],
+                },
+                verified: VerifiedFinding {
+                    finding_id: fid.clone(),
+                    rule_id: rule_id.into(),
+                    entry_route: v.step,
+                    status: VerificationStatus::Proven,
+                    evidence: v.evidence,
+                    replay_cmd: format!("smg replay {}", fid),
+                },
+            });
+        }
+    }
+
     hits
 }
 
@@ -2967,6 +3056,28 @@ mod tests {
             safe_res.violations.is_empty(),
             "hardened workflow must have 0 violations, got: {:?}",
             safe_res.violations
+        );
+
+        // Phase 16A: Verify `verify_route_fuzz_with_config` auto-wires stateful workflow checks on POST routes
+        let auto_route = RouteSchema {
+            method: "POST".into(),
+            path: "/api/orders".into(),
+            source_file: "src/orders.ts".into(),
+            line: 10,
+            params: vec![],
+            from_openapi: false,
+        };
+        let auto_cfg = SandboxProbeConfig {
+            user_a_header: wf.user_a_header.clone(),
+            user_b_header: wf.user_b_header.clone(),
+            ..Default::default()
+        };
+        let auto_hits = verify_route_fuzz_with_config(vuln_port, &[auto_route], &auto_cfg).await;
+        assert!(
+            auto_hits.iter().any(|h| h.finding.rule_id == "SMG-IDOR-001"
+                && h.verified.status == VerificationStatus::Proven),
+            "expected auto-wired PROVEN SMG-IDOR-001 from verify_route_fuzz_with_config, got: {:#?}",
+            auto_hits
         );
     }
 }

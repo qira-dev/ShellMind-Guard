@@ -1288,7 +1288,12 @@ pub(crate) fn execute_scan_pipeline_full(
                     | "defi"
             )
         });
-        let web3_hits = smg_web3::scan_web3_repo(opts.path, &summary.files, force_web3);
+        let web3_hits = smg_web3::scan_web3_repo_with_options(
+            opts.path,
+            &summary.files,
+            force_web3,
+            cfg.scan.deep_audit,
+        );
         smg_graph::append_local_static_findings(&mut graph_res.findings, &web3_hits);
     }
     #[cfg(feature = "pqc")]
@@ -1336,7 +1341,7 @@ pub(crate) fn execute_scan_pipeline_full(
             .flatten()
     });
     let effective_port = resolve_sandbox_port(opts.port, &cfg)?;
-    let wants_deep_fuzz = opts.deep
+    let wants_deep_fuzz = (opts.deep || cfg.scan.deep_audit)
         && !graph_res.route_schemas.is_empty()
         && (opts.layers.is_empty()
             || opts.layers.iter().any(|l| {
