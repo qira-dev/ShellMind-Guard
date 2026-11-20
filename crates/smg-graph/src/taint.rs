@@ -2887,10 +2887,19 @@ fn check_call_taint_sinks(
         }
 
         // 1. Command Injection (SMG-CMDI-001)
-        let is_shell_exec = matches!(
+        let is_dynamic_code_eval = matches!(
+            lang,
+            Language::JavaScript | Language::TypeScript | Language::Python
+        ) && matches!(
             ftxt,
-            "exec" | "execSync" | "child_process.exec" | "child_process.execSync"
-        ) || ftxt.ends_with(".execSync")
+            "eval" | "Function" | "vm.runInNewContext" | "vm.runInThisContext"
+        );
+        let is_shell_exec = is_dynamic_code_eval
+            || matches!(
+                ftxt,
+                "exec" | "execSync" | "child_process.exec" | "child_process.execSync"
+            )
+            || ftxt.ends_with(".execSync")
             || (ftxt.ends_with(".exec")
                 && !ftxt.starts_with("db.")
                 && !ftxt.starts_with("tx.")
@@ -3030,6 +3039,20 @@ fn check_call_taint_sinks(
                 | "axios.delete"
                 | "axios.request"
                 | "got"
+                | "got.get"
+                | "got.post"
+                | "got.put"
+                | "got.delete"
+                | "needle"
+                | "needle.get"
+                | "needle.post"
+                | "needle.put"
+                | "needle.delete"
+                | "needle.request"
+                | "superagent.get"
+                | "superagent.post"
+                | "superagent.put"
+                | "superagent.delete"
                 | "http.Get"
                 | "http.Post"
                 | "http.NewRequest"

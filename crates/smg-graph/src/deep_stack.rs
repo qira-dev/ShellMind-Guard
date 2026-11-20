@@ -730,6 +730,7 @@ fn scan_backend_and_db_deep(
             // 5. Prototype Pollution (`SMG-CFG-PROTO`, JS/TS)
             if matches!(lang, Language::TypeScript | Language::JavaScript)
                 && !has_proto_guard
+                && !block_low.contains("object.create(null)")
                 && is_proto_pollution_write(&trimmed, &block_low, &raw_obj_vars, &scalar_taint_vars)
                 && !existing_hit_keys.contains(&("SMG-CFG-PROTO".to_string(), abs_line))
             {
@@ -1303,9 +1304,9 @@ fn is_proto_pollution_write(
         let is_key_like = matches!(key_var, "key" | "prop" | "attr" | "field" | "path" | "k")
             || scalar_vars.contains(key_var);
         let rhs_is_untrusted = rhs.contains(&format!("[{}]", key_var))
-            || trimmed.contains("[key]")
-            || trimmed.contains("[prop]")
-            || trimmed.contains("[attr]")
+            || rhs.contains("[key]")
+            || rhs.contains("[prop]")
+            || rhs.contains("[attr]")
             || contains_request_source(rhs)
             || scalar_vars.iter().any(|v| contains_ident(rhs, v));
         return is_key_like && rhs_is_untrusted;
@@ -1338,10 +1339,39 @@ fn is_open_redirect_line(
     if is_first_arg_static_string(trimmed, "redirect(")
         || is_first_arg_static_string(trimmed, "redirect_to ")
         || is_first_arg_static_string(trimmed, "sendredirect(")
+        || is_first_arg_anchored_relative_prefix(trimmed, "redirect(")
+        || is_first_arg_anchored_relative_prefix(trimmed, "redirect_to ")
+        || is_first_arg_anchored_relative_prefix(trimmed, "sendredirect(")
     {
         return false;
     }
     contains_request_source(trimmed) || scalar_vars.iter().any(|v| contains_ident(trimmed, v))
+}
+
+/// Returns true when the first argument begins with a same-origin anchored relative path literal
+/// such as `'/user/' + id` or `"/items/" + slug` (starts with `/` followed by a static path char,
+/// so user input cannot turn the URL into `//evil.com` or `https://evil.com`).
+fn is_first_arg_anchored_relative_prefix(trimmed: &str, marker: &str) -> bool {
+    let Some(pos) = trimmed.to_ascii_lowercase().find(marker) else {
+        return false;
+    };
+    let rest = trimmed[pos + marker.len()..].trim();
+    let Some(quote) = rest
+        .chars()
+        .next()
+        .filter(|&c| c == '"' || c == '\'' || c == '`')
+    else {
+        return false;
+    };
+    let after_q = &rest[quote.len_utf8()..];
+    let mut chars = after_q.chars();
+    if chars.next() != Some('/') {
+        return false;
+    }
+    matches!(
+        chars.next(),
+        Some(c) if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')
+    )
 }
 
 fn is_first_arg_static_string(trimmed: &str, marker: &str) -> bool {
@@ -1629,6 +1659,89 @@ app.post('/api/safe_merge', requireAuth, (req, res) => {
             safe.findings.is_empty(),
             "expected 0 findings on hardened merge/jwt/redirect handler, got: {:#?}",
             safe.findings
+        );
+    }
+
+    #[test]
+    fn test_phase15b_object_create_null_proto_fp_and_nodegoat_handlers() {
+        // 1. Express `acceptParams` (string-slice params + Object.create(null)) and anchored relative redirect must NOT trigger FPs
+        let safe_express = run_inline(&[
+            (
+                "lib/utils.js",
+                r#"function acceptParams(str) {
+    var ret = { value: str, quality: 1, params: {} };
+    var key = str.slice(0, 2).trim();
+    var value = str.slice(3, 6).trim();
+    ret.params[key] = value;
+    return ret;
+}
+function acceptNullProto(str) {
+    var ret = { params: Object.create(null) };
+    for (var key in str) {
+        ret.params[key] = str[key];
+    }
+    return ret;
+}
+"#,
+            ),
+            (
+                "controllers/user.js",
+                r#"exports.create = function(req, res) {
+    var id = req.params.id;
+    res.redirect('/user/' + id);
+};
+"#,
+            ),
+        ]);
+        assert!(
+            !safe_express
+                .findings
+                .iter()
+                .any(|f| matches!(f.rule_id.as_str(), "SMG-CFG-PROTO" | "SMG-SSRF-REDIRECT")),
+            "Express safe patterns must not trigger SMG-CFG-PROTO or SMG-SSRF-REDIRECT, got: {:#?}",
+            safe_express.findings
+        );
+
+        // 2. Constructor-assigned handlers (`this.method = (req, res) =>`) with `eval` RCE & `needle.get` SSRF
+        let nodegoat_like = run_inline(&[
+            (
+                "app/routes/contributions.js",
+                r#"function ContributionsHandler(db) {
+    this.handleContributionsUpdate = (req, res, next) => {
+        const preTax = eval(req.body.preTax);
+        return res.json({ preTax });
+    };
+}
+"#,
+            ),
+            (
+                "app/routes/research.js",
+                r#"const needle = require("needle");
+function ResearchHandler(db) {
+    this.displayResearch = (req, res) => {
+        const url = req.query.url + req.query.symbol;
+        return needle.get(url, (error, newResponse, body) => {
+            return res.send(body);
+        });
+    };
+}
+"#,
+            ),
+        ]);
+        let rules: Vec<&str> = nodegoat_like
+            .findings
+            .iter()
+            .map(|f| f.rule_id.as_str())
+            .collect();
+        assert!(
+            rules.contains(&"SMG-CMDI-001"),
+            "expected eval() RCE in this.handleContributionsUpdate, got: {:?}",
+            rules
+        );
+        assert!(
+            rules.contains(&"SMG-SSRF-001"),
+            "expected needle.get() SSRF in this.displayResearch, got: {:?}",
+            rules
         );
     }
 }

@@ -77,6 +77,30 @@ pub struct ScanConfig {
     pub max_threads: usize,
     #[serde(default = "default_max_file_bytes")]
     pub max_file_bytes: u64,
+    #[serde(default)]
+    pub deep_audit: bool,
+}
+
+impl ScanConfig {
+    /// CFG basic-block budget per function (256 standard, 2048 under `--deep-audit`).
+    pub fn max_cfg_blocks(&self) -> usize {
+        if self.deep_audit { 2048 } else { 256 }
+    }
+
+    /// AST block nesting depth budget per function (32 standard, 64 under `--deep-audit`).
+    pub fn max_ast_block_depth(&self) -> usize {
+        if self.deep_audit { 64 } else { 32 }
+    }
+
+    /// Polymorphic CHA/RTA dispatch target fanout cap (8 standard, 64 under `--deep-audit`).
+    pub fn max_cha_targets(&self) -> usize {
+        if self.deep_audit { 64 } else { 8 }
+    }
+
+    /// Cross-file witness & taint hop budget (64 standard, 256 under `--deep-audit`).
+    pub fn max_witness_hops(&self) -> usize {
+        if self.deep_audit { 256 } else { 64 }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -265,6 +289,7 @@ impl Default for ScanConfig {
             ],
             max_threads: default_max_threads(),
             max_file_bytes: default_max_file_bytes(),
+            deep_audit: false,
         }
     }
 }
@@ -305,5 +330,26 @@ impl ShellMindGuardConfig {
         let out_path = root.join(".shellmind-guard.toml");
         fs::write(&out_path, toml_str)?;
         Ok((detected, out_path))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_phase15b_deep_audit_budget_scaling() {
+        let mut cfg = ScanConfig::default();
+        assert!(!cfg.deep_audit);
+        assert_eq!(cfg.max_cfg_blocks(), 256);
+        assert_eq!(cfg.max_ast_block_depth(), 32);
+        assert_eq!(cfg.max_cha_targets(), 8);
+        assert_eq!(cfg.max_witness_hops(), 64);
+
+        cfg.deep_audit = true;
+        assert_eq!(cfg.max_cfg_blocks(), 2048);
+        assert_eq!(cfg.max_ast_block_depth(), 64);
+        assert_eq!(cfg.max_cha_targets(), 64);
+        assert_eq!(cfg.max_witness_hops(), 256);
     }
 }

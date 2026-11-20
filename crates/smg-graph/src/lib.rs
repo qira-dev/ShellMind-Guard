@@ -30,7 +30,7 @@ pub use deps::{ReachableVulnStatus, assess_dependency_reachability, compute_reac
 pub use lattice::{
     GraphAnalysisResult, LatticeFinding, RuleHitStat, TraceHop, append_local_static_findings,
     compute_rule_telemetry, finding_matches_layer, solve_guard_lattice,
-    solve_guard_lattice_with_public,
+    solve_guard_lattice_with_options, solve_guard_lattice_with_public,
 };
 pub use phase10::{ParamTypeHint, RouteParamSpec, RouteSchema, collect_deep_schema_findings};
 pub use rules::{RULE_CATALOG, RuleDoc, find_rule_doc};
@@ -46,9 +46,10 @@ fn load_or_parse_summaries_cached(
     let cfg_json = serde_json::to_string(&cfg.guards).unwrap_or_default();
     let adv_stamp = smg_core::advisories_db_stamp();
     let versioned_cfg = format!(
-        "v23-ultra-max-precision-{}|{}|{}",
+        "v24-phase15b-deep-audit-{}|{}|{}|{}",
         env!("CARGO_PKG_VERSION"),
         adv_stamp,
+        cfg.scan.deep_audit,
         cfg_json
     );
     let cfg_hash = blake3::hash(versioned_cfg.as_bytes()).to_hex().to_string();
@@ -113,9 +114,10 @@ pub fn analyze_codebase(
             .collect()
     });
 
-    Ok(solve_guard_lattice_with_public(
+    Ok(solve_guard_lattice_with_options(
         &summaries,
         &cfg.guards.public_routes,
+        cfg.scan.deep_audit,
     ))
 }
 
@@ -126,9 +128,10 @@ pub fn analyze_codebase_cached(
     store: &mut StateStore,
 ) -> Result<GraphAnalysisResult> {
     let all_summaries = load_or_parse_summaries_cached(files, cfg, store)?;
-    Ok(solve_guard_lattice_with_public(
+    Ok(solve_guard_lattice_with_options(
         &all_summaries,
         &cfg.guards.public_routes,
+        cfg.scan.deep_audit,
     ))
 }
 
@@ -159,6 +162,10 @@ pub fn analyze_codebase_cached_changed_since(
     let owned_slice: Vec<FileAstSummary> = sliced.into_iter().cloned().collect();
     Ok((
         full_fallback,
-        solve_guard_lattice_with_public(&owned_slice, &cfg.guards.public_routes),
+        solve_guard_lattice_with_options(
+            &owned_slice,
+            &cfg.guards.public_routes,
+            cfg.scan.deep_audit,
+        ),
     ))
 }

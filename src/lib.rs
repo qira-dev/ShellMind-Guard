@@ -247,6 +247,7 @@ pub(crate) struct ScanRunOptions<'a> {
     pub unsafe_host_fallback: bool,
     pub trust_repo_config: bool,
     pub deep: bool,
+    pub deep_audit: bool,
     pub sandbox_mem_mb: Option<u64>,
     pub sandbox_tls: bool,
     pub mock_shims: bool,
@@ -335,6 +336,11 @@ struct ScanCmdArgs {
         help = "Enable Phase 10 deep schema validation (SMG-FUZZ-SCHEMA) & targeted route payload fuzzing"
     )]
     deep: bool,
+    #[arg(
+        long,
+        help = "Enable Phase 15 Tier-2 deep audit budget (unlocks 2048-block CFG, 64 CHA targets, 256 witness hops)"
+    )]
+    deep_audit: bool,
     #[arg(long)]
     boot_cmd: Option<String>,
     #[arg(long, default_value_t = 39911)]
@@ -1226,7 +1232,10 @@ pub(crate) fn execute_scan_pipeline_full(
     cbom_path: Option<&Path>,
 ) -> Result<ScanOutcome> {
     let t0 = Instant::now();
-    let cfg = ShellMindGuardConfig::load_from_dir(opts.path)?;
+    let mut cfg = ShellMindGuardConfig::load_from_dir(opts.path)?;
+    if opts.deep_audit {
+        cfg.scan.deep_audit = true;
+    }
     let summary =
         scan_repository_with_options(opts.path, &cfg, &ScanOptions { include_generated })?;
     let mut store = StateStore::open(opts.path)?;
@@ -1654,6 +1663,7 @@ pub fn run_cli() -> Result<ExitCode> {
                 write_baseline,
                 min_confidence,
                 deep,
+                deep_audit,
                 boot_cmd,
                 port,
                 sync_race,
@@ -1702,6 +1712,7 @@ pub fn run_cli() -> Result<ExitCode> {
                     unsafe_host_fallback,
                     trust_repo_config,
                     deep,
+                    deep_audit,
                     sandbox_mem_mb,
                     sandbox_tls,
                     mock_shims,
@@ -1878,6 +1889,7 @@ pub fn run_cli() -> Result<ExitCode> {
                                 unsafe_host_fallback,
                                 trust_repo_config,
                                 deep,
+                                deep_audit,
                                 sandbox_mem_mb,
                                 sandbox_tls,
                                 mock_shims,
@@ -2995,6 +3007,7 @@ fn handle_claude_pre_commit() -> Result<ExitCode> {
         unsafe_host_fallback: false,
         trust_repo_config: false,
         deep: false,
+        deep_audit: false,
         sandbox_mem_mb: None,
         sandbox_tls: false,
         mock_shims: false,
@@ -4183,6 +4196,7 @@ mod main_tests {
             unsafe_host_fallback: false,
             trust_repo_config: false,
             deep: false,
+            deep_audit: false,
             sandbox_mem_mb: None,
             sandbox_tls: false,
             mock_shims: false,
@@ -4208,6 +4222,7 @@ mod main_tests {
             unsafe_host_fallback: false,
             trust_repo_config: false,
             deep: true,
+            deep_audit: false,
             sandbox_mem_mb: None,
             sandbox_tls: false,
             mock_shims: false,
@@ -4233,6 +4248,7 @@ mod main_tests {
             unsafe_host_fallback: false,
             trust_repo_config: false,
             deep: true,
+            deep_audit: false,
             sandbox_mem_mb: None,
             sandbox_tls: false,
             mock_shims: false,
@@ -4260,6 +4276,7 @@ mod main_tests {
             unsafe_host_fallback: false,
             trust_repo_config: false,
             deep: true,
+            deep_audit: false,
             sandbox_mem_mb: None,
             sandbox_tls: false,
             mock_shims: false,
@@ -4451,6 +4468,7 @@ mod main_tests {
             unsafe_host_fallback: false,
             trust_repo_config: false,
             deep: false,
+            deep_audit: false,
             sandbox_mem_mb: None,
             sandbox_tls: false,
             mock_shims: false,
@@ -4481,6 +4499,7 @@ mod main_tests {
             unsafe_host_fallback: false,
             trust_repo_config: false,
             deep: false,
+            deep_audit: false,
             sandbox_mem_mb: None,
             sandbox_tls: false,
             mock_shims: false,
@@ -4571,6 +4590,7 @@ void ota_apply(const uint8_t *img, uint32_t len) {
             unsafe_host_fallback: false,
             trust_repo_config: false,
             deep: false,
+            deep_audit: false,
             sandbox_mem_mb: None,
             sandbox_tls: false,
             mock_shims: false,
@@ -4637,6 +4657,7 @@ contract Vault {
             unsafe_host_fallback: false,
             trust_repo_config: false,
             deep: false,
+            deep_audit: false,
             sandbox_mem_mb: None,
             sandbox_tls: false,
             mock_shims: false,
@@ -4698,6 +4719,7 @@ pub fn configure_tls() {
                 unsafe_host_fallback: false,
                 trust_repo_config: false,
                 deep: false,
+                deep_audit: false,
                 sandbox_mem_mb: None,
                 sandbox_tls: false,
                 mock_shims: false,
@@ -4730,6 +4752,7 @@ pub fn configure_tls() {
                 unsafe_host_fallback: false,
                 trust_repo_config: false,
                 deep: false,
+                deep_audit: false,
                 sandbox_mem_mb: None,
                 sandbox_tls: false,
                 mock_shims: false,

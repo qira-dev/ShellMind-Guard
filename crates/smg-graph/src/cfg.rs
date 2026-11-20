@@ -7,9 +7,6 @@ use smg_core::ShellMindGuardConfig;
 use std::collections::HashSet;
 use tree_sitter::Node;
 
-const MAX_CFG_BLOCKS: usize = 256;
-const MAX_AST_BLOCK_DEPTH: usize = 32;
-
 /// Single Basic Block inside a selective per-function CFG built for candidate routes & sinks.
 #[derive(Debug, Clone)]
 pub struct CfgBlock {
@@ -119,7 +116,7 @@ pub fn compute_cfg_guard_dominance(
 
     let mut builder = CfgBuilder::new(src, cfg, entry_guards);
     let exit_bb = builder.lower_block(body, 0, 0);
-    if builder.blocks.len() > MAX_CFG_BLOCKS {
+    if builder.blocks.len() > cfg.scan.max_cfg_blocks() {
         return entry_guards.to_set();
     }
 
@@ -275,7 +272,7 @@ impl<'a> CfgBuilder<'a> {
     }
 
     fn new_block(&mut self) -> Option<usize> {
-        if self.blocks.len() >= MAX_CFG_BLOCKS {
+        if self.blocks.len() >= self.cfg.scan.max_cfg_blocks() {
             return None;
         }
         let id = self.blocks.len();
@@ -304,7 +301,9 @@ impl<'a> CfgBuilder<'a> {
 
     /// Lowers a block/statement list returning `Some(fallthrough_bb)` or `None` if all paths terminated.
     fn lower_block(&mut self, node: Node, mut cur_bb: usize, depth: usize) -> Option<usize> {
-        if depth >= MAX_AST_BLOCK_DEPTH || self.blocks.len() >= MAX_CFG_BLOCKS {
+        if depth >= self.cfg.scan.max_ast_block_depth()
+            || self.blocks.len() >= self.cfg.scan.max_cfg_blocks()
+        {
             return Some(cur_bb);
         }
         let mut cursor = node.walk();

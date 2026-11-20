@@ -3078,6 +3078,59 @@ fn extract_single_node<'a>(
         return false;
     }
 
+    // 4b. Constructor / module-assigned handler methods: `this.handleFoo = (req, res) => { ... }` or `exports.foo = function(...) { ... }`
+    if kind == "assignment_expression"
+        && let (Some(left_node), Some(right_node)) = (
+            node.child_by_field_name("left"),
+            node.child_by_field_name("right"),
+        )
+        && left_node.kind() == "member_expression"
+        && matches!(right_node.kind(), "arrow_function" | "function_expression")
+    {
+        let left_txt = node_text(left_node, src).trim();
+        if left_txt.starts_with("this.")
+            || left_txt.starts_with("exports.")
+            || left_txt.starts_with("module.exports.")
+        {
+            let name = left_txt
+                .rsplit('.')
+                .next()
+                .unwrap_or(left_txt)
+                .trim()
+                .to_string();
+            if !name.is_empty() {
+                let body = node_text(right_node, src);
+                let mut calls = Vec::new();
+                collect_calls(right_node, src, &mut calls);
+                let guards = classify_fn_guards_cfg(right_node, src, cfg);
+                let sink_kind = classify_sink(&name, body);
+                let sym_kind = if sink_kind.is_some() {
+                    SymbolKind::Sink
+                } else {
+                    SymbolKind::Function
+                };
+                let line_start = node.start_position().row + 1;
+                let mut sym = SymbolInfo::base(
+                    format!("{}::{}:{}", rel_path, name, line_start),
+                    rel_path,
+                    name.clone(),
+                    sym_kind,
+                    sink_kind,
+                    line_start,
+                    node.end_position().row + 1,
+                    guards,
+                    calls,
+                    None,
+                );
+                sym.apply_taint(crate::taint::analyze_function_taint(
+                    right_node, src, rel_path, lang, &name, None,
+                ));
+                symbols.push(sym);
+                return false;
+            }
+        }
+    }
+
     true
 }
 

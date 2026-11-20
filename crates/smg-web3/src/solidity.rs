@@ -1429,21 +1429,94 @@ fn check_initializer_and_admin_access(
     }
 
     let body_low = f.body_text.to_ascii_lowercase();
-    if (body_low.contains("for (") || body_low.contains("for(") || body_low.contains("while ("))
-        && body_low.contains("msg.value")
+    let has_loop =
+        body_low.contains("for (") || body_low.contains("for(") || body_low.contains("while (");
+    if has_loop {
+        if body_low.contains("msg.value") {
+            findings.push(LocalStaticFinding {
+                rule_id: "SMG-WEB3-ACCESS".into(),
+                severity: "HIGH".into(),
+                title: format!(
+                    "`msg.value` reused inside loop in `{}.{}` (double-counting value vulnerability)",
+                    c.name, f.name
+                ),
+                rel_path: rel_path.into(),
+                line: f.start_line,
+                symbol: format!("{}.{}", c.name, f.name),
+                sink_kind: SinkKind::BalanceUpdate,
+                missing_guard: GuardKind::InputValidation,
+                confidence: Confidence::Confirmed,
+                remediation: "Never accumulate or check `msg.value` inside a loop; decrement remaining value or track explicit per-iteration accounting.".into(),
+            });
+        } else if let Some(helper) = c.functions.iter().find(|callee| {
+            callee.name != f.name
+                && f.body_text.contains(&format!("{}(", callee.name))
+                && callee.body_text.to_ascii_lowercase().contains("msg.value")
+        }) {
+            findings.push(LocalStaticFinding {
+                rule_id: "SMG-WEB3-ACCESS".into(),
+                severity: "CRITICAL".into(),
+                title: format!(
+                    "`msg.value` reused across loop iterations in `{}.{}` via `{}` (double-counting value vulnerability)",
+                    c.name, f.name, helper.name
+                ),
+                rel_path: rel_path.into(),
+                line: f.start_line,
+                symbol: format!("{}.{}", c.name, f.name),
+                sink_kind: SinkKind::BalanceUpdate,
+                missing_guard: GuardKind::InputValidation,
+                confidence: Confidence::Confirmed,
+                remediation: "Track cumulative payment across loop iterations instead of comparing `msg.value` inside an internal helper called from a loop.".into(),
+            });
+        }
+    }
+
+    // Caller-controlled arbitrary external call (`target.functionCall(data)` / `target.call(data)` without auth)
+    if !has_auth
+        && (body_low.contains(".functioncall(")
+            || body_low.contains(".functioncallwithvalue(")
+            || body_low.contains(".call("))
     {
-        findings.push(LocalStaticFinding {
-            rule_id: "SMG-WEB3-ACCESS".into(),
-            severity: "HIGH".into(),
-            title: format!("`msg.value` reused inside loop in `{}.{}` (double-counting value vulnerability)", c.name, f.name),
-            rel_path: rel_path.into(),
-            line: f.start_line,
-            symbol: format!("{}.{}", c.name, f.name),
-            sink_kind: SinkKind::BalanceUpdate,
-            missing_guard: GuardKind::InputValidation,
-            confidence: Confidence::Confirmed,
-            remediation: "Never accumulate or check `msg.value` inside a loop; decrement remaining value or track explicit per-iteration accounting.".into(),
+        let mut addr_params: Vec<&str> = Vec::new();
+        let mut bytes_params: Vec<&str> = Vec::new();
+        for p in f.params_text.split(',') {
+            let toks: Vec<&str> = p.split_whitespace().collect();
+            if toks.len() >= 2 {
+                let ptype = toks[0].to_ascii_lowercase();
+                let pname = toks.last().copied().unwrap_or("");
+                if ptype == "address" && !pname.is_empty() {
+                    addr_params.push(pname);
+                } else if ptype == "bytes" && !pname.is_empty() {
+                    bytes_params.push(pname);
+                }
+            }
+        }
+        let has_arbitrary_call = addr_params.iter().any(|ap| {
+            let ap_low = ap.to_ascii_lowercase();
+            bytes_params.iter().any(|bp| {
+                let bp_low = bp.to_ascii_lowercase();
+                body_low.contains(&format!("{ap_low}.functioncall({bp_low}"))
+                    || body_low.contains(&format!("{ap_low}.functioncallwithvalue({bp_low}"))
+                    || body_low.contains(&format!("{ap_low}.call({bp_low}"))
+            })
         });
+        if has_arbitrary_call {
+            findings.push(LocalStaticFinding {
+                rule_id: "SMG-WEB3-ACCESS".into(),
+                severity: "CRITICAL".into(),
+                title: format!(
+                    "Unauthenticated arbitrary external call in `{}.{}`: caller controls both target address and calldata",
+                    c.name, f.name
+                ),
+                rel_path: rel_path.into(),
+                line: f.start_line,
+                symbol: format!("{}.{}", c.name, f.name),
+                sink_kind: SinkKind::AuthMutation,
+                missing_guard: GuardKind::Auth,
+                confidence: Confidence::Confirmed,
+                remediation: "Restrict external call targets to an allowlist or fixed callback interface (`IERC3156FlashBorrower`) instead of executing arbitrary caller-supplied calldata.".into(),
+            });
+        }
     }
     if f.mutability == "payable" && body_low.contains("delegatecall(") && low.contains("multicall")
     {
@@ -1690,42 +1763,140 @@ fn check_math_and_oracle_inside_fn(
     }
 
     let c_low = c.name.to_ascii_lowercase();
-    let is_amm_pair_contract =
-        (c_low.contains("pair") || c_low.contains("pool") || c_low.contains("router"))
-            && !(fn_low.contains("borrow")
-                || fn_low.contains("liquidat")
-                || fn_low.contains("collateral"));
+    let contract_has_lending_fn = c.functions.iter().any(|ff| {
+        let n = ff.name.to_ascii_lowercase();
+        n.contains("borrow") || n.contains("liquidat") || n.contains("collateral")
+    });
+    let is_amm_pair_contract = (c_low.contains("pair")
+        || c_low.contains("router")
+        || (c_low.contains("pool") && !contract_has_lending_fn))
+        && !(fn_low.contains("borrow")
+            || fn_low.contains("liquidat")
+            || fn_low.contains("collateral")
+            || fn_low.contains("oracle"));
     let is_valuation_fn = fn_low.contains("price")
+        || fn_low.contains("oracle")
         || fn_low.contains("borrow")
         || fn_low.contains("liquidat")
         || fn_low.contains("collateral")
+        || fn_low.contains("depositrequired")
         || fn_low.contains("value");
     let has_pricing_math = body.contains('*') || body.contains('/');
-    if !is_amm_pair_contract
-        && is_valuation_fn
-        && has_pricing_math
-        && low.contains("getreserves(")
-        && !low.contains("twap")
+    let lacks_twap_or_feed = !low.contains("twap")
         && !low.contains("observe(")
         && !low.contains("consult(")
-        && !low.contains("latestrounddata")
-    {
-        let r_18dec = 1_000_000_000_000_000_000_000_000u128;
-        let skew = check_amm_spot_skew_bps(r_18dec, r_18dec, r_18dec / 2);
-        findings.push(LocalStaticFinding {
-            rule_id: "SMG-WEB3-ORACLE".into(),
-            severity: "CRITICAL".into(),
-            title: format!(
-                "Flash-loan manipulable AMM `getReserves()` spot pricing in `{}.{}` (2-tx 50% swap skews price by {} bps)",
-                c.name, f.name, skew
-            ),
-            rel_path: rel_path.into(),
-            line: f.start_line,
-            symbol: format!("{}.{}", c.name, f.name),
-            sink_kind: SinkKind::SchemaTampering,
-            missing_guard: GuardKind::InputValidation,
-            confidence: Confidence::Confirmed,
-            remediation: "Use manipulation-resistant TWAP (`observe`/`consult`) or Chainlink feeds for collateral and liquidation valuation.".into(),
-        });
+        && !low.contains("latestrounddata");
+    if !is_amm_pair_contract && is_valuation_fn && has_pricing_math && lacks_twap_or_feed {
+        if low.contains("getreserves(") {
+            let r_18dec = 1_000_000_000_000_000_000_000_000u128;
+            let skew = check_amm_spot_skew_bps(r_18dec, r_18dec, r_18dec / 2);
+            findings.push(LocalStaticFinding {
+                rule_id: "SMG-WEB3-ORACLE".into(),
+                severity: "CRITICAL".into(),
+                title: format!(
+                    "Flash-loan manipulable AMM `getReserves()` spot pricing in `{}.{}` (2-tx 50% swap skews price by {} bps)",
+                    c.name, f.name, skew
+                ),
+                rel_path: rel_path.into(),
+                line: f.start_line,
+                symbol: format!("{}.{}", c.name, f.name),
+                sink_kind: SinkKind::SchemaTampering,
+                missing_guard: GuardKind::InputValidation,
+                confidence: Confidence::Confirmed,
+                remediation: "Use manipulation-resistant TWAP (`observe`/`consult`) or Chainlink feeds for collateral and liquidation valuation.".into(),
+            });
+        } else if body.contains('/')
+            && low.contains(".balance")
+            && low.contains("balanceof(")
+            && !low.contains("totalsupply")
+        {
+            let r_18dec = 1_000_000_000_000_000_000_000_000u128;
+            let skew = check_amm_spot_skew_bps(r_18dec, r_18dec, r_18dec / 2);
+            findings.push(LocalStaticFinding {
+                rule_id: "SMG-WEB3-ORACLE".into(),
+                severity: "CRITICAL".into(),
+                title: format!(
+                    "Flash-loan manipulable spot balance-ratio AMM oracle in `{}.{}` (2-tx 50% swap skews price by {} bps)",
+                    c.name, f.name, skew
+                ),
+                rel_path: rel_path.into(),
+                line: f.start_line,
+                symbol: format!("{}.{}", c.name, f.name),
+                sink_kind: SinkKind::SchemaTampering,
+                missing_guard: GuardKind::InputValidation,
+                confidence: Confidence::Confirmed,
+                remediation: "Replace instantaneous pair balance ratios (`pair.balance / token.balanceOf(pair)`) with manipulation-resistant TWAP or Chainlink price feeds.".into(),
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+mod phase15b_tests {
+    use super::*;
+
+    #[test]
+    fn test_phase15b_truster_puppet_freerider_defi_exploits() {
+        let ctx = Web3Context::default();
+        let truster = r#"
+pragma solidity ^0.8.0;
+contract TrusterLenderPool {
+    function flashLoan(uint256 amount, address borrower, address target, bytes calldata data) external returns (bool) {
+        target.functionCall(data);
+        return true;
+    }
+}
+"#;
+        let (_, truster_hits) = analyze_solidity_file("src/TrusterLenderPool.sol", truster, &ctx);
+        assert!(
+            truster_hits
+                .iter()
+                .any(|h| h.rule_id == "SMG-WEB3-ACCESS" && h.severity == "CRITICAL"),
+            "expected CRITICAL SMG-WEB3-ACCESS on Truster arbitrary functionCall, got: {:#?}",
+            truster_hits
+        );
+
+        let puppet = r#"
+pragma solidity ^0.8.0;
+contract PuppetPool {
+    address public uniswapPair;
+    function borrow(uint256 amount) external payable {}
+    function _computeOraclePrice() private view returns (uint256) {
+        return uniswapPair.balance * (10 ** 18) / token.balanceOf(uniswapPair);
+    }
+}
+"#;
+        let (_, puppet_hits) = analyze_solidity_file("src/PuppetPool.sol", puppet, &ctx);
+        assert!(
+            puppet_hits
+                .iter()
+                .any(|h| h.rule_id == "SMG-WEB3-ORACLE" && h.severity == "CRITICAL"),
+            "expected CRITICAL SMG-WEB3-ORACLE on Puppet balance-ratio spot oracle, got: {:#?}",
+            puppet_hits
+        );
+
+        let freerider = r#"
+pragma solidity ^0.8.0;
+contract FreeRiderNFTMarketplace {
+    function buyMany(uint256[] calldata tokenIds) external payable {
+        for (uint256 i = 0; i < tokenIds.length; i++) {
+            _buyOne(tokenIds[i]);
+        }
+    }
+    function _buyOne(uint256 tokenId) private {
+        uint256 priceToPay = offers[tokenId];
+        require(msg.value >= priceToPay, "not enough");
+    }
+}
+"#;
+        let (_, freerider_hits) =
+            analyze_solidity_file("src/FreeRiderNFTMarketplace.sol", freerider, &ctx);
+        assert!(
+            freerider_hits
+                .iter()
+                .any(|h| h.rule_id == "SMG-WEB3-ACCESS" && h.severity == "CRITICAL"),
+            "expected CRITICAL SMG-WEB3-ACCESS on FreeRider inter-procedural msg.value loop, got: {:#?}",
+            freerider_hits
+        );
     }
 }

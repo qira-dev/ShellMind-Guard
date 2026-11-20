@@ -486,7 +486,17 @@ pub fn solve_guard_lattice_with_public(
     summaries: &[FileAstSummary],
     public_routes: &[String],
 ) -> GraphAnalysisResult {
-    const MAX_CHA_TARGETS: usize = 8;
+    solve_guard_lattice_with_options(summaries, public_routes, false)
+}
+
+/// Global Cross-File Call Graph + Guard-Set Lattice with explicit Tier-2 `--deep-audit` budget control.
+pub fn solve_guard_lattice_with_options(
+    summaries: &[FileAstSummary],
+    public_routes: &[String],
+    deep_audit: bool,
+) -> GraphAnalysisResult {
+    let max_cha_targets: usize = if deep_audit { 64 } else { 8 };
+    let max_witness_hops: usize = if deep_audit { 256 } else { 64 };
 
     let mut arena = SymbolArena::default();
     let wildcard_id = arena.intern("*");
@@ -768,7 +778,7 @@ pub fn solve_guard_lattice_with_public(
                         } else {
                             all_impls
                         };
-                        for &impl_ty_id in chosen_impls.iter().take(MAX_CHA_TARGETS) {
+                        for &impl_ty_id in chosen_impls.iter().take(max_cha_targets) {
                             if let Some(m_idxs) = type_methods_map.get(&(impl_ty_id, member_id)) {
                                 for &idx in m_idxs {
                                     if !dst_indices.contains(&idx) {
@@ -1449,7 +1459,7 @@ pub fn solve_guard_lattice_with_public(
     let witness_is_polymorphically_ambiguous =
         |tree: &BfsTree, sink: NodeIndex, required_guard: GuardKind| -> bool {
             let mut cur = sink;
-            for _ in 0..64 {
+            for _ in 0..max_witness_hops {
                 if ambiguous_guard_callers.contains(&(cur.index(), required_guard)) {
                     return true;
                 }
@@ -1658,7 +1668,7 @@ pub fn solve_guard_lattice_with_public(
                     // Check whether cross-file taint traversed an ambiguous polymorphic dispatch edge
                     let mut poly_ambig = false;
                     let mut cur_t = idx;
-                    for _ in 0..64 {
+                    for _ in 0..max_witness_hops {
                         let parent_opt = taint_bit_parents[cur_t.index()]
                             .get(req_bit.trailing_zeros() as usize)
                             .copied()

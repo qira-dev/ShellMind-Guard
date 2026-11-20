@@ -166,6 +166,10 @@ fn tool_definitions() -> Value {
                     "deep": {
                         "type": "boolean",
                         "description": "Enable Phase 10 deep AST/OpenAPI schema validation (SMG-FUZZ-SCHEMA)"
+                    },
+                    "deep_audit": {
+                        "type": "boolean",
+                        "description": "Enable Phase 15 Tier-2 deep audit budget (unlocks 2048-block CFG, 64 CHA targets, 256 witness hops)"
                     }
                 }
             }
@@ -325,6 +329,10 @@ fn handle_tool_call(params: &Value) -> Result<Value> {
                 .and_then(smg_graph::Confidence::parse);
 
             let deep = args.get("deep").and_then(|v| v.as_bool()).unwrap_or(false);
+            let deep_audit = args
+                .get("deep_audit")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
 
             let outcome = execute_scan_pipeline(ScanRunOptions {
                 path: &root,
@@ -336,6 +344,7 @@ fn handle_tool_call(params: &Value) -> Result<Value> {
                 unsafe_host_fallback: false,
                 trust_repo_config: false,
                 deep,
+                deep_audit,
                 sandbox_mem_mb: None,
                 sandbox_tls: false,
                 mock_shims: false,
