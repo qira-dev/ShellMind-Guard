@@ -4405,6 +4405,17 @@ pub fn analyze_function_taint(
         summary.guards.insert(GuardKind::OwnershipCheck);
     }
 
+    // Phase 15C: Prune mathematically unreachable (SMT UNSAT) dead-path findings.
+    if !summary.local_taint_hits.is_empty() || !summary.param_sinks.is_empty() {
+        let use_z3 = crate::smt::is_z3_available();
+        summary
+            .local_taint_hits
+            .retain(|hit| crate::smt::is_line_reachable(fn_node, src, hit.line, use_z3));
+        summary
+            .param_sinks
+            .retain(|hit| crate::smt::is_line_reachable(fn_node, src, hit.line, use_z3));
+    }
+
     summary
 }
 

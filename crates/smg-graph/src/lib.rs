@@ -14,6 +14,7 @@ pub mod rule_pack;
 pub mod rules;
 pub mod scope;
 pub mod secrets_config;
+pub mod smt;
 pub mod subgraph;
 pub mod taint;
 
@@ -34,6 +35,10 @@ pub use lattice::{
 };
 pub use phase10::{ParamTypeHint, RouteParamSpec, RouteSchema, collect_deep_schema_findings};
 pub use rules::{RULE_CATALOG, RuleDoc, find_rule_doc};
+pub use smt::{
+    CmpOp, PathConstraint, SmtVerdict, emit_smtlib2, extract_path_constraints_to_line,
+    is_line_reachable, is_z3_available, parse_condition_expr, solve_path_constraints,
+};
 pub use subgraph::{
     collect_git_changed_files, should_force_full_scan_on_diff, slice_summaries_for_changed_files,
 };
@@ -46,7 +51,7 @@ fn load_or_parse_summaries_cached(
     let cfg_json = serde_json::to_string(&cfg.guards).unwrap_or_default();
     let adv_stamp = smg_core::advisories_db_stamp();
     let versioned_cfg = format!(
-        "v24-phase15b-deep-audit-{}|{}|{}|{}",
+        "v25-phase15c-smt-{}|{}|{}|{}",
         env!("CARGO_PKG_VERSION"),
         adv_stamp,
         cfg.scan.deep_audit,
