@@ -368,8 +368,25 @@ fn inspect_solana_instruction_fn(
         .unwrap_or_else(|| "instruction".into());
     let body = node_txt(fn_node, src);
     let base_line = fn_node.start_position().row + 1;
-    let ctx_has_validated_program = extract_ctx_struct_name(body)
-        .is_some_and(|st| sctx.structs_with_validated_program.contains(&st));
+    let impl_struct_validated = body.contains("&self") && {
+        let mut cur = fn_node.parent();
+        let mut matched = false;
+        while let Some(p) = cur {
+            if p.kind() == "impl_item" {
+                let impl_txt = node_txt(p, src);
+                matched = sctx
+                    .structs_with_validated_program
+                    .iter()
+                    .any(|st| impl_txt.contains(st));
+                break;
+            }
+            cur = p.parent();
+        }
+        matched
+    };
+    let ctx_has_validated_program = impl_struct_validated
+        || extract_ctx_struct_name(body)
+            .is_some_and(|st| sctx.structs_with_validated_program.contains(&st));
 
     let body_low = body.to_ascii_lowercase();
     let has_lamport_zero = body_low.contains("try_borrow_mut_lamports") && body_low.contains("= 0");

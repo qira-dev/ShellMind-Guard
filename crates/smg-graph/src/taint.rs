@@ -2901,6 +2901,8 @@ fn check_call_taint_sinks(
             )
             || ftxt.ends_with(".execSync")
             || (ftxt.ends_with(".exec")
+                && !ftxt.starts_with('/')
+                && !ftxt.contains("RegExp")
                 && !ftxt.starts_with("db.")
                 && !ftxt.starts_with("tx.")
                 && !ftxt.starts_with("stmt.")

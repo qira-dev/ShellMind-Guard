@@ -1043,7 +1043,7 @@ fn audit_package_json(
                 continue;
             };
             let ln = find_line_for_needle(&lines, &format!("\"{}\"", pkg));
-            if is_floating_version(ver) {
+            if is_floating_version(ver) && section != "peerDependencies" {
                 out.push(make_dep_finding(
                     "HIGH",
                     format!(

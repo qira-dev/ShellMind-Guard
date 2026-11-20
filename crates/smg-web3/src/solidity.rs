@@ -1344,7 +1344,8 @@ fn check_initializer_and_admin_access(
         let guarded = has_auth
             || f.body_text.contains("initialized")
             || f.body_text.contains("_initializing")
-            || f.body_text.contains("_disableInitializers");
+            || f.body_text.contains("_disableInitializers")
+            || (f.body_text.contains("require(") && f.body_text.contains("== 0"));
         if !guarded {
             let mut conf = Confidence::Confirmed;
             let mut note = String::new();
@@ -1394,6 +1395,10 @@ fn check_initializer_and_admin_access(
         }
     }
 
+    let is_amm_lp_mint = low == "mint"
+        && (f.body_text.to_ascii_lowercase().contains("mintcallback")
+            || c.name.to_ascii_lowercase().contains("pool")
+            || c.name.to_ascii_lowercase().contains("pair"));
     let is_privileged_name = (matches!(
         low.as_str(),
         "setowner"
@@ -1409,7 +1414,7 @@ fn check_initializer_and_admin_access(
             | "setfee"
             | "setoracle"
             | "setadmin"
-    ) || (low == "mint" && f.mutability != "payable"));
+    ) || (low == "mint" && f.mutability != "payable" && !is_amm_lp_mint));
     if is_privileged_name && !has_auth {
         findings.push(LocalStaticFinding {
             rule_id: "SMG-WEB3-ACCESS".into(),
@@ -1916,6 +1921,27 @@ contract ERC721 {
                 .any(|h| h.title.contains("Arbitrary `transferFrom")),
             "ERC721 internal self-call transferFrom must not false-positive, got: {:#?}",
             erc721_hits
+        );
+
+        // Phase 17B: UniswapV3Pool initialize (`require(slot0.sqrtPriceX96 == 0)`) and AMM LP mint must NOT FP
+        let uniswap_v3 = r#"
+pragma solidity =0.7.6;
+contract UniswapV3Pool {
+    function initialize(uint160 sqrtPriceX96) external {
+        require(slot0.sqrtPriceX96 == 0, 'AI');
+        slot0.sqrtPriceX96 = sqrtPriceX96;
+    }
+    function mint(address recipient, int24 tickLower, int24 tickUpper, uint128 amount, bytes calldata data) external returns (uint256, uint256) {
+        IUniswapV3MintCallback(msg.sender).uniswapV3MintCallback(amount, 0, data);
+        return (amount, 0);
+    }
+}
+"#;
+        let (_, uni_hits) = analyze_solidity_file("contracts/UniswapV3Pool.sol", uniswap_v3, &ctx);
+        assert!(
+            uni_hits.is_empty(),
+            "UniswapV3Pool initialize/mint must have 0 FPs, got: {:#?}",
+            uni_hits
         );
     }
 }

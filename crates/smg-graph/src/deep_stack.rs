@@ -1768,5 +1768,24 @@ function ResearchHandler(db) {
             "Internal non-request schema loop must not trigger SMG-CFG-PROTO, got: {:#?}",
             fastify_safe.findings
         );
+
+        // Phase 17B: JS RegExp literal `.exec()` (NestJS `partner.guard.ts`) must NOT trigger SMG-CMDI-001
+        let nest_regex = run_inline(&[(
+            "src/partner.guard.ts",
+            r#"export function canActivate(req: any) {
+    const auth = req.headers.authorization;
+    const m = /^Bearer (\S+)$/.exec(auth);
+    return Boolean(m);
+}
+"#,
+        )]);
+        assert!(
+            !nest_regex
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "SMG-CMDI-001"),
+            "JS RegExp literal .exec() must not trigger SMG-CMDI-001, got: {:#?}",
+            nest_regex.findings
+        );
     }
 }
