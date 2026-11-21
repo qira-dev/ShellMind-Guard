@@ -1,6 +1,7 @@
 pub mod arena;
 pub mod ast;
 pub mod call_hierarchy;
+pub mod cfa_ssa;
 pub mod cfg;
 pub mod deep_stack;
 pub mod deps;
@@ -18,6 +19,7 @@ pub mod rules;
 pub mod scope;
 pub mod secrets_config;
 pub mod smt;
+pub mod smt_advanced;
 pub mod subgraph;
 pub mod taint;
 
@@ -46,6 +48,14 @@ pub use rules::{RULE_CATALOG, RuleDoc, find_rule_doc};
 pub use smt::{
     CmpOp, PathConstraint, SmtVerdict, emit_smtlib2, extract_path_constraints_to_line,
     is_line_reachable, is_z3_available, parse_condition_expr, solve_path_constraints,
+};
+pub use smt_advanced::{
+    ArrayConstraint, BvBitState, BvConstraint, LinearIneq, check_interprocedural_feasibility,
+    solve_array_constraints, solve_bv_constraints, solve_lia_constraints,
+};
+pub use cfa_ssa::{
+    AllocSite, CallString2, ContextKey, FieldSensitivePointsTo, KCfaContextTable, PointsToStmt,
+    SsaDefUseGraph, SsaOp, SsaVar,
 };
 pub use subgraph::{
     collect_git_changed_files, should_force_full_scan_on_diff, slice_summaries_for_changed_files,
