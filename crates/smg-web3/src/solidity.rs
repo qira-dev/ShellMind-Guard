@@ -164,8 +164,11 @@ fn classify_external_call(call_node: Node, src: &[u8]) -> Option<(bool, String)>
         return Some((true, "low_level_call".into()));
     }
     // 2300-gas Solidity `.transfer()` / `.send()` cannot reenter; only flag callback-capable token/ETH helpers
-    if full.contains("sendValue(") || raw_fn.ends_with(".send") {
+    if full.contains("sendValue(") {
         return Some((true, "eth_send_callback_risk".into()));
+    }
+    if raw_fn.ends_with(".send") {
+        return Some((false, "eth_send".into()));
     }
     if raw_fn.contains("safeTransferFrom")
         || raw_fn.contains("safeBatchTransferFrom")
@@ -752,8 +755,7 @@ fn extract_contract(
                     // Check preceding NatSpec comment for `@custom:storage-location erc7201:`
                     let item_start = item.start_byte();
                     let lookback_start = item_start.saturating_sub(240);
-                    let preceding =
-                        std::str::from_utf8(&src[lookback_start..item_start]).unwrap_or("");
+                    let preceding = String::from_utf8_lossy(&src[lookback_start..item_start]);
                     if preceding.contains("@custom:storage-location")
                         && preceding.contains("erc7201:")
                     {

@@ -509,21 +509,27 @@ pub fn link_library_placeholders(hex_str: &str) -> String {
     let mut i = 0usize;
     while i < bytes.len() {
         if i + 40 <= bytes.len() && bytes[i] == b'_' && bytes[i + 1] == b'_' {
-            // Standard solc v0.5+ (`__$<34 hex>$__`) or legacy (`__<name>___...`) 40-char placeholder
-            let slice = &clean[i..i + 40];
-            if (slice.starts_with("__$") && slice.ends_with("$__")) || slice.ends_with("__") {
+            let slice = &bytes[i..i + 40];
+            let is_solc_v5 =
+                slice.starts_with(&[b'_', b'_', 0x24]) && slice.ends_with(&[0x24, b'_', b'_']);
+            if is_solc_v5 || slice.ends_with(b"__") {
                 out.push_str(MOCK_LIB_ADDR_HEX);
                 i += 40;
                 continue;
             }
         }
-        out.push(bytes[i] as char);
+        if bytes[i].is_ascii() {
+            out.push(bytes[i] as char);
+        }
         i += 1;
     }
     out
 }
 
 pub fn decode_hex_bytecode(hex_str: &str) -> Vec<u8> {
+    if !hex_str.is_ascii() {
+        return Vec::new();
+    }
     let linked = link_library_placeholders(hex_str);
     let clean = linked.as_str();
     if clean.is_empty() || !clean.is_ascii() || !clean.len().is_multiple_of(2) {

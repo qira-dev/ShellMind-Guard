@@ -269,7 +269,9 @@ fn check_pqc_hybrid_and_downgrade(
         if is_fn_hdr && !fn_chunks.last().is_none_or(Vec::is_empty) {
             fn_chunks.push(Vec::new());
         }
-        fn_chunks.last_mut().unwrap().push((*ln, line.as_str()));
+        if let Some(last) = fn_chunks.last_mut() {
+            last.push((*ln, line.as_str()));
+        }
     }
 
     for chunk in &fn_chunks {

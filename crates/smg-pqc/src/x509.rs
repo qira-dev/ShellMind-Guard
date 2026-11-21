@@ -188,7 +188,11 @@ pub fn parse_x509_der(rel_path: &str, chain_index: usize, der: &[u8]) -> Option<
         && after_validity.windows(3).any(|w| w == [0x01, 0x01, 0xff]);
 
     let (sig_alg, sig_shor) = classify_x509_oid(&sig_oid);
-    let current_year = 2026u32;
+    let current_year = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| 1970u32.saturating_add((d.as_secs() / 31_557_600) as u32))
+        .unwrap_or(2026u32)
+        .max(2026u32);
     let remaining_years = not_after_year.map(|y| y.saturating_sub(current_year));
 
     Some(X509CertRecord {

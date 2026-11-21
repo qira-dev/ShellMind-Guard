@@ -1126,15 +1126,18 @@ fn analyze_single_hw_function(
             }
 
             let has_sig_call = low.contains("verify_signature")
-                || low.contains("ed25519")
-                || low.contains("ecdsa")
+                || low.contains("ed25519_verify")
+                || low.contains("ecdsa_verify")
                 || low.contains("rsa_verify")
                 || low.contains("crypto_verify")
                 || low.contains("mbedtls_pk_verify")
-                || low.contains("wc_")
-                || low.contains("mcuboot_")
-                || low.contains("bootutil_")
-                || low.contains("validate_ota");
+                || low.contains("wc_signatureverify")
+                || low.contains("wc_ed25519_verify")
+                || low.contains("wc_ecc_verify")
+                || low.contains("wc_rsa_verify")
+                || low.contains("bootutil_img_validate")
+                || low.contains("mcuboot_verify")
+                || low.contains("validate_ota_signature");
             if has_sig_call {
                 let checked_inline = low.starts_with("if")
                     || low.contains("if (")

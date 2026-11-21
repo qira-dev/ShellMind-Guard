@@ -184,8 +184,10 @@ pub fn scan_web3_repo_with_options(
                                 },
                                 severity: "CRITICAL".into(),
                                 title: format!(
-                                    "[revm PROVEN multi-tx invariant] `{}` violated {}",
-                                    c.name, inv_res.summary
+                                    "[revm {} multi-tx invariant] `{}` violated {}",
+                                    if is_solvency { "HEURISTIC" } else { "PROVEN" },
+                                    c.name,
+                                    inv_res.summary
                                 ),
                                 rel_path: f.rel_path.clone(),
                                 line: c.start_line.max(1),
@@ -196,7 +198,11 @@ pub fn scan_web3_repo_with_options(
                                     SinkKind::AuthMutation
                                 },
                                 missing_guard: GuardKind::Auth,
-                                confidence: Confidence::Proven,
+                                confidence: if is_solvency {
+                                    Confidence::Heuristic
+                                } else {
+                                    Confidence::Proven
+                                },
                                 remediation: "Enforce caller authorization and protocol solvency invariants across all multi-transaction call sequences.".into(),
                             });
                         }
@@ -234,12 +240,24 @@ pub fn scan_web3_repo_with_options(
     all_findings.extend(detect_proxy_storage_collisions(&proxies, &impls));
 
     // Deterministic deduplication by (rule_id, rel_path, line) retaining highest severity
+    let conf_rank = |c: Confidence| -> u8 {
+        match c {
+            Confidence::Proven => 3,
+            Confidence::Confirmed => 2,
+            Confidence::Heuristic => 1,
+        }
+    };
     let mut best_by_key: HashMap<(String, String, usize), usize> = HashMap::new();
     let mut deduped: Vec<LocalStaticFinding> = Vec::new();
     for f in all_findings {
         let key = (f.rule_id.clone(), f.rel_path.clone(), f.line);
         if let Some(&idx) = best_by_key.get(&key) {
-            if severity_rank(&f.severity) > severity_rank(&deduped[idx].severity) {
+            let new_key = (severity_rank(&f.severity), conf_rank(f.confidence));
+            let old_key = (
+                severity_rank(&deduped[idx].severity),
+                conf_rank(deduped[idx].confidence),
+            );
+            if new_key > old_key {
                 deduped[idx] = f;
             }
         } else {

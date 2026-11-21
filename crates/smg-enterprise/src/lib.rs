@@ -146,20 +146,59 @@ mod tests {
         let pcr0_srv = pcr0.clone();
         let handle = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 8192];
-            let _ = stream.read(&mut buf);
-            let quote = sign_tee_quote(
+            let mut req_bytes = Vec::new();
+            let mut tmp = [0u8; 4096];
+            let mut header_end = None;
+            let mut content_len = 0usize;
+            loop {
+                let n = stream.read(&mut tmp).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                req_bytes.extend_from_slice(&tmp[..n]);
+                if header_end.is_none()
+                    && let Some(pos) = req_bytes.windows(4).position(|w| w == b"\r\n\r\n")
+                {
+                    header_end = Some(pos + 4);
+                    let hdrs = String::from_utf8_lossy(&req_bytes[..pos]);
+                    for line in hdrs.lines() {
+                        if let Some((k, v)) = line.split_once(':')
+                            && k.trim().eq_ignore_ascii_case("content-length")
+                        {
+                            content_len = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                }
+                if let Some(he) = header_end
+                    && req_bytes.len() >= he + content_len
+                {
+                    break;
+                }
+            }
+            let req_body = header_end
+                .map(|he| &req_bytes[he..req_bytes.len().min(he + content_len)])
+                .unwrap_or(&[]);
+            let parsed_req: crate::tee::RemoteTeeScanRequest =
+                serde_json::from_slice(req_body).unwrap();
+            let req_hash =
+                crate::tee::compute_request_blake3_hex(&parsed_req.nonce_hex, &parsed_req.files);
+            let findings: Vec<smg_graph::LatticeFinding> = Vec::new();
+            let fin_bytes = serde_json::to_vec(&findings).unwrap();
+            let fin_hash = blake3::hash(&fin_bytes).to_hex().to_string();
+            let quote = crate::tee::sign_tee_quote_with_transcript(
                 &pkcs8,
                 TeePlatform::IntelTdx,
                 &pcr0_srv,
                 nonce,
                 now,
                 "tdx-enclave-01",
+                Some(req_hash),
+                Some(fin_hash),
             )
             .unwrap();
             let body = serde_json::to_string(&RemoteTeeScanResponse {
                 quote,
-                findings: Vec::new(),
+                findings,
                 scan_elapsed_ms: 12,
             })
             .unwrap();

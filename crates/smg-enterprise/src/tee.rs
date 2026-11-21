@@ -160,6 +160,30 @@ pub fn sign_tee_quote(
     issued_at_unix: u64,
     enclave_session_id: &str,
 ) -> Result<TeeAttestationQuote> {
+    sign_tee_quote_with_transcript(
+        pkcs8_key,
+        platform,
+        pcr0_or_mrtd_hex,
+        nonce_hex,
+        issued_at_unix,
+        enclave_session_id,
+        None,
+        None,
+    )
+}
+
+/// Signs a TEE attestation quote with optional cryptographic request/findings BLAKE3 transcript hashes.
+#[allow(clippy::too_many_arguments)]
+pub fn sign_tee_quote_with_transcript(
+    pkcs8_key: &[u8],
+    platform: TeePlatform,
+    pcr0_or_mrtd_hex: &str,
+    nonce_hex: &str,
+    issued_at_unix: u64,
+    enclave_session_id: &str,
+    request_blake3_hex: Option<String>,
+    findings_blake3_hex: Option<String>,
+) -> Result<TeeAttestationQuote> {
     let pair = Ed25519KeyPair::from_pkcs8(pkcs8_key)
         .map_err(|_| anyhow::anyhow!("invalid Ed25519 PKCS#8 attestation key"))?;
     let mut q = TeeAttestationQuote {
@@ -169,8 +193,8 @@ pub fn sign_tee_quote(
         issued_at_unix,
         enclave_session_id: enclave_session_id.trim().to_string(),
         signature_b64: String::new(),
-        request_blake3_hex: None,
-        findings_blake3_hex: None,
+        request_blake3_hex: request_blake3_hex.map(|s| s.trim().to_ascii_lowercase()),
+        findings_blake3_hex: findings_blake3_hex.map(|s| s.trim().to_ascii_lowercase()),
     };
     validate_quote_fields(&q)?;
     let msg = canonical_quote_signing_bytes(&q);
@@ -287,7 +311,7 @@ pub struct RemoteTeeScanResponse {
     pub scan_elapsed_ms: u128,
 }
 
-fn compute_request_blake3_hex(nonce_hex: &str, files: &HashMap<String, String>) -> String {
+pub fn compute_request_blake3_hex(nonce_hex: &str, files: &HashMap<String, String>) -> String {
     let mut keys: Vec<&String> = files.keys().collect();
     keys.sort();
     let mut hasher = blake3::Hasher::new();
@@ -401,10 +425,12 @@ pub fn execute_remote_tee_scan(
     let body: RemoteTeeScanResponse =
         serde_json::from_slice(&raw_bytes).context("invalid remote TEE response JSON")?;
 
-    if let Some(ref quoted_req_hash) = body.quote.request_blake3_hex
-        && !quoted_req_hash
-            .trim()
-            .eq_ignore_ascii_case(&expected_req_hash)
+    let Some(ref quoted_req_hash) = body.quote.request_blake3_hex else {
+        bail!("fail-closed TEE attestation: quote is missing mandatory request_blake3_hex binding");
+    };
+    if !quoted_req_hash
+        .trim()
+        .eq_ignore_ascii_case(&expected_req_hash)
     {
         bail!(
             "fail-closed TEE attestation: request transcript BLAKE3 mismatch (expected {}, got {})",
@@ -412,19 +438,20 @@ pub fn execute_remote_tee_scan(
             quoted_req_hash
         );
     }
-    if let Some(ref quoted_fin_hash) = body.quote.findings_blake3_hex {
-        let findings_json = serde_json::to_vec(&body.findings).unwrap_or_default();
-        let expected_fin_hash = blake3::hash(&findings_json).to_hex().to_string();
-        if !quoted_fin_hash
-            .trim()
-            .eq_ignore_ascii_case(&expected_fin_hash)
-        {
-            bail!(
-                "fail-closed TEE attestation: findings transcript BLAKE3 mismatch (expected {}, got {})",
-                expected_fin_hash,
-                quoted_fin_hash
-            );
-        }
+    let Some(ref quoted_fin_hash) = body.quote.findings_blake3_hex else {
+        bail!("fail-closed TEE attestation: quote is missing mandatory findings_blake3_hex binding");
+    };
+    let findings_json = serde_json::to_vec(&body.findings).unwrap_or_default();
+    let expected_fin_hash = blake3::hash(&findings_json).to_hex().to_string();
+    if !quoted_fin_hash
+        .trim()
+        .eq_ignore_ascii_case(&expected_fin_hash)
+    {
+        bail!(
+            "fail-closed TEE attestation: findings transcript BLAKE3 mismatch (expected {}, got {})",
+            expected_fin_hash,
+            quoted_fin_hash
+        );
     }
 
     let verify_now = SystemTime::now()
