@@ -422,14 +422,36 @@ fn handle_tool_call(params: &Value) -> Result<Value> {
                     anyhow::anyhow!("Finding `{}` not found in {}", finding_id, root.display())
                 })?;
 
-            let prompt_excerpt = build_minimal_patch_prompt(&root, &finding, None)?;
-            json!({
+            const MAX_EXPLAIN_BYTES: usize = 30 * 1024;
+            let mut source_context = build_minimal_patch_prompt(&root, &finding, None)?;
+            let mut explain_val = json!({
                 "ok": true,
                 "finding": finding,
                 "remediation": finding.remediation,
-                "source_context": prompt_excerpt,
+                "source_context": source_context,
+                "truncated": false,
                 "replay_cmd": format!("smg replay {}", finding.id),
-            })
+            });
+            let encoded_len = explain_val.to_string().len();
+            if encoded_len > MAX_EXPLAIN_BYTES {
+                let overhead = encoded_len.saturating_sub(source_context.len());
+                let budget = MAX_EXPLAIN_BYTES.saturating_sub(overhead + 64);
+                let mut cut = budget.min(source_context.len());
+                while cut > 0 && !source_context.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                source_context.truncate(cut);
+                source_context.push_str("\n...[truncated to MCP 32 KiB budget]");
+                explain_val = json!({
+                    "ok": true,
+                    "finding": finding,
+                    "remediation": finding.remediation,
+                    "source_context": source_context,
+                    "truncated": true,
+                    "replay_cmd": format!("smg replay {}", finding.id),
+                });
+            }
+            explain_val
         }
         "shellmind_guard_init" => {
             let root =
@@ -479,10 +501,25 @@ fn handle_tool_call(params: &Value) -> Result<Value> {
         other => anyhow::bail!("Unknown MCP tool `{}`", other),
     };
 
+    let mut text = serde_json::to_string(&payload)?;
+    const MAX_MCP_ENVELOPE_BYTES: usize = 32 * 1024;
+    if text.len() > MAX_MCP_ENVELOPE_BYTES {
+        let mut cut = (MAX_MCP_ENVELOPE_BYTES - 128).min(text.len());
+        while cut > 0 && !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text = serde_json::to_string(&json!({
+            "ok": true,
+            "truncated": true,
+            "budget_bytes": MAX_MCP_ENVELOPE_BYTES,
+            "preview": &text[..cut],
+        }))?;
+    }
+
     Ok(json!({
         "content": [{
             "type": "text",
-            "text": serde_json::to_string(&payload)?
+            "text": text
         }],
         "isError": false
     }))

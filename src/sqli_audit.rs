@@ -260,7 +260,9 @@ fn send_injectable(
     }
     let resp = req.send()?;
     let status = resp.status().as_u16();
-    let body = resp.text().unwrap_or_default();
+    let mut raw = Vec::new();
+    let _ = std::io::Read::read_to_end(&mut std::io::Read::take(resp, 2 * 1024 * 1024), &mut raw);
+    let body = String::from_utf8_lossy(&raw).into_owned();
     Ok(Response { status, body })
 }
 
@@ -285,7 +287,7 @@ fn body_diverges(a: &Response, b: &Response) -> bool {
     }
     let max = a.body.len().max(b.body.len()).max(1);
     let delta = (a.body.len() as i64 - b.body.len() as i64).unsigned_abs() as usize;
-    delta * 100 / max > 5 || a.body.len() != b.body.len()
+    delta * 100 / max > 5
 }
 
 fn median_f64(samples: &mut [f64]) -> f64 {
@@ -470,8 +472,12 @@ pub fn run_sqli_audit(cfg: &SqliAuditConfig) -> Result<SqliAuditReport> {
                     let mut samples = Vec::new();
                     for _ in 0..TIME_PAYLOAD_REPS {
                         let t0 = Instant::now();
-                        let _ = send_probe(payload);
-                        samples.push(t0.elapsed().as_secs_f64());
+                        if send_probe(payload).is_ok() {
+                            samples.push(t0.elapsed().as_secs_f64());
+                        }
+                    }
+                    if samples.len() < TIME_PAYLOAD_REPS {
+                        continue;
                     }
                     let payload_median = median_f64(&mut samples);
                     if payload_median - baseline_median >= (delay as f64) * 0.7 {

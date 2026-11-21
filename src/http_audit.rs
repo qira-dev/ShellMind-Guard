@@ -329,7 +329,12 @@ fn probe_graphql_introspection(client: &Client, endpoint: &str, findings: &mut V
         .send()
     {
         let status = resp.status().as_u16();
-        let body = resp.text().unwrap_or_default();
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(
+            &mut std::io::Read::take(resp, 2 * 1024 * 1024),
+            &mut buf,
+        );
+        let body = String::from_utf8_lossy(&buf);
         if (200..300).contains(&status) && body.contains("__schema") {
             dedup_insert(
                 findings,
@@ -386,7 +391,12 @@ pub fn run_http_audit(cfg: &HttpAuditConfig) -> Result<HttpAuditReport> {
             if !(200..300).contains(&status) {
                 continue;
             }
-            let Ok(body) = resp.text() else { continue };
+            let mut raw = Vec::new();
+            let _ = std::io::Read::read_to_end(
+                &mut std::io::Read::take(resp, 2 * 1024 * 1024),
+                &mut raw,
+            );
+            let body = String::from_utf8_lossy(&raw).into_owned();
             if detect_schema_kind(&body) == Some("openapi") {
                 if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) {
                     schema_findings.extend(lint_openapi(&value, schema_url.as_str()));
@@ -403,6 +413,12 @@ pub fn run_http_audit(cfg: &HttpAuditConfig) -> Result<HttpAuditReport> {
             .clone()
             .or_else(|| parsed.join("graphql").ok().map(|u| u.to_string()));
         if let Some(endpoint) = gql {
+            if !cfg.allow_remote && !crate::idor_audit::is_lab_or_loopback_url(&endpoint)? {
+                bail!(
+                    "Refusing remote --graphql endpoint '{}' by default (pass `--allow-remote` to probe non-loopback staging targets).",
+                    endpoint
+                );
+            }
             probe_graphql_introspection(&client, &endpoint, &mut schema_findings);
         }
     }

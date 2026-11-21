@@ -232,6 +232,33 @@ fn purl_ecosystem(eco: &str) -> &str {
 
 /// Exports a combined CycloneDX 1.5 SBOM + VEX document tagging `SMG-DEP-*` vulnerabilities with
 /// 4-tier call-graph VEX provenance (`ProvenRouteSymbol`, `ImportedSafeApiOnly`,
+fn title_matches_package(title: &str, pkg: &str) -> bool {
+    if pkg.is_empty() {
+        return false;
+    }
+    let bytes = title.as_bytes();
+    let mut start = 0;
+    while let Some(pos) = title[start..].find(pkg) {
+        let abs = start + pos;
+        let end = abs + pkg.len();
+        let left_ok = abs == 0
+            || !matches!(
+                bytes[abs - 1],
+                b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-' | b'.' | b'/'
+            );
+        let right_ok = end == bytes.len()
+            || !matches!(
+                bytes[end],
+                b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-' | b'.' | b'/'
+            );
+        if left_ok && right_ok {
+            return true;
+        }
+        start = abs + pkg.len().max(1);
+    }
+    false
+}
+
 /// `ImportedUnprovenSymbol`, `DeclaredUnused`), sealed with a deterministic BLAKE3 digest.
 pub fn to_cyclonedx_vex_json(
     project_name: &str,
@@ -304,7 +331,8 @@ pub fn to_cyclonedx_vex_json(
             let root_ref = format!("pkg:generic/{project_name}");
             let matched_comp_ref = deps
                 .iter()
-                .find(|d| f.title.contains(&d.name))
+                .filter(|d| title_matches_package(&f.title, &d.name))
+                .max_by_key(|d| d.name.len())
                 .map(|d| {
                     let purl_eco = purl_ecosystem(&d.ecosystem);
                     format!("pkg:{}/{}@{}", purl_eco, d.name, d.version)

@@ -2435,8 +2435,9 @@ where
     state.bg_running = Some((label, 0));
     state.bg_rx = Some(rx);
     std::thread::spawn(move || {
-        let ev = work();
-        let _ = tx.send(ev);
+        if let Ok(ev) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
+            let _ = tx.send(ev);
+        }
     });
 }
 
@@ -3432,8 +3433,8 @@ fn open_path_in_browser(path: &std::path::Path) -> std::io::Result<std::process:
     }
     #[cfg(target_os = "windows")]
     {
-        Command::new("cmd")
-            .args(["/C", "start", ""])
+        // Invoke explorer.exe directly (no cmd.exe shell parsing of &, |, ^, %).
+        Command::new("explorer.exe")
             .arg(path)
             .stdout(Stdio::null())
             .stderr(Stdio::null())

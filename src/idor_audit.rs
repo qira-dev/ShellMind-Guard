@@ -78,7 +78,8 @@ pub fn is_lab_or_loopback_url(base_url: &str) -> Result<bool> {
     }
     if let Ok(ip) = host.trim_matches(['[', ']']).parse::<IpAddr>() {
         return Ok(match ip {
-            IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+            // Explicitly exclude IPv4 link-local (169.254.0.0/16, cloud IMDS 169.254.169.254)
+            IpAddr::V4(v4) => v4.is_loopback() || v4.is_private(),
             IpAddr::V6(v6) => v6.is_loopback(),
         });
     }
@@ -220,7 +221,9 @@ fn send_with_headers(
         .send()
         .with_context(|| format!("HTTP request failed for {url}"))?;
     let status = resp.status().as_u16();
-    let body = resp.text().unwrap_or_default();
+    let mut buf = Vec::new();
+    let _ = std::io::Read::read_to_end(&mut std::io::Read::take(resp, 2 * 1024 * 1024), &mut buf);
+    let body = String::from_utf8_lossy(&buf).into_owned();
     Ok((status, body))
 }
 

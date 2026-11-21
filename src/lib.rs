@@ -2395,6 +2395,7 @@ pub fn run_cli() -> Result<ExitCode> {
                                 "[SMG watch] GATE FAILED: {} blocking finding(s)",
                                 next_outcome.graph.findings.len()
                             );
+                            return Ok(ExitCode::from(2));
                         }
                     }
                 }

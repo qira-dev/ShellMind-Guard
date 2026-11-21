@@ -547,10 +547,9 @@ fn eval_arg(raw: &str, ctx: &DslCtx) -> Option<String> {
     }
     if let Some(rest) = raw.strip_prefix("headers[") {
         let name = rest
-            .trim_start_matches("['")
-            .trim_end_matches("']")
-            .trim_start_matches("[\"")
-            .trim_end_matches("\"]")
+            .trim_end_matches(']')
+            .trim()
+            .trim_matches(|c| c == '\'' || c == '"')
             .trim();
         for line in ctx.headers.lines() {
             if let Some((k, v)) = line.split_once(": ")
@@ -701,34 +700,48 @@ pub struct HttpResponse {
 pub struct HttpRunners {
     no_redirect: Client,
     redirect: Client,
+    allow_remote: bool,
 }
 
 impl HttpRunners {
-    pub fn build(timeout: Duration) -> Result<HttpRunners> {
+    pub fn build_with_scope(timeout: Duration, allow_remote: bool) -> Result<HttpRunners> {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let build = |redirects: bool| -> Result<Client> {
+            let policy = if redirects {
+                Policy::custom(move |attempt| {
+                    if attempt.previous().len() >= 10 {
+                        return attempt.stop();
+                    }
+                    if !allow_remote
+                        && !crate::idor_audit::is_lab_or_loopback_url(attempt.url().as_str())
+                            .unwrap_or(false)
+                    {
+                        return attempt.stop();
+                    }
+                    attempt.follow()
+                })
+            } else {
+                Policy::none()
+            };
             let client = Client::builder()
                 .connect_timeout(Duration::from_secs(5))
                 .timeout(timeout)
-                .redirect(if redirects {
-                    Policy::limited(10)
-                } else {
-                    Policy::none()
-                })
+                .redirect(policy)
                 .user_agent(concat!(
                     "Mozilla/5.0 (compatible; ShellMind-Guard/",
                     env!("CARGO_PKG_VERSION"),
                     ")"
                 ))
                 // Lab-only runner: loopback/RFC1918 targets frequently use
-                // self-signed certs, so chain trust is relaxed by design.
-                .danger_accept_invalid_certs(true) // smg-ignore: SMG-CFG-TLS
+                // self-signed certs; remote staging targets verify TLS by default.
+                .danger_accept_invalid_certs(!allow_remote) // smg-ignore: SMG-CFG-TLS
                 .build()?;
             Ok(client)
         };
         Ok(HttpRunners {
             no_redirect: build(false)?,
             redirect: build(true)?,
+            allow_remote,
         })
     }
 }
@@ -754,29 +767,24 @@ pub struct RawRequest {
 }
 
 pub fn parse_raw_request(raw: &str) -> Option<RawRequest> {
-    let mut lines = raw.lines();
+    let (head, body) = if let Some(pos) = raw.find("\r\n\r\n") {
+        (&raw[..pos], raw[pos + 4..].to_string())
+    } else if let Some(pos) = raw.find("\n\n") {
+        (&raw[..pos], raw[pos + 2..].to_string())
+    } else {
+        (raw, String::new())
+    };
+    let mut lines = head.lines();
     let first = lines.next()?.trim().to_string();
     let mut tokens = first.split_whitespace();
     let method = tokens.next()?.to_ascii_uppercase();
     let target = tokens.next()?.to_string();
     let mut headers = Vec::new();
-    let mut body_offset: Option<usize> = None;
-    let mut offset = first.len() + 1;
     for line in lines {
-        let line_end = offset + line.len();
-        if line.is_empty() {
-            body_offset = Some(offset + 1);
-            break;
-        }
         if let Some((k, v)) = line.split_once(':') {
             headers.push((k.trim().to_string(), v.trim().to_string()));
         }
-        offset = line_end + 1;
     }
-    let body = body_offset
-        .filter(|&s| s <= raw.len())
-        .map(|s| raw[s..].to_string())
-        .unwrap_or_default();
     Some(RawRequest {
         method,
         target,
@@ -798,6 +806,9 @@ fn send_request(
     body: &str,
     follow_redirects: bool,
 ) -> Result<HttpResponse> {
+    if !runners.allow_remote && !crate::idor_audit::is_lab_or_loopback_url(url)? {
+        bail!("refusing off-scope template URL '{url}' without --allow-remote");
+    }
     let client = if follow_redirects {
         &runners.redirect
     } else {
@@ -826,12 +837,11 @@ fn send_request(
             v.to_str().unwrap_or("<binary>")
         ));
     }
-    let bytes = resp.bytes()?;
-    let body = if bytes.len() > MAX_CAPTURE_BODY {
-        String::from_utf8_lossy(&bytes[..MAX_CAPTURE_BODY]).into_owned()
-    } else {
-        String::from_utf8_lossy(&bytes).into_owned()
-    };
+    let mut bytes = Vec::new();
+    let _ = resp
+        .take(MAX_CAPTURE_BODY as u64)
+        .read_to_end(&mut bytes);
+    let body = String::from_utf8_lossy(&bytes).into_owned();
     Ok(HttpResponse {
         status,
         headers: header_str,
@@ -983,7 +993,11 @@ fn matcher_on_text(m: &Matcher, text: &str, resp: &HttpResponse, vars: &Vars) ->
             let mut all = true;
             let mut any = false;
             for p in &patterns {
-                let re = match Regex::new(p) {
+                let re = match regex::RegexBuilder::new(p)
+                    .size_limit(256 * 1024)
+                    .dfa_size_limit(256 * 1024)
+                    .build()
+                {
                     Ok(re) => re,
                     Err(_) => return None,
                 };
@@ -991,7 +1005,7 @@ fn matcher_on_text(m: &Matcher, text: &str, resp: &HttpResponse, vars: &Vars) ->
                 all &= hit;
                 any |= hit;
             }
-            Some(if cond_and { all } else { any })
+            Some(if cond_and { all && !patterns.is_empty() } else { any })
         }
         "size" => {
             let sizes = m.size.as_ref()?.to_vec();
@@ -1009,6 +1023,11 @@ fn matcher_on_text(m: &Matcher, text: &str, resp: &HttpResponse, vars: &Vars) ->
         }
         "dsl" => {
             let exprs = m.dsl.as_ref()?.to_vec();
+            let cond_and = m
+                .condition
+                .as_deref()
+                .unwrap_or("or")
+                .eq_ignore_ascii_case("and");
             let ctx = DslCtx {
                 status: resp.status,
                 body: &resp.body,
@@ -1018,13 +1037,11 @@ fn matcher_on_text(m: &Matcher, text: &str, resp: &HttpResponse, vars: &Vars) ->
             let mut all = true;
             let mut any = false;
             for e in &exprs {
-                {
-                    let v = eval_dsl(e, &ctx)?;
-                    all &= v;
-                    any |= v;
-                }
+                let v = eval_dsl(e, &ctx)?;
+                all &= v;
+                any |= v;
             }
-            Some(all || any)
+            Some(if cond_and { all && !exprs.is_empty() } else { any })
         }
         _ => return None,
     };
@@ -1166,8 +1183,9 @@ pub fn build_dns_query(name: &str, qtype: u16, id: u16) -> Vec<u8> {
     out.extend_from_slice(&[0x01, 0x00]); // RD flag
     out.extend_from_slice(&[0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]); // QDCOUNT=1
     for label in name.split('.').filter(|l| !l.is_empty()) {
-        out.push(label.len().min(63) as u8);
-        out.extend_from_slice(label.as_bytes());
+        let len = label.len().min(63);
+        out.push(len as u8);
+        out.extend_from_slice(&label.as_bytes()[..len]);
     }
     out.push(0);
     out.extend_from_slice(&qtype.to_be_bytes());
@@ -1295,8 +1313,10 @@ pub fn send_dns_query(
             continue;
         }
         let mut buf = [0u8; 4096];
-        let n = sock.recv_from(&mut buf).ok()?.0;
-        if buf[0..2] != id.to_be_bytes() {
+        let Ok((n, _)) = sock.recv_from(&mut buf) else {
+            continue;
+        };
+        if n < 12 || buf[0..2] != id.to_be_bytes() {
             continue;
         }
         if let Some((rcode, records)) = parse_dns_response(&buf[..n])
@@ -1487,13 +1507,13 @@ pub fn execute_network_block(
 
     for host_raw in hosts {
         let host = substitute(&host_raw, vars, &extra);
-        let (host_name, host_port): (String, Option<u16>) =
-            if host.rsplit_once(':').is_some() && !host.contains('[') {
-                let (h, p) = host.rsplit_once(':').unwrap();
-                (h.to_string(), p.parse().ok())
-            } else {
-                (host.clone(), None)
-            };
+        let (host_name, host_port): (String, Option<u16>) = if !host.contains('[')
+            && let Some((h, p)) = host.rsplit_once(':')
+        {
+            (h.to_string(), p.parse().ok())
+        } else {
+            (host.clone(), None)
+        };
         let ip: std::net::IpAddr = host_name.parse().map_err(|_| {
             anyhow::anyhow!(
                 "network host '{host_name}' is not an IP (hostname DNS resolution is outside the network engine scope; use {{Host}} of an IP target)"
@@ -1763,7 +1783,7 @@ pub fn run_template_audit(cfg: &TemplateRunConfig) -> Result<TemplateRunReport> 
     let (templates, mut skipped, parse_errors) =
         load_templates_dir(&cfg.templates_dir, cfg.max_templates.max(1))?;
     let base_vars = parse_target(&cfg.target)?;
-    let runners = HttpRunners::build(cfg.timeout)?;
+    let runners = HttpRunners::build_with_scope(cfg.timeout, cfg.allow_remote)?;
     let mut matches = Vec::new();
     let mut executed = 0usize;
 

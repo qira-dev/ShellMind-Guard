@@ -416,11 +416,13 @@ fn tunnel(stream: &mut TcpStream, target: &str, ctx: &ConnCtx) -> Result<()> {
         Ok(mut origin) => {
             stream.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")?;
             stream.flush()?;
-            // Transparent byte relay (TLS stays opaque by design).
-            let _ = origin.set_read_timeout(None);
-            let _ = origin.set_write_timeout(None);
-            let _ = stream.set_read_timeout(None);
-            let _ = stream.set_write_timeout(None);
+            // Transparent byte relay (TLS stays opaque by design) with bounded idle timeout
+            // and symmetric Shutdown::Both so half-closed peers never deadlock `up.join()`.
+            let idle = Some(Duration::from_secs(60));
+            let _ = origin.set_read_timeout(idle);
+            let _ = origin.set_write_timeout(idle);
+            let _ = stream.set_read_timeout(idle);
+            let _ = stream.set_write_timeout(idle);
 
             let mut up_stream = stream
                 .try_clone()
@@ -433,8 +435,12 @@ fn tunnel(stream: &mut TcpStream, target: &str, ctx: &ConnCtx) -> Result<()> {
             let up = thread::spawn(move || {
                 let n = std::io::copy(&mut up_stream, &mut up_origin).unwrap_or(0);
                 up_counter.store(n as u64, Ordering::Relaxed);
+                let _ = up_origin.shutdown(std::net::Shutdown::Both);
+                let _ = up_stream.shutdown(std::net::Shutdown::Both);
             });
             let down = std::io::copy(&mut origin, stream).unwrap_or(0);
+            let _ = origin.shutdown(std::net::Shutdown::Both);
+            let _ = stream.shutdown(std::net::Shutdown::Both);
             let _ = up.join();
             let up_n = up_bytes.load(Ordering::Relaxed);
 

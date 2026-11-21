@@ -157,7 +157,13 @@ pub fn replay_entry(client: &Client, entry: &ProxyEntry) -> Result<ProxyEntry> {
         ) {
             continue;
         }
-        req = req.header(k, v.trim());
+        let Ok(hname) = reqwest::header::HeaderName::from_bytes(k.trim().as_bytes()) else {
+            continue;
+        };
+        let Ok(hval) = reqwest::header::HeaderValue::from_str(v.trim()) else {
+            continue;
+        };
+        req = req.header(hname, hval);
     }
     if !entry.req_body.is_empty() {
         req = req.body(entry.req_body.clone());
@@ -172,7 +178,11 @@ pub fn replay_entry(client: &Client, entry: &ProxyEntry) -> Result<ProxyEntry> {
             v.to_str().unwrap_or("<binary>")
         ));
     }
-    let bytes = resp.bytes()?;
+    let mut bytes = Vec::new();
+    let _ = std::io::Read::read_to_end(
+        &mut std::io::Read::take(resp, (MAX_CAPTURE_IN_VIEW + 1) as u64),
+        &mut bytes,
+    );
     let body = if bytes.len() > MAX_CAPTURE_IN_VIEW {
         String::from_utf8_lossy(&bytes[..MAX_CAPTURE_IN_VIEW]).into_owned()
     } else {
@@ -710,6 +720,36 @@ fn draw_diff_modal(f: &mut Frame, diff: &[(char, String)], from_id: u64, to_id: 
     );
 }
 
+struct ProxyTerminalGuard;
+
+static PROXY_TUI_PANIC_HOOK: std::sync::Once = std::sync::Once::new();
+
+impl ProxyTerminalGuard {
+    fn enter() -> Result<Self> {
+        PROXY_TUI_PANIC_HOOK.call_once(|| {
+            let orig = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                let _ = disable_raw_mode();
+                let _ = execute!(stdout(), LeaveAlternateScreen);
+                orig(info);
+            }));
+        });
+        enable_raw_mode()?;
+        if let Err(e) = execute!(stdout(), EnterAlternateScreen) {
+            let _ = disable_raw_mode();
+            return Err(e.into());
+        }
+        Ok(Self)
+    }
+}
+
+impl Drop for ProxyTerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(stdout(), LeaveAlternateScreen);
+    }
+}
+
 /// Blocking TUI loop. Returns when the user presses `q` (or `Esc` closes a
 /// modal / `Ctrl+C` quits) or the terminal fails.
 pub fn run_proxy_tui(
@@ -717,9 +757,8 @@ pub fn run_proxy_tui(
     summary: Arc<Mutex<ProxySummary>>,
 ) -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    enable_raw_mode()?;
+    let _term_guard = ProxyTerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
-    execute!(stdout(), EnterAlternateScreen)?;
 
     let mut app = App {
         entries,
@@ -837,6 +876,7 @@ pub fn run_proxy_tui(
                         };
                         let client = Client::builder()
                             .timeout(Duration::from_secs(10))
+                            .redirect(reqwest::redirect::Policy::none())
                             // Replayer targets the user's own lab app only.
                             .danger_accept_invalid_certs(true) // smg-ignore: SMG-CFG-TLS
                             .build()?;
@@ -867,7 +907,6 @@ pub fn run_proxy_tui(
                             app.status_message = Some("nothing selected".into());
                             continue;
                         };
-                        let path = format!("/tmp/smg-proxy-{}.txt", entry.id);
                         let content = format!(
                             "{} {}\n{}\n\n--- request body ---\n{}\n\n--- response ({} {}ms) ---\n{}\n{}",
                             entry.method,
@@ -879,8 +918,35 @@ pub fn run_proxy_tui(
                             entry.resp_headers,
                             entry.resp_body
                         );
-                        match std::fs::write(&path, content) {
-                            Ok(_) => app.status_message = Some(format!("exported to {path}")),
+                        let export_res = (|| -> std::io::Result<std::path::PathBuf> {
+                            let dir = std::env::temp_dir()
+                                .join(format!("smg-proxy-exports-{}", std::process::id()));
+                            std::fs::create_dir_all(&dir)?;
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::PermissionsExt;
+                                let _ = std::fs::set_permissions(
+                                    &dir,
+                                    std::fs::Permissions::from_mode(0o700),
+                                );
+                            }
+                            let path = dir.join(format!("entry-{}-{}.txt", entry.id, now_unix_ms()));
+                            let mut opts = std::fs::OpenOptions::new();
+                            opts.write(true).create_new(true);
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::OpenOptionsExt;
+                                opts.mode(0o600);
+                            }
+                            use std::io::Write as _;
+                            let mut f = opts.open(&path)?;
+                            f.write_all(content.as_bytes())?;
+                            Ok(path)
+                        })();
+                        match export_res {
+                            Ok(path) => {
+                                app.status_message = Some(format!("exported to {}", path.display()))
+                            }
                             Err(e) => app.status_message = Some(format!("export failed: {e}")),
                         }
                     }
@@ -936,8 +1002,7 @@ pub fn run_proxy_tui(
         Ok(())
     })();
 
-    disable_raw_mode()?;
-    execute!(stdout(), LeaveAlternateScreen)?;
+    drop(_term_guard);
     result
 }
 

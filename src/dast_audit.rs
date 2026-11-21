@@ -185,26 +185,18 @@ pub(crate) fn to_page_response(
             v.to_str().unwrap_or("<binary>")
         ));
     }
-    let location = hm
-        .get("Location")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default()
-        .to_string();
-    let bytes = resp.bytes()?;
-    let body = if bytes.len() > MAX_BODY_CAPTURE {
-        String::from_utf8_lossy(&bytes[..MAX_BODY_CAPTURE]).into_owned()
-    } else {
-        String::from_utf8_lossy(&bytes).into_owned()
-    };
-    let mut page = PageResponse {
+    let mut bytes = Vec::new();
+    let _ = std::io::Read::read_to_end(
+        &mut std::io::Read::take(resp, MAX_BODY_CAPTURE as u64),
+        &mut bytes,
+    );
+    let body = String::from_utf8_lossy(&bytes).into_owned();
+    let page = PageResponse {
         url: url.to_string(),
         status,
         headers: header_str,
         body,
     };
-    if !location.is_empty() {
-        page.headers.push_str(&format!("Location: {location}\r\n"));
-    }
     Ok(page)
 }
 
@@ -595,24 +587,29 @@ fn active_findings_for_target(
         }
     }
 
-    // 3. SSTI math proof
-    for payload in ["{{7*7}}", "${7*7}", "<%= 7*7 %>"] {
-        if let Ok(resp) = send(payload)
-            && resp.body.contains("49")
-        {
-            dedup_insert(
-                findings,
-                DastFinding {
-                    id: "SMG-DAST-SSTI".into(),
-                    severity: "critical".into(),
-                    url: target.url_template.clone(),
-                    param: Some(target.param.clone()),
-                    payload: payload.to_string(),
-                    evidence: "7*7 evaluated to 49 in response".into(),
-                    proof: "deterministic arithmetic template-evaluation proof".into(),
-                },
-            );
-            break;
+    // 3. SSTI math proof (compare against baseline to eliminate pages that already contain "49")
+    let baseline_has_49 = send("smg_ssti_baseline")
+        .map(|r| r.body.contains("49"))
+        .unwrap_or(false);
+    if !baseline_has_49 {
+        for payload in ["{{7*7}}", "\x24{7*7}", "<%= 7*7 %>"] {
+            if let Ok(resp) = send(payload)
+                && resp.body.contains("49")
+            {
+                dedup_insert(
+                    findings,
+                    DastFinding {
+                        id: "SMG-DAST-SSTI".into(),
+                        severity: "critical".into(),
+                        url: target.url_template.clone(),
+                        param: Some(target.param.clone()),
+                        payload: payload.to_string(),
+                        evidence: "7*7 evaluated to 49 in response (absent from baseline)".into(),
+                        proof: "deterministic arithmetic template-evaluation proof".into(),
+                    },
+                );
+                break;
+            }
         }
     }
 
