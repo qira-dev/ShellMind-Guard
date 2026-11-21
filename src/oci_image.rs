@@ -277,7 +277,10 @@ where
                 pending_long_name = Some(p);
             }
         } else if typeflag == b'L' {
-            let end = payload.iter().position(|&b| b == 0).unwrap_or(payload.len());
+            let end = payload
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(payload.len());
             let p = String::from_utf8_lossy(&payload[..end]).trim().to_string();
             if !p.is_empty() {
                 pending_long_name = Some(p);

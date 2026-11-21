@@ -951,7 +951,8 @@ pub fn run_z3_smtlib2(script: &str) -> Option<SmtVerdict> {
     }
     let mut buf = Vec::new();
     if let Some(stdout_pipe) = child.stdout.take() {
-        let _ = std::io::Read::read_to_end(&mut std::io::Read::take(stdout_pipe, 256 * 1024), &mut buf);
+        let _ =
+            std::io::Read::read_to_end(&mut std::io::Read::take(stdout_pipe, 256 * 1024), &mut buf);
     }
     let stdout = String::from_utf8_lossy(&buf);
     let mut lines = stdout.lines().map(str::trim).filter(|l| !l.is_empty());

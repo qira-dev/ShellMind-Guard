@@ -24,10 +24,7 @@ pub fn strip_yaml_comment_quoted(line: &str) -> &str {
             in_single = !in_single;
         } else if b == b'"' && !in_single {
             in_double = true;
-        } else if b == b'#'
-            && !in_single
-            && (i == 0 || bytes[i - 1].is_ascii_whitespace())
-        {
+        } else if b == b'#' && !in_single && (i == 0 || bytes[i - 1].is_ascii_whitespace()) {
             return &line[..i];
         }
     }
@@ -383,10 +380,26 @@ mod tests {
         );
         let yml = "privileged: &p true\nother: *p\nResource:\n  - arn:aws:iam::*:root\n  - https://example.com\nbase: &a\n  readOnlyRootFilesystem: false\nmid: &b\n  <<: *a\nsvc:\n  <<: [*b]\n";
         let entries = parse_structural_yaml_entries(yml);
-        assert!(entries.iter().any(|e| e.key == "privileged" && e.value == "true"));
-        assert!(entries.iter().any(|e| e.key == "other" && e.value == "true"));
-        assert!(entries.iter().any(|e| e.is_list_item && e.key.is_empty() && e.value == "arn:aws:iam::*:root"));
-        assert!(entries.iter().any(|e| e.is_list_item && e.key.is_empty() && e.value == "https://example.com"));
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.key == "privileged" && e.value == "true")
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.key == "other" && e.value == "true")
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.is_list_item && e.key.is_empty() && e.value == "arn:aws:iam::*:root")
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.is_list_item && e.key.is_empty() && e.value == "https://example.com")
+        );
         assert_eq!(
             entries
                 .iter()

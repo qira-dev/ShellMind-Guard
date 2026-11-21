@@ -4780,7 +4780,13 @@ pub(crate) fn append_audit_event(
     {
         return Ok(None);
     }
-    let dir = project_root.join(".shellmind-guard");
+    // Resolve nearest .git root so scanning a subdirectory does not litter nested .shellmind-guard/ dirs.
+    let anchor = canon
+        .ancestors()
+        .find(|a| a.join(".git").exists())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| project_root.to_path_buf());
+    let dir = anchor.join(".shellmind-guard");
     fs::create_dir_all(&dir)?;
     let log_path = dir.join("audit-history.jsonl");
     let ts = std::time::SystemTime::now()

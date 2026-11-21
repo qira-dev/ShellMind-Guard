@@ -10,3 +10,6 @@ serde.workspace = true
 serde_json.workspace = true
 smg-core = { path = "../smg-core" }
 smg-graph = { path = "../smg-graph" }
+
+[lints]
+workspace = true

@@ -439,7 +439,9 @@ pub fn execute_remote_tee_scan(
         );
     }
     let Some(ref quoted_fin_hash) = body.quote.findings_blake3_hex else {
-        bail!("fail-closed TEE attestation: quote is missing mandatory findings_blake3_hex binding");
+        bail!(
+            "fail-closed TEE attestation: quote is missing mandatory findings_blake3_hex binding"
+        );
     };
     let findings_json = serde_json::to_vec(&body.findings).unwrap_or_default();
     let expected_fin_hash = blake3::hash(&findings_json).to_hex().to_string();

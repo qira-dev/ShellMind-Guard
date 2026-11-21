@@ -18,3 +18,6 @@ smg-core = { path = "../smg-core" }
 smg-graph = { path = "../smg-graph" }
 smg-report = { path = "../smg-report" }
 smg-sandbox = { path = "../smg-sandbox" }
+
+[lints]
+workspace = true

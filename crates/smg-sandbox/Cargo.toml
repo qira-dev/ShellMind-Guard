@@ -17,3 +17,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 tracing.workspace = true
 smg-core = { path = "../smg-core" }
 smg-graph = { path = "../smg-graph" }
+
+[lints.clippy]
+todo = "deny"
+unimplemented = "deny"

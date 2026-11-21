@@ -104,12 +104,7 @@ fn record_param_shadowing(node: Node, src: &[u8], table: &mut FileScopeTable) {
     record_param_shadowing_depth(node, src, table, 0);
 }
 
-fn record_param_shadowing_depth(
-    node: Node,
-    src: &[u8],
-    table: &mut FileScopeTable,
-    depth: usize,
-) {
+fn record_param_shadowing_depth(node: Node, src: &[u8], table: &mut FileScopeTable, depth: usize) {
     if depth >= MAX_AST_WALK_DEPTH {
         return;
     }

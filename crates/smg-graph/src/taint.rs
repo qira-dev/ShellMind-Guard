@@ -467,7 +467,9 @@ pub(crate) fn strip_comments_and_non_attr_strings(src: &str) -> String {
                 i += 1;
                 continue;
             }
-            let ch = line[i..].chars().next().unwrap();
+            let Some(ch) = line[i..].chars().next() else {
+                break;
+            };
             out.push(ch);
             i += ch.len_utf8();
         }
@@ -842,7 +844,9 @@ fn strip_comments_and_quoted_strings(text: &str) -> String {
                 continue;
             }
         }
-        let ch = text[i..].chars().next().unwrap();
+        let Some(ch) = text[i..].chars().next() else {
+            break;
+        };
         out.push(ch);
         i += ch.len_utf8();
     }
@@ -855,7 +859,7 @@ fn csrf_exempt_re() -> &'static Regex {
         Regex::new(
             r"(?i)(?:@csrf_exempt\b|(?:^|[^.\w])csrf_exempt\s*\(|\bcsrf(?:protection)?\s*:\s*false\b)",
         )
-        .unwrap()
+        .expect("static csrf_exempt regex must compile")
     })
 }
 

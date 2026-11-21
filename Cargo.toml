@@ -21,6 +21,13 @@ license = "Apache-2.0"
 repository = "https://github.com/qira-dev/ShellMind-Guard"
 description = "Deterministic multi-file AST Guard-Set Lattice & Bubblewrap PoC verifier for business-logic, auth, and payment race-condition bugs."
 
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+todo = "deny"
+unimplemented = "deny"
+
 [workspace.dependencies]
 anyhow = "1.0"
 base64 = "0.22"
@@ -113,8 +120,12 @@ web3 = ["dep:smg-web3"]
 pqc = ["dep:smg-pqc"]
 enterprise = ["dep:smg-enterprise"]
 
+[lints]
+workspace = true
+
 [profile.release]
 codegen-units = 1
 lto = "thin"
 strip = true
 opt-level = "s"
+overflow-checks = true

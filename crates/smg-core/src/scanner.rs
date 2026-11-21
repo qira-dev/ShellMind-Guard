@@ -493,7 +493,11 @@ pub fn scan_repository_with_options(
                     .unwrap_or(0);
 
                 let mut bytes = Vec::with_capacity((meta.len() as usize).min(64 * 1024));
-                if file.take(limit.saturating_add(1)).read_to_end(&mut bytes).is_err() {
+                if file
+                    .take(limit.saturating_add(1))
+                    .read_to_end(&mut bytes)
+                    .is_err()
+                {
                     skipped.fetch_add(1, Ordering::Relaxed);
                     return None;
                 }

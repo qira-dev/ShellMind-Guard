@@ -5,6 +5,9 @@ on:
     branches: [main, master]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   check-and-test:
     strategy:
@@ -13,8 +16,8 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           components: rustfmt, clippy
       - name: Check formatting (Ubuntu)
@@ -31,4 +34,4 @@ jobs:
         run: cargo test --workspace --locked
       - name: Self-Scan Dogfood Gate (Ubuntu)
         if: runner.os == 'Linux'
-        run: cargo run --locked -- scan crates --ci --format sarif --sarif /tmp/self.sarif
+        run: cargo run --locked -- scan . --ci --format sarif --sarif /tmp/self.sarif

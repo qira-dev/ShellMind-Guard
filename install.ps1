@@ -5,6 +5,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
 # ShellMind Guard — 1-Command Windows Installer
 $Repo = "qira-dev/ShellMind-Guard"
@@ -24,7 +25,11 @@ function Install-FromSource {
             cargo install --path $PSScriptRoot --root $CargoRoot --locked
         } else {
             Write-Host "[ShellMind Guard] Building from GitHub repository via cargo..."
-            cargo install --git "https://github.com/$Repo.git" --root $CargoRoot --locked
+            if ($Version -ne "latest") {
+                cargo install --git "https://github.com/$Repo.git" --tag $Version --root $CargoRoot --locked
+            } else {
+                cargo install --git "https://github.com/$Repo.git" --root $CargoRoot --locked
+            }
         }
         if ($LASTEXITCODE -ne 0) {
             throw "cargo install exited with code $LASTEXITCODE"
@@ -56,16 +61,25 @@ if (-not $FromSource) {
         Write-Host "[ShellMind Guard] Downloading $Asset ($Version)..."
         Invoke-WebRequest -Uri "$BaseUrl/$Asset" -OutFile $ZipPath -UseBasicParsing
         Invoke-WebRequest -Uri "$BaseUrl/SHA256SUMS.txt" -OutFile $SumsPath -UseBasicParsing
-        $ExpectedLine = Get-Content $SumsPath | Where-Object { $_ -match "\s+$Asset`$" } | Select-Object -First 1
+        $EscapedAsset = [regex]::Escape($Asset)
+        $ExpectedLine = Get-Content $SumsPath | Where-Object { $_ -match "\s+$EscapedAsset`$" } | Select-Object -First 1
         if (-not $ExpectedLine) {
-            throw "Checksum for $Asset not found in SHA256SUMS.txt"
+            throw [System.Security.SecurityException]"Checksum for $Asset not found in SHA256SUMS.txt"
         }
         $ExpectedHash = ($ExpectedLine -split "\s+")[0].ToUpperInvariant()
         $ActualHash = (Get-FileHash -Path $ZipPath -Algorithm SHA256).Hash.ToUpperInvariant()
         if ($ExpectedHash -ne $ActualHash) {
             throw [System.Security.SecurityException]"SHA256 checksum mismatch for $Asset! Expected $ExpectedHash, got $ActualHash"
         }
-        Expand-Archive -Path $ZipPath -DestinationPath $InstallDir -Force
+        $ExtractDir = Join-Path $TmpDir "extract"
+        New-Item -ItemType Directory -Force -Path $ExtractDir | Out-Null
+        Expand-Archive -Path $ZipPath -DestinationPath $ExtractDir -Force
+        foreach ($BinName in @("smg.exe", "shellmind-guard.exe")) {
+            $Candidate = Join-Path $ExtractDir $BinName
+            if (Test-Path $Candidate) {
+                Copy-Item -Path $Candidate -Destination (Join-Path $InstallDir $BinName) -Force
+            }
+        }
     } catch [System.Security.SecurityException] {
         Write-Error $_.Exception.Message
         exit 1

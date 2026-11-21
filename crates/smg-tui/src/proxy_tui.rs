@@ -930,7 +930,8 @@ pub fn run_proxy_tui(
                                     std::fs::Permissions::from_mode(0o700),
                                 );
                             }
-                            let path = dir.join(format!("entry-{}-{}.txt", entry.id, now_unix_ms()));
+                            let path =
+                                dir.join(format!("entry-{}-{}.txt", entry.id, now_unix_ms()));
                             let mut opts = std::fs::OpenOptions::new();
                             opts.write(true).create_new(true);
                             #[cfg(unix)]

@@ -160,10 +160,7 @@ impl SandboxConfig {
             match after_bracket.strip_prefix(':') {
                 Some(p) => ("::1", p),
                 None if after_bracket.is_empty() => ("::1", ""),
-                None => anyhow::bail!(
-                    "Malformed IPv6 authority in sandbox.base_url `{}`",
-                    raw
-                ),
+                None => anyhow::bail!("Malformed IPv6 authority in sandbox.base_url `{}`", raw),
             }
         } else if let Some((h, p)) = authority.rsplit_once(':') {
             (h, p)

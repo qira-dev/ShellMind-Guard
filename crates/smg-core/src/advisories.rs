@@ -1099,7 +1099,10 @@ mod tests {
         assert_eq!(canonical_ecosystem("Debian:12"), Some("Debian"));
         assert_eq!(canonical_ecosystem("Alpine:v3.19"), Some("Alpine"));
         assert_eq!(canonical_ecosystem("Ubuntu:22.04:LTS"), Some("Ubuntu"));
-        assert_eq!(normalize_package_name("PyPI", "foo__bar..baz"), "foo-bar-baz");
+        assert_eq!(
+            normalize_package_name("PyPI", "foo__bar..baz"),
+            "foo-bar-baz"
+        );
         assert!(version_matches_range(
             "Debian:12",
             "1:3.0.11-1~deb12u1",
@@ -1135,7 +1138,9 @@ mod tests {
             "1.36.1-r15",
             ""
         ));
-        assert!(version_matches_range("NuGet", "1.2.3.4", "1.2.3.0", "1.2.3.5", ""));
+        assert!(version_matches_range(
+            "NuGet", "1.2.3.4", "1.2.3.0", "1.2.3.5", ""
+        ));
         assert_eq!(
             cvss_vector_to_severity("CVSS:3.1/AV:L/AC:H/PR:H/UI:R/S:U/C:H/I:H/A:H"),
             Some("MEDIUM")

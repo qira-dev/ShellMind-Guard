@@ -14,3 +14,6 @@ smg-graph = { path = "../smg-graph" }
 tree-sitter.workspace = true
 tree-sitter-rust.workspace = true
 tree-sitter-solidity = "1.2.13"
+
+[lints]
+workspace = true

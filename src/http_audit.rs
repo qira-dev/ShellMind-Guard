@@ -330,10 +330,8 @@ fn probe_graphql_introspection(client: &Client, endpoint: &str, findings: &mut V
     {
         let status = resp.status().as_u16();
         let mut buf = Vec::new();
-        let _ = std::io::Read::read_to_end(
-            &mut std::io::Read::take(resp, 2 * 1024 * 1024),
-            &mut buf,
-        );
+        let _ =
+            std::io::Read::read_to_end(&mut std::io::Read::take(resp, 2 * 1024 * 1024), &mut buf);
         let body = String::from_utf8_lossy(&buf);
         if (200..300).contains(&status) && body.contains("__schema") {
             dedup_insert(

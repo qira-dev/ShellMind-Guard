@@ -53,7 +53,11 @@ install_from_source() {
     cargo install --path "${script_dir}" --root "${cargo_root}" --locked
   else
     echo "[ShellMind Guard] Building from GitHub repository..."
-    cargo install --git "https://github.com/${REPO}.git" --root "${cargo_root}" --locked
+    if [[ "${VERSION}" != "latest" ]]; then
+      cargo install --git "https://github.com/${REPO}.git" --tag "${VERSION}" --root "${cargo_root}" --locked
+    else
+      cargo install --git "https://github.com/${REPO}.git" --root "${cargo_root}" --locked
+    fi
   fi
   install -m 0755 "${cargo_root}/bin/${BIN_NAME}" "${INSTALL_DIR}/${BIN_NAME}"
   if [[ -f "${cargo_root}/bin/smg" ]]; then
@@ -74,8 +78,8 @@ if [[ "${FROM_SOURCE}" -eq 0 ]] && asset="$(detect_asset)"; then
   trap 'rm -rf "${tmp_dir}"' EXIT
 
   echo "[ShellMind Guard] Downloading ${asset} (${VERSION})..."
-  if curl -fsSL "${base_url}/${asset}" -o "${tmp_dir}/${asset}" && curl -fsSL "${base_url}/SHA256SUMS.txt" -o "${tmp_dir}/SHA256SUMS.txt"; then
-    expected="$(grep " ${asset}\$" "${tmp_dir}/SHA256SUMS.txt" | awk '{print $1}' || true)"
+  if curl --proto "=https" --tlsv1.2 -fsSL "${base_url}/${asset}" -o "${tmp_dir}/${asset}" && curl --proto "=https" --tlsv1.2 -fsSL "${base_url}/SHA256SUMS.txt" -o "${tmp_dir}/SHA256SUMS.txt"; then
+    expected="$(awk -v a="${asset}" 'NF>=2 && $2==a {print $1; exit}' "${tmp_dir}/SHA256SUMS.txt" || true)"
     if [[ -z "${expected}" ]]; then
       echo "[ShellMind Guard] Missing SHA256 entry for ${asset} in SHA256SUMS.txt! Aborting." >&2
       exit 1
@@ -89,7 +93,7 @@ if [[ "${FROM_SOURCE}" -eq 0 ]] && asset="$(detect_asset)"; then
       echo "[ShellMind Guard] Checksum mismatch! Aborting." >&2
       exit 1
     fi
-    tar -xzf "${tmp_dir}/${asset}" -C "${tmp_dir}"
+    tar --no-same-owner -xzf "${tmp_dir}/${asset}" -C "${tmp_dir}"
     install -m 0755 "${tmp_dir}/${BIN_NAME}" "${INSTALL_DIR}/${BIN_NAME}"
     if [[ -f "${tmp_dir}/smg" ]]; then
       install -m 0755 "${tmp_dir}/smg" "${INSTALL_DIR}/smg"

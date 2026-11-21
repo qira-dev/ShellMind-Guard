@@ -588,20 +588,18 @@ pub fn run_live_secret_verification(
         {
             (cand.raw_token.clone(), cand.paired_secret.clone())
         } else {
-            let content = file_cache
-                .entry(f.file.clone())
-                .or_insert_with(|| {
-                    let Ok(canon_root) = fs::canonicalize(repo_root) else {
-                        return String::new();
-                    };
-                    let Ok(canon_file) = fs::canonicalize(repo_root.join(&f.file)) else {
-                        return String::new();
-                    };
-                    if !canon_file.starts_with(&canon_root) {
-                        return String::new();
-                    }
-                    fs::read_to_string(&canon_file).unwrap_or_default()
-                });
+            let content = file_cache.entry(f.file.clone()).or_insert_with(|| {
+                let Ok(canon_root) = fs::canonicalize(repo_root) else {
+                    return String::new();
+                };
+                let Ok(canon_file) = fs::canonicalize(repo_root.join(&f.file)) else {
+                    return String::new();
+                };
+                if !canon_file.starts_with(&canon_root) {
+                    return String::new();
+                }
+                fs::read_to_string(&canon_file).unwrap_or_default()
+            });
             let lines: Vec<&str> = content.lines().collect();
             let line_idx = f.line.saturating_sub(1);
             let line_str = lines.get(line_idx).copied().unwrap_or("");

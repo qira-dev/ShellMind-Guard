@@ -82,7 +82,9 @@ fn scan_android_manifest(rel_path: &str, raw_source: &str, out: &mut Vec<LocalSt
     let source_low = source.to_ascii_lowercase();
     let mut app_has_permission = false;
     for cap in manifest_tag_re().captures_iter(source) {
-        let full = cap.get(0).unwrap();
+        let Some(full) = cap.get(0) else {
+            continue;
+        };
         let tag = cap
             .get(1)
             .map(|m| m.as_str().to_ascii_lowercase())

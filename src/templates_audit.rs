@@ -838,9 +838,7 @@ fn send_request(
         ));
     }
     let mut bytes = Vec::new();
-    let _ = resp
-        .take(MAX_CAPTURE_BODY as u64)
-        .read_to_end(&mut bytes);
+    let _ = resp.take(MAX_CAPTURE_BODY as u64).read_to_end(&mut bytes);
     let body = String::from_utf8_lossy(&bytes).into_owned();
     Ok(HttpResponse {
         status,
@@ -1005,7 +1003,11 @@ fn matcher_on_text(m: &Matcher, text: &str, resp: &HttpResponse, vars: &Vars) ->
                 all &= hit;
                 any |= hit;
             }
-            Some(if cond_and { all && !patterns.is_empty() } else { any })
+            Some(if cond_and {
+                all && !patterns.is_empty()
+            } else {
+                any
+            })
         }
         "size" => {
             let sizes = m.size.as_ref()?.to_vec();
@@ -1041,7 +1043,11 @@ fn matcher_on_text(m: &Matcher, text: &str, resp: &HttpResponse, vars: &Vars) ->
                 all &= v;
                 any |= v;
             }
-            Some(if cond_and { all && !exprs.is_empty() } else { any })
+            Some(if cond_and {
+                all && !exprs.is_empty()
+            } else {
+                any
+            })
         }
         _ => return None,
     };
