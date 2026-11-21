@@ -1,4 +1,5 @@
 pub mod concurrency;
+pub mod mem_typestate;
 pub mod memory;
 pub mod mobile;
 #[cfg(test)]
@@ -207,6 +208,19 @@ pub fn analyze_ast_phase9(
 
     if matches!(lang, Language::C | Language::Cpp | Language::Rust) {
         memory::analyze_memory_and_overflows(root, src, rel_path, lang, static_findings);
+        if let Ok(src_str) = std::str::from_utf8(src)
+            && !smg_core::is_test_source_path(rel_path)
+        {
+            if matches!(lang, Language::C | Language::Cpp) {
+                static_findings.extend(mem_typestate::analyze_c_cpp_memory_typestate(
+                    rel_path, src_str,
+                ));
+            } else if matches!(lang, Language::Rust) {
+                static_findings.extend(mem_typestate::analyze_rust_async_mutex_across_await(
+                    rel_path, src_str,
+                ));
+            }
+        }
     }
 
     if matches!(

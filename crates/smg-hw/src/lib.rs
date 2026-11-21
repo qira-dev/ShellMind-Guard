@@ -1,6 +1,12 @@
 pub mod context;
 pub mod domains;
 pub mod typestate_irq;
+pub mod wcsd_dma;
+
+pub use wcsd_dma::{
+    FnStackNode, MemoryRegion, WcsdResult, analyze_dma_cache_coherency, audit_linker_script,
+    compute_wcsd,
+};
 
 use context::{collect_hw_spec_files, ingest_firmware_context};
 use smg_core::{IndexedFile, Language};
@@ -138,6 +144,22 @@ pub fn scan_hardware_repo(
             &mut raw_findings,
             &mut lock_summaries,
         );
+        if matches!(lang, Language::C | Language::Cpp) {
+            raw_findings.extend(wcsd_dma::analyze_dma_cache_coherency(rel, content));
+        }
+    }
+    for f in files {
+        let low = f.rel_path.to_ascii_lowercase();
+        if (low.ends_with(".ld") || low.ends_with(".lds"))
+            && let Ok(text) = if let Some(b) = f.cached_bytes.as_deref() {
+                Ok(String::from_utf8_lossy(b).into_owned())
+            } else {
+                fs::read_to_string(&f.abs_path)
+            }
+        {
+            let (_regions, _stack, ld_findings) = wcsd_dma::audit_linker_script(&f.rel_path, &text);
+            raw_findings.extend(ld_findings);
+        }
     }
     raw_findings.extend(check_cross_fn_irq_deadlocks(&lock_summaries));
 

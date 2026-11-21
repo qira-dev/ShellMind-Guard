@@ -22,6 +22,7 @@ pub mod smt;
 pub mod smt_advanced;
 pub mod subgraph;
 pub mod taint;
+pub mod vex_osv;
 
 use anyhow::Result;
 use rayon::prelude::*;
@@ -60,6 +61,7 @@ pub use cfa_ssa::{
 pub use subgraph::{
     collect_git_changed_files, should_force_full_scan_on_diff, slice_summaries_for_changed_files,
 };
+pub use vex_osv::{AutoVexSymbolIndex, OpenVexStatement, to_openvex_json};
 
 fn load_or_parse_summaries_cached(
     files: &[IndexedFile],
@@ -69,7 +71,7 @@ fn load_or_parse_summaries_cached(
     let cfg_json = serde_json::to_string(&cfg.guards).unwrap_or_default();
     let adv_stamp = smg_core::advisories_db_stamp();
     let versioned_cfg = format!(
-        "v31-phase23-mobsf-iac-{}|{}|{}|{}",
+        "v32-phase28-mem-vex-{}|{}|{}|{}",
         env!("CARGO_PKG_VERSION"),
         adv_stamp,
         cfg.scan.deep_audit,
