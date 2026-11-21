@@ -219,13 +219,34 @@ pub fn parse_apk_installed(content: &str) -> Vec<ResolvedDependency> {
     out
 }
 
-/// Minimal pure-Rust POSIX USTAR tar reader (zero external crates).
+/// Parses a POSIX PAX extended header payload (`<len> key=value\n`) for the `path` record.
+fn parse_pax_path(data: &[u8]) -> Option<String> {
+    let mut pos = 0usize;
+    while pos < data.len() {
+        let sp = data[pos..].iter().position(|&b| b == b' ')?;
+        let len_str = std::str::from_utf8(&data[pos..pos + sp]).ok()?;
+        let rec_len: usize = len_str.parse().ok()?;
+        if rec_len == 0 || pos.saturating_add(rec_len) > data.len() {
+            break;
+        }
+        let kv = &data[pos + sp + 1..pos + rec_len];
+        let kv_str = std::str::from_utf8(kv).ok()?.trim_end_matches('\n');
+        if let Some(val) = kv_str.strip_prefix("path=") {
+            return Some(val.to_string());
+        }
+        pos += rec_len;
+    }
+    None
+}
+
+/// Minimal pure-Rust POSIX USTAR/PAX/GNU-LongLink tar reader (zero external crates).
 /// Calls `visitor(entry_path, entry_bytes)` for every regular file entry.
 pub fn walk_tar_bytes<F>(raw: &[u8], mut visitor: F)
 where
     F: FnMut(&str, &[u8]),
 {
     let mut offset = 0usize;
+    let mut pending_long_name: Option<String> = None;
     while offset + 512 <= raw.len() {
         let header = &raw[offset..offset + 512];
         if header.iter().all(|&b| b == 0) {
@@ -235,7 +256,7 @@ where
         let name = String::from_utf8_lossy(&header[0..name_end]).to_string();
         let prefix_end = header[345..500].iter().position(|&b| b == 0).unwrap_or(155);
         let prefix = String::from_utf8_lossy(&header[345..345 + prefix_end]).to_string();
-        let full_name = if prefix.is_empty() {
+        let ustar_name = if prefix.is_empty() {
             name
         } else {
             format!("{prefix}/{name}")
@@ -246,14 +267,34 @@ where
         let size = usize::from_str_radix(size_trimmed, 8).unwrap_or(0);
 
         let data_start = offset + 512;
-        let data_end = data_start.saturating_add(size).min(raw.len());
-        if (typeflag == b'0' || typeflag == 0) && !full_name.is_empty() {
-            visitor(&full_name, &raw[data_start..data_end]);
+        if size > raw.len().saturating_sub(data_start) {
+            break;
         }
-        let padded = (size + 511) & !511;
+        let data_end = data_start + size;
+        let payload = &raw[data_start..data_end];
+        if typeflag == b'x' {
+            if let Some(p) = parse_pax_path(payload) {
+                pending_long_name = Some(p);
+            }
+        } else if typeflag == b'L' {
+            let end = payload.iter().position(|&b| b == 0).unwrap_or(payload.len());
+            let p = String::from_utf8_lossy(&payload[..end]).trim().to_string();
+            if !p.is_empty() {
+                pending_long_name = Some(p);
+            }
+        } else {
+            let full_name = pending_long_name.take().unwrap_or(ustar_name);
+            if (typeflag == b'0' || typeflag == 0) && !full_name.is_empty() {
+                visitor(&full_name, payload);
+            }
+        }
+        let padded = size.saturating_add(511) & !511;
         offset = data_start.saturating_add(padded);
     }
 }
+
+const MAX_GUNZIP_BYTES: usize = 256 * 1024 * 1024;
+const MAX_TAR_NEST_DEPTH: usize = 6;
 
 fn maybe_gunzip(bytes: &[u8]) -> Vec<u8> {
     if bytes.len() >= 2
@@ -267,12 +308,31 @@ fn maybe_gunzip(bytes: &[u8]) -> Vec<u8> {
             .spawn()
     {
         if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(bytes);
+            let input = bytes.to_vec();
+            let _ = std::thread::spawn(move || {
+                let _ = stdin.write_all(&input);
+            });
         }
-        if let Ok(out) = child.wait_with_output()
-            && out.status.success()
+        let mut out = Vec::new();
+        let mut exceeded = false;
+        if let Some(stdout) = child.stdout.take() {
+            use std::io::Read;
+            let _ = stdout
+                .take((MAX_GUNZIP_BYTES + 1) as u64)
+                .read_to_end(&mut out);
+            if out.len() > MAX_GUNZIP_BYTES {
+                exceeded = true;
+            }
+        }
+        if exceeded {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Vec::new();
+        }
+        if let Ok(status) = child.wait()
+            && status.success()
         {
-            return out.stdout;
+            return out;
         }
     }
     bytes.to_vec()
@@ -310,6 +370,25 @@ fn inspect_layer_tar(
     os_version: &mut String,
     collected: &mut Vec<(ResolvedDependency, String)>,
 ) {
+    inspect_layer_tar_depth(layer_name, tar_bytes, os_family, os_version, collected, 0);
+}
+
+fn looks_like_tar_or_gzip(data: &[u8]) -> bool {
+    (data.len() >= 2 && data[0] == 0x1f && data[1] == 0x8b)
+        || (data.len() >= 262 && &data[257..262] == b"ustar")
+}
+
+fn inspect_layer_tar_depth(
+    layer_name: &str,
+    tar_bytes: &[u8],
+    os_family: &mut String,
+    os_version: &mut String,
+    collected: &mut Vec<(ResolvedDependency, String)>,
+    depth: usize,
+) {
+    if depth >= MAX_TAR_NEST_DEPTH {
+        return;
+    }
     let decompressed = maybe_gunzip(tar_bytes);
     let mut dpkg_blobs: Vec<String> = Vec::new();
     let mut apk_blobs: Vec<String> = Vec::new();
@@ -332,18 +411,13 @@ fn inspect_layer_tar(
             for dep in extract_resolved_dependencies(norm, &text) {
                 collected.push((dep, format!("{layer_name}:{norm}")));
             }
-        } else if norm.ends_with(".tar")
-            || norm.ends_with(".tar.gz")
-            || norm.starts_with("blobs/sha256/")
+        } else if data.len() >= 512
+            && (norm.ends_with("layer.tar")
+                || norm.ends_with(".tar")
+                || norm.ends_with(".tar.gz")
+                || (norm.starts_with("blobs/sha256/") && looks_like_tar_or_gzip(data)))
         {
-            // Nested Docker/OCI layer blob inside `docker save` archive
-            if data.len() >= 512
-                && (norm.ends_with("layer.tar")
-                    || norm.ends_with(".tar")
-                    || norm.ends_with(".tar.gz"))
-            {
-                inspect_layer_tar(norm, data, os_family, os_version, collected);
-            }
+            inspect_layer_tar_depth(norm, data, os_family, os_version, collected, depth + 1);
         }
     });
 

@@ -369,28 +369,30 @@ pub fn verify_single_token(
         Err(e) => {
             return LiveVerifyStatus::Unverified {
                 provider: spec.provider,
-                reason: format!("network error: {e}"),
+                reason: format!("network error: {}", sanitize_reqwest_error(&e)),
             };
         }
     };
 
     let status = resp.status().as_u16();
-    let body = resp.text().unwrap_or_default();
+    let body = read_response_bounded(resp, 256 * 1024);
 
     // Slack returns HTTP 200 with {"ok": false} for revoked tokens
-    if matches!(spec.auth, AuthStyle::SlackAuthTest) {
-        if status == 200 && body.contains("\"ok\":true") {
+    if matches!(spec.auth, AuthStyle::SlackAuthTest)
+        && status == 200
+        && let Ok(val) = serde_json::from_str::<serde_json::Value>(&body)
+        && let Some(ok) = val.get("ok").and_then(|v| v.as_bool())
+    {
+        if ok {
             return LiveVerifyStatus::VerifiedLive {
                 provider: spec.provider,
                 identity_hint: extract_identity_hint(&body),
             };
         }
-        if status == 200 && body.contains("\"ok\":false") {
-            return LiveVerifyStatus::Inactive {
-                provider: spec.provider,
-                http_status: 401,
-            };
-        }
+        return LiveVerifyStatus::Inactive {
+            provider: spec.provider,
+            http_status: 401,
+        };
     }
 
     // Linear GraphQL returns 200 with "errors" on bad key
@@ -500,13 +502,13 @@ fn verify_aws_sts(
         Err(e) => {
             return LiveVerifyStatus::Unverified {
                 provider: "AWS-STS",
-                reason: format!("network error: {e}"),
+                reason: format!("network error: {}", sanitize_reqwest_error(&e)),
             };
         }
     };
 
     let status = resp.status().as_u16();
-    let text = resp.text().unwrap_or_default();
+    let text = read_response_bounded(resp, 256 * 1024);
     if status == 200 && text.contains("GetCallerIdentityResult") {
         let arn = text
             .split("<Arn>")
@@ -533,6 +535,23 @@ fn verify_aws_sts(
 
 /// Verifies all secret findings (working tree + git history candidates) and mutates
 /// `findings` in-place with live verification tags, severity upgrades, and optional `--only-verified` filtering.
+fn sanitize_reqwest_error(e: &reqwest::Error) -> String {
+    let raw = e.to_string();
+    let without_url = raw.split(" for url (").next().unwrap_or(&raw).trim();
+    if without_url.is_empty() {
+        "request failed".to_string()
+    } else {
+        without_url.to_string()
+    }
+}
+
+fn read_response_bounded(resp: reqwest::blocking::Response, max_bytes: usize) -> String {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    let _ = resp.take(max_bytes as u64).read_to_end(&mut buf);
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
 pub fn run_live_secret_verification(
     repo_root: &Path,
     findings: &mut Vec<LatticeFinding>,
@@ -571,7 +590,18 @@ pub fn run_live_secret_verification(
         } else {
             let content = file_cache
                 .entry(f.file.clone())
-                .or_insert_with(|| fs::read_to_string(repo_root.join(&f.file)).unwrap_or_default());
+                .or_insert_with(|| {
+                    let Ok(canon_root) = fs::canonicalize(repo_root) else {
+                        return String::new();
+                    };
+                    let Ok(canon_file) = fs::canonicalize(repo_root.join(&f.file)) else {
+                        return String::new();
+                    };
+                    if !canon_file.starts_with(&canon_root) {
+                        return String::new();
+                    }
+                    fs::read_to_string(&canon_file).unwrap_or_default()
+                });
             let lines: Vec<&str> = content.lines().collect();
             let line_idx = f.line.saturating_sub(1);
             let line_str = lines.get(line_idx).copied().unwrap_or("");

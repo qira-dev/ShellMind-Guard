@@ -433,12 +433,23 @@ mod imp {
     fn drain_pipe<R: std::io::Read + Send + 'static>(
         pipe: Option<R>,
     ) -> Option<std::thread::JoinHandle<String>> {
-        pipe.map(|out| {
+        pipe.map(|mut out| {
             std::thread::spawn(move || {
-                use std::io::Read;
-                let mut s = String::new();
-                let _ = out.take(512 * 1024).read_to_string(&mut s);
-                s
+                let mut captured = Vec::new();
+                let mut chunk = [0u8; 8192];
+                const CAP: usize = 512 * 1024;
+                loop {
+                    match out.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if captured.len() < CAP {
+                                let take = n.min(CAP - captured.len());
+                                captured.extend_from_slice(&chunk[..take]);
+                            }
+                        }
+                    }
+                }
+                String::from_utf8_lossy(&captured).into_owned()
             })
         })
     }

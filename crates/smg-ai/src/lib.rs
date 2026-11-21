@@ -893,19 +893,33 @@ pub fn copy_workspace_filtered(src_root: &Path, dst_root: &Path) -> Result<()> {
     copy_dir_recursive_filtered(&canon_src, &canon_dst, &canon_dst)
 }
 
+#[cfg(unix)]
+pub(crate) fn set_private_dir_mode(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+}
+
+#[cfg(not(unix))]
+pub(crate) fn set_private_dir_mode(_path: &Path) {}
+
 fn copy_dir_recursive_filtered(src: &Path, dst: &Path, canonical_dst_root: &Path) -> Result<()> {
     for entry in fs::read_dir(src)? {
         let entry = entry?;
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
+        let low = name_str.to_ascii_lowercase();
         if matches!(
             name_str.as_ref(),
-            ".git" | "target" | ".shellmind-guard" | ".veriforge"
-        ) {
+            ".git" | "target" | ".shellmind-guard" | ".veriforge" | ".npmrc" | ".env"
+        ) || low.starts_with(".env.")
+            || low.ends_with(".pem")
+            || low.ends_with(".key")
+        {
             continue;
         }
-        let meta = entry.metadata()?;
-        if entry.file_type()?.is_symlink() {
+        // Check lstat file_type() BEFORE metadata() so broken symlinks never abort workspace copy.
+        let ft = entry.file_type()?;
+        if ft.is_symlink() {
             continue;
         }
         let src_path = entry.path();
@@ -913,10 +927,11 @@ fn copy_dir_recursive_filtered(src: &Path, dst: &Path, canonical_dst_root: &Path
             continue;
         }
         let dst_path = dst.join(&name);
-        if meta.is_dir() {
+        if ft.is_dir() {
             fs::create_dir_all(&dst_path)?;
+            set_private_dir_mode(&dst_path);
             copy_dir_recursive_filtered(&src_path, &dst_path, canonical_dst_root)?;
-        } else if meta.is_file() {
+        } else if ft.is_file() {
             fs::copy(&src_path, &dst_path)?;
         }
     }
@@ -927,12 +942,14 @@ fn finding_still_present<'a>(
     post_findings: &'a [LatticeFinding],
     target: &LatticeFinding,
 ) -> Option<&'a LatticeFinding> {
+    // Match globally on (rule_id, sink_kind) without requiring `f.file == target.file`,
+    // preventing false MITIGATED verdicts when a refactoring patch moves vulnerable code.
     post_findings.iter().find(|f| {
         f.rule_id == target.rule_id
             && f.sink_kind == target.sink_kind
-            && f.file == target.file
-            && (f.entry_route == target.entry_route
-                || (target.entry_route.contains(':') && f.title == target.title))
+            && (f.file == target.file
+                || f.entry_route == target.entry_route
+                || f.title == target.title)
     })
 }
 
@@ -951,6 +968,7 @@ pub fn verify_patch_in_isolated_copy(params: &ApplyCheckParams<'_>) -> Result<Ap
         seq
     ));
     fs::create_dir_all(&temp_root)?;
+    set_private_dir_mode(&temp_root);
     let _cleanup = TempDirCleanup(temp_root.clone());
 
     copy_workspace_filtered(params.project_root, &temp_root)?;

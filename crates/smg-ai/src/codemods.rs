@@ -318,6 +318,13 @@ pub fn synthesize_deterministic_codemod_diff(
 
 /// Applies `raw_diff` inside an isolated temp copy and validates syntax for every modified
 /// file using `smg_graph::check_source_syntax` BEFORE launching any sandbox runtime (`97.92%`).
+struct SyntaxTempCleanup(PathBuf);
+impl Drop for SyntaxTempCleanup {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 pub fn verify_diff_syntax_before_sandbox(
     project_root: &Path,
     raw_diff: &str,
@@ -331,19 +338,17 @@ pub fn verify_diff_syntax_before_sandbox(
             .as_nanos()
     ));
     fs::create_dir_all(&temp_root)?;
-    let report = (|| -> Result<Vec<PathBuf>> {
-        copy_workspace_filtered(project_root, &temp_root)?;
-        let applied = apply_unified_diff_safely(&temp_root, raw_diff)?;
-        for rel in &applied.modified_files {
-            if let Some(lang) = Language::from_path(rel) {
-                let content = fs::read_to_string(temp_root.join(rel))?;
-                check_source_syntax(lang, &rel.to_string_lossy(), &content)?;
-            }
+    crate::set_private_dir_mode(&temp_root);
+    let _cleanup = SyntaxTempCleanup(temp_root.clone());
+    copy_workspace_filtered(project_root, &temp_root)?;
+    let applied = apply_unified_diff_safely(&temp_root, raw_diff)?;
+    for rel in &applied.modified_files {
+        if let Some(lang) = Language::from_path(rel) {
+            let content = fs::read_to_string(temp_root.join(rel))?;
+            check_source_syntax(lang, &rel.to_string_lossy(), &content)?;
         }
-        Ok(applied.modified_files)
-    })();
-    let _ = fs::remove_dir_all(&temp_root);
-    report
+    }
+    Ok(applied.modified_files)
 }
 
 /// Bounded 3-iteration Counterexample-Guided Inductive Synthesis (CEGIS) patch loop (`82.33%`):
