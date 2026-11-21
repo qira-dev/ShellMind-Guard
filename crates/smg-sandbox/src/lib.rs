@@ -1,6 +1,14 @@
 pub mod bwrap;
+pub mod h2_race_snapshot;
 pub mod verifier;
 pub mod wire_oracle;
+
+pub use h2_race_snapshot::{
+    DbInvariantVerdict, DbStateSnapshot, H2_CLIENT_PREFACE, H2_FLAG_END_HEADERS,
+    H2_FLAG_END_STREAM, H2_FRAME_DATA, H2_FRAME_HEADERS, H2_FRAME_SETTINGS, H2SinglePacketBurst,
+    build_h2_frame, build_h2_single_packet_burst, diff_db_snapshots, encode_hpack_literal_headers,
+    execute_loopback_h2_single_packet_race,
+};
 
 use anyhow::Result;
 use smg_graph::LatticeFinding;

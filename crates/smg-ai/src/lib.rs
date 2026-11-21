@@ -1,9 +1,13 @@
 pub mod codemods;
+pub mod semantic_patcher;
 
 use anyhow::{Context, Result, bail};
 pub use codemods::{
     CegisOutcome, GeneratedRegressionTest, export_regression_tests, generate_regression_test,
     run_cegis_patch_loop, synthesize_deterministic_codemod_diff, verify_diff_syntax_before_sandbox,
+};
+pub use semantic_patcher::{
+    VerifyFixOutcome, apply_patch_and_verify_fix, synthesize_16lang_multi_hunk_patch,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
