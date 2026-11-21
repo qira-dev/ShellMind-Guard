@@ -1,7 +1,7 @@
 # ShellMind-Guard — Master AI End-to-End Deep Audit Forms (9 Divisions · 100% File Coverage)
 
 > **Purpose:** Copy-paste each form below (one at a time) into an independent AI code auditor with read access to `/home/km-abdullah/ShellMind-Guard`.
-> **Coverage:** All **92 Rust source files** across all 11 workspace crates + root binary are explicitly mapped with zero gaps (Form 9 covers the six Phase 25–26 live-HTTP engine files at full depth, including the proxy TUI which is deliberately audited there instead of Form 7).
+> **Coverage:** All **92 Rust source files** (~91,300 LOC) across all **11 workspace members (10 crates + the root binary)** are explicitly mapped with zero gaps — every file annotated with its line count. Form 9 covers the six Phase 25–26 live-HTTP engine files at full depth (the proxy TUI is deliberately audited there instead of Form 7). Heavy divisions carry a MANDATORY SESSION SPLIT — **15 auditor sessions total**.
 > **Rule:** Never combine multiple forms into one session—run 1 form per fresh context window so the auditor inspects every line at maximum depth.
 
 ---
@@ -10,7 +10,7 @@
 
 ```text
 ROLE: Principal Rust Systems, Compilers, Formal Verification & Security Auditor.
-REPO: /home/km-abdullah/ShellMind-Guard (Rust Edition 2024, 11 workspace crates).
+REPO: /home/km-abdullah/ShellMind-Guard (Rust Edition 2024, 11 workspace members = 10 crates + the root binary).
 MODE: READ-ONLY DEEP AUDIT (do NOT edit code unless explicitly instructed after reporting).
 
 MANDATORY ZERO-HALLUCINATION RULES:
@@ -30,6 +30,12 @@ MANDATORY ZERO-HALLUCINATION RULES:
    (e) Performance & Scaling (hidden O(N^2) loops, quadratic regex backtracking, excessive `.clone()` in hot paths, unbounded allocations on huge files)
    (f) Silent Failures & Dead Logic (`let _ = ...` hiding critical errors, `.unwrap_or_default()` masking parse failures, unreachable branches)
 5. At the end of your report, list EVERY file you read with its line count and verdict (`FINDINGS: N` or `CLEAN — verified line-by-line`).
+6. SESSION SPLIT, WRITE SCOPE & REPORT PROTOCOL:
+   - A division marked "MANDATORY SESSION SPLIT" MUST be run as the listed consecutive fresh sessions (never one giant session) — each session applies the Global Rules ONLY to its own file list.
+   - WRITE SCOPE: you may create/write ONLY your own report file `AUDIT/FORM{N}{X}_REPORT.md` (X = session letter, e.g. FORM2A). NEVER modify, create, or overwrite any other file in the repository. If your target report file already exists, write `..._run2.md` instead — NEVER overwrite an existing report.
+   - If you have no file-write access, output the complete report in your reply so the user can save it.
+   - REPORT STRUCTURE (mandatory): (1) Executive Summary; (2) Findings P0–P3, each with severity, exact file:line + symbol name, root-cause mechanism, minimal repro/trigger trace, and surgical fix; (3) Per-File Verdict table listing EVERY assigned file with its line count and `FINDINGS: N` / `CLEAN — verified line-by-line`; (4) Cross-cutting observations.
+   - Later sessions in a split division MUST read the earlier session report file(s) first and mark duplicates instead of re-reporting them.
 ```
 
 ---
@@ -39,12 +45,12 @@ MANDATORY ZERO-HALLUCINATION RULES:
 ```text
 AUDIT DIVISION: Form 1 of 9 — Core Engine, Delta Cache & OSV Advisory Store
 EXACT FILES TO READ IN FULL (6 files):
-- crates/smg-core/src/lib.rs
-- crates/smg-core/src/scanner.rs
-- crates/smg-core/src/store.rs
-- crates/smg-core/src/advisories.rs
-- crates/smg-core/src/config.rs
-- crates/smg-core/src/yaml.rs
+- crates/smg-core/src/lib.rs (17 lines)
+- crates/smg-core/src/scanner.rs (626 lines)
+- crates/smg-core/src/store.rs (399 lines)
+- crates/smg-core/src/advisories.rs (839 lines)
+- crates/smg-core/src/config.rs (355 lines)
+- crates/smg-core/src/yaml.rs (226 lines)
 
 DEEP AUDIT CHECKLIST:
 1. `scanner.rs`:
@@ -74,33 +80,40 @@ Apply all Global Rules above and output the structured P0–P3 report.
 ```text
 AUDIT DIVISION: Form 2 of 9 — Multi-Language AST, CFG, Taint & Guard-Set Lattice
 EXACT FILES TO READ IN FULL (27 files):
-- crates/smg-graph/src/lib.rs
-- crates/smg-graph/src/arena.rs
-- crates/smg-graph/src/ast.rs
-- crates/smg-graph/src/call_hierarchy.rs
-- crates/smg-graph/src/cfg.rs
-- crates/smg-graph/src/deep_stack.rs
-- crates/smg-graph/src/lattice.rs
-- crates/smg-graph/src/phase10.rs
-- crates/smg-graph/src/scope.rs
-- crates/smg-graph/src/subgraph.rs
-- crates/smg-graph/src/taint.rs
-- crates/smg-graph/src/phase9/mod.rs
-- crates/smg-graph/src/phase9/concurrency.rs
-- crates/smg-graph/src/phase9/memory.rs
-- crates/smg-graph/src/phase9/tests.rs
-- crates/smg-graph/src/langs/mod.rs
-- crates/smg-graph/src/langs/bash.rs
-- crates/smg-graph/src/langs/c_cpp.rs
-- crates/smg-graph/src/langs/csharp.rs
-- crates/smg-graph/src/langs/dart.rs
-- crates/smg-graph/src/langs/java.rs
-- crates/smg-graph/src/langs/kotlin.rs
-- crates/smg-graph/src/langs/php.rs
-- crates/smg-graph/src/langs/ruby.rs
-- crates/smg-graph/src/langs/swift.rs
-- crates/smg-graph/src/langs/tests.rs
-- crates/smg-graph/tests/adversarial_precision_bench.rs
+- crates/smg-graph/src/lib.rs (184 lines)
+- crates/smg-graph/src/arena.rs (243 lines)
+- crates/smg-graph/src/ast.rs (4020 lines)
+- crates/smg-graph/src/call_hierarchy.rs (1242 lines)
+- crates/smg-graph/src/cfg.rs (1008 lines)
+- crates/smg-graph/src/deep_stack.rs (1791 lines)
+- crates/smg-graph/src/lattice.rs (3886 lines)
+- crates/smg-graph/src/phase10.rs (1181 lines)
+- crates/smg-graph/src/scope.rs (323 lines)
+- crates/smg-graph/src/subgraph.rs (216 lines)
+- crates/smg-graph/src/taint.rs (4855 lines)
+- crates/smg-graph/src/phase9/mod.rs (218 lines)
+- crates/smg-graph/src/phase9/concurrency.rs (1150 lines)
+- crates/smg-graph/src/phase9/memory.rs (849 lines)
+- crates/smg-graph/src/phase9/tests.rs (526 lines)
+- crates/smg-graph/src/langs/mod.rs (1151 lines)
+- crates/smg-graph/src/langs/bash.rs (806 lines)
+- crates/smg-graph/src/langs/c_cpp.rs (316 lines)
+- crates/smg-graph/src/langs/csharp.rs (392 lines)
+- crates/smg-graph/src/langs/dart.rs (290 lines)
+- crates/smg-graph/src/langs/java.rs (319 lines)
+- crates/smg-graph/src/langs/kotlin.rs (359 lines)
+- crates/smg-graph/src/langs/php.rs (540 lines)
+- crates/smg-graph/src/langs/ruby.rs (643 lines)
+- crates/smg-graph/src/langs/swift.rs (292 lines)
+- crates/smg-graph/src/langs/tests.rs (960 lines)
+- crates/smg-graph/tests/adversarial_precision_bench.rs (2836 lines)
+
+MANDATORY SESSION SPLIT — this division is 30,596 LOC; a single session CANNOT hold true line-by-line depth. Run as FOUR consecutive fresh sessions, each applying the Global Rules ONLY to its own list:
+- SESSION A -> AUDIT/FORM2A_REPORT.md: lib.rs, arena.rs, ast.rs, cfg.rs, scope.rs, lattice.rs (9,664 lines)
+- SESSION B -> AUDIT/FORM2B_REPORT.md: taint.rs, deep_stack.rs, call_hierarchy.rs, subgraph.rs, phase10.rs (9,285 lines)
+- SESSION C -> AUDIT/FORM2C_REPORT.md: langs/mod.rs, langs/*.rs, langs/tests.rs, phase9/*.rs (8,721 lines)
+- SESSION D -> AUDIT/FORM2D_REPORT.md: tests/adversarial_precision_bench.rs (2,836 lines)
+Later sessions MUST read the earlier session report file(s) first and mark duplicates instead of re-reporting them.
 
 DEEP AUDIT CHECKLIST:
 1. `cfg.rs` & `lattice.rs`:
@@ -131,7 +144,7 @@ Apply all Global Rules above and output the structured P0–P3 report.
 ```text
 AUDIT DIVISION: Form 3 of 9 — Formal SMT Path-Feasibility Solver
 EXACT FILES TO READ IN FULL (1 file — extreme mathematical depth):
-- crates/smg-graph/src/smt.rs
+- crates/smg-graph/src/smt.rs (1300 lines)
 
 DEEP AUDIT CHECKLIST:
 1. Built-in `QF_IDL` Difference-Logic Solver (Bellman-Ford):
@@ -156,24 +169,29 @@ Apply all Global Rules above and output the structured P0–P3 report.
 ```text
 AUDIT DIVISION: Form 4 of 9 — Secrets, Supply-Chain, OCI Container, Mobile & IaC Engines
 EXACT FILES TO READ IN FULL (18 files):
-- crates/smg-graph/src/secrets_config.rs
-- crates/smg-graph/src/git_history.rs
-- crates/smg-graph/src/gitleaks_config.rs
-- crates/smg-graph/src/deps.rs
-- crates/smg-graph/src/iac_policy.rs
-- crates/smg-graph/src/langs/hcl.rs
-- crates/smg-graph/src/infra_dos.rs
-- crates/smg-graph/src/protocols_ai.rs
-- crates/smg-graph/src/phase9/mobile.rs
-- crates/smg-graph/src/rules.rs
-- crates/smg-graph/src/rule_pack/mod.rs
-- crates/smg-graph/src/rule_pack/ai_supply_chain.rs
-- crates/smg-graph/src/rule_pack/cloud_iac.rs
-- crates/smg-graph/src/rule_pack/crypto_legacy.rs
-- crates/smg-graph/src/rule_pack/web_frameworks.rs
-- src/live_verify.rs
-- src/oci_image.rs
-- src/deps_sync.rs
+- crates/smg-graph/src/secrets_config.rs (1913 lines)
+- crates/smg-graph/src/git_history.rs (449 lines)
+- crates/smg-graph/src/gitleaks_config.rs (382 lines)
+- crates/smg-graph/src/deps.rs (3185 lines)
+- crates/smg-graph/src/iac_policy.rs (871 lines)
+- crates/smg-graph/src/langs/hcl.rs (1031 lines)
+- crates/smg-graph/src/infra_dos.rs (1305 lines)
+- crates/smg-graph/src/protocols_ai.rs (877 lines)
+- crates/smg-graph/src/phase9/mobile.rs (1028 lines)
+- crates/smg-graph/src/rules.rs (1023 lines)
+- crates/smg-graph/src/rule_pack/mod.rs (373 lines)
+- crates/smg-graph/src/rule_pack/ai_supply_chain.rs (199 lines)
+- crates/smg-graph/src/rule_pack/cloud_iac.rs (263 lines)
+- crates/smg-graph/src/rule_pack/crypto_legacy.rs (259 lines)
+- crates/smg-graph/src/rule_pack/web_frameworks.rs (779 lines)
+- src/live_verify.rs (892 lines)
+- src/oci_image.rs (578 lines)
+- src/deps_sync.rs (485 lines)
+
+MANDATORY SESSION SPLIT — this division is 15,892 LOC; run as TWO consecutive fresh sessions:
+- SESSION A -> AUDIT/FORM4A_REPORT.md: secrets_config.rs, git_history.rs, gitleaks_config.rs, deps.rs, src/deps_sync.rs, src/oci_image.rs, src/live_verify.rs (7,884 lines)
+- SESSION B -> AUDIT/FORM4B_REPORT.md: iac_policy.rs, langs/hcl.rs, infra_dos.rs, protocols_ai.rs, phase9/mobile.rs, rules.rs, rule_pack/*.rs (8,008 lines)
+Session B MUST read the Session A report first and mark duplicates instead of re-reporting them.
 
 DEEP AUDIT CHECKLIST:
 1. Secrets, `.gitleaks.toml` & Git History (`secrets_config.rs`, `gitleaks_config.rs`, `git_history.rs`, `src/live_verify.rs`):
@@ -205,22 +223,27 @@ Apply all Global Rules above and output the structured P0–P3 report.
 ```text
 AUDIT DIVISION: Form 5 of 9 — Web3, Embedded Hardware, Post-Quantum Crypto & Enterprise TEE
 EXACT FILES TO READ IN FULL (16 files):
-- crates/smg-web3/src/lib.rs
-- crates/smg-web3/src/context.rs
-- crates/smg-web3/src/evm_oracle.rs
-- crates/smg-web3/src/solidity.rs
-- crates/smg-web3/src/svm_move.rs
-- crates/smg-hw/src/lib.rs
-- crates/smg-hw/src/context.rs
-- crates/smg-hw/src/domains.rs
-- crates/smg-hw/src/typestate_irq.rs
-- crates/smg-pqc/src/lib.rs
-- crates/smg-pqc/src/inventory.rs
-- crates/smg-pqc/src/lattice.rs
-- crates/smg-pqc/src/x509.rs
-- crates/smg-enterprise/src/lib.rs
-- crates/smg-enterprise/src/license.rs
-- crates/smg-enterprise/src/tee.rs
+- crates/smg-web3/src/lib.rs (819 lines)
+- crates/smg-web3/src/context.rs (778 lines)
+- crates/smg-web3/src/evm_oracle.rs (1144 lines)
+- crates/smg-web3/src/solidity.rs (1947 lines)
+- crates/smg-web3/src/svm_move.rs (759 lines)
+- crates/smg-hw/src/lib.rs (595 lines)
+- crates/smg-hw/src/context.rs (1028 lines)
+- crates/smg-hw/src/domains.rs (611 lines)
+- crates/smg-hw/src/typestate_irq.rs (2494 lines)
+- crates/smg-pqc/src/lib.rs (329 lines)
+- crates/smg-pqc/src/inventory.rs (776 lines)
+- crates/smg-pqc/src/lattice.rs (509 lines)
+- crates/smg-pqc/src/x509.rs (292 lines)
+- crates/smg-enterprise/src/lib.rs (277 lines)
+- crates/smg-enterprise/src/license.rs (315 lines)
+- crates/smg-enterprise/src/tee.rs (511 lines)
+
+MANDATORY SESSION SPLIT — this division is 13,184 LOC; run as TWO consecutive fresh sessions:
+- SESSION A -> AUDIT/FORM5A_REPORT.md: smg-web3/* — lib.rs, context.rs, evm_oracle.rs, solidity.rs, svm_move.rs (5,447 lines)
+- SESSION B -> AUDIT/FORM5B_REPORT.md: smg-hw/* (4 files), smg-pqc/* (4 files), smg-enterprise/* (3 files) (7,737 lines)
+Session B MUST read the Session A report first and mark duplicates instead of re-reporting them.
 
 DEEP AUDIT CHECKLIST:
 1. `smg-hw` Abstract Interpretation (`domains.rs`, `typestate_irq.rs`, `context.rs`):
@@ -245,12 +268,12 @@ Apply all Global Rules above and output the structured P0–P3 report.
 ```text
 AUDIT DIVISION: Form 6 of 9 — Sandbox Isolation, Loopback Verifier, TLS/PQC & IDOR
 EXACT FILES TO READ IN FULL (6 files):
-- crates/smg-sandbox/src/lib.rs
-- crates/smg-sandbox/src/bwrap.rs
-- crates/smg-sandbox/src/verifier.rs
-- crates/smg-sandbox/src/wire_oracle.rs
-- src/tls_audit.rs
-- src/idor_audit.rs
+- crates/smg-sandbox/src/lib.rs (729 lines)
+- crates/smg-sandbox/src/bwrap.rs (1440 lines)
+- crates/smg-sandbox/src/verifier.rs (3083 lines)
+- crates/smg-sandbox/src/wire_oracle.rs (507 lines)
+- src/tls_audit.rs (573 lines)
+- src/idor_audit.rs (319 lines)
 
 DEEP AUDIT CHECKLIST:
 1. `smg-sandbox` (`bwrap.rs`, `verifier.rs`, `wire_oracle.rs`):
@@ -276,18 +299,23 @@ Apply all Global Rules above and output the structured P0–P3 report.
 ```text
 AUDIT DIVISION: Form 7 of 9 — Auto-Patcher, Reports, TUI, MCP Server & CLI
 EXACT FILES TO READ IN FULL (12 files):
-- crates/smg-ai/src/lib.rs
-- crates/smg-ai/src/codemods.rs
-- crates/smg-report/src/lib.rs
-- crates/smg-tui/src/lib.rs
-- crates/smg-tui/src/palette.rs
-- crates/smg-tui/src/session.rs
-- crates/smg-tui/src/views.rs
-- src/mcp.rs
-- src/rules_catalog.rs
-- src/lib.rs
-- src/main.rs
-- src/bin/smg.rs
+- crates/smg-ai/src/lib.rs (1243 lines)
+- crates/smg-ai/src/codemods.rs (790 lines)
+- crates/smg-report/src/lib.rs (727 lines)
+- crates/smg-tui/src/lib.rs (3918 lines)
+- crates/smg-tui/src/palette.rs (311 lines)
+- crates/smg-tui/src/session.rs (210 lines)
+- crates/smg-tui/src/views.rs (835 lines)
+- src/mcp.rs (671 lines)
+- src/rules_catalog.rs (103 lines)
+- src/lib.rs (5756 lines)
+- src/main.rs (3 lines)
+- src/bin/smg.rs (3 lines)
+
+MANDATORY SESSION SPLIT — this division is 14,570 LOC; run as TWO consecutive fresh sessions:
+- SESSION A -> AUDIT/FORM7A_REPORT.md: src/lib.rs, src/main.rs, src/bin/smg.rs, crates/smg-ai/*, src/rules_catalog.rs (7,895 lines)
+- SESSION B -> AUDIT/FORM7B_REPORT.md: smg-report/*, smg-tui/* (4 files), src/mcp.rs (6,672 lines)
+Session B MUST read the Session A report first and mark duplicates instead of re-reporting them.
 
 DEEP AUDIT CHECKLIST:
 1. `smg-ai` (`codemods.rs`, `lib.rs`):
@@ -301,6 +329,7 @@ DEEP AUDIT CHECKLIST:
    - Audit JSON-RPC 2.0 framing, error codes, input validation on all MCP tool arguments (path traversal, command injection, unbounded scan output), and strict 32 KiB response budget enforcement.
 5. `src/lib.rs` & `src/rules_catalog.rs`:
    - Audit CLI flag interactions (`--changed-since`, `--git-history`, `--verify-live`, `--only-verified`, `--online-osv`, `--baseline`, `--exclude-rule`, `--fail-on`, `--ci`, `--watch`), exit code correctness, and git pre-commit hook install/uninstall safety (never clobbering user's existing hooks).
+   - Phase 25–26 dispatch arms in `src/lib.rs` (`Commands::{Templates, Sqli, Dast, Proxy, HttpAudit}`): audit flag parsing, guardrail flag pass-through (`--allow-remote`, `--allow-remote-bind`, `--skip-timing`, `--passive-only`), JSON/console output symmetry, exit-code correctness per arm, and impossible-flag combinations (e.g. `sqli --method POST` without `--data`, proxy bind without `--allow-remote-bind`, `http-audit` with neither URL nor `--schema`).
 
 Apply all Global Rules above and output the structured P0–P3 report.
 ```
@@ -320,9 +349,9 @@ MANDATORY COMMANDS & CHECKS TO RUN:
 2. Silent Error Swallowing Audit:
    - Inspect every `let _ = ...`, `.ok()`, and `.unwrap_or_default()` in production code—flag any case that silently hides I/O failures, security policy parse errors, or cache corruption.
 3. Full Compiler & Test Gate:
-   - Run `cargo clippy --workspace --all-targets -- -D warnings` (must be 0 warnings).
-   - Run `cargo test --workspace` (verify 100% pass, 0 ignored/flaky tests).
-   - Run `smg scan . --deep-audit --format compact` (verify 0 findings in `src/` and `crates/`).
+   - Run `cargo clippy --workspace --all-targets --locked -- -D warnings` (must be 0 warnings).
+   - Run `SMG_ENFORCE_PRECISION_GATE=1 cargo test --workspace --locked` (verify 100% pass — the env var also enforces the adversarial precision gate; 0 ignored/flaky tests).
+   - Run `smg scan src --deep-audit --format compact` and `smg scan crates --deep-audit --format compact` (verify 0 findings in both).
 4. Adversarial Malformed-Input Crash Audit:
    - Verify how `smg` handles: empty files, 0-byte tar/lockfiles, invalid UTF-8 binary blobs renamed to `.rs`/`.py`/`.tf`, deeply nested brackets, circular symlinks, and empty git repositories (no commits yet).
 5. Performance & Binary Hygiene:
@@ -341,12 +370,12 @@ Apply all Global Rules above and output the structured P0–P3 report.
 ```text
 AUDIT DIVISION: Form 9 of 9 — Live HTTP Verification Engines & Proxy TUI (Full Depth)
 EXACT FILES TO READ IN FULL (6 files):
-- src/templates_audit.rs      (Nuclei-compatible YAML detection template runner: HTTP + DNS + TCP/TLS engines)
-- src/sqli_audit.rs           (non-destructive SQLi prover: error-based, boolean differential, time-based, ORDER BY enumeration)
-- src/dast_audit.rs           (same-host crawler + passive header audit + proof-based active checks)
-- src/proxy.rs                (localhost HTTP inspection proxy engine: interception + CONNECT tunnel + JSONL sink)
-- src/http_audit.rs           (passive HTTP posture auditor + static OpenAPI/GraphQL schema linter)
-- crates/smg-tui/src/proxy_tui.rs  (proxy TUI: history, Repeater replay, decoder, wordlist Intruder, Compare diff)
+- src/templates_audit.rs (2237 lines)      (Nuclei-compatible YAML detection template runner: HTTP + DNS + TCP/TLS engines)
+- src/sqli_audit.rs (756 lines)           (non-destructive SQLi prover: error-based, boolean differential, time-based, ORDER BY enumeration)
+- src/dast_audit.rs (1203 lines)           (same-host crawler + passive header audit + proof-based active checks)
+- src/proxy.rs (678 lines)                (localhost HTTP inspection proxy engine: interception + CONNECT tunnel + JSONL sink)
+- src/http_audit.rs (656 lines)           (passive HTTP posture auditor + static OpenAPI/GraphQL schema linter)
+- crates/smg-tui/src/proxy_tui.rs (1125 lines)  (proxy TUI: history, Repeater replay, decoder, wordlist Intruder, Compare diff)
 
 CONTEXT: These six files are the Phase 25–26 live verification engines. They are DOCUMENTED as strictly
 defensive: detection/proof only; loopback/RFC1918 default with --allow-remote opt-in; NO WAF-evasion/tamper
@@ -542,6 +571,7 @@ DEEP AUDIT CHECKLIST:
      another local user → write target hijack) — assess and propose mkstemp-style fix if warranted.
 
 7. CROSS-ENGINE GUARDRAIL & CONSISTENCY MATRIX (verify EVERY row against the actual code, not the docs):
+   - OWNERSHIP BOUNDARIES: the DEFINITION of `is_lab_or_loopback_url()` is Form 6's audit target (idor_audit.rs); `src/lib.rs` dispatch arms are Form 7's — Form 9 verifies ONLY the six engine files and each engine's call site of the guard.
    - Scope enforcement: `is_lab_or_loopback_url()` (idor_audit) is called by templates/sqli/dast/http-audit —
      build the bypass/edge table: `[::ffff:127.0.0.1]`, `0x7f.1`, `127.1`, `2130706433`, `0177.0.0.1`,
      `localhost.evil.com`, `.local` suffix, IPv6 `::1`, DNS-rebinding hostnames, missing/empty host, and
