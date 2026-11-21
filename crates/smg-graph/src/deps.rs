@@ -2572,7 +2572,7 @@ pub fn scan_dependencies_with_store(
         .unwrap_or("");
     match fname {
         "package.json" => audit_package_json(rel_path, content, store),
-        "package-lock.json" => audit_package_lock(rel_path, content, store),
+        "package-lock.json" | "npm-shrinkwrap.json" => audit_package_lock(rel_path, content, store),
         "Cargo.toml" => audit_cargo_toml(rel_path, content, store),
         "Cargo.lock" => audit_cargo_lock(rel_path, content, store),
         "go.mod" => audit_go_mod(rel_path, content, store),
@@ -2582,7 +2582,7 @@ pub fn scan_dependencies_with_store(
         "yarn.lock" | "pnpm-lock.yaml" | "bun.lock" | "go.sum" | "pom.xml" | "build.gradle"
         | "build.gradle.kts" | "gradle.lockfile" | "packages.lock.json" | "composer.json"
         | "composer.lock" | "Gemfile" | "Gemfile.lock" | "Package.resolved" | "pubspec.yaml"
-        | "pubspec.lock" | ".npmrc" | "Pipfile.lock" => {
+        | "pubspec.lock" | ".npmrc" | "Pipfile.lock" | "mix.lock" => {
             audit_generic_ecosystem_manifest(rel_path, content, store)
         }
         _ => Vec::new(),

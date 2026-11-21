@@ -127,6 +127,20 @@ fn infer_param_type(name: &str, schema_type: Option<&str>) -> ParamTypeHint {
     }
 }
 
+fn contains_word_bounded_expr(haystack: &str, expr: &str) -> bool {
+    for (pos, _) in haystack.match_indices(expr) {
+        let before_ok = pos == 0
+            || !haystack[..pos]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+        if before_ok {
+            return true;
+        }
+    }
+    false
+}
+
 fn has_positive_bound_for(code_low: &str, param_name: &str) -> bool {
     let p = param_name.to_ascii_lowercase();
     // Slice code up to the first financial mutation sink so post-sink checks never suppress pre-sink risks.
@@ -153,13 +167,13 @@ fn has_positive_bound_for(code_low: &str, param_name: &str) -> bool {
         || scope.contains("is_finite(")
         || scope.contains("isnan(")
         || scope.contains("is_nan(");
-    scope.contains(&format!("{p} > 0"))
-        || scope.contains(&format!("{p} >= 1"))
+    contains_word_bounded_expr(scope, &format!("{p} > 0"))
+        || contains_word_bounded_expr(scope, &format!("{p} >= 1"))
         || scope.contains(&format!("0 < {p}"))
         || (has_nan_safe_neg
-            && (scope.contains(&format!("{p} <= 0"))
-                || scope.contains(&format!("{p} < 1"))
-                || scope.contains(&format!("{p} < 0"))))
+            && (contains_word_bounded_expr(scope, &format!("{p} <= 0"))
+                || contains_word_bounded_expr(scope, &format!("{p} < 1"))
+                || contains_word_bounded_expr(scope, &format!("{p} < 0"))))
         || scope.contains(".positive(")
         || scope.contains("gt=0")
         || scope.contains("ge=1")
@@ -851,7 +865,12 @@ pub fn merge_repo_route_schemas(summaries: &[FileAstSummary]) -> Vec<RouteSchema
             let key = (s.method.clone(), s.path.clone());
             if let Some(existing) = by_key.get_mut(&key) {
                 for p in &s.params {
-                    add_unique_param(&mut existing.params, p.clone());
+                    let mut cand = p.clone();
+                    // Never let documentation-only OpenAPI `minimum` suppress missing runtime code validation.
+                    if s.from_openapi && !existing.from_openapi {
+                        cand.has_positive_bound = false;
+                    }
+                    add_unique_param(&mut existing.params, cand);
                 }
                 existing.from_openapi |= s.from_openapi;
                 if existing.source_file.is_empty() && !s.source_file.is_empty() {

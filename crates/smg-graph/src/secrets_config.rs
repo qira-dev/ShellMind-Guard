@@ -314,8 +314,8 @@ fn secret_token_pack() -> &'static (RegexSet, Vec<(SecretTokenSpec, Regex)>) {
                 SecretTokenSpec { provider: "Okta API Token", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 2, min_entropy: 3.2, requires_keyword: Some("okta") },
             ),
             (
-                r"\b(dop_v1_[0-9a-f]{64}|doo_v1_[0-9a-f]{64}|dor_v1_[0-9a-f]{64})\b",
-                SecretTokenSpec { provider: "DigitalOcean v1 Token", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 7, min_entropy: 3.0, requires_keyword: None },
+                r"\b(sk-[0-9A-Za-z]{20}T3BlbkFJ[0-9A-Za-z]{20})\b",
+                SecretTokenSpec { provider: "OpenAI Legacy Token", rule_id: "SMG-SEC-APIKEY", severity: "CRITICAL", prefix_skip: 7, min_entropy: 3.0, requires_keyword: None },
             ),
             (
                 r"\b(ya29\.[0-9A-Za-z_-]{50,})\b",
@@ -793,7 +793,10 @@ pub fn is_sensitive_env_or_pem_with_content(rel_path: &str, content: &str) -> bo
             let t = l.trim();
             t.is_empty()
                 || t.starts_with('#')
-                || t.starts_with("sops_")
+                || t.starts_with("sops_version=")
+                || t.starts_with("sops_mac=")
+                || t.starts_with("sops_lastmodified=")
+                || t.starts_with("sops_unencrypted_suffix=")
                 || t == "sops:"
                 || line_has_sops_ciphertext(t)
         });
@@ -1153,8 +1156,7 @@ pub fn scan_secrets_and_config(rel_path: &str, content: &str) -> Vec<LocalStatic
         };
 
         if line.contains(".sign(") || line.contains(".sign (") {
-            let lines_vec: Vec<&str> = content.lines().collect();
-            let window = lines_vec[idx..lines_vec.len().min(idx + 4)].join(" ");
+            let window = lines[idx..lines.len().min(idx + 4)].join(" ");
             for cap in jwt_js_re().captures_iter(&window) {
                 if let Some(m) = cap.get(1).or_else(|| cap.get(2)) {
                     check_jwt_literal(m.as_str(), &mut findings);
@@ -1500,8 +1502,22 @@ fn scan_jwt_logic_flaws(
                 test_saw_open_brace = false;
             }
             if in_cfg_test {
+                let mut in_str = false;
+                let mut escaped = false;
                 for ch in line.chars() {
-                    if ch == '{' {
+                    if in_str {
+                        if escaped {
+                            escaped = false;
+                        } else if ch == '\\' {
+                            escaped = true;
+                        } else if ch == '"' {
+                            in_str = false;
+                        }
+                        continue;
+                    }
+                    if ch == '"' {
+                        in_str = true;
+                    } else if ch == '{' {
                         test_brace_depth += 1;
                         test_saw_open_brace = true;
                     } else if ch == '}' {
@@ -1666,8 +1682,15 @@ fn is_ignored_by_gitignore(rel_path: &str, gitignore_files: &[(&str, &[String])]
             let clean_pat = pat.trim_start_matches('/').trim_end_matches('/');
             let matched = if clean_pat.contains('/') {
                 glob_match(clean_pat, candidate_rel)
+                    || candidate_rel
+                        .strip_prefix(clean_pat)
+                        .is_some_and(|r| r.starts_with('/'))
             } else {
-                glob_match(clean_pat, file_name) || glob_match(clean_pat, candidate_rel)
+                glob_match(clean_pat, file_name)
+                    || glob_match(clean_pat, candidate_rel)
+                    || candidate_rel
+                        .split('/')
+                        .any(|seg| !seg.is_empty() && glob_match(clean_pat, seg))
             };
             if matched {
                 ignored = !negated;

@@ -432,10 +432,10 @@ fn scan_cicd_workflow(rel_path: &str, content: &str, out: &mut Vec<LocalStaticFi
 }
 
 fn scan_kubernetes_manifest(rel_path: &str, content: &str, out: &mut Vec<LocalStaticFinding>) {
-    // Split multi-document YAML (`---` / `...`) keeping exact 1-based line alignment via smg-core::yaml
-    for doc in smg_core::yaml::split_yaml_documents_preserving_lines(content) {
-        let doc_lines: Vec<&str> = doc.lines().collect();
-        analyze_k8s_doc(rel_path, 0, &doc_lines, out);
+    // Zero-copy multi-document YAML split (`---` / `...`) with exact 1-based line offsets
+    for (start_line, doc_slice) in smg_core::yaml::split_yaml_document_slices(content) {
+        let doc_lines: Vec<&str> = doc_slice.lines().collect();
+        analyze_k8s_doc(rel_path, start_line.saturating_sub(1), &doc_lines, out);
     }
 }
 

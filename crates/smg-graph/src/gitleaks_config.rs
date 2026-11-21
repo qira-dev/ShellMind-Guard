@@ -62,6 +62,14 @@ pub struct CompiledAllowlist {
     pub stopwords: Vec<String>,
 }
 
+fn compile_bounded_regex(pat: &str) -> Option<Regex> {
+    regex::RegexBuilder::new(pat)
+        .size_limit(256 * 1024)
+        .dfa_size_limit(256 * 1024)
+        .build()
+        .ok()
+}
+
 impl CompiledAllowlist {
     fn from_raw(raw: RawAllowlist) -> Self {
         let require_all = raw
@@ -71,12 +79,12 @@ impl CompiledAllowlist {
         let paths = raw
             .paths
             .into_iter()
-            .filter_map(|p| Regex::new(&p).ok())
+            .filter_map(|p| compile_bounded_regex(&p))
             .collect();
         let regexes = raw
             .regexes
             .into_iter()
-            .filter_map(|r| Regex::new(&r).ok())
+            .filter_map(|r| compile_bounded_regex(&r))
             .collect();
         let commits = raw
             .commits
@@ -191,7 +199,7 @@ impl GitleaksConfig {
             if r.id.trim().is_empty() || r.regex.trim().is_empty() {
                 continue;
             }
-            if let Ok(re) = Regex::new(&r.regex) {
+            if let Some(re) = compile_bounded_regex(&r.regex) {
                 let mut r_allow = Vec::new();
                 if let Some(a) = r.allowlist {
                     r_allow.push(CompiledAllowlist::from_raw(a));

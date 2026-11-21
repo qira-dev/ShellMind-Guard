@@ -117,6 +117,45 @@ pub fn extract_aws_secret_near(lines: &[&str], center_idx: usize) -> Option<Stri
     None
 }
 
+fn unquote_git_path(raw: &str) -> String {
+    let inner = match raw.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        Some(s) => s,
+        None => return raw.to_string(),
+    };
+    let bytes = inner.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            if i + 3 < bytes.len()
+                && bytes[i + 1..i + 4]
+                    .iter()
+                    .all(|b| (b'0'..=b'7').contains(b))
+                && let Ok(oct_str) = std::str::from_utf8(&bytes[i + 1..i + 4])
+                && let Ok(v) = u8::from_str_radix(oct_str, 8)
+            {
+                out.push(v);
+                i += 4;
+                continue;
+            }
+            let esc = match bytes[i + 1] {
+                b'n' => b'\n',
+                b't' => b'\t',
+                b'r' => b'\r',
+                b'"' => b'"',
+                b'\\' => b'\\',
+                other => other,
+            };
+            out.push(esc);
+            i += 2;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn should_skip_history_path(rel_path: &str, include_tests: bool) -> bool {
     let norm = rel_path.replace('\\', "/");
     let fname = Path::new(&norm)
@@ -239,7 +278,14 @@ pub fn scan_git_history(
         }
 
         if let Some(path_part) = line.strip_prefix("+++ b/") {
-            cur_file = path_part.trim().to_string();
+            cur_file = unquote_git_path(path_part.trim());
+            skip_file = should_skip_history_path(&cur_file, include_tests);
+            skip_hunk = false;
+            continue;
+        }
+        if let Some(path_part) = line.strip_prefix("+++ \"b/") {
+            let trimmed = path_part.trim();
+            cur_file = unquote_git_path(&format!("\"{trimmed}"));
             skip_file = should_skip_history_path(&cur_file, include_tests);
             skip_hunk = false;
             continue;
