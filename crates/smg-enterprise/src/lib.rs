@@ -1,5 +1,11 @@
+pub mod attestation_merkle;
 pub mod license;
 pub mod tee;
+
+pub use attestation_merkle::{
+    MerkleAuditLog, MerkleProofStep, NitroCoseAttestation, SevSnpReportSummary, TdxQuoteV4Summary,
+    verify_merkle_inclusion, verify_nitro_cose_sign1, verify_sev_snp_report, verify_tdx_quote_v4,
+};
 
 pub use license::{
     LicenseClaims, LicenseTier, SignedLicenseToken, compute_binary_blake3, decode_pubkey_32,
