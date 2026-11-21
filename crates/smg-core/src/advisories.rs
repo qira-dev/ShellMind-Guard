@@ -23,9 +23,17 @@ pub struct AdvisoryRecord {
 }
 
 /// Normalizes ecosystem strings to canonical OSV names
-/// (`npm`, `crates.io`, `Go`, `PyPI`, `Maven`, `Packagist`, `RubyGems`, `Pub`, `NuGet`).
+/// (`npm`, `crates.io`, `Go`, `PyPI`, `Maven`, `Packagist`, `RubyGems`, `Pub`, `NuGet`,
+/// plus versioned Linux distro ecosystems such as `Debian:12`, `Alpine:v3.19`, `Ubuntu:22.04:LTS`).
 pub fn canonical_ecosystem(raw: &str) -> Option<&'static str> {
-    match raw.trim().to_ascii_lowercase().as_str() {
+    let base = raw
+        .trim()
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    match base.as_str() {
         "npm" => Some("npm"),
         "cargo" | "crates.io" | "rust" => Some("crates.io"),
         "go" | "golang" => Some("Go"),
@@ -46,15 +54,142 @@ pub fn canonical_ecosystem(raw: &str) -> Option<&'static str> {
     }
 }
 
-/// Normalizes package identifiers per ecosystem (`PyPI` collapses `_`/`.` into `-`, PEP 503).
+/// Normalizes package identifiers per ecosystem (`PyPI` collapses runs of `-`/`_`/`.` into `-`, PEP 503).
 pub fn normalize_package_name(ecosystem: &str, name: &str) -> String {
     let eco = canonical_ecosystem(ecosystem).unwrap_or(ecosystem);
     let lower = name.trim().to_ascii_lowercase();
     if eco == "PyPI" {
-        lower.replace(['_', '.'], "-")
+        let mut out = String::with_capacity(lower.len());
+        let mut prev_dash = false;
+        for ch in lower.chars() {
+            if matches!(ch, '-' | '_' | '.') {
+                if !prev_dash {
+                    out.push('-');
+                    prev_dash = true;
+                }
+            } else {
+                out.push(ch);
+                prev_dash = false;
+            }
+        }
+        out
     } else {
         lower
     }
+}
+
+fn is_distro_ecosystem(eco: Option<&str>) -> bool {
+    matches!(
+        eco,
+        Some("Debian" | "Alpine" | "Ubuntu" | "Rocky Linux" | "AlmaLinux" | "Red Hat")
+    )
+}
+
+fn dpkg_char_order(b: u8) -> u16 {
+    if b == b'~' {
+        0
+    } else if b.is_ascii_alphabetic() {
+        b as u16
+    } else {
+        (b as u16) + 256
+    }
+}
+
+/// Compares two dpkg/apk version fragments using Debian dpkg ordering:
+/// `~` sorts before everything (including end-of-string), digit runs compare numerically,
+/// and non-digit runs compare with letters before punctuation.
+fn cmp_dpkg_fragment(a: &str, b: &str) -> std::cmp::Ordering {
+    let ab = a.as_bytes();
+    let bb = b.as_bytes();
+    let (mut ia, mut ib) = (0usize, 0usize);
+    while ia < ab.len() || ib < bb.len() {
+        // Non-digit runs
+        while (ia < ab.len() && !ab[ia].is_ascii_digit())
+            || (ib < bb.len() && !bb[ib].is_ascii_digit())
+        {
+            let ca = if ia < ab.len() && !ab[ia].is_ascii_digit() {
+                let o = dpkg_char_order(ab[ia]);
+                ia += 1;
+                Some(o)
+            } else {
+                None
+            };
+            let cb = if ib < bb.len() && !bb[ib].is_ascii_digit() {
+                let o = dpkg_char_order(bb[ib]);
+                ib += 1;
+                Some(o)
+            } else {
+                None
+            };
+            let ord = match (ca, cb) {
+                (Some(0), None) => std::cmp::Ordering::Less,
+                (None, Some(0)) => std::cmp::Ordering::Greater,
+                (Some(x), Some(y)) => x.cmp(&y),
+                (None, Some(_)) => std::cmp::Ordering::Less,
+                (Some(_), None) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            };
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        // Digit runs (skip leading zeros, compare by length then lexically for arbitrary precision)
+        let da_start = ia;
+        while ia < ab.len() && ab[ia].is_ascii_digit() {
+            ia += 1;
+        }
+        let db_start = ib;
+        while ib < bb.len() && bb[ib].is_ascii_digit() {
+            ib += 1;
+        }
+        let sa = &ab[da_start..ia];
+        let sb = &bb[db_start..ib];
+        let za = sa
+            .iter()
+            .position(|&c| c != b'0')
+            .map(|p| &sa[p..])
+            .unwrap_or(&[]);
+        let zb = sb
+            .iter()
+            .position(|&c| c != b'0')
+            .map(|p| &sb[p..])
+            .unwrap_or(&[]);
+        let ord = za.len().cmp(&zb.len()).then_with(|| za.cmp(zb));
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+fn parse_distro_version(raw: &str) -> Option<(u64, &str, &str)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.contains('*') {
+        return None;
+    }
+    let (epoch, rest) = if let Some((ep, r)) = trimmed.split_once(':') {
+        (ep.parse::<u64>().ok()?, r)
+    } else {
+        (0u64, trimmed)
+    };
+    if rest.is_empty() {
+        return None;
+    }
+    let (upstream, rev) = match rest.rsplit_once('-') {
+        Some((u, r)) => (u, r),
+        None => (rest, ""),
+    };
+    Some((epoch, upstream, rev))
+}
+
+fn cmp_distro_versions(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    let (ea, ua, ra) = parse_distro_version(a)?;
+    let (eb, ub, rb) = parse_distro_version(b)?;
+    Some(
+        ea.cmp(&eb)
+            .then_with(|| cmp_dpkg_fragment(ua, ub))
+            .then_with(|| cmp_dpkg_fragment(ra, rb)),
+    )
 }
 
 fn split_numeric_and_suffix(part: &str) -> Option<(u64, String)> {
@@ -79,7 +214,8 @@ struct SemverKey {
     major: u64,
     minor: u64,
     patch: u64,
-    /// `0` = pre-release (`-alpha`, `1.0.0rc1`), `1` = normal release, `2` = post-release (`post1` or Go `vX.Y.Z-0.<ts>-<hash>`)
+    fourth: u64,
+    /// `0` = pre-release (`-alpha`, `1.0.0rc1`, Go `vX.Y.Z-0.<ts>-<hash>`), `1` = normal release, `2` = PEP 440 post-release (`post1`)
     tier: u8,
     pre: String,
 }
@@ -110,15 +246,20 @@ fn parse_semver_key(raw: &str) -> Option<SemverKey> {
         Some(p) => split_numeric_and_suffix(p)?,
         None => (0, String::new()),
     };
+    let (fourth, fourth_tail) = match parts.next() {
+        Some(p) => split_numeric_and_suffix(p)?,
+        None => (0, String::new()),
+    };
     let mut pre_norm = prerelease.unwrap_or("").trim().to_ascii_lowercase();
-    if !patch_tail.is_empty() && pre_norm.is_empty() {
+    if !fourth_tail.is_empty() && pre_norm.is_empty() {
+        pre_norm = fourth_tail;
+    } else if !patch_tail.is_empty() && pre_norm.is_empty() {
         pre_norm = patch_tail;
     } else if !minor_tail.is_empty() && pre_norm.is_empty() {
         pre_norm = minor_tail;
     }
-    // Go post-tag pseudo-version `v1.2.3-0.20230101120000-abcdef` sorts AFTER `1.2.3` release.
-    let is_post_tag =
-        (pre_norm.starts_with("0.") && pre_norm.len() >= 18) || pre_norm.starts_with("post");
+    // PEP 440 post-release (`post1`) sorts AFTER the release; Go `vX.Y.Z-0.<ts>-<hash>` is a pre-release (< vX.Y.Z).
+    let is_post_tag = pre_norm.starts_with("post");
     let tier = if pre_norm.is_empty() {
         1
     } else if is_post_tag {
@@ -130,9 +271,19 @@ fn parse_semver_key(raw: &str) -> Option<SemverKey> {
         major,
         minor,
         patch,
+        fourth,
         tier,
         pre: pre_norm,
     })
+}
+
+fn split_alpha_num_ident(s: &str) -> Option<(&str, u64)> {
+    let alpha_len = s.bytes().take_while(|b| b.is_ascii_alphabetic()).count();
+    if alpha_len == 0 || alpha_len == s.len() {
+        return None;
+    }
+    let num = s[alpha_len..].parse::<u64>().ok()?;
+    Some((&s[..alpha_len], num))
 }
 
 fn cmp_prerelease_ident(a: &str, b: &str) -> std::cmp::Ordering {
@@ -141,7 +292,15 @@ fn cmp_prerelease_ident(a: &str, b: &str) -> std::cmp::Ordering {
         // SemVer 2.0.0 §11.4.3: numeric identifiers always have lower precedence than non-numeric.
         (Ok(_), Err(_)) => std::cmp::Ordering::Less,
         (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
-        (Err(_), Err(_)) => a.cmp(b),
+        (Err(_), Err(_)) => {
+            if let (Some((pa, na)), Some((pb, nb))) =
+                (split_alpha_num_ident(a), split_alpha_num_ident(b))
+                && pa == pb
+            {
+                return na.cmp(&nb);
+            }
+            a.cmp(b)
+        }
     }
 }
 
@@ -150,6 +309,7 @@ fn cmp_semver_keys(a: &SemverKey, b: &SemverKey) -> std::cmp::Ordering {
         .cmp(&b.major)
         .then_with(|| a.minor.cmp(&b.minor))
         .then_with(|| a.patch.cmp(&b.patch))
+        .then_with(|| a.fourth.cmp(&b.fourth))
         .then_with(|| a.tier.cmp(&b.tier))
         .then_with(|| {
             if a.pre == b.pre {
@@ -193,8 +353,49 @@ pub fn version_matches_range(
     fixed: &str,
     last_affected: &str,
 ) -> bool {
-    if canonical_ecosystem(ecosystem) == Some("Go") && is_go_pseudo_version(installed) {
-        return false;
+    let canon_eco = canonical_ecosystem(ecosystem);
+    if is_distro_ecosystem(canon_eco) {
+        if parse_distro_version(installed).is_none() {
+            return false;
+        }
+        let intro_trimmed = introduced.trim();
+        if !intro_trimmed.is_empty() && intro_trimmed != "0" {
+            let Some(ord) = cmp_distro_versions(installed, intro_trimmed) else {
+                return false;
+            };
+            if ord == std::cmp::Ordering::Less {
+                return false;
+            }
+        }
+        let fixed_trimmed = fixed.trim();
+        if !fixed_trimmed.is_empty() {
+            let Some(ord) = cmp_distro_versions(installed, fixed_trimmed) else {
+                return false;
+            };
+            if ord != std::cmp::Ordering::Less {
+                return false;
+            }
+        }
+        let last_trimmed = last_affected.trim();
+        if !last_trimmed.is_empty() {
+            let Some(ord) = cmp_distro_versions(installed, last_trimmed) else {
+                return false;
+            };
+            if ord == std::cmp::Ordering::Greater {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    if canon_eco == Some("Go") && is_go_pseudo_version(installed) {
+        let fixed_trimmed = fixed.trim();
+        let last_trimmed = last_affected.trim();
+        let has_pseudo_bound = (!fixed_trimmed.is_empty() && is_go_pseudo_version(fixed_trimmed))
+            || (!last_trimmed.is_empty() && is_go_pseudo_version(last_trimmed));
+        if !has_pseudo_bound {
+            return false;
+        }
     }
     let Some(inst) = parse_semver_key(installed) else {
         return false;
@@ -328,6 +529,7 @@ impl AdvisoryStore {
             return Ok(0);
         }
         let tx = self.conn.transaction()?;
+        let mut upserted = 0usize;
         {
             let mut stmt = tx.prepare_cached(
                 "INSERT INTO advisories
@@ -358,11 +560,12 @@ impl AdvisoryStore {
                     rec.source.trim(),
                     rec.updated_at
                 ])?;
+                upserted += 1;
             }
         }
         tx.commit()?;
         let _ = self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
-        Ok(records.len())
+        Ok(upserted)
     }
 
     /// Queries all indexed advisories matching `(ecosystem, package)` pairs in one fast SQLite pass.
@@ -447,7 +650,7 @@ fn normalize_severity(raw: &str) -> &'static str {
         "CRITICAL" => "CRITICAL",
         "HIGH" => "HIGH",
         "MEDIUM" | "MODERATE" => "MEDIUM",
-        "LOW" => "LOW",
+        "LOW" | "NONE" | "NEGLIGIBLE" | "INFORMATIONAL" | "INFO" | "UNSPECIFIED" | "" => "LOW",
         _ => "HIGH",
     }
 }
@@ -484,11 +687,92 @@ fn cvss_vector_to_severity(vector: &str) -> Option<&'static str> {
             "LOW"
         });
     }
-    if vector.starts_with("CVSS:3") {
-        // Basic conservative severity fallback when vector string carries high/complete impact hints.
-        if vector.contains("C:H/I:H/A:H") {
-            return Some("CRITICAL");
+    if vector.starts_with("CVSS:3.") {
+        let mut av = 0.85_f64;
+        let mut ac = 0.77_f64;
+        let mut ui = 0.85_f64;
+        let mut scope_changed = false;
+        let mut c = 0.0_f64;
+        let mut i = 0.0_f64;
+        let mut a = 0.0_f64;
+        let mut pr_code = "N";
+        for part in vector.split('/').skip(1) {
+            if let Some((k, v)) = part.split_once(':') {
+                match k {
+                    "AV" => {
+                        av = match v {
+                            "N" => 0.85,
+                            "A" => 0.62,
+                            "L" => 0.55,
+                            "P" => 0.20,
+                            _ => 0.85,
+                        };
+                    }
+                    "AC" => ac = if v == "H" { 0.44 } else { 0.77 },
+                    "PR" => pr_code = v,
+                    "UI" => ui = if v == "R" { 0.62 } else { 0.85 },
+                    "S" => scope_changed = v == "C",
+                    "C" => {
+                        c = match v {
+                            "H" => 0.56,
+                            "L" => 0.22,
+                            _ => 0.0,
+                        };
+                    }
+                    "I" => {
+                        i = match v {
+                            "H" => 0.56,
+                            "L" => 0.22,
+                            _ => 0.0,
+                        };
+                    }
+                    "A" => {
+                        a = match v {
+                            "H" => 0.56,
+                            "L" => 0.22,
+                            _ => 0.0,
+                        };
+                    }
+                    _ => {}
+                }
+            }
         }
+        let pr = match (pr_code, scope_changed) {
+            ("N", _) => 0.85,
+            ("L", false) => 0.62,
+            ("L", true) => 0.68,
+            ("H", false) => 0.27,
+            ("H", true) => 0.50,
+            _ => 0.85,
+        };
+        let iss = 1.0 - (1.0 - c) * (1.0 - i) * (1.0 - a);
+        if iss <= 0.0 {
+            return Some("LOW");
+        }
+        let impact = if scope_changed {
+            7.52 * (iss - 0.029) - 3.25 * (iss - 0.02).powf(15.0)
+        } else {
+            6.42 * iss
+        };
+        if impact <= 0.0 {
+            return Some("LOW");
+        }
+        let exploitability = 8.22 * av * ac * pr * ui;
+        let raw = if scope_changed {
+            (1.08 * (impact + exploitability)).min(10.0)
+        } else {
+            (impact + exploitability).min(10.0)
+        };
+        let score = (raw * 10.0).ceil() / 10.0;
+        return Some(if score >= 9.0 {
+            "CRITICAL"
+        } else if score >= 7.0 {
+            "HIGH"
+        } else if score >= 4.0 {
+            "MEDIUM"
+        } else {
+            "LOW"
+        });
     }
     None
 }
@@ -788,21 +1072,74 @@ mod tests {
             "PyPI", "1.0.0", "1.0.0a1", "1.0.0", ""
         ));
 
-        // F-74: Go post-tag pseudo-version `v1.2.3-0.20230101120000-abcdef >= v1.2.3`
+        // Go pre-release pseudo-version `v1.2.3-0.20230101120000-abcdef < v1.2.3` per Go module spec
         assert!(version_matches_range(
-            "Go",
-            "v1.2.3-0.20230101120000-abcdef123456",
-            "1.2.3",
-            "1.2.4",
-            ""
-        ));
-        assert!(!version_matches_range(
             "Go",
             "v1.2.3-0.20230101120000-abcdef123456",
             "0",
             "1.2.3",
             ""
         ));
+        assert!(!version_matches_range(
+            "Go",
+            "v1.2.3-0.20230101120000-abcdef123456",
+            "1.2.3",
+            "1.2.4",
+            ""
+        ));
+        assert!(version_matches_range(
+            "Go",
+            "v0.0.0-20230101120000-abcdef123456",
+            "0",
+            "v0.0.0-20240101000000-fedcba654321",
+            ""
+        ));
+
+        // Distro ecosystems, Debian epochs/+debNuM/tilde, Alpine -rN, PEP 503 & 4-part versions
+        assert_eq!(canonical_ecosystem("Debian:12"), Some("Debian"));
+        assert_eq!(canonical_ecosystem("Alpine:v3.19"), Some("Alpine"));
+        assert_eq!(canonical_ecosystem("Ubuntu:22.04:LTS"), Some("Ubuntu"));
+        assert_eq!(normalize_package_name("PyPI", "foo__bar..baz"), "foo-bar-baz");
+        assert!(version_matches_range(
+            "Debian:12",
+            "1:3.0.11-1~deb12u1",
+            "0",
+            "1:3.0.11-1~deb12u2",
+            ""
+        ));
+        assert!(!version_matches_range(
+            "Debian:12",
+            "1:3.0.11-1~deb12u2",
+            "0",
+            "1:3.0.11-1~deb12u2",
+            ""
+        ));
+        assert!(version_matches_range(
+            "Debian",
+            "1.1.1w-0+deb11u1",
+            "0",
+            "1.1.1w-0+deb11u2",
+            ""
+        ));
+        assert!(!version_matches_range(
+            "Alpine:v3.19",
+            "1.36.1-r15",
+            "0",
+            "1.36.1-r2",
+            ""
+        ));
+        assert!(version_matches_range(
+            "Alpine:v3.19",
+            "1.36.1-r2",
+            "0",
+            "1.36.1-r15",
+            ""
+        ));
+        assert!(version_matches_range("NuGet", "1.2.3.4", "1.2.3.0", "1.2.3.5", ""));
+        assert_eq!(
+            cvss_vector_to_severity("CVSS:3.1/AV:L/AC:H/PR:H/UI:R/S:U/C:H/I:H/A:H"),
+            Some("MEDIUM")
+        );
 
         // F-67: wal_checkpoint(TRUNCATE) flushes WAL bytes on upsert
         let nanos = SystemTime::now()

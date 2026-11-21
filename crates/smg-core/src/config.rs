@@ -150,9 +150,21 @@ impl SandboxConfig {
                 raw
             );
         };
-        let authority = rest.split('/').next().unwrap_or("");
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+        anyhow::ensure!(
+            !authority.contains('@'),
+            "Refusing userinfo in sandbox.base_url `{}`",
+            raw
+        );
         let (host, port_str) = if let Some(after_bracket) = authority.strip_prefix("[::1]") {
-            ("::1", after_bracket.strip_prefix(':').unwrap_or(""))
+            match after_bracket.strip_prefix(':') {
+                Some(p) => ("::1", p),
+                None if after_bracket.is_empty() => ("::1", ""),
+                None => anyhow::bail!(
+                    "Malformed IPv6 authority in sandbox.base_url `{}`",
+                    raw
+                ),
+            }
         } else if let Some((h, p)) = authority.rsplit_once(':') {
             (h, p)
         } else {
@@ -173,6 +185,7 @@ impl SandboxConfig {
             let p: u16 = port_str
                 .parse()
                 .with_context(|| format!("Invalid port in sandbox.base_url `{}`", raw))?;
+            anyhow::ensure!(p != 0, "Refusing port 0 in sandbox.base_url `{}`", raw);
             Ok(Some(p))
         }
     }
@@ -294,6 +307,9 @@ impl Default for ScanConfig {
     }
 }
 
+const MAX_SAFE_FILE_BYTES: u64 = 64 * 1024 * 1024;
+const MIN_SAFE_FILE_BYTES: u64 = 1024;
+
 impl ShellMindGuardConfig {
     pub fn load_from_dir(root: &Path) -> Result<Self> {
         let cfg_path = root.join(".shellmind-guard.toml");
@@ -302,12 +318,47 @@ impl ShellMindGuardConfig {
         }
         let raw = fs::read_to_string(&cfg_path)
             .with_context(|| format!("Failed to read {}", cfg_path.display()))?;
-        let parsed: Self = toml::from_str(&raw)
+        let mut parsed: Self = toml::from_str(&raw)
             .with_context(|| format!("Invalid TOML in {}", cfg_path.display()))?;
+        let max_allowed_threads = std::thread::available_parallelism()
+            .map(|n| n.get().saturating_mul(2))
+            .unwrap_or(8)
+            .max(16);
+        parsed.scan.max_threads = parsed.scan.max_threads.clamp(1, max_allowed_threads);
+        parsed.scan.max_file_bytes = parsed
+            .scan
+            .max_file_bytes
+            .clamp(MIN_SAFE_FILE_BYTES, MAX_SAFE_FILE_BYTES);
         Ok(parsed)
     }
 
+    /// Loads `.shellmind-guard.toml` and strips privileged `[sandbox]` / `[ai]` sections unless
+    /// `trust_repo_config` is explicitly enabled by the operator.
+    pub fn load_trusted_from_dir(root: &Path, trust_repo_config: bool) -> Result<Self> {
+        let mut cfg = Self::load_from_dir(root)?;
+        if !trust_repo_config {
+            cfg.sandbox.boot_cmd = None;
+            cfg.sandbox.base_url = None;
+            cfg.ai = AiConfig::default();
+        }
+        Ok(cfg)
+    }
+
     pub fn detect_and_write_init(root: &Path) -> Result<(Vec<String>, std::path::PathBuf)> {
+        Self::detect_and_write_init_with_force(root, false)
+    }
+
+    pub fn detect_and_write_init_with_force(
+        root: &Path,
+        force: bool,
+    ) -> Result<(Vec<String>, std::path::PathBuf)> {
+        let out_path = root.join(".shellmind-guard.toml");
+        if out_path.exists() && !force {
+            anyhow::bail!(
+                "Refusing to overwrite existing {} (pass force=true to overwrite)",
+                out_path.display()
+            );
+        }
         let mut detected = Vec::new();
         if root.join("package.json").exists() {
             detected.push("Node.js / TypeScript".to_string());
@@ -327,7 +378,6 @@ impl ShellMindGuardConfig {
 
         let cfg = Self::default();
         let toml_str = toml::to_string_pretty(&cfg)?;
-        let out_path = root.join(".shellmind-guard.toml");
         fs::write(&out_path, toml_str)?;
         Ok((detected, out_path))
     }
@@ -351,5 +401,49 @@ mod tests {
         assert_eq!(cfg.max_ast_block_depth(), 64);
         assert_eq!(cfg.max_cha_targets(), 64);
         assert_eq!(cfg.max_witness_hops(), 256);
+    }
+
+    #[test]
+    fn test_loopback_port_blocks_ipv6_userinfo_ssrf_and_port_zero() {
+        let mut sb = SandboxConfig {
+            base_url: Some("http://[::1]@evil.com/api".into()),
+            ..Default::default()
+        };
+        assert!(sb.loopback_port().is_err());
+
+        sb.base_url = Some("http://[::1]evil.com/api".into());
+        assert!(sb.loopback_port().is_err());
+
+        sb.base_url = Some("http://127.0.0.1:0/api".into());
+        assert!(sb.loopback_port().is_err());
+
+        sb.base_url = Some("http://[::1]:8080/api".into());
+        assert_eq!(sb.loopback_port().unwrap(), Some(8080));
+
+        sb.base_url = Some("https://[::1]/api".into());
+        assert_eq!(sb.loopback_port().unwrap(), Some(443));
+    }
+
+    #[test]
+    fn test_load_from_dir_clamps_untrusted_limits_and_trust_gate() {
+        let tmp = std::env::temp_dir().join(format!("smg_cfg_clamp_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(
+            tmp.join(".shellmind-guard.toml"),
+            "[scan]\nmax_threads = 999999\nmax_file_bytes = 999999999999\n[sandbox]\nboot_cmd = \"id\"\n[ai]\nprovider = \"openai_compatible\"\nendpoint = \"https://evil.example\"\n",
+        )
+        .unwrap();
+
+        let cfg = ShellMindGuardConfig::load_from_dir(&tmp).unwrap();
+        assert!(cfg.scan.max_threads <= 128 && cfg.scan.max_threads >= 1);
+        assert_eq!(cfg.scan.max_file_bytes, MAX_SAFE_FILE_BYTES);
+
+        let untrusted = ShellMindGuardConfig::load_trusted_from_dir(&tmp, false).unwrap();
+        assert!(untrusted.sandbox.boot_cmd.is_none());
+        assert!(!untrusted.ai.is_enabled());
+
+        assert!(ShellMindGuardConfig::detect_and_write_init(&tmp).is_err());
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

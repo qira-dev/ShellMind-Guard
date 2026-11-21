@@ -27,10 +27,11 @@ pub struct StoredFinding {
     pub poc_cmd: String,
 }
 
-/// Resolves the per-user XDG / local cache base directory (`$XDG_CACHE_HOME` or `~/.cache`).
+/// Resolves the per-user XDG / local cache base directory (absolute `XDG_CACHE_HOME` or `~/.cache`).
 pub fn cache_base_dir() -> PathBuf {
     std::env::var_os("XDG_CACHE_HOME")
         .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute())
         .or_else(|| {
             std::env::var_os("HOME")
                 .or_else(|| std::env::var_os("USERPROFILE"))
@@ -38,6 +39,15 @@ pub fn cache_base_dir() -> PathBuf {
         })
         .unwrap_or_else(std::env::temp_dir)
 }
+
+#[cfg(unix)]
+fn set_private_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
+}
+
+#[cfg(not(unix))]
+fn set_private_mode(_path: &Path, _mode: u32) {}
 
 pub struct StateStore {
     conn: Connection,
@@ -47,12 +57,14 @@ impl StateStore {
     pub fn open(project_root: &Path) -> Result<Self> {
         let canon = fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
         let repo_key = blake3::hash(canon.to_string_lossy().as_bytes()).to_hex();
-        let smg_dir = cache_base_dir()
-            .join("shellmind-guard")
-            .join(&repo_key.as_str()[..16]);
+        let parent_dir = cache_base_dir().join("shellmind-guard");
+        let smg_dir = parent_dir.join(&repo_key.as_str()[..16]);
         fs::create_dir_all(&smg_dir)?;
+        set_private_mode(&parent_dir, 0o700);
+        set_private_mode(&smg_dir, 0o700);
         let db_path = smg_dir.join("state.db");
-        let conn = Connection::open(db_path)?;
+        let mut conn = Connection::open(&db_path)?;
+        set_private_mode(&db_path, 0o600);
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
 
         conn.execute_batch(
@@ -67,73 +79,80 @@ impl StateStore {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap_or(0);
         if user_ver < 1 {
-            conn.execute_batch(
-                "
-                CREATE TABLE IF NOT EXISTS scans (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    started_at INTEGER NOT NULL DEFAULT (unixepoch()),
-                    total_files INTEGER NOT NULL DEFAULT 0,
-                    modified_files INTEGER NOT NULL DEFAULT 0
-                );
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let tx_ver: i64 = tx
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap_or(0);
+            if tx_ver < 1 {
+                tx.execute_batch(
+                    "
+                    CREATE TABLE IF NOT EXISTS scans (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        started_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                        total_files INTEGER NOT NULL DEFAULT 0,
+                        modified_files INTEGER NOT NULL DEFAULT 0
+                    );
 
-                CREATE TABLE IF NOT EXISTS files (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    rel_path TEXT NOT NULL UNIQUE,
-                    lang TEXT NOT NULL,
-                    blake3_hash TEXT NOT NULL,
-                    mtime_ns INTEGER NOT NULL,
-                    size_bytes INTEGER NOT NULL,
-                    last_scan_id INTEGER NOT NULL
-                );
+                    CREATE TABLE IF NOT EXISTS files (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        rel_path TEXT NOT NULL UNIQUE,
+                        lang TEXT NOT NULL,
+                        blake3_hash TEXT NOT NULL,
+                        mtime_ns INTEGER NOT NULL,
+                        size_bytes INTEGER NOT NULL,
+                        last_scan_id INTEGER NOT NULL
+                    );
 
-                CREATE TABLE IF NOT EXISTS ast_cache (
-                    rel_path TEXT PRIMARY KEY,
-                    blake3_hash TEXT NOT NULL,
-                    config_hash TEXT NOT NULL,
-                    ast_json TEXT NOT NULL
-                );
+                    CREATE TABLE IF NOT EXISTS ast_cache (
+                        rel_path TEXT PRIMARY KEY,
+                        blake3_hash TEXT NOT NULL,
+                        config_hash TEXT NOT NULL,
+                        ast_json TEXT NOT NULL
+                    );
 
-                DROP TABLE IF EXISTS edges;
-                DROP TABLE IF EXISTS symbols;
+                    DROP TABLE IF EXISTS edges;
+                    DROP TABLE IF EXISTS symbols;
 
-                CREATE TABLE IF NOT EXISTS findings (
-                    id TEXT PRIMARY KEY,
-                    scan_id INTEGER NOT NULL,
-                    rule_id TEXT NOT NULL,
-                    severity TEXT NOT NULL,
-                    confidence TEXT NOT NULL DEFAULT 'CONFIRMED',
-                    status TEXT NOT NULL,
-                    trace_json TEXT NOT NULL,
-                    poc_cmd TEXT NOT NULL
-                );
+                    CREATE TABLE IF NOT EXISTS findings (
+                        id TEXT PRIMARY KEY,
+                        scan_id INTEGER NOT NULL,
+                        rule_id TEXT NOT NULL,
+                        severity TEXT NOT NULL,
+                        confidence TEXT NOT NULL DEFAULT 'CONFIRMED',
+                        status TEXT NOT NULL,
+                        trace_json TEXT NOT NULL,
+                        poc_cmd TEXT NOT NULL
+                    );
 
-                CREATE VIRTUAL TABLE IF NOT EXISTS findings_fts USING fts5(
-                    id UNINDEXED,
-                    rule_id,
-                    trace_json,
-                    poc_cmd
-                );
-                ",
-            )?;
+                    CREATE VIRTUAL TABLE IF NOT EXISTS findings_fts USING fts5(
+                        id UNINDEXED,
+                        rule_id,
+                        trace_json,
+                        poc_cmd
+                    );
+                    ",
+                )?;
 
-            let mut has_confidence = false;
-            {
-                let mut stmt = conn.prepare("PRAGMA table_info(findings)")?;
-                let cols = stmt.query_map([], |r| r.get::<_, String>(1))?;
-                for col in cols.flatten() {
-                    if col == "confidence" {
-                        has_confidence = true;
-                        break;
+                let mut has_confidence = false;
+                {
+                    let mut stmt = tx.prepare("PRAGMA table_info(findings)")?;
+                    let cols = stmt.query_map([], |r| r.get::<_, String>(1))?;
+                    for col in cols.flatten() {
+                        if col == "confidence" {
+                            has_confidence = true;
+                            break;
+                        }
                     }
                 }
+                if !has_confidence {
+                    tx.execute(
+                        "ALTER TABLE findings ADD COLUMN confidence TEXT NOT NULL DEFAULT 'CONFIRMED'",
+                        [],
+                    )?;
+                }
+                tx.execute_batch("PRAGMA user_version = 1;")?;
             }
-            if !has_confidence {
-                conn.execute(
-                    "ALTER TABLE findings ADD COLUMN confidence TEXT NOT NULL DEFAULT 'CONFIRMED'",
-                    [],
-                )?;
-            }
-            conn.execute_batch("PRAGMA user_version = 1;")?;
+            tx.commit()?;
         }
 
         Ok(Self { conn })
@@ -219,6 +238,10 @@ impl StateStore {
             "UPDATE scans SET modified_files = ?1 WHERE id = ?2",
             params![changed_files.len() as i64, scan_id],
         )?;
+        tx.execute(
+            "DELETE FROM scans WHERE id NOT IN (SELECT id FROM scans ORDER BY id DESC LIMIT 1000)",
+            [],
+        )?;
 
         tx.commit()?;
 
@@ -286,6 +309,14 @@ impl StateStore {
         scan_id: i64,
         rows: &[(&str, &str, &str, &str, &str, &str, &str)],
     ) -> Result<()> {
+        let mut deduped: HashMap<&str, usize> = HashMap::with_capacity(rows.len());
+        let mut order: Vec<&str> = Vec::with_capacity(rows.len());
+        for (i, row) in rows.iter().enumerate() {
+            if !deduped.contains_key(row.0) {
+                order.push(row.0);
+            }
+            deduped.insert(row.0, i);
+        }
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -299,7 +330,9 @@ impl StateStore {
             let mut fts = tx.prepare(
                 "INSERT INTO findings_fts (id, rule_id, trace_json, poc_cmd) VALUES (?1, ?2, ?3, ?4)",
             )?;
-            for (id, rule_id, severity, confidence, status, trace_json, poc_cmd) in rows {
+            for id in order {
+                let (id, rule_id, severity, confidence, status, trace_json, poc_cmd) =
+                    rows[deduped[id]];
                 ins.execute(params![
                     id, scan_id, rule_id, severity, confidence, status, trace_json, poc_cmd
                 ])?;

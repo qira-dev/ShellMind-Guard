@@ -4,9 +4,12 @@ use ignore::WalkBuilder;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Instant, UNIX_EPOCH};
+
+const MAX_TOTAL_CACHED_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Language {
@@ -66,9 +69,11 @@ impl Language {
             fname,
             "package.json"
                 | "package-lock.json"
+                | "npm-shrinkwrap.json"
                 | "yarn.lock"
                 | "pnpm-lock.yaml"
                 | "bun.lock"
+                | "deno.lock"
                 | "Cargo.toml"
                 | "Cargo.lock"
                 | "go.mod"
@@ -77,7 +82,9 @@ impl Language {
                 | "pyproject.toml"
                 | "poetry.lock"
                 | "uv.lock"
+                | "Pipfile"
                 | "Pipfile.lock"
+                | "conda-lock.yml"
                 | "pom.xml"
                 | "build.gradle"
                 | "build.gradle.kts"
@@ -88,20 +95,29 @@ impl Language {
                 | "Gemfile"
                 | "Gemfile.lock"
                 | "Package.resolved"
+                | "Cartfile.resolved"
                 | "pubspec.yaml"
                 | "pubspec.lock"
                 | "mix.lock"
+                | "rebar.lock"
                 | ".npmrc"
         ) {
             return Some(Language::Manifest);
         }
         let low_fname = fname.to_ascii_lowercase();
         if fname == ".gitignore"
-            || fname == "Dockerfile"
-            || fname.starts_with("Dockerfile.")
+            || low_fname == "dockerfile"
+            || low_fname.starts_with("dockerfile.")
             || matches!(
                 fname,
-                "AndroidManifest.xml" | "network_security_config.xml" | "Info.plist" | "Podfile"
+                ".envrc"
+                    | "id_rsa"
+                    | "id_ed25519"
+                    | "id_ecdsa"
+                    | "AndroidManifest.xml"
+                    | "network_security_config.xml"
+                    | "Info.plist"
+                    | "Podfile"
             )
             || matches!(
                 low_fname.as_str(),
@@ -200,11 +216,43 @@ pub fn is_generated_file_path(rel_path: &str) -> bool {
 
 /// Detects standard compiler/protobuf generated headers within the first 512 bytes.
 pub fn has_generated_header(bytes: &[u8]) -> bool {
-    let prefix = std::str::from_utf8(&bytes[..bytes.len().min(512)]).unwrap_or("");
+    let prefix = String::from_utf8_lossy(&bytes[..bytes.len().min(512)]);
     let low = prefix.to_ascii_lowercase();
     (low.contains("code generated") && low.contains("do not edit"))
         || low.contains("@generated")
         || low.contains("auto-generated file. do not edit")
+}
+
+fn is_skipped_test_filename(fname: &str) -> bool {
+    fname.ends_with("_test.go")
+        || fname.ends_with(".test.ts")
+        || fname.ends_with(".spec.ts")
+        || fname.ends_with(".test.tsx")
+        || fname.ends_with(".spec.tsx")
+        || fname.ends_with(".test.js")
+        || fname.ends_with(".spec.js")
+        || fname.ends_with(".test.jsx")
+        || fname.ends_with(".spec.jsx")
+        || fname.ends_with("_test.rs")
+        || fname.ends_with("_test.py")
+        || (fname.starts_with("test_") && fname.ends_with(".py"))
+        || fname.ends_with("Test.java")
+        || fname.ends_with("Tests.java")
+        || fname.ends_with("Test.kt")
+        || fname.ends_with("Tests.kt")
+        || fname.ends_with("Test.cs")
+        || fname.ends_with("Tests.cs")
+        || fname.ends_with("Test.php")
+        || fname.ends_with("Tests.php")
+        || fname.ends_with("_test.dart")
+        || fname.ends_with("Tests.swift")
+        || fname.ends_with("_test.c")
+        || fname.ends_with("_test.cpp")
+        || fname.ends_with("_test.cc")
+        || fname.ends_with("_spec.rb")
+        || fname.ends_with("_test.rb")
+        || fname.ends_with("_test.sh")
+        || fname.ends_with(".bats")
 }
 
 static INCLUDE_TESTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -261,7 +309,12 @@ pub fn is_test_source_path(rel_path: &str) -> bool {
         || fname.ends_with("harness.sol")
 }
 
-fn should_visit_entry(entry: &ignore::DirEntry, root: &Path, ignore_set: &[String]) -> bool {
+fn should_visit_entry(
+    entry: &ignore::DirEntry,
+    root: &Path,
+    ignore_set: &[String],
+    include_tests: bool,
+) -> bool {
     let name = entry.file_name().to_string_lossy();
     if matches!(
         name.as_ref(),
@@ -277,9 +330,10 @@ fn should_visit_entry(entry: &ignore::DirEntry, root: &Path, ignore_set: &[Strin
             | "venv"
             | ".next"
             | ".nuxt"
-            | "__tests__"
-            | "testdata"
     ) {
+        return false;
+    }
+    if !include_tests && matches!(name.as_ref(), "__tests__" | "testdata") {
         return false;
     }
     if let Ok(rel) = entry.path().strip_prefix(root) {
@@ -318,7 +372,11 @@ fn should_visit_entry(entry: &ignore::DirEntry, root: &Path, ignore_set: &[Strin
         }
         if ignore_set.iter().any(|ig| {
             let clean = ig.trim_matches('/');
-            !clean.is_empty() && (rel_norm == clean || rel_norm.starts_with(&format!("{}/", clean)))
+            !clean.is_empty()
+                && (rel_norm == clean
+                    || rel_norm
+                        .strip_prefix(clean)
+                        .is_some_and(|r| r.starts_with('/')))
         }) {
             return false;
         }
@@ -339,6 +397,7 @@ pub fn scan_repository_with_options(
     let canon_root = fs::canonicalize(root)?;
     let total_seen = AtomicUsize::new(0);
     let skipped = AtomicUsize::new(0);
+    let include_tests = INCLUDE_TESTS.load(Ordering::Relaxed);
 
     let ignore_set: Vec<String> = cfg
         .scan
@@ -360,7 +419,9 @@ pub fn scan_repository_with_options(
         .git_global(true)
         .git_exclude(true)
         .threads(cfg.scan.max_threads)
-        .filter_entry(move |entry| should_visit_entry(entry, &root_for_filter, &ignore_for_filter))
+        .filter_entry(move |entry| {
+            should_visit_entry(entry, &root_for_filter, &ignore_for_filter, include_tests)
+        })
         .build();
 
     for entry in walker.flatten() {
@@ -370,36 +431,7 @@ pub fn scan_repository_with_options(
         total_seen.fetch_add(1, Ordering::Relaxed);
         let path = entry.path();
         let fname = entry.file_name().to_string_lossy();
-        if fname.ends_with("_test.go")
-            || fname.ends_with(".test.ts")
-            || fname.ends_with(".spec.ts")
-            || fname.ends_with(".test.tsx")
-            || fname.ends_with(".spec.tsx")
-            || fname.ends_with(".test.js")
-            || fname.ends_with(".spec.js")
-            || fname.ends_with(".test.jsx")
-            || fname.ends_with(".spec.jsx")
-            || fname.ends_with("_test.rs")
-            || fname.ends_with("_test.py")
-            || (fname.starts_with("test_") && fname.ends_with(".py"))
-            || fname.ends_with("Test.java")
-            || fname.ends_with("Tests.java")
-            || fname.ends_with("Test.kt")
-            || fname.ends_with("Tests.kt")
-            || fname.ends_with("Test.cs")
-            || fname.ends_with("Tests.cs")
-            || fname.ends_with("Test.php")
-            || fname.ends_with("Tests.php")
-            || fname.ends_with("_test.dart")
-            || fname.ends_with("Tests.swift")
-            || fname.ends_with("_test.c")
-            || fname.ends_with("_test.cpp")
-            || fname.ends_with("_test.cc")
-            || fname.ends_with("_spec.rb")
-            || fname.ends_with("_test.rb")
-            || fname.ends_with("_test.sh")
-            || fname.ends_with(".bats")
-        {
+        if !include_tests && is_skipped_test_filename(&fname) {
             skipped.fetch_add(1, Ordering::Relaxed);
             continue;
         }
@@ -423,39 +455,70 @@ pub fn scan_repository_with_options(
 
     let max_bytes = cfg.scan.max_file_bytes;
     let include_generated = opts.include_generated;
+    let cached_budget_used = AtomicUsize::new(0);
     let files: Vec<IndexedFile> = pool.install(|| {
         candidate_paths
             .into_par_iter()
             .filter_map(|(abs_path, rel_path, language)| {
-                let canon_file = fs::canonicalize(&abs_path).ok()?;
+                let Ok(canon_file) = fs::canonicalize(&abs_path) else {
+                    skipped.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                };
                 if !canon_file.starts_with(&canon_root) {
+                    skipped.fetch_add(1, Ordering::Relaxed);
                     return None;
                 }
-                let meta = fs::metadata(&canon_file).ok()?;
-                let size_bytes = meta.len();
+                let Ok(file) = fs::File::open(&canon_file) else {
+                    skipped.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                };
+                let Ok(meta) = file.metadata() else {
+                    skipped.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                };
                 let limit = if language == Language::Manifest {
                     max_bytes.max(16 * 1024 * 1024)
                 } else {
                     max_bytes
                 };
-                if size_bytes > limit {
+                if meta.len() > limit {
+                    skipped.fetch_add(1, Ordering::Relaxed);
                     return None;
                 }
                 let mtime_ns = meta
                     .modified()
                     .ok()
                     .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| d.as_nanos() as i64)
+                    .map(|d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
                     .unwrap_or(0);
 
-                let bytes = fs::read(&canon_file).ok()?;
+                let mut bytes = Vec::with_capacity((meta.len() as usize).min(64 * 1024));
+                if file.take(limit.saturating_add(1)).read_to_end(&mut bytes).is_err() {
+                    skipped.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+                let size_bytes = bytes.len() as u64;
+                if size_bytes > limit {
+                    skipped.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+                // Skip binary blobs containing NUL bytes in the leading 8 KiB
+                if bytes[..bytes.len().min(8192)].contains(&0u8) {
+                    skipped.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
                 if !include_generated && has_generated_header(&bytes) {
                     skipped.fetch_add(1, Ordering::Relaxed);
                     return None;
                 }
                 let hash = blake3::hash(&bytes).to_hex().to_string();
                 let cached_bytes = if bytes.len() <= 256 * 1024 {
-                    Some(bytes)
+                    let prev = cached_budget_used.fetch_add(bytes.len(), Ordering::Relaxed);
+                    if prev.saturating_add(bytes.len()) <= MAX_TOTAL_CACHED_BYTES {
+                        Some(bytes)
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 };
@@ -489,6 +552,7 @@ pub fn scan_repository_metadata_signature(
     cfg: &ShellMindGuardConfig,
 ) -> Result<Vec<(String, i64, u64)>> {
     let canon_root = fs::canonicalize(root)?;
+    let include_tests = INCLUDE_TESTS.load(Ordering::Relaxed);
     let ignore_set: Vec<String> = cfg
         .scan
         .ignore_paths
@@ -506,7 +570,9 @@ pub fn scan_repository_metadata_signature(
         .git_global(true)
         .git_exclude(true)
         .threads(cfg.scan.max_threads)
-        .filter_entry(move |entry| should_visit_entry(entry, &root_for_filter, &ignore_for_filter))
+        .filter_entry(move |entry| {
+            should_visit_entry(entry, &root_for_filter, &ignore_for_filter, include_tests)
+        })
         .build();
 
     let max_bytes = cfg.scan.max_file_bytes;
@@ -516,10 +582,20 @@ pub fn scan_repository_metadata_signature(
             continue;
         }
         let path = entry.path();
+        let fname = entry.file_name().to_string_lossy();
+        if !include_tests && is_skipped_test_filename(&fname) {
+            continue;
+        }
         if let Some(lang) = Language::from_path(path)
             && let Ok(rel) = path.strip_prefix(&canon_root)
-            && let Ok(meta) = fs::metadata(path)
+            && let Ok(canon_file) = fs::canonicalize(path)
+            && canon_file.starts_with(&canon_root)
+            && let Ok(meta) = fs::metadata(&canon_file)
         {
+            let rel_norm = rel.to_string_lossy().replace('\\', "/");
+            if is_generated_file_path(&rel_norm) {
+                continue;
+            }
             let size_bytes = meta.len();
             let limit = if lang == Language::Manifest {
                 max_bytes.max(16 * 1024 * 1024)
@@ -533,13 +609,9 @@ pub fn scan_repository_metadata_signature(
                 .modified()
                 .ok()
                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_nanos() as i64)
+                .map(|d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
                 .unwrap_or(0);
-            sig.push((
-                rel.to_string_lossy().replace('\\', "/"),
-                mtime_ns,
-                size_bytes,
-            ));
+            sig.push((rel_norm, mtime_ns, size_bytes));
         }
     }
     sig.sort_by(|a, b| a.0.cmp(&b.0));
