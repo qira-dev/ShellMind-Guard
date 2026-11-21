@@ -1640,6 +1640,10 @@ pub(crate) fn execute_scan_pipeline_full(
         let hw_hits = smg_hw::scan_hardware_repo(opts.path, &summary.files, force_hw);
         smg_graph::append_local_static_findings(&mut graph_res.findings, &hw_hits);
     }
+    {
+        let ai_artifact_hits = smg_graph::scan_repo_ai_model_artifacts(opts.path);
+        smg_graph::append_local_static_findings(&mut graph_res.findings, &ai_artifact_hits);
+    }
     #[cfg(feature = "web3")]
     {
         let force_web3 = opts.layers.iter().any(|l| {
@@ -1670,7 +1674,7 @@ pub(crate) fn execute_scan_pipeline_full(
             || opts.layers.iter().any(|l| {
                 matches!(
                     l.trim().to_ascii_lowercase().as_str(),
-                    "pqc" | "quantum" | "post-quantum" | "cbom"
+                    "pqc" | "quantum" | "post-quantum" | "cbom" | "all"
                 )
             });
         if wants_pqc {

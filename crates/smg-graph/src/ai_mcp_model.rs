@@ -272,8 +272,7 @@ pub fn analyze_mcp_tool_poisoning(rel_path: &str, source: &str) -> Vec<LocalStat
         if trimmed.starts_with("#[cfg(test)]") {
             break;
         }
-        if crate::taint::is_pattern_matcher_or_doc_line(line)
-            || trimmed.starts_with("//")
+        if trimmed.starts_with("//")
             || trimmed.starts_with('#')
             || trimmed.starts_with('"')
             || trimmed.contains(".contains(")
@@ -499,6 +498,63 @@ pub fn inspect_pickle_bytes(rel_path: &str, bytes: &[u8]) -> Vec<LocalStaticFind
         }
     }
 
+    findings
+}
+
+/// Walks `project_root` (bounded depth 5, skipping build/VCS dirs) for ML model artifacts
+/// (`tokenizer_config.json`, `.pkl`, `.pt`, `.pth`) that source-code indexers skip, and runs
+/// Jinja2 Chat-Template SSTI and Binary Pickle Opcode inspection end-to-end.
+pub fn scan_repo_ai_model_artifacts(project_root: &std::path::Path) -> Vec<LocalStaticFinding> {
+    fn walk(
+        root: &std::path::Path,
+        dir: &std::path::Path,
+        depth: usize,
+        out: &mut Vec<LocalStaticFinding>,
+    ) {
+        if depth > 5 || out.len() >= 128 {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if path.is_dir() {
+                if matches!(
+                    name_str.as_ref(),
+                    ".git" | "target" | "node_modules" | ".venv" | "venv" | "__pycache__" | "dist" | "build"
+                ) {
+                    continue;
+                }
+                walk(root, &path, depth + 1, out);
+                continue;
+            }
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let low = name_str.to_ascii_lowercase();
+            if low == "tokenizer_config.json" {
+                if let Ok(text) = std::fs::read_to_string(&path) {
+                    out.extend(inspect_chat_template_ssti(&rel, &text));
+                }
+            } else if (low.ends_with(".pkl") || low.ends_with(".pt") || low.ends_with(".pth"))
+                && let Ok(mut f) = std::fs::File::open(&path)
+            {
+                use std::io::Read;
+                let mut buf = vec![0u8; 256 * 1024];
+                if let Ok(n) = f.read(&mut buf) {
+                    buf.truncate(n);
+                    out.extend(inspect_pickle_bytes(&rel, &buf));
+                }
+            }
+        }
+    }
+    let mut findings = Vec::new();
+    walk(project_root, project_root, 0, &mut findings);
     findings
 }
 

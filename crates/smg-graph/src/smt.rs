@@ -455,6 +455,64 @@ pub fn solve_path_constraints(constraints: &[PathConstraint], use_z3: bool) -> S
         return builtin;
     }
 
+    // Phase 27/32: Refine with pure-Rust QF_LIA i128 GCD + Fourier-Motzkin solver
+    let mut lia_ineqs = Vec::new();
+    for c in &flat {
+        if let PathConstraint::IntCmp { var, op, value } = c {
+            let mut terms = std::collections::BTreeMap::new();
+            match op {
+                CmpOp::Le => {
+                    terms.insert(var.clone(), 1i128);
+                    lia_ineqs.push(crate::smt_advanced::LinearIneq {
+                        terms,
+                        rhs: *value as i128,
+                    });
+                }
+                CmpOp::Lt => {
+                    terms.insert(var.clone(), 1i128);
+                    lia_ineqs.push(crate::smt_advanced::LinearIneq {
+                        terms,
+                        rhs: (*value as i128).saturating_sub(1),
+                    });
+                }
+                CmpOp::Ge => {
+                    terms.insert(var.clone(), -1i128);
+                    lia_ineqs.push(crate::smt_advanced::LinearIneq {
+                        terms,
+                        rhs: -(*value as i128),
+                    });
+                }
+                CmpOp::Gt => {
+                    terms.insert(var.clone(), -1i128);
+                    lia_ineqs.push(crate::smt_advanced::LinearIneq {
+                        terms,
+                        rhs: -((*value as i128).saturating_add(1)),
+                    });
+                }
+                CmpOp::Eq => {
+                    terms.insert(var.clone(), 1i128);
+                    lia_ineqs.push(crate::smt_advanced::LinearIneq {
+                        terms: terms.clone(),
+                        rhs: *value as i128,
+                    });
+                    let mut neg = std::collections::BTreeMap::new();
+                    neg.insert(var.clone(), -1i128);
+                    lia_ineqs.push(crate::smt_advanced::LinearIneq {
+                        terms: neg,
+                        rhs: -(*value as i128),
+                    });
+                }
+                CmpOp::Neq => {}
+            }
+        }
+    }
+    if !lia_ineqs.is_empty() {
+        let lia_verdict = crate::smt_advanced::solve_lia_constraints(&lia_ineqs);
+        if lia_verdict.is_unsat() {
+            return lia_verdict;
+        }
+    }
+
     if use_z3 && is_z3_available() {
         let script = emit_smtlib2(&flat);
         if let Some(z3_res) = run_z3_smtlib2(&script) {

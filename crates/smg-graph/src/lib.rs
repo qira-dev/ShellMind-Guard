@@ -65,6 +65,7 @@ pub use subgraph::{
 pub use ai_mcp_model::{
     analyze_indirect_prompt_injection, analyze_mcp_tool_poisoning,
     analyze_model_deserialization_and_ssti, inspect_chat_template_ssti, inspect_pickle_bytes,
+    scan_repo_ai_model_artifacts,
 };
 pub use vex_osv::{AutoVexSymbolIndex, OpenVexStatement, to_openvex_json};
 

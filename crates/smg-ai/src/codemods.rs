@@ -105,7 +105,7 @@ pub fn synthesize_deterministic_codemod_diff(
     let idx = target_line.saturating_sub(1);
     let raw_line = *lines.get(idx)?;
 
-    let replaced = match finding.rule_id.as_str() {
+    let replaced_opt = match finding.rule_id.as_str() {
         "SMG-CFG-TLS" => {
             if raw_line.contains("verify=False") {
                 Some(raw_line.replace("verify=False", "verify=True"))
@@ -303,17 +303,33 @@ pub fn synthesize_deterministic_codemod_diff(
             }
         }
         _ => None,
-    }?;
+    };
 
-    if replaced == raw_line {
-        return None;
+    if let Some(replaced) = replaced_opt
+        && replaced != raw_line
+    {
+        return Some(format_single_line_udiff(
+            rel_path,
+            target_line,
+            raw_line,
+            &replaced,
+        ));
     }
-    Some(format_single_line_udiff(
-        rel_path,
-        target_line,
-        raw_line,
-        &replaced,
-    ))
+
+    // Phase 31/32 fallback: 16-language multi-hunk semantic AST patcher for Auth/TxLock findings
+    let lang = Language::from_path(Path::new(rel_path))?;
+    if matches!(finding.missing_guard, GuardKind::Auth | GuardKind::TxLock)
+        && let Some((udiff, _patched)) = crate::semantic_patcher::synthesize_16lang_multi_hunk_patch(
+            lang,
+            finding.missing_guard,
+            rel_path,
+            &content,
+            target_line,
+        )
+    {
+        return Some(udiff);
+    }
+    None
 }
 
 /// Applies `raw_diff` inside an isolated temp copy and validates syntax for every modified

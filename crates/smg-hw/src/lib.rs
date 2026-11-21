@@ -161,6 +161,20 @@ pub fn scan_hardware_repo(
             raw_findings.extend(ld_findings);
         }
     }
+    for spec_path in collect_hw_spec_files(project_root, 5, 64) {
+        let low = spec_path.to_string_lossy().to_ascii_lowercase();
+        if (low.ends_with(".ld") || low.ends_with(".lds"))
+            && let Ok(text) = fs::read_to_string(&spec_path)
+        {
+            let rel = spec_path
+                .strip_prefix(project_root)
+                .unwrap_or(&spec_path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let (_regions, _stack, ld_findings) = wcsd_dma::audit_linker_script(&rel, &text);
+            raw_findings.extend(ld_findings);
+        }
+    }
     raw_findings.extend(check_cross_fn_irq_deadlocks(&lock_summaries));
 
     // Deduplicate on `(rule_id, rel_path, line)` while keeping highest severity

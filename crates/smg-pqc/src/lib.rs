@@ -31,6 +31,7 @@ pub fn scan_pqc_repo(
 ) -> PqcScanResult {
     let (mut findings, assets) = analyze_pqc_inventory(files, min_pq_category);
     let mut certificates = Vec::new();
+    let mut seen_rel: std::collections::HashSet<String> = std::collections::HashSet::new();
     for f in files {
         let low = f.rel_path.to_ascii_lowercase();
         if low.ends_with(".pem") || low.ends_with(".crt") || low.ends_with(".cer") {
@@ -47,6 +48,7 @@ pub fn scan_pqc_repo(
                 }
             }
         } else if low.ends_with(".der") {
+            seen_rel.insert(f.rel_path.clone());
             let bytes_opt = f
                 .cached_bytes
                 .clone()
@@ -56,6 +58,7 @@ pub fn scan_pqc_repo(
                 findings.extend(der_hits);
             }
         } else if low.ends_with(".so") || low.ends_with(".elf") {
+            seen_rel.insert(f.rel_path.clone());
             let bytes_opt = f
                 .cached_bytes
                 .clone()
@@ -67,6 +70,62 @@ pub fn scan_pqc_repo(
             }
         }
     }
+    // Phase 32: Bounded disk walk for `.der`, `.elf`, `.so` binaries skipped by source-code indexers
+    fn walk_pqc_binaries(
+        root: &Path,
+        dir: &Path,
+        depth: usize,
+        seen: &mut std::collections::HashSet<String>,
+        out: &mut Vec<LocalStaticFinding>,
+    ) {
+        if depth > 4 || out.len() >= 128 {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if path.is_dir() {
+                if matches!(
+                    name_str.as_ref(),
+                    ".git" | "target" | "node_modules" | ".venv" | "dist" | "build"
+                ) {
+                    continue;
+                }
+                walk_pqc_binaries(root, &path, depth + 1, seen, out);
+                continue;
+            }
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if !seen.insert(rel.clone()) {
+                continue;
+            }
+            let low = name_str.to_ascii_lowercase();
+            if low.ends_with(".der") {
+                if let Ok(der) = std::fs::read(&path) {
+                    let (_a, hits) = x509_starttls_elf::inspect_x509_der(&rel, &der, 2026);
+                    out.extend(hits);
+                }
+            } else if (low.ends_with(".elf") || low.ends_with(".so"))
+                && let Ok(mut f) = std::fs::File::open(&path)
+            {
+                use std::io::Read;
+                let mut buf = vec![0u8; 512 * 1024];
+                if let Ok(n) = f.read(&mut buf) {
+                    buf.truncate(n);
+                    let (_a, hits) = x509_starttls_elf::scan_elf_crypto_symbols(&rel, &buf);
+                    out.extend(hits);
+                }
+            }
+        }
+    }
+    walk_pqc_binaries(project_root, project_root, 0, &mut seen_rel, &mut findings);
     let cbom_json = build_static_cbom_cyclonedx(project_root, &assets, &certificates);
     PqcScanResult {
         findings,
