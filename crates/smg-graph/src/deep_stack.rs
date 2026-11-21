@@ -302,7 +302,7 @@ pub fn scan_ast_deep(
         .collect();
 
     if matches!(lang, Language::TypeScript | Language::JavaScript) {
-        scan_frontend_ast(
+        scan_frontend_ast_depth(
             root,
             src,
             rel_path,
@@ -310,13 +310,15 @@ pub fn scan_ast_deep(
             scope,
             &existing_xss_lines,
             static_findings,
+            0,
         );
     }
 
     scan_backend_and_db_deep(rel_path, lang, full_src, symbols, static_findings);
 }
 
-fn scan_frontend_ast(
+#[allow(clippy::too_many_arguments)]
+fn scan_frontend_ast_depth(
     node: Node,
     src: &[u8],
     rel_path: &str,
@@ -324,6 +326,33 @@ fn scan_frontend_ast(
     scope: &crate::scope::FileScopeTable,
     existing_xss_lines: &HashSet<usize>,
     out: &mut Vec<LocalStaticFinding>,
+    depth: usize,
+) {
+    if depth >= crate::taint::MAX_AST_WALK_DEPTH {
+        return;
+    }
+    scan_frontend_ast_inner(
+        node,
+        src,
+        rel_path,
+        full_src,
+        scope,
+        existing_xss_lines,
+        out,
+        depth,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_frontend_ast_inner(
+    node: Node,
+    src: &[u8],
+    rel_path: &str,
+    full_src: &str,
+    scope: &crate::scope::FileScopeTable,
+    existing_xss_lines: &HashSet<usize>,
+    out: &mut Vec<LocalStaticFinding>,
+    depth: usize,
 ) {
     let kind = node.kind();
     let line = node.start_position().row + 1;
@@ -522,7 +551,16 @@ fn scan_frontend_ast(
 
     let mut c = node.walk();
     for ch in node.children(&mut c) {
-        scan_frontend_ast(ch, src, rel_path, full_src, scope, existing_xss_lines, out);
+        scan_frontend_ast_depth(
+            ch,
+            src,
+            rel_path,
+            full_src,
+            scope,
+            existing_xss_lines,
+            out,
+            depth + 1,
+        );
     }
 }
 
@@ -600,14 +638,6 @@ fn scan_backend_and_db_deep(
         let mut seen_schema_validation = false;
         let mut seen_proto_guard = false;
         let mut seen_redirect_guard = false;
-        // Also honor multi-line `__proto__` guard blocks within the function when an `if (...__proto__...)` terminates
-        let block_has_early_proto_guard = block_low.contains("__proto__")
-            && (block_low.contains("continue")
-                || block_low.contains("return")
-                || block_low.contains("throw"));
-        let block_has_early_redirect_guard = (block_low.contains("startswith(\"/\")")
-            || block_low.contains("startswith('/')"))
-            && (block_low.contains("\"//\"") || block_low.contains("'//'"));
 
         let existing_hit_keys: HashSet<(String, usize)> = sym
             .local_taint_hits
@@ -632,8 +662,8 @@ fn scan_backend_and_db_deep(
                 seen_redirect_guard = true;
             }
             let has_schema_validation = seen_schema_validation;
-            let has_proto_guard = seen_proto_guard || block_has_early_proto_guard;
-            let has_redirect_guard = seen_redirect_guard || block_has_early_redirect_guard;
+            let has_proto_guard = seen_proto_guard;
+            let has_redirect_guard = seen_redirect_guard;
 
             // Track assignments (`const filter = req.body;`, `data = request.json`, `tpl = req.query.tpl`)
             if let Some((lhs, rhs)) = split_simple_assign(&trimmed) {

@@ -778,6 +778,7 @@ pub fn solve_guard_lattice_with_options(
                         } else {
                             all_impls
                         };
+                        let cha_truncated = chosen_impls.len() > max_cha_targets;
                         for &impl_ty_id in chosen_impls.iter().take(max_cha_targets) {
                             if let Some(m_idxs) = type_methods_map.get(&(impl_ty_id, member_id)) {
                                 for &idx in m_idxs {
@@ -787,7 +788,7 @@ pub fn solve_guard_lattice_with_options(
                                 }
                             }
                         }
-                        if !dst_indices.is_empty() {
+                        if !dst_indices.is_empty() && !cha_truncated {
                             is_cha_dispatch = true;
                         }
                     }
@@ -1868,7 +1869,7 @@ pub fn solve_guard_lattice_with_options(
         let mut routes_by_seg_len: HashMap<usize, Vec<(String, Vec<String>)>> = HashMap::new();
         let mut wildcard_prefix_routes: Vec<(String, Vec<String>)> = Vec::new();
         let mut index_route = |method: &str, rp: &str, segs: Vec<String>| {
-            if rp.ends_with("/*") || (rp.len() > 1 && rp.ends_with('/')) {
+            if rp.ends_with("/*") {
                 let mut prefix_segs = segs.clone();
                 if prefix_segs.last().is_some_and(|s| s == "*") {
                     prefix_segs.pop();
@@ -2192,15 +2193,26 @@ pub fn append_local_static_findings(
     if extra.is_empty() {
         return;
     }
+    fn norm_rule(r: &str) -> &str {
+        if r == "SMG-MEM-BOUNDS" || r == "SMG-HW-BOUNDS" {
+            "__BOUNDS__"
+        } else {
+            r
+        }
+    }
+    let mut index_by_key: HashMap<(String, String), usize> =
+        HashMap::with_capacity(findings.len().saturating_add(extra.len()));
+    for (i, f) in findings.iter().enumerate() {
+        index_by_key
+            .entry((f.entry_route.clone(), norm_rule(&f.rule_id).to_string()))
+            .or_insert(i);
+    }
     let mut seq = findings.len();
     for sf in extra {
         let entry_route = format!("{}:{}", sf.rel_path, sf.line);
-        if let Some(existing) = findings.iter_mut().find(|f| {
-            f.entry_route == entry_route
-                && (f.rule_id == sf.rule_id
-                    || (f.rule_id == "SMG-MEM-BOUNDS" && sf.rule_id == "SMG-HW-BOUNDS")
-                    || (f.rule_id == "SMG-HW-BOUNDS" && sf.rule_id == "SMG-MEM-BOUNDS"))
-        }) {
+        let key = (entry_route.clone(), norm_rule(&sf.rule_id).to_string());
+        if let Some(&idx) = index_by_key.get(&key) {
+            let existing = &mut findings[idx];
             let should_replace = (existing.rule_id == "SMG-MEM-BOUNDS"
                 && sf.rule_id == "SMG-HW-BOUNDS")
                 || (matches!(sf.confidence, Confidence::Proven)
@@ -2222,6 +2234,8 @@ pub fn append_local_static_findings(
             continue;
         }
         seq += 1;
+        let new_idx = findings.len();
+        index_by_key.insert(key, new_idx);
         findings.push(LatticeFinding {
             id: format!("{}-{}", sf.rule_id, seq),
             rule_id: sf.rule_id.clone(),

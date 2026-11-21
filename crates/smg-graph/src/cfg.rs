@@ -116,7 +116,7 @@ pub fn compute_cfg_guard_dominance(
 
     let mut builder = CfgBuilder::new(src, cfg, entry_guards);
     let exit_bb = builder.lower_block(body, 0, 0);
-    if builder.blocks.len() > cfg.scan.max_cfg_blocks() {
+    if builder.budget_exhausted || builder.blocks.len() > cfg.scan.max_cfg_blocks() {
         return entry_guards.to_set();
     }
 
@@ -252,6 +252,7 @@ struct CfgBuilder<'a> {
     src: &'a [u8],
     cfg: &'a ShellMindGuardConfig,
     blocks: Vec<CfgBlock>,
+    budget_exhausted: bool,
 }
 
 impl<'a> CfgBuilder<'a> {
@@ -259,6 +260,7 @@ impl<'a> CfgBuilder<'a> {
         Self {
             src,
             cfg,
+            budget_exhausted: false,
             blocks: vec![CfgBlock {
                 preds: Vec::new(),
                 succs: Vec::new(),
@@ -273,6 +275,7 @@ impl<'a> CfgBuilder<'a> {
 
     fn new_block(&mut self) -> Option<usize> {
         if self.blocks.len() >= self.cfg.scan.max_cfg_blocks() {
+            self.budget_exhausted = true;
             return None;
         }
         let id = self.blocks.len();
@@ -826,7 +829,9 @@ fn stmt_unconditionally_exits(stmt: Node, src: &[u8]) -> bool {
             .children(&mut c)
             .any(|ch| stmt_unconditionally_exits(ch, src));
     }
-    let code = crate::ast::strip_comments(node_text(stmt, src)).to_ascii_lowercase();
+    let code = crate::taint::strip_comments_and_non_attr_strings(node_text(stmt, src))
+        .trim()
+        .to_ascii_lowercase();
     code.starts_with("return ")
         || code == "return;"
         || code == "return"

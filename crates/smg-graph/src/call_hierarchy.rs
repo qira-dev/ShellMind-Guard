@@ -8,7 +8,7 @@ use smg_core::Language;
 use std::collections::{HashMap, HashSet};
 use tree_sitter::Node;
 
-const MAX_WALK_DEPTH: usize = 64;
+const MAX_WALK_DEPTH: usize = 512;
 
 #[derive(Debug, Default)]
 pub struct FileCallHierarchyData {

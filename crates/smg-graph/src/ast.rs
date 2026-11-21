@@ -994,6 +994,13 @@ fn collect_calls_depth(node: Node, src: &[u8], calls: &mut Vec<String>, depth: u
 }
 
 fn find_inline_fn_node(arg: Node) -> Option<Node> {
+    find_inline_fn_node_depth(arg, 0)
+}
+
+fn find_inline_fn_node_depth(arg: Node, depth: usize) -> Option<Node> {
+    if depth >= crate::taint::MAX_AST_WALK_DEPTH {
+        return None;
+    }
     if matches!(
         arg.kind(),
         "arrow_function" | "function_expression" | "func_literal"
@@ -1003,7 +1010,7 @@ fn find_inline_fn_node(arg: Node) -> Option<Node> {
     if matches!(arg.kind(), "expression_list" | "parenthesized_expression") {
         let mut c = arg.walk();
         for ch in arg.children(&mut c) {
-            if let Some(found) = find_inline_fn_node(ch) {
+            if let Some(found) = find_inline_fn_node_depth(ch, depth + 1) {
                 return Some(found);
             }
         }
@@ -1013,7 +1020,7 @@ fn find_inline_fn_node(arg: Node) -> Option<Node> {
     {
         let mut c = inner_args.walk();
         for ch in inner_args.children(&mut c) {
-            if let Some(found) = find_inline_fn_node(ch) {
+            if let Some(found) = find_inline_fn_node_depth(ch, depth + 1) {
                 return Some(found);
             }
         }

@@ -481,11 +481,20 @@ pub fn is_line_reachable(fn_node: Node, src: &[u8], target_line: usize, use_z3: 
 /// - `QF_IDL` Difference-Logic negative-cycle detection via Bellman-Ford (`x < y && y < z && z <= x`)
 /// - Bounded DNF splitting for small `Or` clauses (up to 4 disjuncts)
 fn solve_builtin_conjunction(flat: &[PathConstraint]) -> SmtVerdict {
-    // Handle a single small `Or` by checking if ALL disjuncts are UNSAT
-    if let Some((or_idx, PathConstraint::Or(branches))) = flat
-        .iter()
-        .enumerate()
-        .find(|(_, c)| matches!(c, PathConstraint::Or(b) if b.len() <= 4))
+    let mut split_budget = 64usize;
+    solve_builtin_conjunction_budgeted(flat, &mut split_budget)
+}
+
+fn solve_builtin_conjunction_budgeted(
+    flat: &[PathConstraint],
+    split_budget: &mut usize,
+) -> SmtVerdict {
+    // Handle a single small `Or` by checking if ALL disjuncts are UNSAT (bounded split budget)
+    if *split_budget > 0
+        && let Some((or_idx, PathConstraint::Or(branches))) = flat
+            .iter()
+            .enumerate()
+            .find(|(_, c)| matches!(c, PathConstraint::Or(b) if b.len() <= 4))
     {
         if branches.is_empty() {
             return SmtVerdict::Unsat {
@@ -496,6 +505,12 @@ fn solve_builtin_conjunction(flat: &[PathConstraint]) -> SmtVerdict {
         let mut all_unsat = true;
         let mut last_reason = String::new();
         for br in branches {
+            if *split_budget == 0 {
+                return SmtVerdict::Unknown {
+                    solver: "builtin-qf-idl",
+                };
+            }
+            *split_budget -= 1;
             let mut sub = Vec::with_capacity(flat.len());
             for (i, item) in flat.iter().enumerate() {
                 if i == or_idx {
@@ -504,7 +519,7 @@ fn solve_builtin_conjunction(flat: &[PathConstraint]) -> SmtVerdict {
                     sub.push(item.clone());
                 }
             }
-            match solve_builtin_conjunction(&sub) {
+            match solve_builtin_conjunction_budgeted(&sub, split_budget) {
                 SmtVerdict::Unsat { reason, .. } => last_reason = reason,
                 _ => {
                     all_unsat = false;
@@ -729,28 +744,60 @@ pub fn emit_smtlib2(constraints: &[PathConstraint]) -> String {
         collect_smt_vars(c, &mut bool_vars, &mut int_vars, &mut str_vars);
     }
 
+    // Build collision-free bijection from source variable name -> unique SMT-LIB2 identifier
+    let mut all_names: Vec<String> = bool_vars
+        .iter()
+        .chain(int_vars.iter())
+        .chain(str_vars.iter())
+        .cloned()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    all_names.sort();
+    let mut ident_map: HashMap<String, String> = HashMap::with_capacity(all_names.len());
+    let mut used_idents: HashSet<String> = HashSet::with_capacity(all_names.len());
+    for name in all_names {
+        let base = sanitize_smt_ident(&name);
+        let unique = if used_idents.insert(base.clone()) {
+            base
+        } else {
+            let mut suffix = 2usize;
+            loop {
+                let cand = format!("{base}_{suffix}");
+                if used_idents.insert(cand.clone()) {
+                    break cand;
+                }
+                suffix += 1;
+            }
+        };
+        ident_map.insert(name, unique);
+    }
+
     let mut out = String::from("(set-logic ALL)\n");
     let mut b_sorted: Vec<_> = bool_vars.into_iter().collect();
     b_sorted.sort();
     for v in &b_sorted {
-        out.push_str(&format!("(declare-const {} Bool)\n", sanitize_smt_ident(v)));
+        if let Some(id) = ident_map.get(v) {
+            out.push_str(&format!("(declare-const {id} Bool)\n"));
+        }
     }
     let mut i_sorted: Vec<_> = int_vars.into_iter().collect();
     i_sorted.sort();
     for v in &i_sorted {
-        out.push_str(&format!("(declare-const {} Int)\n", sanitize_smt_ident(v)));
+        if let Some(id) = ident_map.get(v) {
+            out.push_str(&format!("(declare-const {id} Int)\n"));
+        }
     }
     let mut s_sorted: Vec<_> = str_vars.into_iter().collect();
     s_sorted.sort();
     for v in &s_sorted {
-        out.push_str(&format!(
-            "(declare-const {} String)\n",
-            sanitize_smt_ident(v)
-        ));
+        if let Some(id) = ident_map.get(v) {
+            out.push_str(&format!("(declare-const {id} String)\n"));
+        }
     }
 
     for c in constraints {
-        out.push_str(&format!("(assert {})\n", constraint_to_smt2(c)));
+        out.push_str(&format!("(assert {})\n", constraint_to_smt2(c, &ident_map)));
     }
     out.push_str("(check-sat)\n(get-model)\n");
     out
@@ -801,15 +848,22 @@ fn escape_smt_string(raw: &str) -> String {
     raw.replace('"', "\"\"")
 }
 
-fn constraint_to_smt2(c: &PathConstraint) -> String {
+fn lookup_smt_ident(raw: &str, ident_map: &HashMap<String, String>) -> String {
+    ident_map
+        .get(raw)
+        .cloned()
+        .unwrap_or_else(|| sanitize_smt_ident(raw))
+}
+
+fn constraint_to_smt2(c: &PathConstraint, ident_map: &HashMap<String, String>) -> String {
     match c {
         PathConstraint::ConstBool(b) => if *b { "true" } else { "false" }.to_string(),
         PathConstraint::BoolLit { name, value } => {
-            let id = sanitize_smt_ident(name);
+            let id = lookup_smt_ident(name, ident_map);
             if *value { id } else { format!("(not {id})") }
         }
         PathConstraint::IntCmp { var, op, value } => {
-            let id = sanitize_smt_ident(var);
+            let id = lookup_smt_ident(var, ident_map);
             let lit = if *value < 0 {
                 format!("(- {})", value.unsigned_abs())
             } else {
@@ -821,12 +875,12 @@ fn constraint_to_smt2(c: &PathConstraint) -> String {
             format!(
                 "({} {} {})",
                 op.smt2_op(),
-                sanitize_smt_ident(lhs),
-                sanitize_smt_ident(rhs)
+                lookup_smt_ident(lhs, ident_map),
+                lookup_smt_ident(rhs, ident_map)
             )
         }
         PathConstraint::StrEq { var, literal, eq } => {
-            let id = sanitize_smt_ident(var);
+            let id = lookup_smt_ident(var, ident_map);
             let esc = escape_smt_string(literal);
             if *eq {
                 format!("(= {id} \"{esc}\")")
@@ -838,7 +892,10 @@ fn constraint_to_smt2(c: &PathConstraint) -> String {
             if parts.is_empty() {
                 "true".to_string()
             } else {
-                let inner: Vec<String> = parts.iter().map(constraint_to_smt2).collect();
+                let inner: Vec<String> = parts
+                    .iter()
+                    .map(|p| constraint_to_smt2(p, ident_map))
+                    .collect();
                 format!("(and {})", inner.join(" "))
             }
         }
@@ -846,14 +903,18 @@ fn constraint_to_smt2(c: &PathConstraint) -> String {
             if parts.is_empty() {
                 "false".to_string()
             } else {
-                let inner: Vec<String> = parts.iter().map(constraint_to_smt2).collect();
+                let inner: Vec<String> = parts
+                    .iter()
+                    .map(|p| constraint_to_smt2(p, ident_map))
+                    .collect();
                 format!("(or {})", inner.join(" "))
             }
         }
     }
 }
 
-/// Runs `z3 -smt2 -T:1 -memory:512 -in` on an SMT-LIB2 script and parses `sat`/`unsat` + model.
+/// Runs `z3 -smt2 -T:1 -memory:512 -in` on an SMT-LIB2 script with an external hard deadline
+/// and deterministic child reaping.
 pub fn run_z3_smtlib2(script: &str) -> Option<SmtVerdict> {
     let mut child = Command::new("z3")
         .args(["-smt2", "-T:1", "-memory:512", "-in"])
@@ -864,10 +925,35 @@ pub fn run_z3_smtlib2(script: &str) -> Option<SmtVerdict> {
         .ok()?;
 
     if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(script.as_bytes());
+        let payload = script.as_bytes().to_vec();
+        let _ = std::thread::spawn(move || {
+            let _ = stdin.write_all(&payload);
+        });
     }
-    let output = child.wait_with_output().ok()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Some(SmtVerdict::Unknown { solver: "z3" });
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let mut buf = Vec::new();
+    if let Some(stdout_pipe) = child.stdout.take() {
+        let _ = std::io::Read::read_to_end(&mut std::io::Read::take(stdout_pipe, 256 * 1024), &mut buf);
+    }
+    let stdout = String::from_utf8_lossy(&buf);
     let mut lines = stdout.lines().map(str::trim).filter(|l| !l.is_empty());
     let first = lines.next()?;
     match first {
@@ -981,49 +1067,49 @@ fn split_top_level_word_op<'a>(s: &'a str, word: &str) -> Option<Vec<&'a str>> {
 
 fn split_top_level_cmp(s: &str) -> Option<(&str, CmpOp, &str)> {
     let mut depth = 0i32;
-    let mut in_str: Option<char> = None;
+    let mut in_str: Option<u8> = None;
     let bytes = s.as_bytes();
     let mut i = 0usize;
     while i < bytes.len() {
-        let ch = bytes[i] as char;
+        let b = bytes[i];
         if let Some(q) = in_str {
-            if ch == q && (i == 0 || bytes[i - 1] != b'\\') {
+            if b == q && (i == 0 || bytes[i - 1] != b'\\') {
                 in_str = None;
             }
             i += 1;
             continue;
         }
-        match ch {
-            '"' | '\'' => {
-                in_str = Some(ch);
+        match b {
+            b'"' | b'\'' => {
+                in_str = Some(b);
                 i += 1;
             }
-            '(' | '[' | '{' => {
+            b'(' | b'[' | b'{' => {
                 depth += 1;
                 i += 1;
             }
-            ')' | ']' | '}' => {
+            b')' | b']' | b'}' => {
                 depth -= 1;
                 i += 1;
             }
-            _ if depth == 0 => {
-                let rem = &s[i..];
-                let matched = if rem.starts_with("===") {
+            _ if depth == 0 && s.is_char_boundary(i) => {
+                let rem = &bytes[i..];
+                let matched = if rem.starts_with(b"===") {
                     Some((CmpOp::Eq, 3))
-                } else if rem.starts_with("!==") {
+                } else if rem.starts_with(b"!==") {
                     Some((CmpOp::Neq, 3))
-                } else if rem.starts_with("==") {
+                } else if rem.starts_with(b"==") {
                     Some((CmpOp::Eq, 2))
-                } else if rem.starts_with("!=") {
+                } else if rem.starts_with(b"!=") {
                     Some((CmpOp::Neq, 2))
-                } else if rem.starts_with("<=") {
+                } else if rem.starts_with(b"<=") {
                     Some((CmpOp::Le, 2))
-                } else if rem.starts_with(">=") {
+                } else if rem.starts_with(b">=") {
                     Some((CmpOp::Ge, 2))
-                } else if rem.starts_with('<') && !rem.starts_with("<<") {
+                } else if rem.starts_with(b"<") && !rem.starts_with(b"<<") {
                     Some((CmpOp::Lt, 1))
-                } else if rem.starts_with('>')
-                    && !rem.starts_with(">>")
+                } else if rem.starts_with(b">")
+                    && !rem.starts_with(b">>")
                     && (i == 0 || bytes[i - 1] != b'-')
                 {
                     Some((CmpOp::Gt, 1))
@@ -1042,15 +1128,15 @@ fn split_top_level_cmp(s: &str) -> Option<(&str, CmpOp, &str)> {
 }
 
 fn is_valid_var_expr(s: &str) -> bool {
-    if s.is_empty() || s.len() > 64 {
+    if s.is_empty() || s.len() > 64 || matches!(s, "true" | "false" | "null" | "None") {
         return false;
     }
     let first = s.chars().next().unwrap_or(' ');
-    if !(first.is_ascii_alphabetic() || first == '_' || first == '$') {
+    if !(first.is_ascii_alphabetic() || first == '_' || first == '\x24') {
         return false;
     }
     s.chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '$'))
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '\x24'))
 }
 
 fn parse_int_literal(s: &str) -> Option<i64> {
@@ -1081,7 +1167,6 @@ fn block_always_exits(node: Node, src: &[u8]) -> bool {
     ) {
         return true;
     }
-    let txt = strip_comments(node_text(node, src)).to_ascii_lowercase();
     let mut cursor = node.walk();
     for ch in node.children(&mut cursor) {
         if matches!(
@@ -1095,6 +1180,8 @@ fn block_always_exits(node: Node, src: &[u8]) -> bool {
             return true;
         }
     }
+    let txt = crate::taint::strip_comments_and_non_attr_strings(node_text(node, src))
+        .to_ascii_lowercase();
     txt.contains("return ")
         || txt.contains("return;")
         || txt.contains("throw ")
@@ -1206,6 +1293,19 @@ mod tests {
         assert!(smt2.contains("(assert (= v_role \"admin\"))"));
         assert!(smt2.contains("(assert (not v_is_disabled))"));
         assert!(smt2.contains("(check-sat)"));
+
+        // Unicode identifiers must not panic in split_top_level_cmp (P0 regression)
+        let _ = parse_condition_expr("用户名 === \"admin\"");
+        let _ = parse_condition_expr("café > 10");
+
+        // Collision-free SMT-LIB2 ident bijection (`user.id` vs `user_id`)
+        let col_constraints = vec![
+            parse_condition_expr("user.id > 0").unwrap(),
+            parse_condition_expr("user_id < 0").unwrap(),
+        ];
+        let col_smt2 = emit_smtlib2(&col_constraints);
+        assert!(col_smt2.contains("(declare-const v_user_id Int)"));
+        assert!(col_smt2.contains("(declare-const v_user_id_2 Int)"));
     }
 
     #[test]

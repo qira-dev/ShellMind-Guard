@@ -101,6 +101,18 @@ fn walk_scope(node: Node, src: &[u8], lang: Language, table: &mut FileScopeTable
 }
 
 fn record_param_shadowing(node: Node, src: &[u8], table: &mut FileScopeTable) {
+    record_param_shadowing_depth(node, src, table, 0);
+}
+
+fn record_param_shadowing_depth(
+    node: Node,
+    src: &[u8],
+    table: &mut FileScopeTable,
+    depth: usize,
+) {
+    if depth >= MAX_AST_WALK_DEPTH {
+        return;
+    }
     if matches!(
         node.kind(),
         "identifier" | "shorthand_property_identifier_pattern"
@@ -120,7 +132,7 @@ fn record_param_shadowing(node: Node, src: &[u8], table: &mut FileScopeTable) {
     }
     let mut c = node.walk();
     for ch in node.children(&mut c) {
-        record_param_shadowing(ch, src, table);
+        record_param_shadowing_depth(ch, src, table, depth + 1);
     }
 }
 
@@ -172,6 +184,29 @@ fn update_binding_from_rhs(
     }
 }
 
+fn has_non_negated_xss_sanitizer(low: &str) -> bool {
+    for needle in [
+        "dompurify.sanitize(",
+        "sanitizehtml(",
+        "sanitize_html(",
+        "escapehtml(",
+    ] {
+        for (pos, _) in low.match_indices(needle) {
+            let prev = &low[..pos];
+            if prev.ends_with("un") || prev.ends_with("de") || prev.ends_with("re") {
+                continue;
+            }
+            if let Some(ch) = prev.chars().next_back()
+                && (ch.is_ascii_alphanumeric() || ch == '_')
+            {
+                continue;
+            }
+            return true;
+        }
+    }
+    false
+}
+
 fn contains_xss_sanitizer_call(node: Node, src: &[u8]) -> bool {
     let k = node.kind();
     if matches!(k, "call_expression" | "call")
@@ -186,10 +221,7 @@ fn contains_xss_sanitizer_call(node: Node, src: &[u8]) -> bool {
         }
     }
     let low = node_text(node, src).to_ascii_lowercase();
-    low.contains("dompurify.sanitize(")
-        || low.contains("sanitizehtml(")
-        || low.contains("sanitize_html(")
-        || low.contains("escapehtml(")
+    has_non_negated_xss_sanitizer(&low)
 }
 
 fn has_direct_tainted_unsanitized_wrap(rhs_txt: &str) -> bool {

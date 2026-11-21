@@ -1530,7 +1530,34 @@ fn extract_expr_wrapper(
     wrapped
 }
 
+thread_local! {
+    static EXPR_WALK_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+struct ExprDepthGuard;
+
+impl Drop for ExprDepthGuard {
+    fn drop(&mut self) {
+        EXPR_WALK_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+fn enter_expr_depth() -> Option<ExprDepthGuard> {
+    EXPR_WALK_DEPTH.with(|d| {
+        let cur = d.get();
+        if cur >= MAX_AST_WALK_DEPTH {
+            None
+        } else {
+            d.set(cur + 1);
+            Some(ExprDepthGuard)
+        }
+    })
+}
+
 fn expr_call_sanitized_bits(node: Node, src: &[u8], env: &TaintEnv) -> u8 {
+    let Some(_guard) = enter_expr_depth() else {
+        return 0;
+    };
     let k = node.kind();
     let txt = node_text(node, src);
     let mut bits = sanitizer_clear_mask(txt);
@@ -1558,6 +1585,9 @@ fn expr_call_sanitized_bits(node: Node, src: &[u8], env: &TaintEnv) -> u8 {
 }
 
 fn ast_eval_masks(node: Node, src: &[u8], env: &TaintEnv) -> (u8, u8) {
+    let Some(_guard) = enter_expr_depth() else {
+        return (0, 0);
+    };
     let k = node.kind();
     let txt = node_text(node, src);
 
@@ -1973,6 +2003,9 @@ fn is_safe_fmt_or_join_call(node: Node, src: &[u8], env: &TaintEnv) -> bool {
 }
 
 fn is_pure_safe_literal_expr(node: Node, src: &[u8], env: &TaintEnv) -> bool {
+    let Some(_guard) = enter_expr_depth() else {
+        return false;
+    };
     let k = node.kind();
     let txt = node_text(node, src).trim();
     if txt.is_empty() {
