@@ -1,3 +1,4 @@
+pub mod ai_mcp_model;
 pub mod arena;
 pub mod ast;
 pub mod call_hierarchy;
@@ -61,6 +62,10 @@ pub use cfa_ssa::{
 pub use subgraph::{
     collect_git_changed_files, should_force_full_scan_on_diff, slice_summaries_for_changed_files,
 };
+pub use ai_mcp_model::{
+    analyze_indirect_prompt_injection, analyze_mcp_tool_poisoning,
+    analyze_model_deserialization_and_ssti, inspect_chat_template_ssti, inspect_pickle_bytes,
+};
 pub use vex_osv::{AutoVexSymbolIndex, OpenVexStatement, to_openvex_json};
 
 fn load_or_parse_summaries_cached(
@@ -71,7 +76,7 @@ fn load_or_parse_summaries_cached(
     let cfg_json = serde_json::to_string(&cfg.guards).unwrap_or_default();
     let adv_stamp = smg_core::advisories_db_stamp();
     let versioned_cfg = format!(
-        "v32-phase28-mem-vex-{}|{}|{}|{}",
+        "v33-phase29-web3-ai-mcp-{}|{}|{}|{}",
         env!("CARGO_PKG_VERSION"),
         adv_stamp,
         cfg.scan.deep_audit,

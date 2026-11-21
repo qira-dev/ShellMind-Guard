@@ -2,6 +2,12 @@ pub mod context;
 pub mod evm_oracle;
 pub mod solidity;
 pub mod svm_move;
+pub mod ultra_web3;
+
+pub use ultra_web3::{
+    analyze_move_ultra_depth, analyze_solana_pda_depth, analyze_solidity_ultra_depth,
+    detect_diamond_selector_collisions,
+};
 
 use context::{EvmSlotEntry, abi_selector, detect_proxy_storage_collisions, ingest_web3_context};
 use evm_oracle::{InvariantCampaignConfig, run_stateful_revm_invariant_campaign};
@@ -128,6 +134,11 @@ pub fn scan_web3_repo_with_options(
                 if smg_core::is_test_source_path(&f.rel_path) {
                     continue;
                 }
+                all_findings.extend(ultra_web3::analyze_solidity_ultra_depth(
+                    &f.rel_path,
+                    &text,
+                    &contracts,
+                ));
                 for c in contracts {
                     if matches!(
                         c.kind,
@@ -225,6 +236,9 @@ pub fn scan_web3_repo_with_options(
             }
             Language::Move => {
                 all_findings.extend(analyze_move_file(&f.rel_path, &text));
+                if !smg_core::is_test_source_path(&f.rel_path) {
+                    all_findings.extend(ultra_web3::analyze_move_ultra_depth(&f.rel_path, &text));
+                }
             }
             Language::Rust => {
                 all_findings.extend(analyze_solana_rust_file_with_ctx(
@@ -232,6 +246,9 @@ pub fn scan_web3_repo_with_options(
                     &text,
                     Some(&solana_ws_ctx),
                 ));
+                if !smg_core::is_test_source_path(&f.rel_path) {
+                    all_findings.extend(ultra_web3::analyze_solana_pda_depth(&f.rel_path, &text));
+                }
             }
             _ => {}
         }

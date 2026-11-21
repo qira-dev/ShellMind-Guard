@@ -104,6 +104,15 @@ pub fn scan_protocols_ai_and_workflow(
 
     scan_graphql_ws_grpc(rel_path, &lines, &low_full, &mut out);
     scan_ai_prompt_and_agent_tools(rel_path, &lines, &low_full, &mut out);
+    for hit in crate::ai_mcp_model::analyze_indirect_prompt_injection(rel_path, content) {
+        push_unique(&mut out, hit);
+    }
+    for hit in crate::ai_mcp_model::analyze_mcp_tool_poisoning(rel_path, content) {
+        push_unique(&mut out, hit);
+    }
+    for hit in crate::ai_mcp_model::analyze_model_deserialization_and_ssti(rel_path, content) {
+        push_unique(&mut out, hit);
+    }
     scan_oauth_pkce_state_redirect(rel_path, &lines, &low_full, &mut out);
     scan_http_crlf_and_host_poisoning(rel_path, &lines, &mut out);
     scan_workflow_state_machine(rel_path, &lines, &mut out);
