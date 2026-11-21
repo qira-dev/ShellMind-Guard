@@ -8,7 +8,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
-### Added (Waves 1–4 + `smg-hw`, `smg-web3`, `smg-pqc`, and `smg-enterprise` Frontier Modules)
+## [0.2.0] - 2026-11-22
+
+### Security & Hardening (8-Phase Full-Repo Audit Remediation)
+- **Security Perimeter & Core (`smg-core`):** Blocked IPv6 `[::1]@evil.com` SSRF & port-0 bypasses, clamped untrusted `.shellmind-guard.toml` limits (`load_trusted_from_dir`), zero-copy YAML document slicing with 16 MiB cap, distro-aware dpkg/apk/Go/PEP 503/CVSS v3.1 advisory matching, TOCTOU-safe `File::take` scanning, and `BEGIN IMMEDIATE` transactional SQLite migrations with `0700`/`0600` permissions.
+- **Graph, SMT & Specialist Engines (`smg-graph`, `smg-web3`, `smg-hw`, `smg-pqc`, `smg-enterprise`):** Eliminated UTF-8 boundary panics and unbounded AST/scope/taint/CFG recursion, bounded external `z3` execution with kill/reap, capped `RegexBuilder` NFA/DFA limits (`256 KiB`), fixed `smg-web3` reentrancy/solvency precision, enforced `SMG-HW-BOOT` allowlist, dynamic `SystemTime` PQC clock, and mandatory BLAKE3 transcript binding in `smg-enterprise` TEE quotes.
+- **Sandbox, AI Patcher, OCI & Live Auditors (`smg-sandbox`, `smg-ai`, `src/`):** Stripped URLs from `reqwest::Error` in `live_verify` (preventing token leaks), bounded `oci_image` `maybe_gunzip` (256 MiB) + POSIX PAX/OCI-layout support, blocked `169.254.169.254` IMDS link-local SSRF across live HTTP/DAST/SQLi/IDOR/Template auditors, enforced 2 MiB bounded HTTP reads, fixed `proxy.rs` tunnel deadlock, enforced 32 KiB MCP response budget, hardened TUI/Proxy panic recovery + `0700`/`0600` exports, and replaced Windows `cmd /C start` with shell-free `explorer.exe`.
+- **Workspace, CI/CD & Installers:** Enforced `[workspace.lints]` (`unsafe_code = "forbid"`, `todo = "deny"`, `unimplemented = "deny"`), release `overflow-checks = true`, SHA-pinned GitHub Actions with `actions/attest-build-provenance` SLSA attestations, full `src/` + `crates/` dogfood CI gate, and TLS 1.2+ / fail-closed checksum verification in `install.sh` and `install.ps1`.
+
+### Added (Phases 6–26b + `smg-hw`, `smg-web3`, `smg-pqc`, and `smg-enterprise` Frontier Modules)
 - **Confidential Compute Remote TEE & Commercial Licensing (`crates/smg-enterprise`, `--features enterprise`, `smg enterprise ...`):**
   - Added isolated opt-in crate `smg-enterprise` implementing fail-closed `ring` Ed25519 signed license tokens with optional binary BLAKE3 digest pinning, hardware device node detection (`AWS Nitro /dev/nsm`, `Intel TDX`, `AMD SEV-SNP`), PCR0/MRTD + anti-replay nonce quote attestation verification (`verify_tee_attestation_quote`), and HTTPS-enforced `remote-scan` enclave wire client.
 - **Post-Quantum Crypto-Agility & Static CBOM (`crates/smg-pqc`, `--features pqc`, `--compliance pqc`, `--cbom <FILE>`):**

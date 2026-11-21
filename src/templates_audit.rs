@@ -2000,8 +2000,9 @@ mod tests {
     }
 
     fn temp_templates_dir(entries: &[(&str, &str)]) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("smg-tpl-{}-{}", std::process::id(), entries.len()));
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("smg-tpl-{}-{seq}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         for (name, content) in entries {

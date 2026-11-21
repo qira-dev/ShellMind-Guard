@@ -34,4 +34,6 @@ jobs:
         run: cargo test --workspace --locked
       - name: Self-Scan Dogfood Gate (Ubuntu)
         if: runner.os == 'Linux'
-        run: cargo run --locked -- scan . --ci --format sarif --sarif /tmp/self.sarif
+        run: |
+          cargo run --locked -- scan src --ci --format sarif --sarif /tmp/self-src.sarif
+          cargo run --locked -- scan crates --ci --format sarif --sarif /tmp/self-crates.sarif
