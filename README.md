@@ -1,6 +1,10 @@
 <div align="center">
 
-# ShellMind Guard
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/wordmark-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="assets/wordmark-light.svg">
+  <img alt="ShellMind Guard" src="assets/wordmark-light.svg" width="460">
+</picture>
 
 **Compiler-Grade Multi-File Security, Business-Logic, Concurrency & Frontier Domain Verifier**
 
