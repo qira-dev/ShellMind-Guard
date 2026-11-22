@@ -3,7 +3,10 @@
 //! Strictly scoped to developer QA & authorized lab verification:
 //! - Defaults to loopback / RFC1918 lab hosts; `--allow-remote` opt-in for the
 //!   owner's own staging servers (same policy as `smg idor`).
-//! - Only GET requests and urlencoded POST bodies are driven.
+//! - Only GET requests and urlencoded/JSON POST bodies are driven.
+//! - Injection surfaces: URL query, urlencoded form body, recursive JSON body
+//!   leaves (`$.user.id`, `$.items[0].code`), plus opt-in request headers
+//!   (`--test-headers`) and cookies (`--test-cookies`).
 //! - Techniques: error-based signature detection, boolean-based differential
 //!   response analysis, statistically-verified time-based delay, and ORDER BY
 //!   UNION column-count detection.
@@ -116,6 +119,7 @@ pub struct TechniqueEvidence {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SqliParamResult {
     pub param: String,
+    pub location: String,
     pub error_based: Option<TechniqueEvidence>,
     pub boolean_based: Option<TechniqueEvidence>,
     pub time_based: Option<TechniqueEvidence>,
@@ -141,6 +145,12 @@ pub struct SqliAuditConfig {
     pub headers: HashMap<String, String>,
     pub body: Option<String>,
     pub params: Vec<String>,
+    /// Request-header names to test as injection surfaces ("auto" expands to
+    /// User-Agent / X-Forwarded-For / Referer). Opt-in only.
+    pub test_headers: Vec<String>,
+    /// Cookie names to test as injection surfaces. Opt-in only; the Cookie
+    /// header comes from `headers`.
+    pub test_cookies: Vec<String>,
     pub delay_secs: u64,
     pub skip_timing: bool,
     pub allow_remote: bool,
@@ -187,52 +197,323 @@ fn set_param_in_pairs(pairs: &str, param: &str, value: &str) -> Option<String> {
     Some(rebuilt.join("&"))
 }
 
+/// Injection surfaces supported by the parameter engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParamLocation {
+    Query,
+    Form,
+    Json,
+    Header,
+    Cookie,
+}
+
+impl ParamLocation {
+    fn as_str(self) -> &'static str {
+        match self {
+            ParamLocation::Query => "query",
+            ParamLocation::Form => "form",
+            ParamLocation::Json => "json",
+            ParamLocation::Header => "header",
+            ParamLocation::Cookie => "cookie",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ParamRef {
+    name: String,
+    location: ParamLocation,
+}
+
+// ---------------------------------------------------------------------------
+// JSON body surface (recursive leaf paths)
+// ---------------------------------------------------------------------------
+
+enum JsonPathTok {
+    Key(String),
+    Idx(usize),
+}
+
+/// Parses a JSON path like `$.user.id` or `$.items[0].code` into tokens.
+fn parse_json_path(path: &str) -> Option<Vec<JsonPathTok>> {
+    let rest = path.strip_prefix('$')?;
+    let chars: Vec<char> = rest.chars().collect();
+    let mut toks = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '.' => {
+                i += 1;
+                let start = i;
+                while i < chars.len() && chars[i] != '.' && chars[i] != '[' {
+                    i += 1;
+                }
+                let key: String = chars[start..i].iter().collect();
+                if key.is_empty() {
+                    return None;
+                }
+                toks.push(JsonPathTok::Key(key));
+            }
+            '[' => {
+                i += 1;
+                let start = i;
+                while i < chars.len() && chars[i] != ']' {
+                    i += 1;
+                }
+                if i >= chars.len() {
+                    return None;
+                }
+                let idx: String = chars[start..i].iter().collect();
+                i += 1;
+                toks.push(JsonPathTok::Idx(idx.trim().parse().ok()?));
+            }
+            _ => return None,
+        }
+    }
+    if toks.is_empty() { None } else { Some(toks) }
+}
+
+/// Collects the JSON paths of every scalar leaf (e.g. `$.user.id`, `$.items[0].code`).
+fn walk_json_params(value: &serde_json::Value, prefix: &str, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                let path = format!("{prefix}.{k}");
+                if v.is_object() || v.is_array() {
+                    walk_json_params(v, &path, out);
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (idx, v) in items.iter().enumerate() {
+                let path = format!("{prefix}[{idx}]");
+                if v.is_object() || v.is_array() {
+                    walk_json_params(v, &path, out);
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+        _ => out.push(prefix.to_string()),
+    }
+}
+
+/// Reads the scalar at `path` as a string.
+fn get_json_leaf_str(root: &serde_json::Value, path: &str) -> Option<String> {
+    let toks = parse_json_path(path)?;
+    let mut cur = root;
+    for tok in &toks {
+        cur = match tok {
+            JsonPathTok::Key(k) => cur.get(k)?,
+            JsonPathTok::Idx(idx) => cur.get(*idx)?,
+        };
+    }
+    Some(match cur {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    })
+}
+
+/// Replaces the scalar at `path` with a string value; returns true when applied.
+fn set_json_leaf(root: &mut serde_json::Value, path: &str, value: &str) -> bool {
+    let Some(toks) = parse_json_path(path) else {
+        return false;
+    };
+    let mut cur = root;
+    for (i, tok) in toks.iter().enumerate() {
+        let last = i + 1 == toks.len();
+        match tok {
+            JsonPathTok::Key(k) => {
+                let map = match cur {
+                    serde_json::Value::Object(map) => map,
+                    _ => return false,
+                };
+                if last {
+                    if !map.contains_key(k.as_str()) {
+                        return false;
+                    }
+                    map.insert(k.clone(), serde_json::Value::String(value.to_string()));
+                    return true;
+                }
+                cur = match map.get_mut(k.as_str()) {
+                    Some(v) => v,
+                    None => return false,
+                };
+            }
+            JsonPathTok::Idx(idx) => {
+                let items = match cur {
+                    serde_json::Value::Array(items) => items,
+                    _ => return false,
+                };
+                if *idx >= items.len() {
+                    return false;
+                }
+                if last {
+                    items[*idx] = serde_json::Value::String(value.to_string());
+                    return true;
+                }
+                cur = &mut items[*idx];
+            }
+        }
+    }
+    false
+}
+
+/// Detects a JSON request body: explicit Content-Type or a leading `{`/`[`.
+fn body_is_json(cfg: &SqliAuditConfig) -> bool {
+    if let Some((_, ct)) = cfg
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+        && ct.to_ascii_lowercase().contains("application/json")
+    {
+        return true;
+    }
+    cfg.body
+        .as_deref()
+        .map(|b| {
+            let t = b.trim_start();
+            t.starts_with('{') || t.starts_with('[')
+        })
+        .unwrap_or(false)
+}
+
+/// Parses the template `Cookie` header into name/value pairs.
+fn cookie_pairs(cfg: &SqliAuditConfig) -> Vec<(String, String)> {
+    cfg.headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("cookie"))
+        .map(|(_, v)| {
+            v.split(';')
+                .filter_map(|kv| {
+                    kv.trim()
+                        .split_once('=')
+                        .map(|(k, val)| (k.trim().to_string(), val.trim().to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn header_template_value(cfg: &SqliAuditConfig, name: &str) -> Option<String> {
+    cfg.headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.clone())
+}
+
+// ---------------------------------------------------------------------------
+// Injectable request template
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Clone)]
 struct Injectable {
     url: String,
     body: Option<String>,
+    body_is_json: bool,
+    /// Header overrides layered on top of the template headers (lowercase names).
+    extra_headers: Vec<(String, String)>,
 }
 
-fn make_injectable(cfg: &SqliAuditConfig, param: &str) -> Result<Injectable> {
+fn base_injectable(cfg: &SqliAuditConfig, url_str: &str) -> Injectable {
+    Injectable {
+        url: url_str.to_string(),
+        body: cfg.body.clone(),
+        body_is_json: body_is_json(cfg),
+        extra_headers: Vec::new(),
+    }
+}
+
+fn make_injectable(cfg: &SqliAuditConfig, pref: &ParamRef) -> Result<Injectable> {
     let url = reqwest::Url::parse(cfg.url.trim())
         .with_context(|| format!("Invalid URL '{}'", cfg.url))?;
-    let query = url.query().unwrap_or_default().to_string();
-    let in_url = set_param_in_pairs(&query, param, "x").is_some();
-    let in_body = cfg
-        .body
-        .as_deref()
-        .map(|b| set_param_in_pairs(b, param, "x").is_some())
-        .unwrap_or(false);
-    if !in_url && !in_body {
-        bail!("Parameter '{param}' not found in URL query or POST body");
+    let inj = base_injectable(cfg, url.as_str());
+    let present = match pref.location {
+        ParamLocation::Query => {
+            let query = url.query().unwrap_or_default().to_string();
+            set_param_in_pairs(&query, &pref.name, "x").is_some()
+        }
+        ParamLocation::Form => cfg
+            .body
+            .as_deref()
+            .map(|b| set_param_in_pairs(b, &pref.name, "x").is_some())
+            .unwrap_or(false),
+        ParamLocation::Json => {
+            let body = cfg
+                .body
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("JSON injection requires a --data body"))?;
+            let mut parsed: serde_json::Value =
+                serde_json::from_str(body).context("Invalid JSON body")?;
+            set_json_leaf(&mut parsed, &pref.name, "x")
+        }
+        // Header names are opt-in via --test-headers, so presence is assumed:
+        // the header may be injected into a request that never carried it
+        // (sqlmap-style surface testing).
+        ParamLocation::Header => true,
+        ParamLocation::Cookie => cookie_pairs(cfg)
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case(&pref.name)),
+    };
+    if !present {
+        bail!(
+            "Parameter '{}' not found at location '{}' (URL query, form body, JSON body, or Cookie header)",
+            pref.name,
+            pref.location.as_str()
+        );
     }
-    Ok(Injectable {
-        url: url.to_string(),
-        body: cfg.body.clone(),
-    })
+    Ok(inj)
 }
 
-fn inject_value(
-    param: &str,
-    original_url: &str,
-    original_body: Option<&str>,
-    value: &str,
-) -> Injectable {
-    let mut inj = Injectable {
-        url: original_url.to_string(),
-        body: original_body.map(|b| b.to_string()),
-    };
-    if let Ok(mut u) = reqwest::Url::parse(original_url) {
-        let query = u.query().unwrap_or_default().to_string();
-        if let Some(nq) = set_param_in_pairs(&query, param, value) {
-            u.set_query(Some(&nq));
-            inj.url = u.to_string();
+/// Returns a copy of the request template with `pref` set to `value`.
+fn inject_value(cfg: &SqliAuditConfig, pref: &ParamRef, url_str: &str, value: &str) -> Injectable {
+    let mut inj = base_injectable(cfg, url_str);
+    match pref.location {
+        ParamLocation::Query => {
+            if let Ok(mut u) = reqwest::Url::parse(url_str) {
+                let query = u.query().unwrap_or_default().to_string();
+                if let Some(nq) = set_param_in_pairs(&query, &pref.name, value) {
+                    u.set_query(Some(&nq));
+                    inj.url = u.to_string();
+                }
+            }
         }
-    }
-    if let Some(orig_body) = original_body
-        && let Some(nb) = set_param_in_pairs(orig_body, param, value)
-    {
-        inj.body = Some(nb);
+        ParamLocation::Form => {
+            if let Some(orig) = cfg.body.as_deref()
+                && let Some(nb) = set_param_in_pairs(orig, &pref.name, value)
+            {
+                inj.body = Some(nb);
+            }
+        }
+        ParamLocation::Json => {
+            if let Some(orig) = cfg.body.as_deref()
+                && let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(orig)
+                && set_json_leaf(&mut parsed, &pref.name, value)
+            {
+                inj.body = Some(parsed.to_string());
+            }
+        }
+        ParamLocation::Header => {
+            inj.extra_headers
+                .push((pref.name.to_ascii_lowercase(), value.to_string()));
+        }
+        ParamLocation::Cookie => {
+            let rebuilt: Vec<String> = cookie_pairs(cfg)
+                .iter()
+                .map(|(k, v)| {
+                    if k.eq_ignore_ascii_case(&pref.name) {
+                        format!("{k}={value}")
+                    } else {
+                        format!("{k}={v}")
+                    }
+                })
+                .collect();
+            inj.extra_headers
+                .push(("cookie".into(), rebuilt.join("; ")));
+        }
     }
     inj
 }
@@ -251,12 +532,24 @@ fn send_injectable(
     let m = reqwest::Method::from_bytes(method.to_ascii_uppercase().as_bytes())?;
     let mut req = client.request(m, &inj.url);
     for (k, v) in headers {
+        let overridden = inj
+            .extra_headers
+            .iter()
+            .any(|(ek, _)| ek.eq_ignore_ascii_case(k));
+        if !overridden {
+            req = req.header(k.as_str(), v.as_str());
+        }
+    }
+    for (k, v) in &inj.extra_headers {
         req = req.header(k.as_str(), v.as_str());
     }
     if let Some(body) = &inj.body {
-        req = req
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .body(body.clone());
+        let content_type = if inj.body_is_json {
+            "application/json"
+        } else {
+            "application/x-www-form-urlencoded"
+        };
+        req = req.header("Content-Type", content_type).body(body.clone());
     }
     let resp = req.send()?;
     let status = resp.status().as_u16();
@@ -266,15 +559,87 @@ fn send_injectable(
     Ok(Response { status, body })
 }
 
+// ---------------------------------------------------------------------------
+// Structural response normalization (boolean-diff noise reduction)
+// ---------------------------------------------------------------------------
+
+/// JSON fields whose values churn between identical requests (timestamps,
+/// request ids, nonces). Their values are replaced before boolean diffing so
+/// a changing `timestamp`/`request_id` cannot fake a divergence.
+const VARIABLE_JSON_FIELDS: &[&str] = &[
+    "timestamp",
+    "created_at",
+    "updated_at",
+    "modified_at",
+    "created",
+    "updated",
+    "modified",
+    "date",
+    "expires",
+    "expires_at",
+    "epoch",
+    "ts",
+    "time",
+    "uuid",
+    "guid",
+    "request_id",
+    "requestid",
+    "trace_id",
+    "traceid",
+    "span_id",
+    "spanid",
+    "nonce",
+    "csrf",
+    "iat",
+    "exp",
+    "jti",
+];
+
+fn normalize_json_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map.iter_mut() {
+                if VARIABLE_JSON_FIELDS.contains(&k.to_ascii_lowercase().as_str()) {
+                    *v = serde_json::Value::String("[SMG-VAR]".into());
+                } else {
+                    normalize_json_value(v);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut() {
+                normalize_json_value(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Canonical comparison text for a response body: JSON documents get their
+/// variable fields replaced with a fixed placeholder and are re-serialized
+/// canonically (sorted keys); non-JSON bodies pass through unchanged.
+fn normalize_response_body(body: &str) -> String {
+    let mut parsed: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(_) => return body.to_string(),
+    };
+    normalize_json_value(&mut parsed);
+    serde_json::to_string(&parsed).unwrap_or_else(|_| body.to_string())
+}
+
 fn body_close(a: &Response, b: &Response) -> bool {
     if a.status != b.status {
         return false;
     }
-    if a.body == b.body {
+    let (na, nb) = (
+        normalize_response_body(&a.body),
+        normalize_response_body(&b.body),
+    );
+    if na == nb {
         return true;
     }
-    let max = a.body.len().max(b.body.len()).max(1);
-    let delta = (a.body.len() as i64 - b.body.len() as i64).unsigned_abs() as usize;
+    let max = na.len().max(nb.len()).max(1);
+    let delta = (na.len() as i64 - nb.len() as i64).unsigned_abs() as usize;
     delta * 100 / max <= 2
 }
 
@@ -282,11 +647,15 @@ fn body_diverges(a: &Response, b: &Response) -> bool {
     if a.status != b.status {
         return true;
     }
-    if a.body == b.body {
+    let (na, nb) = (
+        normalize_response_body(&a.body),
+        normalize_response_body(&b.body),
+    );
+    if na == nb {
         return false;
     }
-    let max = a.body.len().max(b.body.len()).max(1);
-    let delta = (a.body.len() as i64 - b.body.len() as i64).unsigned_abs() as usize;
+    let max = na.len().max(nb.len()).max(1);
+    let delta = (na.len() as i64 - nb.len() as i64).unsigned_abs() as usize;
     delta * 100 / max > 5
 }
 
@@ -304,6 +673,53 @@ fn median_f64(samples: &mut [f64]) -> f64 {
 
 const ERROR_PROBES: &[&str] = &["'", "\"", "')", "'))", "\\"];
 
+fn push_param(prefs: &mut Vec<ParamRef>, name: &str, location: ParamLocation) {
+    if !prefs
+        .iter()
+        .any(|p| p.name == name && p.location == location)
+    {
+        prefs.push(ParamRef {
+            name: name.to_string(),
+            location,
+        });
+    }
+}
+
+/// The original value at a param location, used to shape boolean payloads
+/// (numeric vs quoted-string vs empty).
+fn original_value_of(cfg: &SqliAuditConfig, url: &reqwest::Url, pref: &ParamRef) -> String {
+    match pref.location {
+        ParamLocation::Query => url
+            .query_pairs()
+            .find(|(k, _)| k == pref.name.as_str())
+            .map(|(_, v)| v.to_string())
+            .unwrap_or_default(),
+        ParamLocation::Form => cfg
+            .body
+            .as_deref()
+            .and_then(|b| {
+                b.split('&').find_map(|kv| {
+                    kv.split_once('=')
+                        .filter(|(k, _)| *k == pref.name)
+                        .map(|(_, v)| v.to_string())
+                })
+            })
+            .unwrap_or_default(),
+        ParamLocation::Json => cfg
+            .body
+            .as_deref()
+            .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+            .and_then(|v| get_json_leaf_str(&v, &pref.name))
+            .unwrap_or_default(),
+        ParamLocation::Header => header_template_value(cfg, &pref.name).unwrap_or_default(),
+        ParamLocation::Cookie => cookie_pairs(cfg)
+            .into_iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(&pref.name))
+            .map(|(_, v)| v)
+            .unwrap_or_default(),
+    }
+}
+
 pub fn run_sqli_audit(cfg: &SqliAuditConfig) -> Result<SqliAuditReport> {
     if !cfg.allow_remote && !crate::idor_audit::is_lab_or_loopback_url(&cfg.url)? {
         bail!(
@@ -318,7 +734,7 @@ pub fn run_sqli_audit(cfg: &SqliAuditConfig) -> Result<SqliAuditReport> {
         );
     }
     if method == "POST" && cfg.body.is_none() {
-        bail!("POST requires a urlencoded --data body");
+        bail!("POST requires a --data body (urlencoded or JSON)");
     }
 
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -331,25 +747,105 @@ pub fn run_sqli_audit(cfg: &SqliAuditConfig) -> Result<SqliAuditReport> {
         .user_agent(concat!("ShellMind-Guard/", env!("CARGO_PKG_VERSION")))
         .build()?;
 
-    // Determine the parameter set.
+    // Determine the parameter set across all testable surfaces.
     let url = reqwest::Url::parse(cfg.url.trim())?;
-    let mut params: Vec<String> = cfg.params.clone();
-    if params.is_empty() {
-        params = url.query_pairs().map(|(k, _)| k.to_string()).collect();
+    let mut prefs: Vec<ParamRef> = Vec::new();
+    let json_value = if body_is_json(cfg) {
+        cfg.body
+            .as_deref()
+            .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+    } else {
+        None
+    };
+
+    // Header/cookie surfaces are strictly opt-in.
+    for h in &cfg.test_headers {
+        let trimmed = h.trim().to_string();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.eq_ignore_ascii_case("auto") {
+            for name in ["User-Agent", "X-Forwarded-For", "Referer"] {
+                push_param(&mut prefs, name, ParamLocation::Header);
+            }
+        } else {
+            push_param(&mut prefs, &trimmed, ParamLocation::Header);
+        }
     }
-    if params.is_empty() {
-        bail!("No query parameters found; pass --param or a URL with parameters");
+    for c in &cfg.test_cookies {
+        let trimmed = c.trim();
+        if !trimmed.is_empty() {
+            push_param(&mut prefs, trimmed, ParamLocation::Cookie);
+        }
+    }
+
+    // URL query / form / JSON surfaces: explicit --param names or discovery.
+    if !cfg.params.is_empty() {
+        for name in &cfg.params {
+            let name = name.trim();
+            if name.is_empty() {
+                continue;
+            }
+            let in_query = set_param_in_pairs(url.query().unwrap_or_default(), name, "x").is_some();
+            let in_form = cfg
+                .body
+                .as_deref()
+                .map(|b| set_param_in_pairs(b, name, "x").is_some())
+                .unwrap_or(false);
+            let json_path = if name.starts_with('$') {
+                name.to_string()
+            } else {
+                format!("$.{name}")
+            };
+            let in_json = json_value
+                .as_ref()
+                .map(|v| get_json_leaf_str(v, &json_path).is_some())
+                .unwrap_or(false);
+            if in_query {
+                push_param(&mut prefs, name, ParamLocation::Query);
+            } else if in_form {
+                push_param(&mut prefs, name, ParamLocation::Form);
+            } else if in_json {
+                push_param(&mut prefs, &json_path, ParamLocation::Json);
+            } else {
+                bail!("Parameter '{name}' not found in URL query, form body, or JSON body");
+            }
+        }
+    } else {
+        for (k, _) in url.query_pairs() {
+            push_param(&mut prefs, &k, ParamLocation::Query);
+        }
+        if let Some(body) = cfg.body.as_deref() {
+            if body_is_json(cfg) {
+                if let Some(v) = &json_value {
+                    let mut paths = Vec::new();
+                    walk_json_params(v, "$", &mut paths);
+                    for p in paths {
+                        push_param(&mut prefs, &p, ParamLocation::Json);
+                    }
+                }
+            } else {
+                for kv in body.split('&').filter(|kv| !kv.is_empty()) {
+                    if let Some((k, _)) = kv.split_once('=') {
+                        push_param(&mut prefs, k, ParamLocation::Form);
+                    }
+                }
+            }
+        }
+    }
+    if prefs.is_empty() {
+        bail!("No testable parameters found; pass --param, --test-headers, or --test-cookies");
     }
 
     let started = Instant::now();
     let mut results = Vec::new();
     let mut vulnerable = 0usize;
 
-    for param in &params {
-        let inj = make_injectable(cfg, param)?;
-        let original_body = cfg.body.clone();
+    for pref in &prefs {
+        let inj = make_injectable(cfg, pref)?;
         let mut result = SqliParamResult {
-            param: param.clone(),
+            param: pref.name.clone(),
+            location: pref.location.as_str().to_string(),
             error_based: None,
             boolean_based: None,
             time_based: None,
@@ -361,14 +857,9 @@ pub fn run_sqli_audit(cfg: &SqliAuditConfig) -> Result<SqliAuditReport> {
         let baseline = send_injectable(&client, &inj, &method, &cfg.headers);
 
         if let Ok(base) = &baseline {
-            let orig_value = url
-                .query_pairs()
-                .find(|(k, _)| k == param.as_str())
-                .map(|(_, v)| v.to_string())
-                .unwrap_or_default();
+            let orig_value = original_value_of(cfg, &url, pref);
             let send_probe = |payload: &str| -> Result<Response> {
-                let probe =
-                    inject_value(param, cfg.url.as_str(), original_body.as_deref(), payload);
+                let probe = inject_value(cfg, pref, cfg.url.as_str(), payload);
                 send_injectable(&client, &probe, &method, &cfg.headers)
             };
 
@@ -558,7 +1049,7 @@ pub fn run_sqli_audit(cfg: &SqliAuditConfig) -> Result<SqliAuditReport> {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
     use std::thread;
 
     /// Full percent-decoder for the mock (matches the engine's encoder).
@@ -581,11 +1072,105 @@ mod tests {
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
+    /// Reads a full mock request (headers + Content-Length body).
+    fn read_request(stream: &mut TcpStream) -> String {
+        let mut data: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = stream.read(&mut buf).unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            data.extend_from_slice(&buf[..n]);
+            if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&data[..pos]);
+                let clen = head
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        if k.trim().eq_ignore_ascii_case("content-length") {
+                            v.trim().parse::<usize>().ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                let have = data.len() - (pos + 4);
+                if have >= clen {
+                    break;
+                }
+            }
+        }
+        String::from_utf8_lossy(&data).into_owned()
+    }
+
+    fn header_value(req: &str, name: &str) -> String {
+        req.lines()
+            .skip(1)
+            .take_while(|l| !l.is_empty())
+            .find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                if k.trim().eq_ignore_ascii_case(name) {
+                    Some(v.trim().to_string())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default()
+    }
+
+    /// Shared vulnerable-endpoint behaviour for the JSON/header/cookie mock
+    /// surfaces. Variable JSON fields (timestamp/request_id) change length per
+    /// payload, so raw body comparison would false-diverge — the boolean
+    /// differential only passes thanks to the structural normalizer.
+    fn vuln_behavior(decoded: &str, delay: u64) -> (u16, String, u64) {
+        if decoded.contains('\'') || decoded.contains('"') {
+            return (
+                500,
+                "You have an error in your SQL syntax; check the manual".into(),
+                0,
+            );
+        }
+        if let Some(col) = decoded
+            .split("ORDER BY")
+            .nth(1)
+            .and_then(|s| s.trim().trim_end_matches("--").trim().parse::<usize>().ok())
+            && col > 3
+        {
+            return (500, "ERROR:  syntax error at or near".into(), 0);
+        }
+        if decoded.contains("sleep") {
+            return (200, "delayed".into(), delay);
+        }
+        let falsy = decoded.ends_with("AND '1'='2") || decoded.ends_with("AND 1=2");
+        let base_item = decoded.split(" ORDER BY").next().unwrap_or("").trim();
+        let ts_len = 80 + (decoded.len() * 7) % 50;
+        if falsy {
+            let body = format!(
+                "{{\"denied\":true,\"blob\":\"{}\",\"timestamp\":\"{}\"}}",
+                "x".repeat(30),
+                "t".repeat(ts_len)
+            );
+            (200, body, 0)
+        } else {
+            let body = format!(
+                "{{\"result\":\"item {base_item}\",\"blob\":\"{}\",\"timestamp\":\"{}\",\"request_id\":\"{}\"}}",
+                "x".repeat(200),
+                "t".repeat(ts_len),
+                "r".repeat(100)
+            );
+            (200, body, 0)
+        }
+    }
+
     /// Mock server with per-endpoint SQLi behaviour:
     /// - `/error?id=` → MySQL signature when value contains a quote
     /// - `/bool?q=`   → long page for truthy payloads, short for falsy
     /// - `/time?id=`  → sleeps when the payload contains "sleep"
     /// - `/union?id=` → SQL error when ORDER BY column > 3
+    /// - `/json`      → JSON body `{"user":{"id":V}}` drives `vuln_behavior`
+    /// - `/hdr`       → `X-Forwarded-For` header drives `vuln_behavior`
+    /// - `/cookie`    → `Cookie: session=V` drives `vuln_behavior`
     fn mock_server(delay: u64) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -594,14 +1179,34 @@ mod tests {
                 let Ok((mut stream, _)) = listener.accept() else {
                     break;
                 };
-                let mut buf = [0u8; 8192];
-                let n = stream.read(&mut buf).unwrap_or(0);
-                let req = String::from_utf8_lossy(&buf[..n]);
+                let req = read_request(&mut stream);
                 let path = req.split_whitespace().nth(1).unwrap_or("");
                 let mut status = 200u16;
                 let mut body = String::new();
                 let mut sleep_secs = 0u64;
-                if let Some((_, q)) = path.split_once('?') {
+                if path.starts_with("/json") {
+                    let body_text = req.split("\r\n\r\n").nth(1).unwrap_or_default();
+                    let id_val = serde_json::from_str::<serde_json::Value>(body_text)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("user").and_then(|u| u.get("id")).map(|x| match x {
+                                serde_json::Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            })
+                        })
+                        .unwrap_or_default();
+                    (status, body, sleep_secs) = vuln_behavior(&id_val, delay);
+                } else if path.starts_with("/hdr") {
+                    let v = header_value(&req, "x-forwarded-for");
+                    (status, body, sleep_secs) = vuln_behavior(&v, delay);
+                } else if path.starts_with("/cookie") {
+                    let cookie = header_value(&req, "cookie");
+                    let v = cookie
+                        .split(';')
+                        .find_map(|kv| kv.trim().strip_prefix("session=").map(|s| s.to_string()))
+                        .unwrap_or_default();
+                    (status, body, sleep_secs) = vuln_behavior(&v, delay);
+                } else if let Some((_, q)) = path.split_once('?') {
                     let raw_value = q
                         .split('&')
                         .find_map(|kv| {
@@ -690,6 +1295,8 @@ mod tests {
             headers: HashMap::new(),
             body: None,
             params: vec![],
+            test_headers: vec![],
+            test_cookies: vec![],
             delay_secs: 1,
             skip_timing: false,
             allow_remote: false,
@@ -758,5 +1365,80 @@ mod tests {
             c.method = "PUT".into();
         }));
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn json_walk_and_set_handle_nested_paths() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"user":{"id":1},"items":[{"code":"A"},{"code":"B"}]}"#)
+                .unwrap();
+        let mut paths = Vec::new();
+        walk_json_params(&v, "$", &mut paths);
+        assert!(paths.contains(&"$.user.id".to_string()));
+        assert!(paths.contains(&"$.items[0].code".to_string()));
+        assert!(paths.contains(&"$.items[1].code".to_string()));
+
+        let mut v2 = v.clone();
+        assert!(set_json_leaf(&mut v2, "$.items[1].code", "x'"));
+        assert_eq!(v2["items"][1]["code"], "x'");
+        assert!(!set_json_leaf(&mut v2, "$.missing", "x"));
+        assert!(!set_json_leaf(&mut v2, "$.items[9].code", "x"));
+    }
+
+    #[test]
+    fn json_variable_fields_normalize_to_identical_text() {
+        let a = r#"{"result":"item 7","timestamp":"tttttttttt","request_id":"r-1"}"#;
+        let b = r#"{"request_id":"zzzzzzzzzzzzz","result":"item 7","timestamp":"u"}"#;
+        assert_eq!(normalize_response_body(a), normalize_response_body(b));
+        assert_eq!(normalize_response_body("plain text"), "plain text");
+    }
+
+    #[test]
+    fn detects_json_body_boolean_with_normalized_timestamps() {
+        let base = mock_server(0);
+        let report = run_sqli_audit(&cfg_for(&format!("{base}/json"), |c| {
+            c.method = "POST".into();
+            c.headers
+                .insert("Content-Type".into(), "application/json".into());
+            c.body = Some(r#"{"user":{"id":7}}"#.into());
+        }))
+        .unwrap();
+        assert_eq!(report.vulnerable_params, 1);
+        let r = &report.results[0];
+        assert_eq!(r.param, "$.user.id");
+        assert_eq!(r.location, "json");
+        assert!(r.boolean_based.is_some());
+    }
+
+    #[test]
+    fn detects_header_surface_injection() {
+        let base = mock_server(0);
+        let report = run_sqli_audit(&cfg_for(&format!("{base}/hdr"), |c| {
+            c.headers
+                .insert("X-Forwarded-For".into(), "10.0.0.9".into());
+            c.test_headers = vec!["X-Forwarded-For".into()];
+        }))
+        .unwrap();
+        assert_eq!(report.vulnerable_params, 1);
+        let r = &report.results[0];
+        assert_eq!(r.param, "X-Forwarded-For");
+        assert_eq!(r.location, "header");
+        assert!(r.error_based.is_some());
+    }
+
+    #[test]
+    fn detects_cookie_surface_injection() {
+        let base = mock_server(0);
+        let report = run_sqli_audit(&cfg_for(&format!("{base}/cookie"), |c| {
+            c.headers
+                .insert("Cookie".into(), "session=abc; theme=dark".into());
+            c.test_cookies = vec!["session".into()];
+        }))
+        .unwrap();
+        assert_eq!(report.vulnerable_params, 1);
+        let r = &report.results[0];
+        assert_eq!(r.param, "session");
+        assert_eq!(r.location, "cookie");
+        assert!(r.error_based.is_some());
     }
 }

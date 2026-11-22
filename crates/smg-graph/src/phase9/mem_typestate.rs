@@ -23,7 +23,10 @@ fn free_call_re() -> &'static Regex {
 fn stack_buf_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"\b(?:char|uint8_t|unsigned\s+char|byte)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\[\s*(\d+)\s*\]").expect("valid stack buf re")
+        Regex::new(
+            r"\b(?:char|uint8_t|unsigned\s+char|byte)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\[\s*(\d+)\s*\]",
+        )
+        .expect("valid stack buf re")
     })
 }
 
@@ -37,14 +40,18 @@ fn malloc_buf_re() -> &'static Regex {
 fn memcpy_const_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"\b(?:memcpy|memmove|memset)\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*,[^,]+,\s*(\d+)\s*\)").expect("valid memcpy re")
+        Regex::new(
+            r"\b(?:memcpy|memmove|memset)\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*,[^,]+,\s*(\d+)\s*\)",
+        )
+        .expect("valid memcpy re")
     })
 }
 
 fn null_assign_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:NULL|nullptr|0)\s*;").expect("valid null assign re")
+        Regex::new(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:NULL|nullptr|0)\s*;")
+            .expect("valid null assign re")
     })
 }
 
@@ -127,7 +134,11 @@ pub fn analyze_c_cpp_memory_typestate(rel_path: &str, source: &str) -> Vec<Local
     for (idx, raw_line) in source.lines().enumerate() {
         let ln = idx + 1;
         let line = raw_line.split("//").next().unwrap_or(raw_line).trim();
-        if line.is_empty() || line.starts_with("/*") || line.starts_with('*') || line.starts_with('#') {
+        if line.is_empty()
+            || line.starts_with("/*")
+            || line.starts_with('*')
+            || line.starts_with('#')
+        {
             continue;
         }
 
@@ -160,7 +171,8 @@ pub fn analyze_c_cpp_memory_typestate(rel_path: &str, source: &str) -> Vec<Local
                 || line.starts_with("case ")
                 || line.starts_with("default:")
             {
-                ptr_states.retain(|_, st| !matches!(st, PtrState::Freed(_, d) if *d >= brace_depth));
+                ptr_states
+                    .retain(|_, st| !matches!(st, PtrState::Freed(_, d) if *d >= brace_depth));
             }
         }
 
@@ -251,7 +263,10 @@ pub fn analyze_c_cpp_memory_typestate(rel_path: &str, source: &str) -> Vec<Local
         }
 
         // 5. Check Use-After-Free dereference (`p->`, `p[i]`, `*p`) on any currently Freed pointer
-        if ptr_states.values().any(|st| matches!(st, PtrState::Freed(_, _))) {
+        if ptr_states
+            .values()
+            .any(|st| matches!(st, PtrState::Freed(_, _)))
+        {
             let freed_vars: Vec<(String, usize)> = ptr_states
                 .iter()
                 .filter_map(|(k, st)| match st {
@@ -293,7 +308,10 @@ pub fn analyze_c_cpp_memory_typestate(rel_path: &str, source: &str) -> Vec<Local
 
 /// Detects Rust `std::sync::Mutex` / `RwLock` guards held across `.await` points inside `async fn`
 /// (which causes Tokio / async executor deadlocks!).
-pub fn analyze_rust_async_mutex_across_await(rel_path: &str, source: &str) -> Vec<LocalStaticFinding> {
+pub fn analyze_rust_async_mutex_across_await(
+    rel_path: &str,
+    source: &str,
+) -> Vec<LocalStaticFinding> {
     if !rel_path.ends_with(".rs") || !source.contains("async fn") || !source.contains(".await") {
         return Vec::new();
     }
@@ -306,8 +324,10 @@ pub fn analyze_rust_async_mutex_across_await(rel_path: &str, source: &str) -> Ve
 
     static GUARD_RE: OnceLock<Regex> = OnceLock::new();
     let guard_re = GUARD_RE.get_or_init(|| {
-        Regex::new(r"\blet\s+(?:mut\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*[^;]+\.(?:lock|read|write)\(\)")
-            .expect("valid guard re")
+        Regex::new(
+            r"\blet\s+(?:mut\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*[^;]+\.(?:lock|read|write)\(\)",
+        )
+        .expect("valid guard re")
     });
 
     let mut findings = Vec::new();
@@ -406,7 +426,10 @@ void safe() {
 }
 "#;
         let hits = analyze_c_cpp_memory_typestate("src/mem.c", vuln_c);
-        assert!(hits.iter().any(|h| h.title.contains("Provable buffer overflow")));
+        assert!(
+            hits.iter()
+                .any(|h| h.title.contains("Provable buffer overflow"))
+        );
         assert!(hits.iter().any(|h| h.title.contains("Use-after-free")));
         assert!(hits.iter().any(|h| h.title.contains("Double-free")));
         assert!(!hits.iter().any(|h| h.symbol == "q"));

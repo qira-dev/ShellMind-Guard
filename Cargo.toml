@@ -37,10 +37,12 @@ ignore = "0.4"
 md-5 = "0.10"
 petgraph = "0.6"
 rayon = "1.10"
+rcgen = "0.13"
 regex = "1"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls-no-provider", "charset", "http2"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rustls-native-certs = "0.8"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml_ng = "0.10"
@@ -49,6 +51,7 @@ sha2 = "0.10"
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 tree-sitter = "0.25"
 tree-sitter-bash = "0.25"
 tree-sitter-c = "0.24"
@@ -92,9 +95,11 @@ base64.workspace = true
 blake3.workspace = true
 clap.workspace = true
 md-5.workspace = true
+rcgen.workspace = true
 regex.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
+rustls-native-certs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml_ng.workspace = true
@@ -102,6 +107,7 @@ sha1.workspace = true
 sha2.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+tungstenite.workspace = true
 smg-core = { path = "crates/smg-core" }
 smg-graph = { path = "crates/smg-graph" }
 smg-sandbox = { path = "crates/smg-sandbox" }

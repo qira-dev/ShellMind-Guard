@@ -42,7 +42,10 @@ fn parse_ld_size(raw: &str) -> Option<u64> {
 
 /// Audits a GNU `.ld` / `.lds` linker script for overlapping memory regions,
 /// RWX SRAM regions, and stack/heap budgets exceeding available RAM.
-pub fn audit_linker_script(rel_path: &str, content: &str) -> (Vec<MemoryRegion>, Option<u64>, Vec<LocalStaticFinding>) {
+pub fn audit_linker_script(
+    rel_path: &str,
+    content: &str,
+) -> (Vec<MemoryRegion>, Option<u64>, Vec<LocalStaticFinding>) {
     static REGION_RE: OnceLock<Regex> = OnceLock::new();
     let region_re = REGION_RE.get_or_init(|| {
         Regex::new(
@@ -52,7 +55,8 @@ pub fn audit_linker_script(rel_path: &str, content: &str) -> (Vec<MemoryRegion>,
     });
     static STACK_SYM_RE: OnceLock<Regex> = OnceLock::new();
     let stack_sym_re = STACK_SYM_RE.get_or_init(|| {
-        Regex::new(r"(?i)_Min_Stack_Size\s*=\s*(0x[0-9a-fA-F]+|\d+[KMG]?)\s*;").expect("valid stack sym re")
+        Regex::new(r"(?i)_Min_Stack_Size\s*=\s*(0x[0-9a-fA-F]+|\d+[KMG]?)\s*;")
+            .expect("valid stack sym re")
     });
 
     let mut regions = Vec::new();
@@ -63,10 +67,15 @@ pub fn audit_linker_script(rel_path: &str, content: &str) -> (Vec<MemoryRegion>,
         let ln = idx + 1;
         if let Some(c) = region_re.captures(line)
             && let (Some(name), Some(orig_m), Some(len_m)) = (c.get(1), c.get(3), c.get(4))
-            && let (Some(origin), Some(length)) =
-                (parse_ld_size(orig_m.as_str()), parse_ld_size(len_m.as_str()))
+            && let (Some(origin), Some(length)) = (
+                parse_ld_size(orig_m.as_str()),
+                parse_ld_size(len_m.as_str()),
+            )
         {
-            let attrs = c.get(2).map(|m| m.as_str().to_ascii_lowercase()).unwrap_or_default();
+            let attrs = c
+                .get(2)
+                .map(|m| m.as_str().to_ascii_lowercase())
+                .unwrap_or_default();
             regions.push(MemoryRegion {
                 name: name.as_str().to_string(),
                 attrs,
@@ -162,7 +171,10 @@ pub struct WcsdResult {
 
 /// Computes exact Inter-Procedural Worst-Case Stack Depth (WCSD) across a firmware call graph,
 /// detects unbounded recursion cycles, and adds worst-case ISR nesting overhead.
-pub fn compute_wcsd(nodes: &[FnStackNode], stack_budget_bytes: u64) -> (WcsdResult, Vec<LocalStaticFinding>) {
+pub fn compute_wcsd(
+    nodes: &[FnStackNode],
+    stack_budget_bytes: u64,
+) -> (WcsdResult, Vec<LocalStaticFinding>) {
     let map: HashMap<&str, &FnStackNode> = nodes.iter().map(|n| (n.name.as_str(), n)).collect();
     let mut memo: HashMap<String, (u64, Vec<String>)> = HashMap::new();
     let mut has_recursion = false;
@@ -228,7 +240,14 @@ pub fn compute_wcsd(nodes: &[FnStackNode], stack_budget_bytes: u64) -> (WcsdResu
     let mut visiting = HashSet::new();
 
     for n in nodes {
-        let (bytes, chain) = dfs(&n.name, &map, &mut visiting, &mut memo, &mut has_recursion, &mut findings);
+        let (bytes, chain) = dfs(
+            &n.name,
+            &map,
+            &mut visiting,
+            &mut memo,
+            &mut has_recursion,
+            &mut findings,
+        );
         if n.is_isr {
             // Hardware exception frame (32 bytes Cortex-M basic frame) + ISR call chain
             worst_isr_bytes = worst_isr_bytes.max(bytes.saturating_add(32));
@@ -239,7 +258,8 @@ pub fn compute_wcsd(nodes: &[FnStackNode], stack_budget_bytes: u64) -> (WcsdResu
     }
 
     let worst_case_bytes = worst_task_bytes.saturating_add(worst_isr_bytes);
-    if stack_budget_bytes > 0 && worst_case_bytes > stack_budget_bytes
+    if stack_budget_bytes > 0
+        && worst_case_bytes > stack_budget_bytes
         && let Some(entry_name) = worst_chain.first()
         && let Some(entry_node) = map.get(entry_name.as_str())
     {
@@ -295,7 +315,9 @@ pub fn analyze_dma_cache_coherency(rel_path: &str, source: &str) -> Vec<LocalSta
     for (idx, line) in source.lines().enumerate() {
         let ln = idx + 1;
         let t = line.trim();
-        if (t.contains("HAL_DMA_Start") || t.contains("HAL_SPI_Transmit_DMA") || t.contains("HAL_UART_Transmit_DMA"))
+        if (t.contains("HAL_DMA_Start")
+            || t.contains("HAL_SPI_Transmit_DMA")
+            || t.contains("HAL_UART_Transmit_DMA"))
             && !has_clean
         {
             findings.push(LocalStaticFinding {
@@ -312,7 +334,9 @@ pub fn analyze_dma_cache_coherency(rel_path: &str, source: &str) -> Vec<LocalSta
             });
             break;
         }
-        if (t.contains("HAL_SPI_Receive_DMA") || t.contains("HAL_UART_Receive_DMA")) && !has_invalidate {
+        if (t.contains("HAL_SPI_Receive_DMA") || t.contains("HAL_UART_Receive_DMA"))
+            && !has_invalidate
+        {
             findings.push(LocalStaticFinding {
                 rule_id: "SMG-HW-DMA".into(),
                 severity: "HIGH".into(),
@@ -384,7 +408,10 @@ _Min_Stack_Size = 128K;
         let (res, hits) = compute_wcsd(&nodes, 2048);
         assert_eq!(res.worst_case_bytes, 2336);
         assert!(!res.has_unbounded_recursion);
-        assert!(hits.iter().any(|h| h.title.contains("Worst-Case Stack Depth")));
+        assert!(
+            hits.iter()
+                .any(|h| h.title.contains("Worst-Case Stack Depth"))
+        );
     }
 
     #[test]

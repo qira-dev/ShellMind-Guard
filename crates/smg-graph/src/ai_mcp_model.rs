@@ -47,9 +47,7 @@ fn extract_assigned_var(line: &str) -> Option<String> {
     let lhs = lhs.trim().trim_end_matches(':');
     let name = lhs.split(':').next()?.trim();
     if !name.is_empty()
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         && !matches!(name, "if" | "while" | "return" | "for")
     {
         Some(name.to_string())
@@ -67,8 +65,7 @@ fn line_mentions_ident(line: &str, ident: &str) -> bool {
     let mut i = 0usize;
     while i + ib.len() <= bytes.len() {
         if &bytes[i..i + ib.len()] == ib {
-            let left_ok =
-                i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+            let left_ok = i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
             let right_ok = i + ib.len() == bytes.len()
                 || !(bytes[i + ib.len()].is_ascii_alphanumeric() || bytes[i + ib.len()] == b'_');
             if left_ok && right_ok {
@@ -159,14 +156,19 @@ pub fn analyze_indirect_prompt_injection(rel_path: &str, source: &str) -> Vec<Lo
         if let Some(lhs) = extract_assigned_var(trimmed) {
             if has_sanitizer {
                 tainted_vars.remove(&lhs);
-            } else if tainted_vars.iter().any(|tv| line_mentions_ident(trimmed, tv)) {
+            } else if tainted_vars
+                .iter()
+                .any(|tv| line_mentions_ident(trimmed, tv))
+            {
                 tainted_vars.insert(lhs.clone());
             }
         }
 
         // Step C: Tainted RAG/Web data flows into LLM invocation
         if LLM_SINKS.iter().any(|s| trimmed.contains(s)) {
-            let uses_tainted = tainted_vars.iter().any(|tv| line_mentions_ident(trimmed, tv));
+            let uses_tainted = tainted_vars
+                .iter()
+                .any(|tv| line_mentions_ident(trimmed, tv));
             if uses_tainted && !has_sanitizer {
                 findings.push(mk_ai_finding(
                     "SMG-AI-INDIRECT-PROMPT-INJ",
@@ -450,7 +452,9 @@ pub fn inspect_pickle_bytes(rel_path: &str, bytes: &[u8]) -> Vec<LocalStaticFind
     // Check pickle magic (`0x80 <proto 2..=5>`) or ASCII protocol 0 (`c<mod>\n<name>\n`)
     let looks_like_pickle = (bytes[0] == 0x80 && (2..=5).contains(&bytes[1]))
         || bytes[0] == b'c'
-        || bytes.windows(2).any(|w| w[0] == 0x80 && (2..=5).contains(&w[1]));
+        || bytes
+            .windows(2)
+            .any(|w| w[0] == 0x80 && (2..=5).contains(&w[1]));
     if !looks_like_pickle {
         return Vec::new();
     }
@@ -524,7 +528,14 @@ pub fn scan_repo_ai_model_artifacts(project_root: &std::path::Path) -> Vec<Local
             if path.is_dir() {
                 if matches!(
                     name_str.as_ref(),
-                    ".git" | "target" | "node_modules" | ".venv" | "venv" | "__pycache__" | "dist" | "build"
+                    ".git"
+                        | "target"
+                        | "node_modules"
+                        | ".venv"
+                        | "venv"
+                        | "__pycache__"
+                        | "dist"
+                        | "build"
                 ) {
                     continue;
                 }
@@ -587,7 +598,10 @@ def safe_answer(query):
     return client.chat.completions.create(model="gpt-4o", messages=[{"role": "user", "content": prompt}])
 "#;
         let hits = analyze_indirect_prompt_injection("agent/safe.py", py);
-        assert!(hits.is_empty(), "sanitized prompt should not fire: {hits:?}");
+        assert!(
+            hits.is_empty(),
+            "sanitized prompt should not fire: {hits:?}"
+        );
     }
 
     #[test]
@@ -618,7 +632,8 @@ cfg = AutoModel.from_pretrained("org/model", trust_remote_code=True)
         assert_eq!(pkl_hits[0].rule_id, "SMG-AI-PICKLE-MALICIOUS-OPCODE");
 
         // HuggingFace tokenizer_config.json Jinja2 SSTI payload
-        let tok_cfg = r#"{"chat_template": "{{ cycler.__init__.__globals__.os.popen('id').read() }}"}"#;
+        let tok_cfg =
+            r#"{"chat_template": "{{ cycler.__init__.__globals__.os.popen('id').read() }}"}"#;
         let ssti_hits = inspect_chat_template_ssti("models/tokenizer_config.json", tok_cfg);
         assert_eq!(ssti_hits.len(), 1);
         assert_eq!(ssti_hits[0].rule_id, "SMG-AI-CHAT-TEMPLATE-SSTI");

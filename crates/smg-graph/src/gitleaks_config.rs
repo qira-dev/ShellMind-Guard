@@ -247,7 +247,11 @@ impl GitleaksConfig {
                 continue;
             }
             for m in rule.regex.find_iter(full_source) {
-                let line_num = full_source[..m.start()].bytes().filter(|&b| b == b'\n').count() + 1;
+                let line_num = full_source[..m.start()]
+                    .bytes()
+                    .filter(|&b| b == b'\n')
+                    .count()
+                    + 1;
                 let tok = m.as_str();
                 if self.is_fingerprint_ignored(None, rel_path, &rule.id, line_num) {
                     continue;
@@ -261,7 +265,10 @@ impl GitleaksConfig {
                     rule_id: format!("SMG-GITLEAKS-{}", rule.id.to_ascii_uppercase()),
                     severity: "HIGH".into(),
                     title: if rule.description.is_empty() {
-                        format!("Multi-line secret matched custom Gitleaks rule `{}`", rule.id)
+                        format!(
+                            "Multi-line secret matched custom Gitleaks rule `{}`",
+                            rule.id
+                        )
                     } else {
                         rule.description.clone()
                     },
@@ -271,7 +278,9 @@ impl GitleaksConfig {
                     sink_kind: SinkKind::SecretLeak,
                     missing_guard: GuardKind::SecretPolicy,
                     confidence: Confidence::Confirmed,
-                    remediation: "Revoke the exposed credential and move it to a secure secrets manager.".into(),
+                    remediation:
+                        "Revoke the exposed credential and move it to a secure secrets manager."
+                            .into(),
                 });
             }
         }

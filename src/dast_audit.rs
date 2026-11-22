@@ -27,6 +27,8 @@ use std::time::{Duration, Instant};
 const DEFAULT_MAX_PAGES: usize = 30;
 const MAX_TARGETS_ACTIVE: usize = 60;
 const MAX_BODY_CAPTURE: usize = 2 * 1024 * 1024;
+/// Extra wait after the load event so post-load SPA XHRs are captured.
+const SPA_SETTLE_MS: u64 = 800;
 
 fn link_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -73,6 +75,7 @@ pub struct DastReport {
     pub targets_tested: usize,
     pub findings: Vec<DastFinding>,
     pub active_enabled: bool,
+    pub spa_enabled: bool,
     pub elapsed_ms: u128,
 }
 
@@ -83,6 +86,9 @@ pub struct DastConfig {
     pub max_pages: usize,
     pub max_depth: usize,
     pub active: bool,
+    /// Render pages in headless Chrome (`--spa`): harvest client-side routes,
+    /// XHR/Fetch endpoints, and DOM source-to-sink flows.
+    pub spa: bool,
     pub timeout: Duration,
     pub allow_remote: bool,
 }
@@ -95,6 +101,7 @@ impl Default for DastConfig {
             max_pages: DEFAULT_MAX_PAGES,
             max_depth: 3,
             active: true,
+            spa: false,
             timeout: Duration::from_secs(8),
             allow_remote: false,
         }
@@ -776,6 +783,25 @@ pub fn run_dast_audit(cfg: &DastConfig) -> Result<DastReport> {
     let helper = HttpHelper::build(cfg.timeout, cfg.headers.clone())?;
     let started = Instant::now();
 
+    // Optional headless-browser plane (`--spa`). The engine must outlive the
+    // session (Chrome dies with the engine), hence the session-first tuple.
+    let mut spa: Option<(crate::cdp_engine::CdpSession, crate::cdp_engine::CdpEngine)> = None;
+    if cfg.spa {
+        match crate::cdp_engine::CdpEngine::launch() {
+            Ok(engine) => match engine.session() {
+                Ok(session) => spa = Some((session, engine)),
+                Err(e) => eprintln!(
+                    "  smg dast: --spa requested but the CDP session failed: {e}; continuing with classic crawl"
+                ),
+            },
+            Err(e) => eprintln!(
+                "  smg dast: --spa requested but headless Chrome is unavailable: {e}; continuing with classic crawl"
+            ),
+        }
+    }
+
+    let mut findings: Vec<DastFinding> = Vec::new();
+
     // ---- Crawl (same-host BFS) ----
     let mut queue: VecDeque<(String, usize)> = VecDeque::new();
     let mut visited: HashSet<String> = HashSet::new();
@@ -811,10 +837,63 @@ pub fn run_dast_audit(cfg: &DastConfig) -> Result<DastReport> {
                 }
             }
         }
+
+        // SPA pass: render in headless Chrome, harvest client-side routes,
+        // background XHR/Fetch endpoints, and DOM source-sink flows.
+        if let Some((session, _engine)) = spa.as_mut() {
+            match session.navigate_and_collect(&url, SPA_SETTLE_MS) {
+                Ok(data) => {
+                    for f in data.dom_findings {
+                        let payload = f.sink.clone();
+                        let evidence =
+                            format!("source '{}' flows into sink '{}'", f.source, f.sink);
+                        dedup_insert(
+                            &mut findings,
+                            DastFinding {
+                                id: "SMG-DAST-DOMXSS-SRC-SINK".into(),
+                                severity: "high".into(),
+                                url: url.clone(),
+                                param: None,
+                                payload,
+                                evidence,
+                                proof: f.value,
+                            },
+                        );
+                    }
+                    if depth < cfg.max_depth {
+                        for cap in link_re().captures_iter(&data.rendered_html) {
+                            if let Some(next) = resolve_url(&base, &cap[1]) {
+                                queue.push_back((next, depth + 1));
+                            }
+                        }
+                        for cap in js_path_re().captures_iter(&data.rendered_html) {
+                            if let Some(next) = resolve_url(&base, &cap[1]) {
+                                queue.push_back((next, depth + 1));
+                            }
+                        }
+                    }
+                    // Background API endpoints behave like crawlable pages for
+                    // the param-harvesting phase.
+                    for xhr in data.xhr_urls {
+                        if let Some(next) = resolve_url(&base, &xhr) {
+                            queue.push_back((next, depth + 1));
+                        }
+                    }
+                    for form in extract_forms(&data.rendered_html) {
+                        if let Some(resolved) = resolve_url(&base, &form.action) {
+                            forms.push((resolved, form));
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("  smg dast: SPA render failed for {url}: {e}");
+                }
+            }
+        }
+
         pages.push(page);
     }
 
-    let mut findings: Vec<DastFinding> = Vec::new();
     for page in &pages {
         findings.extend(passive_header_findings(page));
     }
@@ -920,6 +999,7 @@ pub fn run_dast_audit(cfg: &DastConfig) -> Result<DastReport> {
         targets_tested,
         findings,
         active_enabled: cfg.active,
+        spa_enabled: cfg.spa && spa.is_some(),
         elapsed_ms: started.elapsed().as_millis(),
     })
 }
@@ -1173,6 +1253,7 @@ mod tests {
             max_pages: 10,
             max_depth: 2,
             active: true,
+            spa: false,
             timeout: Duration::from_secs(5),
             allow_remote: false,
         })

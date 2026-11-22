@@ -775,9 +775,11 @@ resource "aws_security_group" "alb_https" {
 }
 
 resource "aws_db_instance" "main" {
-  identifier          = "prod-db"
-  publicly_accessible = false
-  storage_encrypted   = true
+  identifier                          = "prod-db"
+  publicly_accessible                 = false
+  storage_encrypted                   = true
+  iam_database_authentication_enabled = true
+  deletion_protection                 = true
 }
 
 resource "aws_lb_listener" "tls" {

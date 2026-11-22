@@ -28,10 +28,7 @@ fn lang_semantic_guard_snippet(
     guard: GuardKind,
 ) -> (Option<&'static str>, &'static str) {
     match (lang, guard) {
-        (Language::Rust, GuardKind::Auth) => (
-            None,
-            "ensure_authenticated(ctx)?;",
-        ),
+        (Language::Rust, GuardKind::Auth) => (None, "ensure_authenticated(ctx)?;"),
         (Language::Rust, GuardKind::TxLock) => (
             None,
             "let _tx_guard = tx.lock().map_err(|_| anyhow::anyhow!(\"lock poisoned\"))?;",
@@ -48,58 +45,38 @@ fn lang_semantic_guard_snippet(
             Some("from app.security import require_authenticated"),
             "require_authenticated(request)",
         ),
-        (Language::Python, GuardKind::TxLock) => (
-            None,
-            "with db.begin():  # row-level SELECT FOR UPDATE",
-        ),
+        (Language::Python, GuardKind::TxLock) => {
+            (None, "with db.begin():  # row-level SELECT FOR UPDATE")
+        }
         (Language::Go, GuardKind::Auth) => (
             None,
             "if err := requireAuth(ctx); err != nil { return err }",
         ),
-        (Language::Java, GuardKind::Auth) => (
-            None,
-            "SecurityGuard.requireAuthenticated(principal);",
-        ),
-        (Language::CSharp, GuardKind::Auth) => (
-            None,
-            "SecurityGuard.EnsureAuthenticated(User);",
-        ),
-        (Language::Php, GuardKind::Auth) => (
-            None,
-            "AuthGuard::requireAuthenticated($request);",
-        ),
-        (Language::Ruby, GuardKind::Auth) => (
-            None,
-            "authenticate_user!",
-        ),
-        (Language::Kotlin, GuardKind::Auth) => (
-            None,
-            "requireAuthenticated(call)",
-        ),
-        (Language::Swift, GuardKind::Auth) => (
-            None,
-            "try requireAuthenticated(req)",
-        ),
-        (Language::Dart, GuardKind::Auth) => (
-            None,
-            "await requireAuthenticated(request);",
-        ),
-        (Language::C | Language::Cpp, GuardKind::Auth) => (
-            None,
-            "if (!smg_check_auth(ctx)) { return -1; }",
-        ),
-        (Language::Solidity, GuardKind::Auth) => (
-            None,
-            "require(msg.sender == owner, \"Unauthorized\");",
-        ),
-        (Language::Move, GuardKind::Auth) => (
-            None,
-            "assert!(signer::address_of(account) == admin, 0);",
-        ),
+        (Language::Java, GuardKind::Auth) => {
+            (None, "SecurityGuard.requireAuthenticated(principal);")
+        }
+        (Language::CSharp, GuardKind::Auth) => (None, "SecurityGuard.EnsureAuthenticated(User);"),
+        (Language::Php, GuardKind::Auth) => (None, "AuthGuard::requireAuthenticated($request);"),
+        (Language::Ruby, GuardKind::Auth) => (None, "authenticate_user!"),
+        (Language::Kotlin, GuardKind::Auth) => (None, "requireAuthenticated(call)"),
+        (Language::Swift, GuardKind::Auth) => (None, "try requireAuthenticated(req)"),
+        (Language::Dart, GuardKind::Auth) => (None, "await requireAuthenticated(request);"),
+        (Language::C | Language::Cpp, GuardKind::Auth) => {
+            (None, "if (!smg_check_auth(ctx)) { return -1; }")
+        }
+        (Language::Solidity, GuardKind::Auth) => {
+            (None, "require(msg.sender == owner, \"Unauthorized\");")
+        }
+        (Language::Move, GuardKind::Auth) => {
+            (None, "assert!(signer::address_of(account) == admin, 0);")
+        }
         // Generic safe guard fallback for remaining guard kinds across all 16 languages
         (Language::Python, _) => (None, "validate_and_sanitize_input(payload)"),
         (Language::Ruby, _) => (None, "validate_and_sanitize_input!(params)"),
-        (Language::Go, _) => (None, "if err := validateInput(req); err != nil { return err }"),
+        (Language::Go, _) => (
+            None,
+            "if err := validateInput(req); err != nil { return err }",
+        ),
         (Language::Kotlin | Language::Swift, _) => (None, "validateInput(input)"),
         (Language::Solidity, _) => (None, "require(amount > 0, \"Invalid input\");"),
         (Language::Move, _) => (None, "assert!(amount > 0, 1);"),
@@ -210,7 +187,9 @@ where
             rolled_back: true,
             unified_diff: udiff,
             final_source: source.to_string(),
-            reason: "--verify-fix check reported target finding still present — rolled back atomically".into(),
+            reason:
+                "--verify-fix check reported target finding still present — rolled back atomically"
+                    .into(),
         };
     }
 
@@ -232,33 +211,104 @@ mod tests {
     #[test]
     fn synthesizes_and_verifies_multi_hunk_patches_across_all_16_languages() {
         let cases: &[(Language, &str, &str, usize)] = &[
-            (Language::Rust, "a.rs", "fn pay(ctx: &Ctx) -> anyhow::Result<()> {\n    debit();\n    Ok(())\n}\n", 2),
-            (Language::TypeScript, "a.ts", "export async function pay(req: any, res: any) {\n  return debit();\n}\n", 2),
-            (Language::JavaScript, "a.js", "export async function pay(req, res) {\n  return debit();\n}\n", 2),
-            (Language::Python, "a.py", "def pay(request):\n    return debit()\n", 2),
-            (Language::Go, "a.go", "package main\nfunc pay(ctx any) error {\n\treturn debit()\n}\n", 3),
-            (Language::Java, "A.java", "class A {\n  void pay() {\n    debit();\n  }\n}\n", 3),
-            (Language::CSharp, "A.cs", "class A {\n  void Pay() {\n    Debit();\n  }\n}\n", 3),
-            (Language::Php, "a.php", "<?php\nfunction pay($request) {\n  debit();\n}\n", 3),
+            (
+                Language::Rust,
+                "a.rs",
+                "fn pay(ctx: &Ctx) -> anyhow::Result<()> {\n    debit();\n    Ok(())\n}\n",
+                2,
+            ),
+            (
+                Language::TypeScript,
+                "a.ts",
+                "export async function pay(req: any, res: any) {\n  return debit();\n}\n",
+                2,
+            ),
+            (
+                Language::JavaScript,
+                "a.js",
+                "export async function pay(req, res) {\n  return debit();\n}\n",
+                2,
+            ),
+            (
+                Language::Python,
+                "a.py",
+                "def pay(request):\n    return debit()\n",
+                2,
+            ),
+            (
+                Language::Go,
+                "a.go",
+                "package main\nfunc pay(ctx any) error {\n\treturn debit()\n}\n",
+                3,
+            ),
+            (
+                Language::Java,
+                "A.java",
+                "class A {\n  void pay() {\n    debit();\n  }\n}\n",
+                3,
+            ),
+            (
+                Language::CSharp,
+                "A.cs",
+                "class A {\n  void Pay() {\n    Debit();\n  }\n}\n",
+                3,
+            ),
+            (
+                Language::Php,
+                "a.php",
+                "<?php\nfunction pay($request) {\n  debit();\n}\n",
+                3,
+            ),
             (Language::Ruby, "a.rb", "def pay\n  debit\nend\n", 2),
-            (Language::Kotlin, "A.kt", "fun pay(call: Any) {\n  debit()\n}\n", 2),
-            (Language::Swift, "a.swift", "func pay(_ req: Any) throws {\n  debit()\n}\n", 2),
-            (Language::Dart, "a.dart", "Future<void> pay(dynamic request) async {\n  debit();\n}\n", 2),
-            (Language::C, "a.c", "int pay(void *ctx) {\n  return debit();\n}\n", 2),
-            (Language::Cpp, "a.cpp", "int pay(void *ctx) {\n  return debit();\n}\n", 2),
-            (Language::Solidity, "A.sol", "contract A {\n  function pay() external {\n    debit();\n  }\n}\n", 3),
-            (Language::Move, "a.move", "module m::a {\n  public fun pay(account: &signer) {\n    debit();\n  }\n}\n", 3),
+            (
+                Language::Kotlin,
+                "A.kt",
+                "fun pay(call: Any) {\n  debit()\n}\n",
+                2,
+            ),
+            (
+                Language::Swift,
+                "a.swift",
+                "func pay(_ req: Any) throws {\n  debit()\n}\n",
+                2,
+            ),
+            (
+                Language::Dart,
+                "a.dart",
+                "Future<void> pay(dynamic request) async {\n  debit();\n}\n",
+                2,
+            ),
+            (
+                Language::C,
+                "a.c",
+                "int pay(void *ctx) {\n  return debit();\n}\n",
+                2,
+            ),
+            (
+                Language::Cpp,
+                "a.cpp",
+                "int pay(void *ctx) {\n  return debit();\n}\n",
+                2,
+            ),
+            (
+                Language::Solidity,
+                "A.sol",
+                "contract A {\n  function pay() external {\n    debit();\n  }\n}\n",
+                3,
+            ),
+            (
+                Language::Move,
+                "a.move",
+                "module m::a {\n  public fun pay(account: &signer) {\n    debit();\n  }\n}\n",
+                3,
+            ),
         ];
 
         for &(lang, file, src, line) in cases {
-            let outcome = apply_patch_and_verify_fix(
-                lang,
-                GuardKind::Auth,
-                file,
-                src,
-                line,
-                |patched| patched.len() > src.len(),
-            );
+            let outcome =
+                apply_patch_and_verify_fix(lang, GuardKind::Auth, file, src, line, |patched| {
+                    patched.len() > src.len()
+                });
             assert!(
                 outcome.applied && outcome.syntax_ok && outcome.finding_eliminated,
                 "16-lang patch failed for {lang:?}: {outcome:#?}"
@@ -268,7 +318,10 @@ mod tests {
 
         // Verify atomic rollback when `--verify-fix` reports finding still present
         let src = "def pay(request):\n    return debit()\n";
-        let rolled = apply_patch_and_verify_fix(Language::Python, GuardKind::Auth, "a.py", src, 2, |_| false);
+        let rolled =
+            apply_patch_and_verify_fix(Language::Python, GuardKind::Auth, "a.py", src, 2, |_| {
+                false
+            });
         assert!(!rolled.applied);
         assert!(rolled.rolled_back);
         assert_eq!(rolled.final_source, src);

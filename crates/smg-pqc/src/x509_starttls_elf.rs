@@ -34,21 +34,29 @@ pub fn inspect_x509_der(
 ) -> (DerCertAudit, Vec<LocalStaticFinding>) {
     // Standard DER-encoded OID bytes:
     // sha1WithRSAEncryption: 1.2.840.113549.1.1.5
-    const OID_SHA1_RSA: &[u8] = &[0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x05];
+    const OID_SHA1_RSA: &[u8] = &[
+        0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x05,
+    ];
     // ecdsa-with-SHA1: 1.2.840.10045.4.1
     const OID_SHA1_ECDSA: &[u8] = &[0x06, 0x07, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x01];
     // md5WithRSAEncryption: 1.2.840.113549.1.1.4
-    const OID_MD5_RSA: &[u8] = &[0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x04];
+    const OID_MD5_RSA: &[u8] = &[
+        0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x04,
+    ];
     // NIST ML-DSA-44/65/87: 2.16.840.1.101.3.4.3.{17,18,19}
     const OID_ML_DSA_PREFIX: &[u8] = &[0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03];
     // Subject Alternative Name extension: 2.5.29.17
     const OID_SAN: &[u8] = &[0x06, 0x03, 0x55, 0x1D, 0x11];
     // Certificate Transparency SCT List extension: 1.3.6.1.4.1.11129.2.4.2
-    const OID_CT_SCT: &[u8] = &[0x06, 0x0A, 0x2B, 0x06, 0x01, 0x04, 0x01, 0xD6, 0x79, 0x02, 0x04, 0x02];
+    const OID_CT_SCT: &[u8] = &[
+        0x06, 0x0A, 0x2B, 0x06, 0x01, 0x04, 0x01, 0xD6, 0x79, 0x02, 0x04, 0x02,
+    ];
     // TLS Feature (OCSP Must-Staple): 1.3.6.1.5.5.7.1.24
-    const OID_OCSP_MUST_STAPLE: &[u8] = &[0x06, 0x08, 0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x18];
+    const OID_OCSP_MUST_STAPLE: &[u8] =
+        &[0x06, 0x08, 0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x18];
 
-    let has_sha1_sig = contains_subslice(der, OID_SHA1_RSA) || contains_subslice(der, OID_SHA1_ECDSA);
+    let has_sha1_sig =
+        contains_subslice(der, OID_SHA1_RSA) || contains_subslice(der, OID_SHA1_ECDSA);
     let has_md5_sig = contains_subslice(der, OID_MD5_RSA);
     let has_san_extension = contains_subslice(der, OID_SAN);
     let has_wildcard_san = has_san_extension && contains_subslice(der, b"*.");
@@ -121,7 +129,9 @@ pub fn inspect_x509_der(
             sink_kind: SinkKind::Misconfiguration,
             missing_guard: GuardKind::ConfigPolicy,
             confidence: Confidence::Proven,
-            remediation: "Re-issue the certificate with SHA-256/SHA-384 ECDSA or NIST PQC ML-DSA-65/87.".into(),
+            remediation:
+                "Re-issue the certificate with SHA-256/SHA-384 ECDSA or NIST PQC ML-DSA-65/87."
+                    .into(),
         });
     }
     if expired {
@@ -169,6 +179,59 @@ pub fn inspect_x509_der(
         expired,
     };
     (audit, findings)
+}
+
+/// Extracts the Subject CN and all dNSName SAN entries from a DER certificate
+/// (`ssl:` template matching needs the actual values, not just presence).
+/// Substring-scan style consistent with `inspect_x509_der` — the Subject RDN
+/// comes after the Issuer RDN in DER, so the LAST CN OID occurrence is the
+/// subject's; dNSName entries are `82 LL <ascii>` TLVs after the SAN OID.
+pub fn extract_cn_and_san_dns(der: &[u8]) -> (Option<String>, Vec<String>) {
+    // Common Name: 2.5.4.3 encoded as `06 03 55 04 03`.
+    const OID_CN: &[u8] = &[0x06, 0x03, 0x55, 0x04, 0x03];
+    let mut cn = None;
+    if let Some(pos) = der.windows(OID_CN.len()).rposition(|w| w == OID_CN) {
+        let rest = &der[pos + OID_CN.len()..];
+        if rest.len() >= 2 {
+            let tag = rest[0];
+            let len = rest[1] as usize;
+            if matches!(tag, 0x0C | 0x13 | 0x16)
+                && len > 0
+                && 2 + len <= rest.len()
+                && let Ok(s) = std::str::from_utf8(&rest[2..2 + len])
+            {
+                cn = Some(s.to_string());
+            }
+        }
+    }
+
+    // Subject Alternative Name: 2.5.29.17; GeneralNames dNSName = [2] (0x82).
+    const OID_SAN: &[u8] = &[0x06, 0x03, 0x55, 0x1D, 0x11];
+    let mut sans = Vec::new();
+    if let Some(pos) = der.windows(OID_SAN.len()).position(|w| w == OID_SAN) {
+        let start = pos + OID_SAN.len();
+        let bound = (start + 4096).min(der.len());
+        let mut i = start;
+        while i + 2 <= bound {
+            if der[i] == 0x82 {
+                let len = der[i + 1] as usize;
+                if len > 0
+                    && i + 2 + len <= bound
+                    && der[i + 2..i + 2 + len].iter().all(|b| b.is_ascii_graphic())
+                {
+                    if let Ok(s) = std::str::from_utf8(&der[i + 2..i + 2 + len])
+                        && !s.is_empty()
+                    {
+                        sans.push(s.to_string());
+                    }
+                    i += 2 + len;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+    }
+    (cn, sans)
 }
 
 /// STARTTLS application protocol selector.
@@ -406,5 +469,32 @@ mod tests {
         let ids: Vec<&str> = findings.iter().map(|f| f.rule_id.as_str()).collect();
         assert!(ids.contains(&"SMG-ELF-BROKEN-CRYPTO"));
         assert!(ids.contains(&"SMG-ELF-QUANTUM-VULN"));
+    }
+
+    #[test]
+    fn extracts_subject_cn_and_dns_sans() {
+        // Synthetic DER: Issuer CN (first OID occurrence) then Subject CN
+        // (last occurrence — the subject follows the issuer), then the SAN
+        // extension with two dNSName TLVs.
+        let mut der = Vec::new();
+        der.extend_from_slice(&[0x06, 0x03, 0x55, 0x04, 0x03]);
+        der.extend_from_slice(&[0x0C, 0x0C]);
+        der.extend_from_slice(b"Issuer CA CN");
+        der.extend_from_slice(&[0x06, 0x03, 0x55, 0x04, 0x03]);
+        der.extend_from_slice(&[0x0C, 0x10]);
+        der.extend_from_slice(b"lab.example.test");
+        der.extend_from_slice(&[0x06, 0x03, 0x55, 0x1D, 0x11, 0x04]);
+        der.extend_from_slice(&[0x82, 0x03]);
+        der.extend_from_slice(b"abc");
+        der.extend_from_slice(&[0x82, 0x0A]);
+        der.extend_from_slice(b"wild.trace");
+        let (cn, sans) = extract_cn_and_san_dns(&der);
+        assert_eq!(cn.as_deref(), Some("lab.example.test"));
+        assert_eq!(sans, vec!["abc".to_string(), "wild.trace".to_string()]);
+
+        // No CN/SAN present → empty results, not a panic.
+        let (cn, sans) = extract_cn_and_san_dns(b"\x30\x00");
+        assert!(cn.is_none());
+        assert!(sans.is_empty());
     }
 }

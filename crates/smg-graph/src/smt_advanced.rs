@@ -57,27 +57,13 @@ pub enum BvConstraint {
         eq: bool,
     },
     /// `(var | mask) == val`
-    BitOrEq {
-        var: String,
-        mask: u64,
-        val: u64,
-    },
+    BitOrEq { var: String, mask: u64, val: u64 },
     /// `(var >> shift) == val` (logical unsigned right shift, `shift < 64`)
-    UShrEq {
-        var: String,
-        shift: u32,
-        val: u64,
-    },
+    UShrEq { var: String, shift: u32, val: u64 },
     /// `0 <= var <= max_val`
-    UnsignedUpper {
-        var: String,
-        max_val: u64,
-    },
+    UnsignedUpper { var: String, max_val: u64 },
     /// `var == exact`
-    ExactConst {
-        var: String,
-        val: u64,
-    },
+    ExactConst { var: String, val: u64 },
 }
 
 /// Solves a conjunction of `QF_BV` bitvector constraints using exact 64-bit tristate propagation.
@@ -144,9 +130,7 @@ pub fn solve_bv_constraints(constraints: &[BvConstraint]) -> SmtVerdict {
                 if *val > max_shifted {
                     return SmtVerdict::Unsat {
                         solver: "builtin-qf-bv",
-                        reason: format!(
-                            "({var} >> {shift}) == 0x{val:x} exceeds shifted width"
-                        ),
+                        reason: format!("({var} >> {shift}) == 0x{val:x} exceeds shifted width"),
                     };
                 }
                 let shifted_mask = u64::MAX << *shift;
@@ -180,7 +164,9 @@ pub fn solve_bv_constraints(constraints: &[BvConstraint]) -> SmtVerdict {
                 if st.is_contradiction() {
                     return SmtVerdict::Unsat {
                         solver: "builtin-qf-bv",
-                        reason: format!("constant `{var} == 0x{val:x}` contradicts bitmask constraints"),
+                        reason: format!(
+                            "constant `{var} == 0x{val:x}` contradicts bitmask constraints"
+                        ),
                     };
                 }
             }
@@ -285,10 +271,7 @@ pub fn solve_lia_constraints(raw: &[LinearIneq]) -> SmtVerdict {
     }
 
     // Collect variables sorted by ascending elimination cost (pos_count * neg_count)
-    let mut vars: Vec<String> = rows
-        .iter()
-        .flat_map(|r| r.terms.keys().cloned())
-        .collect();
+    let mut vars: Vec<String> = rows.iter().flat_map(|r| r.terms.keys().cloned()).collect();
     vars.sort();
     vars.dedup();
 
@@ -406,10 +389,7 @@ pub enum ArrayConstraint {
         value: i64,
     },
     /// Index equality `idx_a == idx_b`
-    IndexEq {
-        lhs: String,
-        rhs: String,
-    },
+    IndexEq { lhs: String, rhs: String },
 }
 
 /// Applies McCarthy's Read-Over-Write axiom (`select(store(a, i, v), j) == v` when `i == j`)
@@ -665,7 +645,10 @@ mod tests {
             LinearIneq::new([("x".into(), 2)], 3),
             LinearIneq::new([("x".into(), -2)], -3),
         ]);
-        assert!(v_odd.is_unsat(), "expected integer-GCD UNSAT, got {v_odd:?}");
+        assert!(
+            v_odd.is_unsat(),
+            "expected integer-GCD UNSAT, got {v_odd:?}"
+        );
 
         // Multi-variable: x + y <= 10, x - y <= -4 (=> 2x <= 6 => x <= 3), AND x >= 4 (-x <= -4) -> UNSAT
         let v_fm = solve_lia_constraints(&[
@@ -673,7 +656,10 @@ mod tests {
             LinearIneq::new([("x".into(), 1), ("y".into(), -1)], -4),
             LinearIneq::new([("x".into(), -1)], -4),
         ]);
-        assert!(v_fm.is_unsat(), "expected Fourier-Motzkin UNSAT, got {v_fm:?}");
+        assert!(
+            v_fm.is_unsat(),
+            "expected Fourier-Motzkin UNSAT, got {v_fm:?}"
+        );
 
         // Satisfiable: x + y <= 10, x - y <= -4, x >= 3 -> SAT (x=3, y=7)
         let v_sat = solve_lia_constraints(&[
@@ -727,7 +713,10 @@ mod tests {
             &callee_dead,
             false,
         );
-        assert!(verdict.is_unsat(), "expected cross-function UNSAT, got {verdict:?}");
+        assert!(
+            verdict.is_unsat(),
+            "expected cross-function UNSAT, got {verdict:?}"
+        );
 
         // Reachable branch: `if (val >= 10)` -> SAT
         let callee_live = vec![PathConstraint::IntCmp {
@@ -742,6 +731,9 @@ mod tests {
             &callee_live,
             false,
         );
-        assert!(!v_live.is_unsat(), "expected cross-function SAT, got {v_live:?}");
+        assert!(
+            !v_live.is_unsat(),
+            "expected cross-function SAT, got {v_live:?}"
+        );
     }
 }

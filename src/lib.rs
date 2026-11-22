@@ -1,3 +1,4 @@
+mod cdp_engine;
 mod dast_audit;
 mod deps_sync;
 mod http_audit;
@@ -5,7 +6,9 @@ mod idor_audit;
 mod live_verify;
 mod mcp;
 mod oci_image;
+mod oob_server;
 mod proxy;
+mod proxy_mitm;
 mod rules_catalog;
 mod sqli_audit;
 mod templates_audit;
@@ -155,6 +158,39 @@ impl MinConfidenceArg {
             MinConfidenceArg::Heuristic => Confidence::Heuristic,
         }
     }
+}
+
+#[derive(Subcommand, Debug)]
+enum ProxyAction {
+    /// Print (or copy) the local MITM CA certificate for browser/system trust import
+    ExportCa {
+        #[arg(
+            long,
+            value_name = "FILE",
+            help = "Write the CA certificate PEM to this file instead of stdout"
+        )]
+        out: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum OobAction {
+    /// Start the self-hosted OOB callback listener (TCP HTTP catch-all + UDP datagrams)
+    Serve {
+        #[arg(
+            long,
+            default_value = crate::oob_server::DEFAULT_OOB_LISTEN,
+            value_name = "ADDR",
+            help = "Loopback address for both the TCP and UDP callback listeners"
+        )]
+        listen: String,
+        #[arg(
+            long,
+            value_name = "FILE",
+            help = "Append every callback hit as JSONL to this file"
+        )]
+        log: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -696,6 +732,12 @@ enum Commands {
         timeout_ms: u64,
         #[arg(
             long,
+            value_name = "HOST:PORT",
+            help = "Self-hosted OOB callback listener (see `smg oob serve`): enables interactsh-style templates with per-run tokens"
+        )]
+        oob_server: Option<String>,
+        #[arg(
+            long,
             help = "Allow targeting a non-loopback staging URL (default restricts to loopback/private lab hosts)"
         )]
         allow_remote: bool,
@@ -735,6 +777,20 @@ enum Commands {
         header: Vec<String>,
         #[arg(
             long,
+            value_delimiter = ',',
+            value_name = "NAMES",
+            help = "Also test request headers as injection surfaces ('auto' = User-Agent,X-Forwarded-For,Referer)"
+        )]
+        test_headers: Vec<String>,
+        #[arg(
+            long,
+            value_delimiter = ',',
+            value_name = "NAMES",
+            help = "Also test cookie names (from the Cookie header) as injection surfaces"
+        )]
+        test_cookies: Vec<String>,
+        #[arg(
+            long,
             default_value_t = 3,
             value_name = "SECS",
             help = "Time-based payload delay in seconds"
@@ -769,6 +825,11 @@ enum Commands {
         header: Vec<String>,
         #[arg(
             long,
+            help = "Render pages in headless Chrome (SPA crawl): client-side routes, XHR/Fetch endpoints, DOM source-to-sink flows"
+        )]
+        spa: bool,
+        #[arg(
+            long,
             help = "Allow targeting a non-loopback staging URL (default restricts to loopback/private lab hosts)"
         )]
         allow_remote: bool,
@@ -792,6 +853,18 @@ enum Commands {
             help = "Allow binding a non-loopback address (proxy is loopback-only by default)"
         )]
         allow_remote_bind: bool,
+        #[arg(
+            long,
+            help = "Terminate TLS on CONNECT tunnels with an on-the-fly local CA (~/.config/smg/ca-cert.pem); decrypted HTTPS traffic becomes captured/replayable like HTTP"
+        )]
+        mitm_ca: bool,
+        #[command(subcommand)]
+        action: Option<ProxyAction>,
+    },
+    /// Self-hosted OOB callback listener for interactsh-style templates
+    Oob {
+        #[command(subcommand)]
+        action: OobAction,
     },
     /// Passive HTTP security posture + static OpenAPI/GraphQL schema linter (non-destructive)
     HttpAudit {
@@ -816,6 +889,11 @@ enum Commands {
             help = "Explicit GraphQL endpoint for the read-only introspection probe (default: <origin>/graphql)"
         )]
         graphql: Option<String>,
+        #[arg(
+            long,
+            help = "Render the target in headless Chrome: DOM source-to-sink flows + XHR/Fetch endpoints"
+        )]
+        spa: bool,
         #[arg(long, default_value_t = 8_000, value_name = "MS")]
         timeout_ms: u64,
         #[arg(
@@ -3112,6 +3190,7 @@ pub fn run_cli() -> Result<ExitCode> {
             tags,
             max_templates,
             timeout_ms,
+            oob_server,
             allow_remote,
             json,
             fail_on,
@@ -3125,6 +3204,7 @@ pub fn run_cli() -> Result<ExitCode> {
                     tag_filter: tags.iter().map(|s| s.trim().to_string()).collect(),
                     max_templates,
                     timeout: Duration::from_millis(timeout_ms),
+                    oob_server,
                     allow_remote,
                 })?;
             if json {
@@ -3191,6 +3271,8 @@ pub fn run_cli() -> Result<ExitCode> {
             data,
             param,
             header,
+            test_headers,
+            test_cookies,
             delay,
             skip_timing,
             allow_remote,
@@ -3207,6 +3289,8 @@ pub fn run_cli() -> Result<ExitCode> {
                 headers,
                 body: data,
                 params: param,
+                test_headers,
+                test_cookies,
                 delay_secs: delay,
                 skip_timing,
                 allow_remote,
@@ -3263,6 +3347,7 @@ pub fn run_cli() -> Result<ExitCode> {
             max_depth,
             passive_only,
             header,
+            spa,
             allow_remote,
             json,
         } => {
@@ -3277,6 +3362,7 @@ pub fn run_cli() -> Result<ExitCode> {
                 max_pages,
                 max_depth,
                 active: !passive_only,
+                spa,
                 timeout: Duration::from_secs(8),
                 allow_remote,
             })?;
@@ -3321,20 +3407,45 @@ pub fn run_cli() -> Result<ExitCode> {
             no_tui,
             log,
             allow_remote_bind,
+            mitm_ca,
+            action,
         } => {
+            // `smg proxy export-ca` never starts the listener.
+            if let Some(ProxyAction::ExportCa { out }) = action {
+                proxy_mitm::export_ca(out.as_deref())?;
+                return Ok(ExitCode::SUCCESS);
+            }
             let bind_addr: SocketAddr = listen
                 .parse()
                 .with_context(|| format!("Invalid --listen address '{listen}'"))?;
+            let mitm = if mitm_ca {
+                let ca_dir = proxy_mitm::default_ca_dir()?;
+                let ca = proxy_mitm::MitmCa::load_or_create(&ca_dir)?;
+                println!(
+                    "  MITM CA: {} (import into your browser via `smg proxy export-ca` to avoid TLS warnings)",
+                    ca.cert_pem_path.display()
+                );
+                Some(Arc::new(ca))
+            } else {
+                None
+            };
             let handle = proxy::start_proxy(proxy::ProxyConfig {
                 bind_addr,
                 capture_limit: proxy::DEFAULT_CAPTURE_LIMIT,
                 allow_remote_bind,
                 jsonl_log: log,
+                mitm,
             })?;
             let bind = handle.bound_addr;
-            println!(
-                "ShellMind Guard Proxy | listening on http://{bind} (HTTP intercepted · HTTPS CONNECT logged & tunneled transparently)"
-            );
+            if mitm_ca {
+                println!(
+                    "ShellMind Guard Proxy | listening on http://{bind} (HTTP intercepted · HTTPS CONNECT decrypted via local CA)"
+                );
+            } else {
+                println!(
+                    "ShellMind Guard Proxy | listening on http://{bind} (HTTP intercepted · HTTPS CONNECT logged & tunneled transparently)"
+                );
+            }
             println!(
                 "  Point your app/browser proxy at {bind} — TUI keys: j/k select · Tab focus · r replay · d decode · i intruder · e export · q quit"
             );
@@ -3385,11 +3496,31 @@ pub fn run_cli() -> Result<ExitCode> {
                 summary.http_intercepted, summary.https_tunneled, summary.errors
             );
         }
+        Commands::Oob { action } => match action {
+            OobAction::Serve { listen, log } => {
+                let addr: SocketAddr = listen
+                    .parse()
+                    .with_context(|| format!("Invalid --listen address '{listen}'"))?;
+                let handle = oob_server::start_oob_server(addr, log)?;
+                println!(
+                    "ShellMind Guard OOB | TCP {} + UDP {} (HTTP catch-all + raw datagrams; hit store capped at 100k)",
+                    handle.bound_addr, handle.udp_addr
+                );
+                println!(
+                    "  Point templates at it: smg templates <target> --templates DIR --oob-server {}",
+                    handle.bound_addr
+                );
+                println!("  Ctrl+C (SIGINT) stops the listener.");
+                handle.wait_for_stop();
+                println!("  Stopped.");
+            }
+        },
         Commands::HttpAudit {
             url,
             header,
             schema,
             graphql,
+            spa,
             timeout_ms,
             allow_remote,
             json,
@@ -3404,6 +3535,7 @@ pub fn run_cli() -> Result<ExitCode> {
                 headers,
                 schema_file: schema,
                 graphql_endpoint: graphql,
+                spa,
                 timeout: Duration::from_millis(timeout_ms),
                 allow_remote,
             })?;

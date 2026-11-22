@@ -187,7 +187,8 @@ pub fn diff_db_snapshots(
         let before_cnt = before.row_counts.get(tbl).copied().unwrap_or(0);
         let growth = after_cnt.saturating_sub(before_cnt);
         if growth > max_allowed_row_growth {
-            extra_rows_inserted = extra_rows_inserted.saturating_add(growth - max_allowed_row_growth);
+            extra_rows_inserted =
+                extra_rows_inserted.saturating_add(growth - max_allowed_row_growth);
         }
     }
 

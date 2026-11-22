@@ -83,7 +83,9 @@ fn scan_android_gradle(rel_path: &str, source: &str, out: &mut Vec<LocalStaticFi
                 "Set `minifyEnabled true` (or `isMinifyEnabled = true`) in the Android `release` buildType.",
             ));
         }
-        if in_release_block && (low.contains("debuggable true") || low.contains("isdebuggable = true")) {
+        if in_release_block
+            && (low.contains("debuggable true") || low.contains("isdebuggable = true"))
+        {
             out.push(make_phase9_finding(
                 "SMG-MOB-IPC",
                 "HIGH",

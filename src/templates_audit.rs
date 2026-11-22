@@ -1,13 +1,16 @@
 //! Defensive Nuclei-compatible YAML template runner (`smg templates`).
 //!
 //! Loads standard `nuclei-templates/` directories and executes **detection-only**
-//! HTTP, DNS and raw-network (TCP/TLS) templates against a target with strict
-//! lab-scope guardrails:
+//! HTTP, DNS, raw-network (TCP/TLS), `ssl:` (TLS attribute matching),
+//! `websocket:` (ws:// frame round-trip) and `headless:` (CDP-rendered DOM)
+//! templates against a target with strict lab-scope guardrails:
 //! - Defaults to loopback / RFC1918 lab hosts unless `--allow-remote` is passed
 //!   (same policy as `smg idor`).
-//! - Detection templates only: fuzz/payload (`race`, `pipelines`), headless,
-//!   javascript, code, file, ssl, websocket, whois and Interactsh (OOB callback)
-//!   engines are explicitly skipped with a reason instead of guessing.
+//! - Detection templates only: fuzz/payload (`race`, `pipelines`), javascript,
+//!   code, file, whois, flow and lua engines are explicitly skipped with a
+//!   reason instead of guessing. Interactsh/OOB callback templates run only
+//!   against a self-hosted listener (`--oob-server` + `smg oob serve`) with
+//!   per-run random tokens.
 //! - Deterministic substitution: `{{randstr}}` is derived from the template id
 //!   via BLAKE3 so every re-run is byte-for-byte reproducible (zero hallucination).
 
@@ -32,6 +35,9 @@ use std::time::{Duration, Instant};
 
 const MAX_CAPTURE_BODY: usize = 2 * 1024 * 1024;
 const MAX_TEMPLATE_FILES: usize = 5_000;
+/// Post-execution wait before querying the OOB listener so asynchronous
+/// callbacks have time to land.
+const OOB_PROPAGATION_WAIT: Duration = Duration::from_millis(1200);
 
 fn helper_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -187,19 +193,65 @@ pub struct NucleiTemplate {
     pub http: Vec<HttpBlock>,
     pub dns: Vec<DnsBlock>,
     pub network: Vec<NetworkBlock>,
+    pub ssl: Vec<SslBlock>,
+    pub websocket: Vec<WsBlock>,
+    pub headless: Vec<HeadlessBlock>,
     pub variables: HashMap<String, String>,
     pub constants: HashMap<String, String>,
     // Engines that are explicitly outside the defensive detection scope.
-    pub headless: Option<serde_yaml_ng::Value>,
     pub javascript: Option<serde_yaml_ng::Value>,
     pub code: Option<serde_yaml_ng::Value>,
     pub file: Option<serde_yaml_ng::Value>,
-    pub ssl: Option<serde_yaml_ng::Value>,
-    pub websocket: Option<serde_yaml_ng::Value>,
     pub whois: Option<serde_yaml_ng::Value>,
     pub flow: Option<serde_yaml_ng::Value>,
     pub lua: Option<serde_yaml_ng::Value>,
     pub interactive: Option<bool>,
+}
+
+/// `ssl:` block — TLS handshake attribute matching (version, cipher, CN/SAN,
+/// expiry) via the synchronous rustls client + smg-pqc DER inspection.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct SslBlock {
+    pub host: Option<OneOrMany<String>>,
+    pub port: Option<u16>,
+    pub sni: Option<String>,
+    pub matchers: Vec<Matcher>,
+    pub matchers_condition: Option<String>,
+    pub extractors: Vec<Extractor>,
+}
+
+/// `websocket:` block — ws:// handshake, Text-frame inputs, response text
+/// piped through the existing matcher pipeline.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct WsBlock {
+    pub url: Option<String>,
+    pub inputs: Option<Vec<NetworkInput>>,
+    pub matchers: Vec<Matcher>,
+    pub matchers_condition: Option<String>,
+    pub extractors: Vec<Extractor>,
+}
+
+/// `headless:` block — the supported subset of Nuclei headless steps
+/// (`navigate` and `wait`) executed through the shared CDP engine; matchers
+/// run against the final rendered DOM.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct HeadlessBlock {
+    pub steps: Vec<HeadlessStep>,
+    pub matchers: Vec<Matcher>,
+    pub matchers_condition: Option<String>,
+    pub extractors: Vec<Extractor>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct HeadlessStep {
+    pub action: Option<String>,
+    pub url: Option<String>,
+    /// Seconds for `action: wait`.
+    pub duration: Option<f64>,
 }
 
 fn yaml_val_to_string(v: &serde_yaml_ng::Value) -> String {
@@ -847,8 +899,12 @@ fn send_request(
     })
 }
 
-pub fn execute_http_block(runners: &HttpRunners, block: &HttpBlock, vars: &Vars) -> BlockOutcome {
-    let extra = HashMap::new();
+pub fn execute_http_block(
+    runners: &HttpRunners,
+    block: &HttpBlock,
+    vars: &Vars,
+    extra: &HashMap<String, String>,
+) -> BlockOutcome {
     if block.race || block.flow.is_some() || block.payloads.is_some() {
         return BlockOutcome::Skipped(
             "fuzz/race/flow blocks are outside the defensive detection scope".into(),
@@ -858,7 +914,7 @@ pub fn execute_http_block(runners: &HttpRunners, block: &HttpBlock, vars: &Vars)
 
     if let Some(raws) = &block.raw {
         if let Some(raw) = raws.to_vec().into_iter().next() {
-            let substituted = substitute(&raw, vars, &extra);
+            let substituted = substitute(&raw, vars, extra);
             if has_unresolved_vars(&substituted) {
                 return BlockOutcome::Skipped(
                     "raw request has unresolved template variables".into(),
@@ -900,7 +956,7 @@ pub fn execute_http_block(runners: &HttpRunners, block: &HttpBlock, vars: &Vars)
         ));
     }
     if let Some(path) = paths.to_vec().into_iter().next() {
-        let substituted = substitute(&path, vars, &extra);
+        let substituted = substitute(&path, vars, extra);
         if has_unresolved_vars(&substituted) {
             return BlockOutcome::Skipped("path has unresolved template variables".into());
         }
@@ -909,7 +965,7 @@ pub fn execute_http_block(runners: &HttpRunners, block: &HttpBlock, vars: &Vars)
         if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("host")) {
             headers.push(("Host".into(), vars.hostname.clone()));
         }
-        let body = substitute(block.body.as_deref().unwrap_or_default(), vars, &extra);
+        let body = substitute(block.body.as_deref().unwrap_or_default(), vars, extra);
         match send_request(runners, &method, &url, &headers, &body, follow) {
             Ok(resp) => return BlockOutcome::Response(resp),
             Err(e) => return BlockOutcome::Skipped(format!("HTTP request failed: {e}")),
@@ -1344,10 +1400,10 @@ pub fn execute_dns_block(
     vars: &Vars,
     timeout: Duration,
     template_id: &str,
+    extra: &HashMap<String, String>,
 ) -> DnsOutcome {
-    let extra = HashMap::new();
     let name_raw = block.name.clone().unwrap_or_else(|| "{{FQDN}}".into());
-    let name = substitute(&name_raw, vars, &extra);
+    let name = substitute(&name_raw, vars, extra);
     if has_unresolved_vars(&name) {
         return DnsOutcome::Failed("DNS name has unresolved template variables".into());
     }
@@ -1499,8 +1555,8 @@ pub fn execute_network_block(
     block: &NetworkBlock,
     vars: &Vars,
     timeout: Duration,
+    extra: &HashMap<String, String>,
 ) -> Result<Vec<HttpResponse>> {
-    let extra = HashMap::new();
     let hosts = block
         .host
         .as_ref()
@@ -1512,7 +1568,7 @@ pub fn execute_network_block(
     let mut responses = Vec::new();
 
     for host_raw in hosts {
-        let host = substitute(&host_raw, vars, &extra);
+        let host = substitute(&host_raw, vars, extra);
         let (host_name, host_port): (String, Option<u16>) = if !host.contains('[')
             && let Some((h, p)) = host.rsplit_once(':')
         {
@@ -1552,7 +1608,7 @@ pub fn execute_network_block(
             };
             let mut sent = 0usize;
             for input in block.inputs.iter().flatten() {
-                let data = substitute(&input.data, vars, &extra)
+                let data = substitute(&input.data, vars, extra)
                     .replace("\\r", "\r")
                     .replace("\\n", "\n");
                 if conn.write_all(data.as_bytes()).is_err() {
@@ -1580,12 +1636,274 @@ pub fn execute_network_block(
 }
 
 // ---------------------------------------------------------------------------
+// ssl: engine — TLS handshake attribute matching
+// ---------------------------------------------------------------------------
+
+fn current_year_u32() -> u32 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    (1970 + (secs / (365 * 24 * 3600 + 6 * 3600))) as u32
+}
+
+/// Canonical certificate/handshake attribute text fed to the matchers.
+#[cfg(feature = "pqc")]
+fn ssl_cert_attribute_lines(der: &[u8]) -> String {
+    let (audit, _findings) = smg_pqc::inspect_x509_der("templates-ssl", der, current_year_u32());
+    let (cn, sans) = smg_pqc::extract_cn_and_san_dns(der);
+    let mut lines = vec![
+        format!("cn={}", cn.unwrap_or_default()),
+        format!("not_after_year={}", audit.not_after_year.unwrap_or(0)),
+        format!("expired={}", audit.expired),
+        format!("sha1_sig={}", audit.has_sha1_sig),
+        format!("md5_sig={}", audit.has_md5_sig),
+        format!("san_present={}", audit.has_san_extension),
+        format!("wildcard_san={}", audit.has_wildcard_san),
+    ];
+    if sans.is_empty() {
+        lines.push("san=".into());
+    } else {
+        for san in &sans {
+            lines.push(format!("san={san}"));
+        }
+    }
+    lines.join("\n")
+}
+
+#[cfg(not(feature = "pqc"))]
+fn ssl_cert_attribute_lines(der: &[u8]) -> String {
+    format!(
+        "cert_der_len={}\npqc_feature_disabled=true (detailed cert attributes require the `pqc` feature)",
+        der.len()
+    )
+}
+
+/// Executes one `ssl:` block: TLS handshake with the dangerous verifier (same
+/// convention as the `network:` engine), then exposes the negotiated protocol,
+/// cipher suite, and certificate attributes (CN/SAN/expiry via smg-pqc) to the
+/// existing matcher pipeline. Hostname targets are resolved by the OS (the
+/// lab-scope gate already ran at the target level).
+pub fn execute_ssl_block(
+    block: &SslBlock,
+    vars: &Vars,
+    extra: &HashMap<String, String>,
+    timeout: Duration,
+) -> Result<Vec<HttpResponse>> {
+    let hosts = block
+        .host
+        .as_ref()
+        .map(|h| h.to_vec())
+        .unwrap_or_else(|| vec!["{{Hostname}}".into()]);
+    let mut responses = Vec::new();
+    for host_raw in hosts {
+        let host = substitute(&host_raw, vars, extra);
+        if has_unresolved_vars(&host) {
+            continue;
+        }
+        // {{Hostname}} carries host:port (same convention as the network
+        // engine); an explicit block port wins over the target port.
+        let (host_name, target_port): (String, Option<u16>) = if !host.contains('[')
+            && let Some((h, p)) = host.rsplit_once(':')
+        {
+            (h.to_string(), p.parse().ok())
+        } else {
+            (host.clone(), None)
+        };
+        let port = block.port.or(target_port).unwrap_or(443);
+        let mut sock = TcpStream::connect((host_name.as_str(), port))
+            .with_context(|| format!("ssl engine: TCP connect to {host_name}:{port}"))?;
+        sock.set_read_timeout(Some(timeout))?;
+        sock.set_write_timeout(Some(timeout))?;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let cfg = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(InsecureServerVerifier))
+            .with_no_client_auth();
+        let server_name = block.sni.clone().unwrap_or_else(|| host_name.clone());
+        let name = rustls::pki_types::ServerName::try_from(server_name)
+            .map_err(|e| anyhow::anyhow!("ssl engine: invalid SNI/server name: {e}"))?;
+        let mut conn = rustls::ClientConnection::new(Arc::new(cfg), name)
+            .map_err(|e| anyhow::anyhow!("ssl engine: TLS client init failed: {e}"))?;
+        while conn.is_handshaking() {
+            conn.complete_io(&mut sock)
+                .map_err(|e| anyhow::anyhow!("ssl engine: TLS handshake failed: {e}"))?;
+        }
+        let protocol = conn
+            .protocol_version()
+            .map(|v| format!("{v:?}"))
+            .unwrap_or_else(|| "unknown".into());
+        let cipher = conn
+            .negotiated_cipher_suite()
+            .map(|c| format!("{c:?}"))
+            .unwrap_or_else(|| "unknown".into());
+        let mut body = vec![format!("protocol={protocol}"), format!("cipher={cipher}")];
+        if let Some(certs) = conn.peer_certificates()
+            && let Some(leaf) = certs.first()
+        {
+            body.push(ssl_cert_attribute_lines(leaf.as_ref()));
+        }
+        responses.push(HttpResponse {
+            status: 0,
+            headers: String::new(),
+            body: body.join("\n"),
+        });
+    }
+    Ok(responses)
+}
+
+// ---------------------------------------------------------------------------
+// websocket: engine — ws:// handshake + frame round-trip
+// ---------------------------------------------------------------------------
+
+/// Mandatory socket timeouts through the tungstenite TLS-maybe wrapper; a
+/// silent websocket server must never hang the scanner.
+fn set_ws_socket_timeouts(
+    ws: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
+    timeout: Duration,
+) {
+    let apply = |s: &TcpStream| {
+        let _ = s.set_read_timeout(Some(timeout));
+        let _ = s.set_write_timeout(Some(timeout));
+    };
+    match ws.get_ref() {
+        tungstenite::stream::MaybeTlsStream::Plain(s) => apply(s),
+        tungstenite::stream::MaybeTlsStream::Rustls(s) => apply(s.get_ref()),
+        _ => {}
+    }
+}
+
+/// Executes one `websocket:` block: connects (ws:// fully supported; wss://
+/// requires a webpki-trusted certificate), sends each input as a Text frame,
+/// and collects responses with a bounded read phase.
+pub fn execute_ws_block(
+    block: &WsBlock,
+    vars: &Vars,
+    extra: &HashMap<String, String>,
+    timeout: Duration,
+) -> Result<Vec<HttpResponse>> {
+    let raw = block.url.as_deref().unwrap_or("{{base_url}}");
+    let mut url = substitute(raw, vars, extra);
+    if has_unresolved_vars(&url) {
+        bail!("websocket url has unresolved template variables");
+    }
+    if let Some(rest) = url.strip_prefix("http://") {
+        url = format!("ws://{rest}");
+    } else if let Some(rest) = url.strip_prefix("https://") {
+        url = format!("wss://{rest}");
+    }
+    if !url.starts_with("ws://") && !url.starts_with("wss://") {
+        url = format!("ws://{url}");
+    }
+    if url.starts_with("wss://") {
+        bail!(
+            "wss:// targets need a webpki-trusted certificate; lab ws:// targets are fully supported"
+        );
+    }
+    let (mut ws, _resp) =
+        tungstenite::connect(&url).with_context(|| format!("websocket connect to {url}"))?;
+    set_ws_socket_timeouts(&mut ws, timeout);
+    for input in block.inputs.iter().flatten() {
+        let data = substitute(&input.data, vars, extra)
+            .replace("\\r", "\r")
+            .replace("\\n", "\n");
+        ws.send(tungstenite::Message::Text(data.into()))
+            .with_context(|| "websocket send failed")?;
+    }
+    let _ = ws.flush();
+    let mut collected: Vec<String> = Vec::new();
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline && collected.len() < 32 {
+        match ws.read() {
+            Ok(tungstenite::Message::Text(t)) => collected.push(t.to_string()),
+            Ok(tungstenite::Message::Binary(b)) => {
+                collected.push(String::from_utf8_lossy(&b).into_owned())
+            }
+            Ok(tungstenite::Message::Close(_)) => break,
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(e))
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+    let _ = ws.close(None);
+    Ok(vec![HttpResponse {
+        status: 0,
+        headers: String::new(),
+        body: collected.join("\n"),
+    }])
+}
+
+// ---------------------------------------------------------------------------
+// headless: engine — CDP-driven rendered-DOM matching
+// ---------------------------------------------------------------------------
+
+/// Executes one `headless:` block through the shared CDP engine. The browser
+/// is launched lazily on the first headless block and reused for the rest of
+/// the run (`browser` carries the session first so it drops before the engine).
+pub fn execute_headless_block(
+    block: &HeadlessBlock,
+    vars: &Vars,
+    extra: &HashMap<String, String>,
+    browser: &mut Option<(crate::cdp_engine::CdpSession, crate::cdp_engine::CdpEngine)>,
+) -> Result<Vec<HttpResponse>> {
+    if browser.is_none() {
+        let engine = crate::cdp_engine::CdpEngine::launch()?;
+        let session = engine.session()?;
+        *browser = Some((session, engine));
+    }
+    let (session, _engine) = browser.as_mut().expect("headless browser initialized");
+    let resolve = |raw: &str| -> String {
+        let url = substitute(raw, vars, extra);
+        if url.starts_with('/') {
+            format!("{}{}", vars.root_url, url)
+        } else {
+            url
+        }
+    };
+    let mut last_html = String::new();
+    let mut navigated = false;
+    for step in &block.steps {
+        let action = step.action.as_deref().unwrap_or("").to_ascii_lowercase();
+        match action.as_str() {
+            "navigate" => {
+                let url = resolve(step.url.as_deref().unwrap_or("{{base_url}}"));
+                let data = session.navigate_and_collect(&url, 800)?;
+                last_html = data.rendered_html;
+                navigated = true;
+            }
+            "wait" => {
+                let secs = step.duration.unwrap_or(1.0).clamp(0.05, 10.0);
+                std::thread::sleep(Duration::from_secs_f64(secs));
+            }
+            _ => {} // unsupported actions are skipped (documented subset)
+        }
+    }
+    if !navigated {
+        let data = session.navigate_and_collect(&resolve("{{base_url}}"), 800)?;
+        last_html = data.rendered_html;
+    }
+    Ok(vec![HttpResponse {
+        status: 200,
+        headers: String::new(),
+        body: last_html,
+    }])
+}
+
+// ---------------------------------------------------------------------------
 // Template loading & run orchestration
 // ---------------------------------------------------------------------------
 
 pub struct LoadedTemplate {
     pub path: PathBuf,
     pub template: NucleiTemplate,
+    /// Raw YAML contains interactsh/OOB placeholders — needs `--oob-server`.
+    pub uses_oob: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1629,12 +1947,12 @@ pub struct TemplateRunConfig {
     pub max_templates: usize,
     pub timeout: Duration,
     pub allow_remote: bool,
+    /// `--oob-server host:port`: enables interactsh-style templates; tokens
+    /// are per-run random and verified against the self-hosted listener.
+    pub oob_server: Option<String>,
 }
 
-fn unsupported_reason(t: &NucleiTemplate, raw_text: &str) -> Option<String> {
-    if t.headless.is_some() {
-        return Some("headless-browser engine not supported".into());
-    }
+fn unsupported_reason(t: &NucleiTemplate, _raw_text: &str) -> Option<String> {
     if t.javascript.is_some() || t.lua.is_some() {
         return Some("javascript/lua engine not supported".into());
     }
@@ -1643,12 +1961,6 @@ fn unsupported_reason(t: &NucleiTemplate, raw_text: &str) -> Option<String> {
     }
     if t.file.is_some() {
         return Some("file engine not supported".into());
-    }
-    if t.ssl.is_some() {
-        return Some("ssl engine not supported (use `smg tls` for live TLS audits)".into());
-    }
-    if t.websocket.is_some() {
-        return Some("websocket engine not supported".into());
     }
     if t.whois.is_some() {
         return Some("whois engine not supported".into());
@@ -1659,9 +1971,8 @@ fn unsupported_reason(t: &NucleiTemplate, raw_text: &str) -> Option<String> {
     if t.interactive == Some(true) {
         return Some("interactive template not supported".into());
     }
-    if raw_text.contains("interactsh") || raw_text.contains("oob") {
-        return Some("interactsh/OOB callback template not supported".into());
-    }
+    // ssl/websocket/headless are executed by dedicated engines now; OOB
+    // templates are gated at run time by `--oob-server` (see run_template_audit).
     None
 }
 
@@ -1724,11 +2035,17 @@ fn load_templates_dir(
                     });
                     continue;
                 }
-                if tpl.http.is_empty() && tpl.dns.is_empty() && tpl.network.is_empty() {
+                if tpl.http.is_empty()
+                    && tpl.dns.is_empty()
+                    && tpl.network.is_empty()
+                    && tpl.ssl.is_empty()
+                    && tpl.websocket.is_empty()
+                    && tpl.headless.is_empty()
+                {
                     skipped.push(SkippedTemplate {
                         id,
                         path: path.display().to_string(),
-                        reason: "no http/dns/network request block".into(),
+                        reason: "no request block (http/dns/network/ssl/websocket/headless)".into(),
                     });
                     continue;
                 }
@@ -1741,9 +2058,11 @@ fn load_templates_dir(
                     continue;
                 }
                 tpl.id = Some(id);
+                let uses_oob = raw.contains("interactsh") || raw.contains("{{oob");
                 loaded.push(LoadedTemplate {
                     path,
                     template: tpl,
+                    uses_oob,
                 });
             }
             Err(_) => {
@@ -1790,12 +2109,34 @@ pub fn run_template_audit(cfg: &TemplateRunConfig) -> Result<TemplateRunReport> 
         load_templates_dir(&cfg.templates_dir, cfg.max_templates.max(1))?;
     let base_vars = parse_target(&cfg.target)?;
     let runners = HttpRunners::build_with_scope(cfg.timeout, cfg.allow_remote)?;
+    let oob_client =
+        cfg.oob_server.as_ref().and_then(
+            |spec| match crate::oob_server::OobClient::from_server_spec(spec) {
+                Ok(client) => Some(client),
+                Err(e) => {
+                    eprintln!("  smg templates: --oob-server '{spec}' unusable: {e}");
+                    None
+                }
+            },
+        );
     let mut matches = Vec::new();
     let mut executed = 0usize;
+    let mut headless_browser: Option<(
+        crate::cdp_engine::CdpSession,
+        crate::cdp_engine::CdpEngine,
+    )> = None;
 
     for loaded in &templates {
         let tpl = &loaded.template;
         let id = tpl.id.clone().unwrap_or_default();
+        if loaded.uses_oob && oob_client.is_none() {
+            skipped.push(SkippedTemplate {
+                id,
+                path: loaded.path.display().to_string(),
+                reason: "interactsh/OOB callback template requires --oob-server".into(),
+            });
+            continue;
+        }
         let severity = template_severity(tpl);
         if !cfg.severity_filter.is_empty()
             && !cfg
@@ -1817,10 +2158,26 @@ pub fn run_template_audit(cfg: &TemplateRunConfig) -> Result<TemplateRunReport> 
         let vars = Vars::for_template(&base_vars, &id);
         let mut block_skips: Vec<String> = Vec::new();
         let mut template_matched = false;
-        let total_blocks = tpl.http.len() + tpl.dns.len() + tpl.network.len();
+        let total_blocks = tpl.http.len()
+            + tpl.dns.len()
+            + tpl.network.len()
+            + tpl.ssl.len()
+            + tpl.websocket.len()
+            + tpl.headless.len();
+        // Per-run OOB tokens (blake3(run_nonce || template_id || target)) are
+        // injected through the substitution extra-map.
+        let mut extra: HashMap<String, String> = HashMap::new();
+        let mut oob_token: Option<String> = None;
+        if let Some(oob) = &oob_client {
+            let token = oob.token_for_target(&id, &cfg.target);
+            extra.insert("interactsh-url".into(), oob.url_for(&id, &cfg.target));
+            extra.insert("interactsh-host".into(), oob.host.clone());
+            extra.insert("interactsh-token".into(), token.clone());
+            oob_token = Some(token);
+        }
 
         for block in &tpl.http {
-            match execute_http_block(&runners, block, &vars) {
+            match execute_http_block(&runners, block, &vars, &extra) {
                 BlockOutcome::Skipped(reason) => block_skips.push(reason),
                 BlockOutcome::Response(resp) => {
                     executed += 1;
@@ -1857,7 +2214,7 @@ pub fn run_template_audit(cfg: &TemplateRunConfig) -> Result<TemplateRunReport> 
         }
 
         for block in &tpl.dns {
-            match execute_dns_block(block, &vars, cfg.timeout, &id) {
+            match execute_dns_block(block, &vars, cfg.timeout, &id, &extra) {
                 DnsOutcome::Failed(reason) => block_skips.push(reason),
                 DnsOutcome::Records(records) => {
                     executed += 1;
@@ -1892,7 +2249,7 @@ pub fn run_template_audit(cfg: &TemplateRunConfig) -> Result<TemplateRunReport> 
         }
 
         if !tpl.network.is_empty() {
-            match execute_network_block(&tpl.network[0], &vars, cfg.timeout) {
+            match execute_network_block(&tpl.network[0], &vars, cfg.timeout, &extra) {
                 Err(e) => block_skips.push(format!("network engine: {e}")),
                 Ok(responses) => {
                     for resp in responses {
@@ -1926,6 +2283,146 @@ pub fn run_template_audit(cfg: &TemplateRunConfig) -> Result<TemplateRunReport> 
             }
         }
 
+        // ---- ssl: engine (TLS attribute matching) ----
+        if let Some(block) = tpl.ssl.first() {
+            match execute_ssl_block(block, &vars, &extra, cfg.timeout) {
+                Err(e) => block_skips.push(format!("ssl engine: {e}")),
+                Ok(responses) => {
+                    for resp in responses {
+                        executed += 1;
+                        let result = evaluate_matchers(
+                            &block.matchers,
+                            block.matchers_condition.as_deref(),
+                            &resp,
+                            &vars,
+                        );
+                        if result.matched {
+                            template_matched = true;
+                            matches.push(TemplateMatch {
+                                template_id: id.clone(),
+                                template_name: tpl.info.name.clone().unwrap_or_default(),
+                                severity: severity.clone(),
+                                template_path: loaded.path.display().to_string(),
+                                url: format!("{}:{}", vars.hostname, block.port.unwrap_or(443)),
+                                engine: "ssl".into(),
+                                matcher_types: block
+                                    .matchers
+                                    .iter()
+                                    .map(|m| m.kind.clone())
+                                    .collect(),
+                                evidence: result.evidence,
+                                extracted: run_extractors(&block.extractors, &resp),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---- websocket: engine (frame round-trip) ----
+        for block in &tpl.websocket {
+            match execute_ws_block(block, &vars, &extra, cfg.timeout) {
+                Err(e) => block_skips.push(format!("websocket engine: {e}")),
+                Ok(responses) => {
+                    for resp in responses {
+                        executed += 1;
+                        let result = evaluate_matchers(
+                            &block.matchers,
+                            block.matchers_condition.as_deref(),
+                            &resp,
+                            &vars,
+                        );
+                        if result.matched {
+                            template_matched = true;
+                            matches.push(TemplateMatch {
+                                template_id: id.clone(),
+                                template_name: tpl.info.name.clone().unwrap_or_default(),
+                                severity: severity.clone(),
+                                template_path: loaded.path.display().to_string(),
+                                url: block.url.clone().unwrap_or_default(),
+                                engine: "websocket".into(),
+                                matcher_types: block
+                                    .matchers
+                                    .iter()
+                                    .map(|m| m.kind.clone())
+                                    .collect(),
+                                evidence: result.evidence,
+                                extracted: run_extractors(&block.extractors, &resp),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---- headless: engine (rendered-DOM matching via CDP) ----
+        if let Some(block) = tpl.headless.first() {
+            match execute_headless_block(block, &vars, &extra, &mut headless_browser) {
+                Err(e) => block_skips.push(format!("headless engine: {e}")),
+                Ok(responses) => {
+                    for resp in responses {
+                        executed += 1;
+                        let result = evaluate_matchers(
+                            &block.matchers,
+                            block.matchers_condition.as_deref(),
+                            &resp,
+                            &vars,
+                        );
+                        if result.matched {
+                            template_matched = true;
+                            matches.push(TemplateMatch {
+                                template_id: id.clone(),
+                                template_name: tpl.info.name.clone().unwrap_or_default(),
+                                severity: severity.clone(),
+                                template_path: loaded.path.display().to_string(),
+                                url: vars.base_url.clone(),
+                                engine: "headless".into(),
+                                matcher_types: block
+                                    .matchers
+                                    .iter()
+                                    .map(|m| m.kind.clone())
+                                    .collect(),
+                                evidence: result.evidence,
+                                extracted: run_extractors(&block.extractors, &resp),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---- OOB callback verification (per-run tokens) ----
+        if let (Some(token), Some(oob)) = (oob_token.as_deref(), oob_client.as_ref()) {
+            // Give asynchronous callbacks a short propagation window.
+            std::thread::sleep(OOB_PROPAGATION_WAIT);
+            match oob.check(token) {
+                Ok(hits) if !hits.is_empty() => {
+                    template_matched = true;
+                    matches.push(TemplateMatch {
+                        template_id: id.clone(),
+                        template_name: tpl.info.name.clone().unwrap_or_default(),
+                        severity: severity.clone(),
+                        template_path: loaded.path.display().to_string(),
+                        url: cfg.target.clone(),
+                        engine: "oob".into(),
+                        matcher_types: vec!["oob-callback".into()],
+                        evidence: hits
+                            .iter()
+                            .map(|h| {
+                                format!(
+                                    "callback {} {} from {} ({})",
+                                    h.proto, h.path, h.remote, h.method
+                                )
+                            })
+                            .collect(),
+                        extracted: Vec::new(),
+                    });
+                }
+                Ok(_) => {}
+                Err(e) => block_skips.push(format!("oob check: {e}")),
+            }
+        }
+
         if !template_matched && !block_skips.is_empty() && block_skips.len() == total_blocks {
             skipped.push(SkippedTemplate {
                 id,
@@ -1934,6 +2431,10 @@ pub fn run_template_audit(cfg: &TemplateRunConfig) -> Result<TemplateRunReport> 
             });
         }
     }
+
+    // The headless browser outlives all headless blocks; drop the session
+    // before the engine (Chrome dies with the engine).
+    drop(headless_browser);
 
     let target = cfg.target.clone();
     Ok(TemplateRunReport {
@@ -2046,6 +2547,7 @@ http:
             tag_filter: vec![],
             max_templates: 100,
             timeout: Duration::from_secs(5),
+            oob_server: None,
             allow_remote: false,
         })
         .unwrap();
@@ -2082,6 +2584,7 @@ http:
             tag_filter: vec![],
             max_templates: 50,
             timeout: Duration::from_secs(5),
+            oob_server: None,
             allow_remote: false,
         })
         .unwrap();
@@ -2093,6 +2596,7 @@ http:
             tag_filter: vec![],
             max_templates: 50,
             timeout: Duration::from_secs(5),
+            oob_server: None,
             allow_remote: false,
         })
         .unwrap();
@@ -2102,7 +2606,7 @@ http:
     }
 
     #[test]
-    fn interactsh_and_headless_templates_are_skipped_with_reason() {
+    fn interactsh_templates_require_oob_server_and_still_skipped_engines() {
         let dir = temp_templates_dir(&[
             (
                 "oob",
@@ -2115,24 +2619,22 @@ info:
 http:
   - method: GET
     path:
-      - "{{BaseURL}}/"
+      - "{{interactsh-url}}"
     matchers:
       - type: word
-        words: ["x"]
+        words: ["smg-oob"]
 "#,
             ),
             (
-                "headless",
+                "jsengine",
                 r#"
-id: headless-detect
+id: js-detect
 info:
-  name: Headless
+  name: JS engine
   author: smg-test
   severity: info
-headless:
-  - steps:
-      - action: navigate
-        url: "{{BaseURL}}"
+javascript:
+  - code: "console.log(1)"
 "#,
             ),
         ]);
@@ -2143,18 +2645,241 @@ headless:
             tag_filter: vec![],
             max_templates: 50,
             timeout: Duration::from_secs(2),
+            oob_server: None,
             allow_remote: false,
         })
         .unwrap();
-        assert_eq!(report.loaded, 0);
-        assert_eq!(report.skipped.len(), 2);
         assert!(
             report
                 .skipped
                 .iter()
-                .any(|s| s.reason.contains("interactsh"))
+                .any(|s| s.reason.contains("requires --oob-server")),
+            "skipped: {:?}",
+            report.skipped
         );
-        assert!(report.skipped.iter().any(|s| s.reason.contains("headless")));
+        assert!(
+            report
+                .skipped
+                .iter()
+                .any(|s| s.reason.contains("javascript")),
+            "skipped: {:?}",
+            report.skipped
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Loopback TLS origin serving one hello response per session
+    /// (self-signed; the ssl engine uses the dangerous verifier).
+    fn tls_origin_for_templates() -> u16 {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "127.0.0.1");
+        let cert = params.self_signed(&key).unwrap();
+        let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into());
+        let mut server_cfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.der().clone()], key_der)
+            .unwrap();
+        server_cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let server_cfg = std::sync::Arc::new(server_cfg);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            for _ in 0..8 {
+                let Ok((mut sock, _)) = listener.accept() else {
+                    break;
+                };
+                let _ = sock.set_read_timeout(Some(Duration::from_secs(10)));
+                let _ = sock.set_write_timeout(Some(Duration::from_secs(10)));
+                let Ok(mut conn) =
+                    rustls::ServerConnection::new(std::sync::Arc::clone(&server_cfg))
+                else {
+                    continue;
+                };
+                while conn.is_handshaking() {
+                    if conn.complete_io(&mut sock).is_err() {
+                        break;
+                    }
+                }
+                let mut tls = rustls::StreamOwned::new(conn, sock);
+                let mut buf = [0u8; 4096];
+                let _ = tls.read(&mut buf);
+                let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi";
+                let _ = tls.write_all(resp);
+                let _ = tls.flush();
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn ssl_engine_matches_certificate_and_protocol_attributes() {
+        let tls_port = tls_origin_for_templates();
+        let dir = temp_templates_dir(&[(
+            "ssl",
+            &format!(
+                r#"
+id: ssl-attr-check
+info:
+  name: ssl attributes
+  author: smg-test
+  severity: info
+ssl:
+  - port: {tls_port}
+    matchers:
+      - type: word
+        words: ["protocol=TLS", "cn=127.0.0.1"]
+        condition: and
+"#
+            ),
+        )]);
+        let report = run_template_audit(&TemplateRunConfig {
+            target: "http://127.0.0.1:1".into(),
+            templates_dir: dir.clone(),
+            severity_filter: vec![],
+            tag_filter: vec![],
+            max_templates: 10,
+            timeout: Duration::from_secs(5),
+            oob_server: None,
+            allow_remote: false,
+        })
+        .unwrap();
+        let ssl_match = report
+            .matches
+            .iter()
+            .find(|m| m.engine == "ssl")
+            .unwrap_or_else(|| {
+                panic!(
+                    "ssl match; matches={:?} skipped={:?}",
+                    report.matches, report.skipped
+                )
+            });
+        assert_eq!(ssl_match.template_id, "ssl-attr-check");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Loopback WebSocket echo server: replies `pong <payload>` to any Text.
+    fn ws_echo_server() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            for _ in 0..8 {
+                let Ok((sock, _)) = listener.accept() else {
+                    break;
+                };
+                let Ok(mut ws) = tungstenite::accept(sock) else {
+                    continue;
+                };
+                loop {
+                    match ws.read() {
+                        Ok(tungstenite::Message::Text(t)) => {
+                            let _ = ws.send(tungstenite::Message::Text(format!("pong {t}").into()));
+                        }
+                        Ok(tungstenite::Message::Close(_))
+                        | Err(tungstenite::Error::ConnectionClosed)
+                        | Err(tungstenite::Error::AlreadyClosed) => break,
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn websocket_engine_matches_frame_responses() {
+        let ws_port = ws_echo_server();
+        let dir = temp_templates_dir(&[(
+            "ws",
+            &format!(
+                r#"
+id: ws-echo-check
+info:
+  name: ws echo
+  author: smg-test
+  severity: info
+websocket:
+  - url: "ws://127.0.0.1:{ws_port}"
+    inputs:
+      - data: "ping-{{{{randstr}}}}"
+    matchers:
+      - type: word
+        words: ["pong"]
+"#
+            ),
+        )]);
+        let report = run_template_audit(&TemplateRunConfig {
+            target: "http://127.0.0.1:1".into(),
+            templates_dir: dir.clone(),
+            severity_filter: vec![],
+            tag_filter: vec![],
+            max_templates: 10,
+            timeout: Duration::from_secs(5),
+            oob_server: None,
+            allow_remote: false,
+        })
+        .unwrap();
+        let ws_match = report
+            .matches
+            .iter()
+            .find(|m| m.engine == "websocket")
+            .unwrap_or_else(|| {
+                panic!(
+                    "websocket match; matches={:?} skipped={:?}",
+                    report.matches, report.skipped
+                )
+            });
+        assert_eq!(ws_match.template_id, "ws-echo-check");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn oob_callback_template_matches_via_self_hosted_listener() {
+        let oob =
+            crate::oob_server::start_oob_server("127.0.0.1:0".parse().unwrap(), None).unwrap();
+        let dir = temp_templates_dir(&[(
+            "oob",
+            r#"
+id: oob-callback-check
+info:
+  name: oob callback
+  author: smg-test
+  severity: high
+http:
+  - method: GET
+    path:
+      - "{{interactsh-url}}"
+    matchers:
+      - type: word
+        words: ["smg-oob"]
+"#,
+        )]);
+        let report = run_template_audit(&TemplateRunConfig {
+            target: "http://127.0.0.1:9".into(),
+            templates_dir: dir.clone(),
+            severity_filter: vec![],
+            tag_filter: vec![],
+            max_templates: 10,
+            timeout: Duration::from_secs(5),
+            oob_server: Some(oob.bound_addr.to_string()),
+            allow_remote: false,
+        })
+        .unwrap();
+        let oob_match = report
+            .matches
+            .iter()
+            .find(|m| m.engine == "oob")
+            .expect("OOB callback match");
+        assert_eq!(oob_match.template_id, "oob-callback-check");
+        assert!(
+            oob_match.evidence.iter().any(|e| e.contains("tcp")),
+            "evidence: {:?}",
+            oob_match.evidence
+        );
+        oob.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -2168,6 +2893,7 @@ headless:
             tag_filter: vec![],
             max_templates: 10,
             timeout: Duration::from_secs(2),
+            oob_server: None,
             allow_remote: false,
         });
         assert!(err.is_err());
@@ -2255,6 +2981,7 @@ http:
             tag_filter: vec![],
             max_templates: 50,
             timeout: Duration::from_secs(5),
+            oob_server: None,
             allow_remote: false,
         })
         .unwrap();

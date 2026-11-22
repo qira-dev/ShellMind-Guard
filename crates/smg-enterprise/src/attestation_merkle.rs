@@ -59,9 +59,7 @@ pub fn verify_nitro_cose_sign1(
             bail!("Nitro attestation missing PCR0 measurement");
         };
         if !actual.eq_ignore_ascii_case(expected_pcr0) {
-            bail!(
-                "Nitro PCR0 measurement mismatch: expected {expected_pcr0}, got {actual}"
-            );
+            bail!("Nitro PCR0 measurement mismatch: expected {expected_pcr0}, got {actual}");
         }
     }
     Ok(())
@@ -87,7 +85,10 @@ pub fn verify_tdx_quote_v4(
 ) -> Result<TdxQuoteV4Summary> {
     const MIN_TDX_V4_LEN: usize = 48 + 184;
     if quote.len() < MIN_TDX_V4_LEN {
-        bail!("Intel TDX v4 quote too short ({} < {MIN_TDX_V4_LEN} bytes)", quote.len());
+        bail!(
+            "Intel TDX v4 quote too short ({} < {MIN_TDX_V4_LEN} bytes)",
+            quote.len()
+        );
     }
     let version = u16::from_le_bytes([quote[0], quote[1]]);
     if version != 4 {
@@ -136,7 +137,10 @@ pub fn verify_sev_snp_report(
     min_guest_svn: u32,
 ) -> Result<SevSnpReportSummary> {
     if report.len() < 192 {
-        bail!("AMD SEV-SNP attestation report too short ({} < 192 bytes)", report.len());
+        bail!(
+            "AMD SEV-SNP attestation report too short ({} < 192 bytes)",
+            report.len()
+        );
     }
     let version = u32::from_le_bytes(report[0..4].try_into().unwrap());
     if version < 2 {
@@ -353,6 +357,10 @@ mod tests {
         let root = log.root_hex().unwrap();
         let proof = log.inclusion_proof(3).unwrap();
         assert!(verify_merkle_inclusion(b"scan-event-3", &proof, &root));
-        assert!(!verify_merkle_inclusion(b"scan-event-3-TAMPERED", &proof, &root));
+        assert!(!verify_merkle_inclusion(
+            b"scan-event-3-TAMPERED",
+            &proof,
+            &root
+        ));
     }
 }

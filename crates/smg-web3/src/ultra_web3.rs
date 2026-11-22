@@ -44,10 +44,12 @@ pub fn detect_diamond_selector_collisions(
     let mut by_selector: HashMap<[u8; 4], Vec<FacetEntry<'_>>> = HashMap::new();
     for (contract, rel_path, line, sig) in facet_signatures {
         let sel = abi_selector(sig);
-        by_selector
-            .entry(sel)
-            .or_default()
-            .push((contract.as_str(), rel_path.as_str(), *line, sig.as_str()));
+        by_selector.entry(sel).or_default().push((
+            contract.as_str(),
+            rel_path.as_str(),
+            *line,
+            sig.as_str(),
+        ));
     }
 
     let mut out = Vec::new();
@@ -60,10 +62,7 @@ pub fn detect_diamond_selector_collisions(
         if entries.iter().all(|e| e.0 == first_contract) {
             continue;
         }
-        let hex_sel = format!(
-            "0x{:02x}{:02x}{:02x}{:02x}",
-            sel[0], sel[1], sel[2], sel[3]
-        );
+        let hex_sel = format!("0x{:02x}{:02x}{:02x}{:02x}", sel[0], sel[1], sel[2], sel[3]);
         let desc: Vec<String> = entries
             .iter()
             .map(|(c, _, _, s)| format!("{c}.{s}"))
@@ -99,8 +98,7 @@ pub fn analyze_solidity_ultra_depth(
     let mut findings = Vec::new();
 
     // 1. UUPS / Initializable implementation missing `_disableInitializers()` in constructor
-    let is_upgradeable =
-        stripped.contains("UUPSUpgradeable") || stripped.contains("Initializable");
+    let is_upgradeable = stripped.contains("UUPSUpgradeable") || stripped.contains("Initializable");
     if is_upgradeable
         && !stripped.contains("_disableInitializers()")
         && !stripped.contains("VersionedInitializable")
@@ -235,7 +233,9 @@ pub fn analyze_solidity_ultra_depth(
             let end = (idx + 15).min(lines.len());
             let window = lines[idx..end].join("\n");
             let checks_stale = window.contains("updatedAt")
-                && (window.contains("block.timestamp") || window.contains("MAX_DELAY") || window.contains("heartbeat"));
+                && (window.contains("block.timestamp")
+                    || window.contains("MAX_DELAY")
+                    || window.contains("heartbeat"));
             let checks_pos = window.contains("> 0") || window.contains("<= 0");
             if !checks_stale || !checks_pos {
                 findings.push(mk_web3_finding(
@@ -287,7 +287,10 @@ pub fn analyze_solidity_ultra_depth(
     // 7. Diamond Facet Selector Collisions within single file
     let mut facet_sigs: Vec<(String, String, usize, String)> = Vec::new();
     for c in contracts {
-        if c.name.contains("Facet") || stripped.contains("IDiamondCut") || stripped.contains("diamondCut") {
+        if c.name.contains("Facet")
+            || stripped.contains("IDiamondCut")
+            || stripped.contains("diamondCut")
+        {
             for (idx, line) in lines.iter().enumerate() {
                 if let Some(rest) = line.trim().strip_prefix("function ")
                     && (line.contains("external") || line.contains("public"))
@@ -350,7 +353,9 @@ pub fn analyze_solana_pda_depth(rel_path: &str, source: &str) -> Vec<LocalStatic
         }
 
         // 2. Non-canonical PDA derivation via `create_program_address`
-        if trimmed.contains("create_program_address(") && !stripped.contains("find_program_address(") {
+        if trimmed.contains("create_program_address(")
+            && !stripped.contains("find_program_address(")
+        {
             findings.push(mk_web3_finding(
                 "SMG-SOL-PDA-NONCANONICAL",
                 "HIGH",
@@ -416,7 +421,10 @@ pub fn analyze_move_ultra_depth(rel_path: &str, source: &str) -> Vec<LocalStatic
                     || low.contains("receipt")
                     || low.contains("admincap")
                     || low.contains("hotpotato"));
-            if is_sensitive_resource && (trimmed.contains(" has ") && (trimmed.contains("copy") || trimmed.contains("drop"))) {
+            if is_sensitive_resource
+                && (trimmed.contains(" has ")
+                    && (trimmed.contains("copy") || trimmed.contains("drop")))
+            {
                 findings.push(mk_web3_finding(
                     "SMG-MOVE-ABILITY-LEAK",
                     "CRITICAL",
@@ -518,16 +526,41 @@ contract MyVault is UUPSUpgradeable, ERC4626 {
 "#;
         let hits = analyze_solidity_ultra_depth("contracts/MyVault.sol", sol, &[]);
         let ids: Vec<&str> = hits.iter().map(|h| h.rule_id.as_str()).collect();
-        assert!(ids.contains(&"SMG-WEB3-UUPS-UNINIT"), "missing UUPS: {ids:?}");
-        assert!(ids.contains(&"SMG-WEB3-FLASHLOAN-AUTH"), "missing flashloan: {ids:?}");
-        assert!(ids.contains(&"SMG-WEB3-SPOT-ORACLE"), "missing spot oracle: {ids:?}");
-        assert!(ids.contains(&"SMG-WEB3-ORACLE-STALE"), "missing chainlink stale: {ids:?}");
-        assert!(ids.contains(&"SMG-WEB3-ERC4626-INFLATION"), "missing erc4626: {ids:?}");
+        assert!(
+            ids.contains(&"SMG-WEB3-UUPS-UNINIT"),
+            "missing UUPS: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"SMG-WEB3-FLASHLOAN-AUTH"),
+            "missing flashloan: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"SMG-WEB3-SPOT-ORACLE"),
+            "missing spot oracle: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"SMG-WEB3-ORACLE-STALE"),
+            "missing chainlink stale: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"SMG-WEB3-ERC4626-INFLATION"),
+            "missing erc4626: {ids:?}"
+        );
 
         // Diamond selector clash test (`transfer(address,uint256)` in two facets)
         let clash = detect_diamond_selector_collisions(&[
-            ("FacetA".into(), "FacetA.sol".into(), 10, "transfer(address,uint256)".into()),
-            ("FacetB".into(), "FacetB.sol".into(), 20, "transfer(address,uint256)".into()),
+            (
+                "FacetA".into(),
+                "FacetA.sol".into(),
+                10,
+                "transfer(address,uint256)".into(),
+            ),
+            (
+                "FacetB".into(),
+                "FacetB.sol".into(),
+                20,
+                "transfer(address,uint256)".into(),
+            ),
         ]);
         assert_eq!(clash.len(), 1);
         assert_eq!(clash[0].rule_id, "SMG-WEB3-DIAMOND-CLASH");

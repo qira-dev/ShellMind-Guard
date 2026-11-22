@@ -4,12 +4,13 @@
 //! - Intercepts plain HTTP requests (absolute-form & origin-form) end-to-end:
 //!   forwards with `Connection: close`, strips `Accept-Encoding` so bodies are
 //!   inspectable, captures full request/response into the shared TUI history.
-//! - HTTPS `CONNECT` tunnels are logged (host:port, byte counts, duration) and
-//!   relayed byte-for-byte. TLS decryption (MITM CA interception) is
-//!   deliberately NOT performed — this build keeps the proxy strictly
-//!   transparent for TLS so it never terminates or re-signs anyone's traffic.
+//! - HTTPS `CONNECT` tunnels are relayed byte-for-byte by default. With the
+//!   opt-in `--mitm-ca` flag (see `proxy_mitm`) the tunnel is terminated with
+//!   an on-the-fly local-CA leaf certificate and the decrypted HTTP/1.1
+//!   traffic is captured and replayable like plain HTTP (`kind: "https"`).
 //! - Binds loopback only unless `--allow-remote-bind` is passed deliberately.
 
+use crate::proxy_mitm::MitmCa;
 use anyhow::{Context, Result, bail};
 use smg_tui::proxy_tui::{ProxyEntry, ProxySummary};
 use std::io::{Read, Write};
@@ -33,6 +34,9 @@ pub struct ProxyConfig {
     pub capture_limit: usize,
     pub allow_remote_bind: bool,
     pub jsonl_log: Option<PathBuf>,
+    /// Opt-in TLS interception plane (`--mitm-ca`); `None` keeps CONNECT
+    /// tunnels transparent.
+    pub mitm: Option<Arc<MitmCa>>,
 }
 
 pub struct ProxyHandle {
@@ -67,6 +71,7 @@ struct ConnCtx {
     next_id: Arc<AtomicU64>,
     capture_limit: usize,
     log_tx: Option<Sender<Arc<ProxyEntry>>>,
+    mitm: Option<Arc<MitmCa>>,
 }
 
 impl ConnCtx {
@@ -148,6 +153,7 @@ pub fn start_proxy(cfg: ProxyConfig) -> Result<ProxyHandle> {
         next_id: Arc::clone(&next_id),
         capture_limit: cfg.capture_limit.max(1024),
         log_tx: if log_enabled { Some(log_tx) } else { None },
+        mitm: cfg.mitm,
     };
 
     let stop_flag = Arc::clone(&stop);
@@ -157,6 +163,7 @@ pub fn start_proxy(cfg: ProxyConfig) -> Result<ProxyHandle> {
         next_id: Arc::clone(&ctx.next_id),
         capture_limit: ctx.capture_limit,
         log_tx: ctx.log_tx.clone(),
+        mitm: ctx.mitm.clone(),
     };
     let listener_thread = thread::spawn(move || {
         loop {
@@ -181,6 +188,7 @@ pub fn start_proxy(cfg: ProxyConfig) -> Result<ProxyHandle> {
                         next_id: Arc::clone(&listener_ctx.next_id),
                         capture_limit: listener_ctx.capture_limit,
                         log_tx: listener_ctx.log_tx.clone(),
+                        mitm: listener_ctx.mitm.clone(),
                     };
                     thread::spawn(move || {
                         let _ = handle_connection(&mut stream, &conn_ctx);
@@ -211,7 +219,7 @@ fn find_head_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
-fn read_head(stream: &mut TcpStream) -> Result<(String, Vec<u8>)> {
+fn read_head<S: Read>(stream: &mut S) -> Result<(String, Vec<u8>)> {
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
@@ -245,7 +253,20 @@ fn handle_connection(stream: &mut TcpStream, ctx: &ConnCtx) -> Result<()> {
     if method == "CONNECT" {
         tunnel(stream, &target, ctx)
     } else {
-        intercept_http(stream, &head, leftover, &method, &target, ctx)
+        intercept_http(
+            stream,
+            &head,
+            leftover,
+            &method,
+            &target,
+            ctx,
+            InterceptOpts {
+                scheme: "http",
+                kind: "http",
+                origin_override: None,
+                origin_conn: None,
+            },
+        )
     }
 }
 
@@ -259,13 +280,56 @@ fn parse_headers(head: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-fn intercept_http(
-    stream: &mut TcpStream,
+/// The upstream connection of an intercepted request: plain TCP for HTTP, or
+/// an established TLS session (MITM path) for HTTPS.
+enum OriginConn {
+    Plain(TcpStream),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+}
+
+impl Read for OriginConn {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            OriginConn::Plain(s) => s.read(buf),
+            OriginConn::Tls(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for OriginConn {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            OriginConn::Plain(s) => s.write(buf),
+            OriginConn::Tls(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            OriginConn::Plain(s) => s.flush(),
+            OriginConn::Tls(s) => s.flush(),
+        }
+    }
+}
+
+/// Per-interception routing metadata. The plain-HTTP path uses the defaults;
+/// the MITM path pins the CONNECT host/port, a pre-connected TLS origin, and
+/// the `https` capture kind.
+struct InterceptOpts<'a> {
+    scheme: &'static str,
+    kind: &'static str,
+    origin_override: Option<(&'a str, u16)>,
+    origin_conn: Option<OriginConn>,
+}
+
+fn intercept_http<S: Read + Write>(
+    stream: &mut S,
     head: &str,
     leftover: Vec<u8>,
     method: &str,
     target: &str,
     ctx: &ConnCtx,
+    opts: InterceptOpts<'_>,
 ) -> Result<()> {
     let headers = parse_headers(head);
     let content_length = headers
@@ -279,22 +343,53 @@ fn intercept_http(
         .map(|(_, v)| v.clone())
         .unwrap_or_default();
 
-    let url = if target.starts_with("http://") || target.starts_with("https://") {
-        target.to_string()
-    } else {
-        let path = if target.starts_with('/') {
-            target.to_string()
-        } else {
-            format!("/{target}")
-        };
-        format!("http://{host}{path}")
+    let (origin_host, origin_port, url, path_and_query) = match opts.origin_override {
+        // MITM path: the CONNECT target is authoritative; the inner request
+        // line is origin-form.
+        Some((h, p)) => {
+            let path = if target.starts_with('/') {
+                target.to_string()
+            } else {
+                format!("/{target}")
+            };
+            (
+                h.to_string(),
+                p,
+                format!("{}://{}:{}{}", opts.scheme, h, p, path),
+                path,
+            )
+        }
+        None => {
+            let url = if target.starts_with("http://") || target.starts_with("https://") {
+                target.to_string()
+            } else {
+                let path = if target.starts_with('/') {
+                    target.to_string()
+                } else {
+                    format!("/{target}")
+                };
+                format!("{}://{}{}", opts.scheme, host, path)
+            };
+            let parsed = reqwest::Url::parse(&url)?;
+            let origin_host = parsed
+                .host_str()
+                .ok_or_else(|| anyhow::anyhow!("request URL missing host"))?
+                .to_string();
+            let origin_port = parsed.port_or_known_default().unwrap_or(80);
+            let path_and_query = match parsed.query() {
+                Some(q) if !q.is_empty() => format!("{}?{}", parsed.path(), q),
+                _ => {
+                    let p = parsed.path();
+                    if p.is_empty() {
+                        "/".to_string()
+                    } else {
+                        p.to_string()
+                    }
+                }
+            };
+            (origin_host, origin_port, url.clone(), path_and_query)
+        }
     };
-    let parsed = reqwest::Url::parse(&url)?;
-    let origin_host = parsed
-        .host_str()
-        .ok_or_else(|| anyhow::anyhow!("request URL missing host"))?
-        .to_string();
-    let origin_port = parsed.port_or_known_default().unwrap_or(80);
 
     // Read the request body (Content-Length framing only; documented boundary).
     let mut body_bytes: Vec<u8> = Vec::new();
@@ -317,17 +412,6 @@ fn intercept_http(
     let req_body = String::from_utf8_lossy(&body_bytes).into_owned();
 
     let started = Instant::now();
-    let path_and_query = match parsed.query() {
-        Some(q) if !q.is_empty() => format!("{}?{}", parsed.path(), q),
-        _ => {
-            let p = parsed.path();
-            if p.is_empty() {
-                "/".to_string()
-            } else {
-                p.to_string()
-            }
-        }
-    };
 
     // Rebuild origin-form request: strip hop-by-hop headers + compression.
     let mut out_head = format!("{method} {path_and_query} HTTP/1.1\r\n");
@@ -349,10 +433,17 @@ fn intercept_http(
     }
     out_head.push_str("Connection: close\r\n\r\n");
 
-    let mut origin = TcpStream::connect((origin_host.as_str(), origin_port))
-        .with_context(|| format!("proxy could not reach origin {origin_host}:{origin_port}"))?;
-    origin.set_read_timeout(Some(Duration::from_secs(30)))?;
-    origin.set_write_timeout(Some(Duration::from_secs(30)))?;
+    let mut origin: OriginConn = match opts.origin_conn {
+        Some(conn) => conn,
+        None => {
+            let s = TcpStream::connect((origin_host.as_str(), origin_port)).with_context(|| {
+                format!("proxy could not reach origin {origin_host}:{origin_port}")
+            })?;
+            s.set_read_timeout(Some(Duration::from_secs(30)))?;
+            s.set_write_timeout(Some(Duration::from_secs(30)))?;
+            OriginConn::Plain(s)
+        }
+    };
     origin.write_all(out_head.as_bytes())?;
     origin.write_all(&body_bytes)?;
 
@@ -388,7 +479,7 @@ fn intercept_http(
     let entry = ProxyEntry {
         id: 0,
         ts_unix_ms: now_unix_ms(),
-        kind: "http".into(),
+        kind: opts.kind.into(),
         method: method.to_string(),
         url: url.clone(),
         status,
@@ -406,11 +497,14 @@ fn intercept_http(
         duration_ms: started.elapsed().as_millis(),
         replay_of: None,
     };
-    ctx.record(entry, false);
+    ctx.record(entry, opts.kind != "http");
     Ok(())
 }
 
 fn tunnel(stream: &mut TcpStream, target: &str, ctx: &ConnCtx) -> Result<()> {
+    if let Some(mitm) = &ctx.mitm {
+        return tunnel_mitm(stream, target, mitm, ctx);
+    }
     let started = Instant::now();
     match TcpStream::connect(target) {
         Ok(mut origin) => {
@@ -473,6 +567,78 @@ fn tunnel(stream: &mut TcpStream, target: &str, ctx: &ConnCtx) -> Result<()> {
             bail!("CONNECT tunnel to {target} failed: {e}")
         }
     }
+}
+
+/// Parses a CONNECT target (`host:443`, `[::1]:443`, `127.0.0.1:8443`).
+fn parse_connect_target(target: &str) -> Result<(String, u16)> {
+    if let Ok(addr) = target.parse::<SocketAddr>() {
+        return Ok((addr.ip().to_string(), addr.port()));
+    }
+    let Some((host, port)) = target.rsplit_once(':') else {
+        bail!("CONNECT target '{target}' carries no port");
+    };
+    let port = port.trim().parse::<u16>().unwrap_or(443);
+    let host = host.trim().trim_matches(|c| c == '[' || c == ']');
+    if host.is_empty() {
+        bail!("CONNECT target '{target}' carries no host");
+    }
+    Ok((host.to_string(), port))
+}
+
+/// Opt-in TLS termination of a CONNECT tunnel (`--mitm-ca`): presents an
+/// on-the-fly local-CA leaf for the tunnel host, opens an upstream TLS
+/// session, and runs the decrypted HTTP/1.1 request through the same
+/// interception pipeline as plain HTTP (one request per tunnel; the rebuilt
+/// upstream request forces `Connection: close`).
+fn tunnel_mitm(stream: &mut TcpStream, target: &str, mitm: &MitmCa, ctx: &ConnCtx) -> Result<()> {
+    let (host, port) = parse_connect_target(target)?;
+    // The tunnel is established first; the TLS handshake happens over it.
+    stream.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")?;
+    stream.flush()?;
+    let idle = Some(Duration::from_secs(60));
+    let _ = stream.set_read_timeout(idle);
+    let _ = stream.set_write_timeout(idle);
+
+    let server_cfg = mitm.server_config_for(&host)?;
+    let mut client_sock = stream
+        .try_clone()
+        .context("failed to clone client socket for MITM")?;
+    let mut client_conn = rustls::ServerConnection::new(server_cfg)
+        .map_err(|e| anyhow::anyhow!("MITM server TLS init failed: {e}"))?;
+    crate::proxy_mitm::drive_client_handshake(&mut client_conn, &mut client_sock)?;
+    let mut client_tls = rustls::StreamOwned::new(client_conn, client_sock);
+
+    let origin_tls = mitm.connect_upstream(&host, port)?;
+    let origin = OriginConn::Tls(Box::new(origin_tls));
+
+    let (head, leftover) = read_head(&mut client_tls)?;
+    let request_line = head.lines().next().unwrap_or_default().trim().to_string();
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or("").to_ascii_uppercase();
+    let req_target = parts.next().unwrap_or("").to_string();
+    if method.is_empty() || req_target.is_empty() {
+        bail!("malformed request inside CONNECT tunnel: {request_line:?}");
+    }
+    let opts = InterceptOpts {
+        scheme: "https",
+        kind: "https",
+        origin_override: Some((host.as_str(), port)),
+        origin_conn: Some(origin),
+    };
+    intercept_http(
+        &mut client_tls,
+        &head,
+        leftover,
+        &method,
+        &req_target,
+        ctx,
+        opts,
+    )?;
+    // Graceful TLS teardown on the client side.
+    client_tls.conn.send_close_notify();
+    let _ = client_tls.flush();
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -574,6 +740,7 @@ mod tests {
             capture_limit: DEFAULT_CAPTURE_LIMIT,
             allow_remote_bind: false,
             jsonl_log,
+            mitm: None,
         }
     }
 
@@ -653,6 +820,114 @@ mod tests {
         handle.stop.store(true, Ordering::Relaxed);
     }
 
+    /// A loopback HTTPS origin serving one hello response per TLS session with
+    /// a self-signed certificate (exercises the MITM upstream fallback path).
+    fn tls_origin_server() -> (u16, rustls::pki_types::CertificateDer<'static>) {
+        let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+        let cert_der = cert.cert.der().clone();
+        let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
+        let mut server_cfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der)
+            .unwrap();
+        server_cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let server_cfg = Arc::new(server_cfg);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            for _ in 0..8 {
+                let Ok((mut sock, _)) = listener.accept() else {
+                    break;
+                };
+                let _ = sock.set_read_timeout(Some(Duration::from_secs(10)));
+                let _ = sock.set_write_timeout(Some(Duration::from_secs(10)));
+                let Ok(mut conn) = rustls::ServerConnection::new(Arc::clone(&server_cfg)) else {
+                    continue;
+                };
+                while conn.is_handshaking() {
+                    if conn.complete_io(&mut sock).is_err() {
+                        break;
+                    }
+                }
+                let mut tls = rustls::StreamOwned::new(conn, sock);
+                let mut buf = [0u8; 4096];
+                let _ = tls.read(&mut buf);
+                let resp = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 6\r\nConnection: close\r\n\r\nhello!";
+                let _ = tls.write_all(resp);
+                let _ = tls.flush();
+                tls.conn.send_close_notify();
+                let _ = tls.flush();
+            }
+        });
+        (port, cert_der)
+    }
+
+    #[test]
+    fn mitm_connect_decrypts_https_traffic() {
+        use rustls::pki_types::pem::PemObject as _;
+        let (tls_port, _origin_cert) = tls_origin_server();
+        let ca_dir = std::env::temp_dir().join(format!("smg-proxy-mitm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ca_dir);
+        let mitm = crate::proxy_mitm::MitmCa::load_or_create(&ca_dir).unwrap();
+        let ca_der = rustls::pki_types::CertificateDer::from_pem_file(&mitm.cert_pem_path).unwrap();
+        let handle = start_proxy(ProxyConfig {
+            mitm: Some(Arc::new(mitm)),
+            ..test_config(None)
+        })
+        .unwrap();
+
+        // The client trusts only our local CA: validating the on-the-fly leaf
+        // proves the rcgen signing + IP-literal SAN wiring end to end.
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca_der).unwrap();
+        let mut ccfg = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        ccfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let name = rustls::pki_types::ServerName::try_from("127.0.0.1".to_string()).unwrap();
+
+        let mut sock = TcpStream::connect(handle.bound_addr).unwrap();
+        sock.write_all(format!("CONNECT 127.0.0.1:{tls_port} HTTP/1.1\r\n\r\n").as_bytes())
+            .unwrap();
+        let mut established = [0u8; 128];
+        let n = sock.read(&mut established).unwrap();
+        let established = String::from_utf8_lossy(&established[..n]).into_owned();
+        assert!(
+            established.contains("200 Connection established"),
+            "got: {established}"
+        );
+
+        let mut conn = rustls::ClientConnection::new(Arc::new(ccfg), name).unwrap();
+        while conn.is_handshaking() {
+            conn.complete_io(&mut sock).unwrap();
+        }
+        let mut tls = rustls::StreamOwned::new(conn, sock);
+        tls.write_all(b"GET /hello HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .unwrap();
+        tls.flush().unwrap();
+        let mut response = Vec::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            match tls.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => response.extend_from_slice(&chunk[..n]),
+            }
+        }
+        drop(tls);
+        let response = String::from_utf8_lossy(&response).into_owned();
+        assert!(response.contains("hello!"), "got: {response}");
+
+        wait_entries(&handle, 1);
+        let entries = handle.entries.lock().unwrap();
+        assert_eq!(entries[0].kind, "https");
+        assert_eq!(entries[0].method, "GET");
+        assert_eq!(entries[0].status, 200);
+        assert!(entries[0].url.starts_with("https://127.0.0.1:"));
+        assert!(entries[0].resp_body.contains("hello!"));
+        handle.stop.store(true, Ordering::Relaxed);
+        let _ = std::fs::remove_dir_all(&ca_dir);
+    }
+
     #[test]
     fn refuses_non_loopback_bind_without_flag() {
         let err = start_proxy(ProxyConfig {
@@ -660,6 +935,7 @@ mod tests {
             capture_limit: DEFAULT_CAPTURE_LIMIT,
             allow_remote_bind: false,
             jsonl_log: None,
+            mitm: None,
         });
         assert!(err.is_err());
     }

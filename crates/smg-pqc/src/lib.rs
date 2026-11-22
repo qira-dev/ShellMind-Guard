@@ -4,8 +4,8 @@ pub mod x509;
 pub mod x509_starttls_elf;
 
 pub use x509_starttls_elf::{
-    DerCertAudit, ElfCryptoAudit, StartTlsProtocol, inspect_x509_der, negotiate_starttls,
-    scan_elf_crypto_symbols,
+    DerCertAudit, ElfCryptoAudit, StartTlsProtocol, extract_cn_and_san_dns, inspect_x509_der,
+    negotiate_starttls, scan_elf_crypto_symbols,
 };
 
 use inventory::{CryptoAssetRecord, analyze_pqc_inventory, build_static_cbom_cyclonedx};
@@ -54,7 +54,8 @@ pub fn scan_pqc_repo(
                 .clone()
                 .or_else(|| std::fs::read(&f.abs_path).ok());
             if let Some(der) = bytes_opt {
-                let (_audit, der_hits) = x509_starttls_elf::inspect_x509_der(&f.rel_path, &der, 2026);
+                let (_audit, der_hits) =
+                    x509_starttls_elf::inspect_x509_der(&f.rel_path, &der, 2026);
                 findings.extend(der_hits);
             }
         } else if low.ends_with(".so") || low.ends_with(".elf") {

@@ -138,10 +138,15 @@ pub fn decode_all(text: &str) -> Vec<(String, String)> {
 
 /// Replays a captured intercepted-HTTP request (Repeater). Returns a new entry
 /// with `replay_of` pointing at the original id; the caller assigns the id.
+/// `--mitm-ca` sessions are decrypted into `kind: "https"` entries and replay
+/// like plain HTTP (the client accepts the proxy CA's self-signed leaf).
 pub fn replay_entry(client: &Client, entry: &ProxyEntry) -> Result<ProxyEntry> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    if entry.kind != "http" {
-        bail!("CONNECT tunnels (HTTPS) cannot be replayed; only intercepted HTTP requests can");
+    if entry.kind != "http" && entry.kind != "https" {
+        bail!(
+            "kind '{}' cannot be replayed; only intercepted HTTP/HTTPS requests can",
+            entry.kind
+        );
     }
     let method = reqwest::Method::from_bytes(entry.method.as_bytes())
         .with_context(|| format!("invalid replay method '{}'", entry.method))?;

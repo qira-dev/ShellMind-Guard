@@ -61,6 +61,9 @@ pub struct HttpAuditConfig {
     pub headers: HashMap<String, String>,
     pub schema_file: Option<PathBuf>,
     pub graphql_endpoint: Option<String>,
+    /// Render the target in headless Chrome (`--spa`) and report DOM
+    /// source-to-sink flows plus background XHR/Fetch endpoints.
+    pub spa: bool,
     pub timeout: Duration,
     pub allow_remote: bool,
 }
@@ -72,6 +75,7 @@ pub struct HttpAuditReport {
     pub schema_findings: Vec<DastFinding>,
     pub schema_kind: Option<String>,
     pub schema_source: Option<String>,
+    pub spa_xhr_endpoints: Vec<String>,
     pub elapsed_ms: u128,
 }
 
@@ -369,12 +373,53 @@ pub fn run_http_audit(cfg: &HttpAuditConfig) -> Result<HttpAuditReport> {
     let mut schema_findings: Vec<DastFinding> = Vec::new();
     let mut schema_kind: Option<String> = None;
     let mut schema_source: Option<String> = None;
+    let mut spa_xhr_endpoints: Vec<String> = Vec::new();
     let target_url = cfg.url.clone();
 
     if !offline_only {
         // 1. Passive posture: exactly one GET.
         let page = fetch_passive(&client, &target_url)?;
         passive.extend(passive_header_findings(&page));
+
+        // 1b. Optional SPA render (`--spa`): JS-executed DOM source-sink
+        // flows + background XHR/Fetch endpoints.
+        if cfg.spa {
+            match crate::cdp_engine::CdpEngine::launch() {
+                Ok(engine) => match engine.session() {
+                    Ok(mut session) => match session.navigate_and_collect(&target_url, 800) {
+                        Ok(data) => {
+                            for f in data.dom_findings {
+                                let payload = f.sink.clone();
+                                let evidence =
+                                    format!("source '{}' flows into sink '{}'", f.source, f.sink);
+                                dedup_insert(
+                                    &mut passive,
+                                    DastFinding {
+                                        id: "SMG-DAST-DOMXSS-SRC-SINK".into(),
+                                        severity: "high".into(),
+                                        url: target_url.clone(),
+                                        param: None,
+                                        payload,
+                                        evidence,
+                                        proof: f.value,
+                                    },
+                                );
+                            }
+                            spa_xhr_endpoints = data.xhr_urls;
+                        }
+                        Err(e) => {
+                            eprintln!("  smg http-audit: SPA render failed: {e}");
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("  smg http-audit: CDP session failed: {e}");
+                    }
+                },
+                Err(e) => {
+                    eprintln!("  smg http-audit: headless Chrome unavailable: {e}");
+                }
+            }
+        }
 
         // 2. Passive OpenAPI discovery on the origin (plain GETs only).
         let parsed = reqwest::Url::parse(&target_url)?;
@@ -470,6 +515,7 @@ pub fn run_http_audit(cfg: &HttpAuditConfig) -> Result<HttpAuditReport> {
         schema_findings,
         schema_kind,
         schema_source,
+        spa_xhr_endpoints,
         elapsed_ms: started.elapsed().as_millis(),
     })
 }
@@ -545,6 +591,7 @@ mod tests {
             headers: HashMap::new(),
             schema_file: Some(openapi.clone()),
             graphql_endpoint: None,
+            spa: false,
             timeout: Duration::from_secs(5),
             allow_remote: false,
         })
@@ -566,6 +613,7 @@ mod tests {
             headers: HashMap::new(),
             schema_file: Some(sdl),
             graphql_endpoint: None,
+            spa: false,
             timeout: Duration::from_secs(5),
             allow_remote: false,
         })
@@ -625,6 +673,7 @@ mod tests {
             headers: HashMap::new(),
             schema_file: None,
             graphql_endpoint: None,
+            spa: false,
             timeout: Duration::from_secs(5),
             allow_remote: false,
         })
@@ -662,6 +711,7 @@ mod tests {
             headers: HashMap::new(),
             schema_file: None,
             graphql_endpoint: None,
+            spa: false,
             timeout: Duration::from_secs(5),
             allow_remote: false,
         });

@@ -167,10 +167,7 @@ impl FieldSensitivePointsTo {
                     if let Some(sites) = state.pts.get(base) {
                         let is_singleton = sites.len() == 1;
                         for &site in sites {
-                            let entry = state
-                                .field_taint
-                                .entry((site, field.clone()))
-                                .or_insert(0);
+                            let entry = state.field_taint.entry((site, field.clone())).or_insert(0);
                             if is_singleton {
                                 *entry = *taint_bits; // strong update
                             } else {
@@ -295,9 +292,9 @@ impl SsaDefUseGraph {
                     SsaOp::Sanitize { src, clear_bits } => {
                         taint.get(src).copied().unwrap_or(0) & !*clear_bits
                     }
-                    SsaOp::Phi(inputs) => inputs.iter().fold(0u32, |acc, inp| {
-                        acc | taint.get(inp).copied().unwrap_or(0)
-                    }),
+                    SsaOp::Phi(inputs) => inputs
+                        .iter()
+                        .fold(0u32, |acc, inp| acc | taint.get(inp).copied().unwrap_or(0)),
                 };
                 let cur = taint.get(&key).copied().unwrap_or(0);
                 if val != cur {
@@ -334,8 +331,10 @@ impl SsaDefUseGraph {
                 version: v,
             };
             let t = taint.get(&key).copied().unwrap_or(0);
-            if matches!(self.defs.get(&(var_name.to_string(), v)), Some(SsaOp::Sanitize { .. }))
-                && t == 0
+            if matches!(
+                self.defs.get(&(var_name.to_string(), v)),
+                Some(SsaOp::Sanitize { .. })
+            ) && t == 0
             {
                 saw_sanitized_clean = true;
             } else if saw_sanitized_clean && t != 0 {
@@ -415,11 +414,23 @@ mod tests {
         const XSS: u32 = 0b0100;
         let mut g = SsaDefUseGraph::default();
         let x0 = g.define("x", SsaOp::AssignTaint(XSS));
-        let x1 = g.define("x", SsaOp::Sanitize { src: x0.clone(), clear_bits: XSS });
+        let x1 = g.define(
+            "x",
+            SsaOp::Sanitize {
+                src: x0.clone(),
+                clear_bits: XSS,
+            },
+        );
         // Partial merge: only 1 branch sanitized -> still tainted!
         let x_partial = g.define("x_m", SsaOp::Phi(vec![x1.clone(), x0.clone()]));
         // Full merge: both branches sanitized -> clean!
-        let x2 = g.define("x", SsaOp::Sanitize { src: x0, clear_bits: XSS });
+        let x2 = g.define(
+            "x",
+            SsaOp::Sanitize {
+                src: x0,
+                clear_bits: XSS,
+            },
+        );
         let x_full = g.define("x_clean", SsaOp::Phi(vec![x1, x2]));
         // Later reassignment revokes sanitization
         let _x3 = g.define("x", SsaOp::AssignTaint(XSS));

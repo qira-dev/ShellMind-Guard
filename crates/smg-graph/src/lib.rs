@@ -30,9 +30,18 @@ use rayon::prelude::*;
 use smg_core::{IndexedFile, ShellMindGuardConfig, StateStore};
 use std::collections::HashSet;
 
+pub use ai_mcp_model::{
+    analyze_indirect_prompt_injection, analyze_mcp_tool_poisoning,
+    analyze_model_deserialization_and_ssti, inspect_chat_template_ssti, inspect_pickle_bytes,
+    scan_repo_ai_model_artifacts,
+};
 pub use ast::{
     CallSite, Confidence, FileAstSummary, FrontendApiCall, GuardKind, LocalStaticFinding, SinkKind,
     TypeImplSummary, check_source_syntax, parse_file_ast, parse_file_ast_with_hash,
+};
+pub use cfa_ssa::{
+    AllocSite, CallString2, ContextKey, FieldSensitivePointsTo, KCfaContextTable, PointsToStmt,
+    SsaDefUseGraph, SsaOp, SsaVar,
 };
 pub use deps::{ReachableVulnStatus, assess_dependency_reachability, compute_reachable_packages};
 pub use git_history::{
@@ -55,17 +64,8 @@ pub use smt_advanced::{
     ArrayConstraint, BvBitState, BvConstraint, LinearIneq, check_interprocedural_feasibility,
     solve_array_constraints, solve_bv_constraints, solve_lia_constraints,
 };
-pub use cfa_ssa::{
-    AllocSite, CallString2, ContextKey, FieldSensitivePointsTo, KCfaContextTable, PointsToStmt,
-    SsaDefUseGraph, SsaOp, SsaVar,
-};
 pub use subgraph::{
     collect_git_changed_files, should_force_full_scan_on_diff, slice_summaries_for_changed_files,
-};
-pub use ai_mcp_model::{
-    analyze_indirect_prompt_injection, analyze_mcp_tool_poisoning,
-    analyze_model_deserialization_and_ssti, inspect_chat_template_ssti, inspect_pickle_bytes,
-    scan_repo_ai_model_artifacts,
 };
 pub use vex_osv::{AutoVexSymbolIndex, OpenVexStatement, to_openvex_json};
 
