@@ -1,7 +1,7 @@
 {
   "name": "shellmind-guard",
-  "version": "0.1.0",
-  "description": "Zero-AI multi-file security, business-logic & concurrency verifier across 16 languages: Auth/IDOR/CSRF/Race lattice, SQL/NoSQL/XSS/CMDi/SSTI/Path/SSRF taint, secrets, SQL/Terraform IaC, offline OSV deps, engine deadlocks/memory, mobile security, --deep schema fuzzing, Bubblewrap exploit proof & stdio MCP.",
+  "version": "0.3.0",
+  "description": "Zero-AI multi-file security, business-logic, concurrency & frontier-domain verifier across 18 languages: SMT (QF_BV/QF_LIA/Array) + k-CFA/SSA lattice, C/C++ memory typestate, Rust async-mutex, Embedded HW WCSD/DMA/.ld, Web3/revm/Solana/Move, AI Indirect-Prompt/MCP/Pickle/SSTI, PQC/X.509-DER/STARTTLS/ELF, Nitro/TDX/SEV-SNP attestation, HTTP/2 single-packet race, OpenVEX v0.2.0 & stdio MCP.",
   "author": {
     "name": "Qira-Dev",
     "url": "https://github.com/qira-dev/ShellMind-Guard"

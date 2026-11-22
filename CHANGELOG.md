@@ -8,6 +8,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-22
+
+### Added (Phases 27–33: Ultra-Depth Formal, Systems, HW, Web3, AI/MCP, PQC, TEE & Sandbox Engines)
+- **Formal Analysis Core (`crates/smg-graph/src/smt_advanced.rs`, `cfa_ssa.rs`):**
+  - Pure-Rust 64-bit tristate bitvector solver (`QF_BV`), `i128` GCD + bounded Fourier-Motzkin linear integer arithmetic (`QF_LIA`, wired into `smt.rs`), McCarthy Array Read-Over-Write solver, and inter-procedural Caller->Callee constraint propagation.
+  - $k$-CFA ($k=2$) call-string sensitivity, Andersen field-sensitive points-to analysis with singleton strong updates, and SSA Phi-node def-use tracking with sanitizer revocation.
+- **Native Memory & Async Concurrency Typestate (`crates/smg-graph/src/phase9/mem_typestate.rs`):**
+  - Zero-allocation C/C++ Use-After-Free, Double-Free (branch-depth scoped), and provable constant buffer-length overflow (`malloc`/`char buf[N]` -> `memcpy`/`strcpy`), plus Rust `std::sync::Mutex`/`RwLock`/`parking_lot::Mutex` held across `.await` deadlock detection.
+- **Embedded HW WCSD, DMA Coherency & Linker Script Verifier (`crates/smg-hw/src/wcsd_dma.rs`):**
+  - GNU Linker Script (`.ld`/`.lds`) memory region overlap & `_Min_Stack_Size` budget verifier (auto-walked on disk in `smg scan`), inter-procedural Worst-Case Stack Depth (WCSD) with ISR nesting & recursion cycle detection, and DMA cache coherency (`SCB_CleanDCache`/`SCB_InvalidateDCache`) typestate.
+- **Data-Driven OSV Auto-Function VEX & OpenVEX v0.2.0 (`crates/smg-graph/src/vex_osv.rs`, `smg scan --openvex <FILE>`):**
+  - Extracts affected symbols/functions from OSV `ecosystem_specific.imports`/`functions` and exports standards-compliant OpenVEX v0.2.0 JSON via `smg scan --openvex <FILE>`.
+- **Web3 Ultra-Depth (`crates/smg-web3/src/ultra_web3.rs`):**
+  - EIP-2535 Diamond 4-byte facet selector clash detection, UUPS/Initializable missing `_disableInitializers()` & implementation `selfdestruct`, flash-loan callback auth (`executeOperation`/`onFlashLoan`/`uniswapV2Call`/`uniswapV3FlashCallback`), function-bounded AMM spot-price oracle manipulation, Chainlink `latestRoundData()` staleness checks, ERC-4626 first-depositor share inflation, Solana Anchor `init_if_needed` / non-canonical PDA bump / arbitrary CPI, and Move resource ability leak (`copy`/`drop`) / shared `AdminCap` / unguarded `public entry fun`.
+- **AI / LLM / MCP & ML Model Deserialization Security (`crates/smg-graph/src/ai_mcp_model.rs`):**
+  - Indirect Prompt Injection taint graph (`RAG/Web/Email -> Prompt -> LLM -> Tool/Exec` with sanitizer revocation), MCP Tool-Poisoning & invisible Unicode/Bidi/Tag steganography (`U+200B`, `U+202E`, `U+E0000..U+E007F`), unsafe MCP `stdio` shell interpolation, `torch.load` (`weights_only=False`), `pickle`/`dill`/`cloudpickle`/`joblib`/`trust_remote_code=True`, pure-Rust binary Python Pickle opcode inspector (`GLOBAL`/`STACK_GLOBAL`/`REDUCE` on `.pkl`/`.pt`/`.pth`), and HuggingFace/GGUF Jinja2 `chat_template` SSTI inspector (`tokenizer_config.json`), all wired end-to-end into `smg scan`.
+- **PQC X.509 DER, STARTTLS & ELF Crypto Scanner (`crates/smg-pqc/src/x509_starttls_elf.rs`, `smg tls --starttls`):**
+  - Pure-Rust ASN.1 DER X.509 certificate inspector (MD5/SHA-1 weak signatures, NIST PQC `ML-DSA-44/65/87` & `SLH-DSA` OIDs, UTCTime/GeneralizedTime expiry, SAN presence/wildcards), pure-Rust STARTTLS upgrade negotiator (`smg tls <TARGET> --starttls smtp|imap|ftp`), and ELF binary crypto symbol scanner (`.so`/`.elf` auto-walked on `--layers all`/`pqc`).
+- **Confidential Computing Attestation CLI & BLAKE3 Merkle Audit Log (`crates/smg-enterprise/src/attestation_merkle.rs`, `smg verify-attestation`):**
+  - Fail-closed `smg verify-attestation --platform tdx|sev-snp|nitro --input <FILE> [--expected-measurement <HEX>] [--min-svn <N>] [--json]` verifying Intel TDX v4 Quotes (`TD_ATTR_DEBUG` rejection), AMD SEV-SNP reports (`DEBUG` bit & `guest_svn` floor), and AWS Nitro `COSE_Sign1` CBOR framing, with append-only domain-separated BLAKE3 `MerkleAuditLog` & O(log N) inclusion proofs.
+- **RFC 9113 HTTP/2 Single-Packet Race & 16-Lang Multi-Hunk Semantic AST Patcher (`crates/smg-sandbox/src/h2_race_snapshot.rs`, `crates/smg-ai/src/semantic_patcher.rs`):**
+  - Loopback-only RFC 9113 HTTP/2 Single-Packet `END_STREAM` race burst dispatcher (`dispatch_h2_single_packet_race_for_finding`) + DB state snapshot conservation-of-value diff verifier (`diff_db_snapshots`), and 16-language coordinated multi-hunk semantic AST patcher with tree-sitter syntax gate & atomic `--verify-fix` rollback (wired into `codemods.rs`).
+
+### Performance & Precision (Phases 34–35 — Validated Across 60 Real-World Open-Source Repositories)
+- Eliminated per-line `Regex::new` compilation in `mem_typestate.rs` (zero-alloc byte matching), added branch-depth-scoped `free()` state resets (`memcached` `SMG-MEM-BOUNDS` FPs reduced 54%), parallelized `smg-hw` with `rayon::par_iter`, tightened `smg-hw` indicator tokens (replacing bare `"volatile"` with true firmware/kernel tokens), and skipped top-level vendored directories (`deps`, `vendor`, `third_party`, `3rdparty`, `submodules`) outside source packages — turning `nginx`, `nlohmann/json`, `redis`, and `curl` from >25–35s timeouts into clean `7.5s–25.8s` scans with zero crashes across all 60 tested repos.
+- Fixed Move `*Event` struct `copy, drop` FPs (`SMG-MOVE-ABILITY-LEAK`), Aave `VersionedInitializable` FPs (`SMG-WEB3-UUPS-UNINIT`), MCP `description:` tool-poisoning false-negative, and added PHP numeric sanitizers (`is_numeric`, `intval`, `ctype_digit`, `filter_var`).
+
 ## [0.2.0] - 2026-11-22
 
 ### Security & Hardening (8-Phase Full-Repo Audit Remediation)
