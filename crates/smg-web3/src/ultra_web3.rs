@@ -99,11 +99,12 @@ pub fn analyze_solidity_ultra_depth(
     let mut findings = Vec::new();
 
     // 1. UUPS / Initializable implementation missing `_disableInitializers()` in constructor
-    let is_upgradeable = stripped.contains("UUPSUpgradeable")
-        || stripped.contains("Initializable")
-        || stripped.contains("initializer");
+    let is_upgradeable =
+        stripped.contains("UUPSUpgradeable") || stripped.contains("Initializable");
     if is_upgradeable
         && !stripped.contains("_disableInitializers()")
+        && !stripped.contains("VersionedInitializable")
+        && !stripped.contains("lastInitializedRevision")
         && stripped.contains("function initialize")
     {
         let init_line = lines
@@ -407,12 +408,14 @@ pub fn analyze_move_ultra_depth(rel_path: &str, source: &str) -> Vec<LocalStatic
         // 1. Asset/Vault/Cap struct mistakenly granted `copy` or `drop` ability
         if trimmed.starts_with("struct ") || trimmed.starts_with("public struct ") {
             let low = trimmed.to_ascii_lowercase();
-            let is_sensitive_resource = low.contains("coin")
-                || low.contains("vault")
-                || low.contains("treasury")
-                || low.contains("receipt")
-                || low.contains("admincap")
-                || low.contains("hotpotato");
+            let is_event = low.contains("event");
+            let is_sensitive_resource = !is_event
+                && (low.contains("coin")
+                    || low.contains("vault")
+                    || low.contains("treasury")
+                    || low.contains("receipt")
+                    || low.contains("admincap")
+                    || low.contains("hotpotato"));
             if is_sensitive_resource && (trimmed.contains(" has ") && (trimmed.contains("copy") || trimmed.contains("drop"))) {
                 findings.push(mk_web3_finding(
                     "SMG-MOVE-ABILITY-LEAK",

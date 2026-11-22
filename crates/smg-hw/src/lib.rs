@@ -54,7 +54,11 @@ pub fn repo_has_hw_indicators(project_root: &Path, files: &[IndexedFile]) -> boo
 
     // Lightweight indicator scan on C/C++/Rust files (comment-stripped) before spinning deeper domains
     const HW_TOKENS: &[&str] = &[
-        "volatile",
+        "__iomem",
+        "ioremap",
+        "HAL_DMA_",
+        "SCB_CleanDCache",
+        "NVIC_",
         "__user",
         "copy_from_user",
         "spin_lock",

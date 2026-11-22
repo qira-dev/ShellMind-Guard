@@ -52,7 +52,14 @@ pub(crate) const PROFILE: LangProfile = LangProfile {
         "popen(",
         "eval(",
     ],
-    cmd_sanitizers: &["escapeshellarg(", "escapeshellcmd("],
+    cmd_sanitizers: &[
+        "escapeshellarg(",
+        "escapeshellcmd(",
+        "is_numeric(",
+        "intval(",
+        "ctype_digit(",
+        "filter_var(",
+    ],
     path_sinks: &[
         "file_get_contents(",
         "file_put_contents(",
