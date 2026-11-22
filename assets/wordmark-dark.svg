@@ -7,5 +7,5 @@
       <polygon points="288.5,285.3 256.3,303.6 256.9,356.6 289.1,336.4" fill="#10B981"/>
   </g>
   <text x="174" y="88" font-family="Inter,-apple-system,Segoe UI,Roboto,sans-serif" font-size="52" font-weight="700" letter-spacing="-1.2" fill="#F8FAFC">ShellMind <tspan fill="#10B981">Guard</tspan></text>
-  <text x="177" y="122" font-family="Inter,-apple-system,Segoe UI,Roboto,sans-serif" font-size="16" font-weight="500" letter-spacing="1.4" fill="#94A3B8">DETERMINISTIC MULTI-DOMAIN SECURITY VERIFIER</text>
+  <text x="177" y="122" font-family="Inter,-apple-system,Segoe UI,Roboto,sans-serif" font-size="16" font-weight="600" letter-spacing="2.2" fill="#94A3B8">SECURITY VERIFIED, NOT GUESSED.</text>
 </svg>
