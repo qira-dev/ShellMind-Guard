@@ -135,17 +135,30 @@ pub fn scan_hardware_repo(
     let mut raw_findings = Vec::new();
     let mut lock_summaries: Vec<HardwareFunctionLockSummary> = Vec::new();
 
-    for (rel, lang, content) in &sources {
-        analyze_hw_file(
-            rel,
-            *lang,
-            content,
-            &ctx,
-            &mut raw_findings,
-            &mut lock_summaries,
-        );
-        if matches!(lang, Language::C | Language::Cpp) {
-            raw_findings.extend(wcsd_dma::analyze_dma_cache_coherency(rel, content));
+    {
+        use rayon::prelude::*;
+        let per_file: Vec<(Vec<LocalStaticFinding>, Vec<HardwareFunctionLockSummary>)> = sources
+            .par_iter()
+            .map(|(rel, lang, content)| {
+                let mut local_findings = Vec::new();
+                let mut local_locks = Vec::new();
+                analyze_hw_file(
+                    rel,
+                    *lang,
+                    content,
+                    &ctx,
+                    &mut local_findings,
+                    &mut local_locks,
+                );
+                if matches!(lang, Language::C | Language::Cpp) {
+                    local_findings.extend(wcsd_dma::analyze_dma_cache_coherency(rel, content));
+                }
+                (local_findings, local_locks)
+            })
+            .collect();
+        for (lf, ll) in per_file {
+            raw_findings.extend(lf);
+            lock_summaries.extend(ll);
         }
     }
     for f in files {

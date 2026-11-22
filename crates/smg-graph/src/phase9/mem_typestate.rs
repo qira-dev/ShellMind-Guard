@@ -9,7 +9,7 @@ use std::sync::OnceLock;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PtrState {
     Live,
-    Freed(usize), // freed at line
+    Freed(usize, i32), // (freed at line, brace_depth where freed)
     Nullified,
 }
 
@@ -48,8 +48,72 @@ fn null_assign_re() -> &'static Regex {
     })
 }
 
-fn ident_word_re(var: &str) -> Option<Regex> {
-    Regex::new(&format!(r"\b{}(?:\s*->|\s*\[)", regex::escape(var))).ok()
+/// Zero-allocation O(N) check for `var->`, `var[`, or `*var` with C identifier word boundaries.
+fn line_derefs_ptr(line: &str, var: &str) -> bool {
+    let bytes = line.as_bytes();
+    let vb = var.as_bytes();
+    if vb.is_empty() || bytes.len() < vb.len() + 1 {
+        return false;
+    }
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut i = 0usize;
+    while i + vb.len() <= bytes.len() {
+        if &bytes[i..i + vb.len()] == vb {
+            let left_ok = i == 0 || !is_ident(bytes[i - 1]);
+            if left_ok {
+                // Check `*var` (prefix deref)
+                if i > 0 && bytes[i - 1] == b'*' {
+                    let right_ok = i + vb.len() == bytes.len() || !is_ident(bytes[i + vb.len()]);
+                    if right_ok {
+                        return true;
+                    }
+                }
+                // Check `var->` or `var[` (skipping optional ASCII whitespace)
+                let mut j = i + vb.len();
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if j < bytes.len()
+                    && (bytes[j] == b'['
+                        || (bytes[j] == b'-' && j + 1 < bytes.len() && bytes[j + 1] == b'>'))
+                {
+                    return true;
+                }
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Zero-allocation check for `var = ...` reassignment anywhere on the line (excluding `==`).
+fn line_reassigns_ptr(line: &str, var: &str) -> bool {
+    let bytes = line.as_bytes();
+    let vb = var.as_bytes();
+    if vb.is_empty() || bytes.len() < vb.len() + 2 {
+        return false;
+    }
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut i = 0usize;
+    while i + vb.len() < bytes.len() {
+        if &bytes[i..i + vb.len()] == vb {
+            let left_ok = i == 0 || !is_ident(bytes[i - 1]);
+            if left_ok {
+                let mut j = i + vb.len();
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if j < bytes.len()
+                    && bytes[j] == b'='
+                    && (j + 1 >= bytes.len() || bytes[j + 1] != b'=')
+                {
+                    return true;
+                }
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Audits C/C++ source code for Use-After-Free, Double-Free, and provable constant
@@ -67,18 +131,37 @@ pub fn analyze_c_cpp_memory_typestate(rel_path: &str, source: &str) -> Vec<Local
             continue;
         }
 
-        // Reset function-local state when exiting top-level function body
+        // Reset function-local state when exiting top-level function body,
+        // and clear conditional-branch `Freed` states when exiting an inner `{ ... }` block
+        // or entering an `else` / `case` / `default:` / goto-label branch.
         let opens = line.chars().filter(|&c| c == '{').count() as i32;
         let closes = line.chars().filter(|&c| c == '}').count() as i32;
         if brace_depth == 0 && opens > 0 {
             ptr_states.clear();
             buf_sizes.clear();
         }
+        let prev_depth = brace_depth;
         brace_depth = (brace_depth + opens - closes).max(0);
         if brace_depth == 0 {
             ptr_states.clear();
             buf_sizes.clear();
             continue;
+        }
+        if brace_depth < prev_depth
+            || line.starts_with("else")
+            || line.starts_with("} else")
+            || line.starts_with("case ")
+            || line.starts_with("default:")
+            || (line.ends_with(':') && !line.contains(' ') && !line.contains('('))
+        {
+            ptr_states.retain(|_, st| !matches!(st, PtrState::Freed(_, d) if *d > brace_depth));
+            if line.starts_with("else")
+                || line.starts_with("} else")
+                || line.starts_with("case ")
+                || line.starts_with("default:")
+            {
+                ptr_states.retain(|_, st| !matches!(st, PtrState::Freed(_, d) if *d >= brace_depth));
+            }
         }
 
         // 1. Track stack & heap constant buffer capacities
@@ -139,7 +222,7 @@ pub fn analyze_c_cpp_memory_typestate(rel_path: &str, source: &str) -> Vec<Local
             && let Some(v) = c.get(1).or_else(|| c.get(2))
         {
             let var = v.as_str();
-            if let Some(PtrState::Freed(first_ln)) = ptr_states.get(var) {
+            if let Some(PtrState::Freed(first_ln, _)) = ptr_states.get(var) {
                 findings.push(LocalStaticFinding {
                     rule_id: "SMG-MEM-BOUNDS".into(),
                     severity: "CRITICAL".into(),
@@ -157,45 +240,50 @@ pub fn analyze_c_cpp_memory_typestate(rel_path: &str, source: &str) -> Vec<Local
                     ),
                 });
             } else {
-                ptr_states.insert(var.to_string(), PtrState::Freed(ln));
+                // Single-line conditional `if (x) free(p);` does not unconditionally free `p`
+                let is_single_line_cond =
+                    (line.starts_with("if ") || line.starts_with("if(")) && !line.contains('{');
+                if !is_single_line_cond {
+                    ptr_states.insert(var.to_string(), PtrState::Freed(ln, brace_depth));
+                }
             }
             continue;
         }
 
         // 5. Check Use-After-Free dereference (`p->`, `p[i]`, `*p`) on any currently Freed pointer
-        let freed_vars: Vec<(String, usize)> = ptr_states
-            .iter()
-            .filter_map(|(k, st)| match st {
-                PtrState::Freed(fln) => Some((k.clone(), *fln)),
-                _ => None,
-            })
-            .collect();
+        if ptr_states.values().any(|st| matches!(st, PtrState::Freed(_, _))) {
+            let freed_vars: Vec<(String, usize)> = ptr_states
+                .iter()
+                .filter_map(|(k, st)| match st {
+                    PtrState::Freed(fln, _) => Some((k.clone(), *fln)),
+                    _ => None,
+                })
+                .collect();
 
-        for (var, freed_ln) in freed_vars {
-            // Reassignment (`var = ...`) revives the pointer
-            if line.starts_with(&format!("{var} =")) || line.starts_with(&format!("{var}=")) {
-                ptr_states.insert(var, PtrState::Live);
-                continue;
-            }
-            let deref_star = line.contains(&format!("*{var}"));
-            let deref_member = ident_word_re(&var).is_some_and(|re| re.is_match(line));
-            if deref_star || deref_member {
-                findings.push(LocalStaticFinding {
-                    rule_id: "SMG-MEM-BOUNDS".into(),
-                    severity: "CRITICAL".into(),
-                    title: format!(
-                        "Use-after-free: pointer `{var}` dereferenced after `free`/`delete` at line {freed_ln}"
-                    ),
-                    rel_path: rel_path.to_string(),
-                    line: ln,
-                    symbol: var.clone(),
-                    sink_kind: SinkKind::MemorySafety,
-                    missing_guard: GuardKind::MemoryBounds,
-                    confidence: Confidence::Confirmed,
-                    remediation: format!(
-                        "Do not dereference `{var}` after freeing it; nullify `{var} = NULL` and restructure ownership."
-                    ),
-                });
+            for (var, freed_ln) in freed_vars {
+                // Reassignment (`var = ...`) revives the pointer
+                if line_reassigns_ptr(line, &var) {
+                    ptr_states.insert(var, PtrState::Live);
+                    continue;
+                }
+                if line_derefs_ptr(line, &var) {
+                    findings.push(LocalStaticFinding {
+                        rule_id: "SMG-MEM-BOUNDS".into(),
+                        severity: "CRITICAL".into(),
+                        title: format!(
+                            "Use-after-free: pointer `{var}` dereferenced after `free`/`delete` at line {freed_ln}"
+                        ),
+                        rel_path: rel_path.to_string(),
+                        line: ln,
+                        symbol: var.clone(),
+                        sink_kind: SinkKind::MemorySafety,
+                        missing_guard: GuardKind::MemoryBounds,
+                        confidence: Confidence::Confirmed,
+                        remediation: format!(
+                            "Do not dereference `{var}` after freeing it; nullify `{var} = NULL` and restructure ownership."
+                        ),
+                    });
+                }
             }
         }
     }
