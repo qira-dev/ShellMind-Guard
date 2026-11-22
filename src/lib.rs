@@ -3068,6 +3068,13 @@ pub fn run_cli() -> Result<ExitCode> {
                 }
             }
         }
+        #[cfg(not(feature = "enterprise"))]
+        Commands::VerifyAttestation { .. } => {
+            anyhow::bail!(
+                "Attestation verification requires the `enterprise` feature (rebuild with `--features enterprise`)"
+            );
+        }
+        #[cfg(feature = "enterprise")]
         Commands::VerifyAttestation {
             platform,
             input,
