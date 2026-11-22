@@ -2160,11 +2160,13 @@ fn load_templates_dir(
                     && tpl.ssl.is_empty()
                     && tpl.websocket.is_empty()
                     && tpl.headless.is_empty()
+                    && tpl.file.is_empty()
                 {
                     skipped.push(SkippedTemplate {
                         id,
                         path: path.display().to_string(),
-                        reason: "no request block (http/dns/network/ssl/websocket/headless)".into(),
+                        reason: "no request block (http/dns/network/ssl/websocket/headless/file)"
+                            .into(),
                     });
                     continue;
                 }
