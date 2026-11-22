@@ -1140,6 +1140,7 @@ mod tests {
 
     #[test]
     fn replay_rejects_tls_tunnels() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let entry = ProxyEntry {
             id: 1,
             ts_unix_ms: 0,

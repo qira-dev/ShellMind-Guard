@@ -8,6 +8,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-23
+
+### Added (Phases 36–39 — 9-Tool Defensive Parity & Live Engines)
+- **Burp CE-Class Local MITM Proxy (`src/proxy_mitm.rs`, `src/proxy.rs`, `smg-tui`):** Opt-in `--mitm-ca` local ECDSA P-256 Root CA (`0700`/`0600`), on-the-fly per-host leaf certs, HTTP/1.1 keep-alive (up to 32 requests/tunnel), WebSocket upgrade logging (`kind: "ws"`), HTTPS replay, `smg proxy export-ca`, and loopback-only insecure upstream TLS fallback.
+- **ZAP-Class Headless Chrome SPA & DOM-XSS (`src/cdp_engine.rs`, `src/dast_audit.rs`, `src/http_audit.rs`):** Sync CDP engine launching Chrome/Chromium with `0700` throwaway profile and cross-platform `std::env::split_paths` lookup, `--spa` crawling with `--cookie` / `--auth-header` (`Network.setExtraHTTPHeaders`), XHR/Fetch harvesting, and `Page.addScriptToEvaluateOnNewDocument` DOM source-to-sink tracking (`location`, `document.referrer`, `window.name`, `localStorage`, `sessionStorage`).
+- **Nuclei-Class Multi-Engine Templates & Self-Hosted OOB (`src/templates_audit.rs`, `src/oob_server.rs`):** Added `ssl:`, `websocket:` (`ws://` & `wss://`), `headless:`, `file:` (static local matching), `flow:` (multi-step `&&` chaining with extracted variable propagation), and `smg oob serve` / `--oob-server` with per-run random nonce `blake3` tokens and 100k capped hit store.
+- **sqlmap-Class Non-Destructive Surfaces (`src/sqli_audit.rs`):** Added recursive JSON leaf paths, GraphQL `variables`-scoped discovery, `multipart/form-data` boundary-preserving field injection, opt-in `--test-headers` / `--test-cookies`, and 26-field JSON response normalization.
+- **Static Tool Parity (`smg-graph`, `smg-pqc`, `src/{tls_audit,idor_audit}.rs`):** Added `.gitleaksignore` + multiline custom rules, MobSF `build.gradle`/`Podfile`/`pubspec.yaml` checks, expanded Checkov AWS/GCP/Azure IaC policies from 52 to **78**, added X.509 SCT/OCSP Must-Staple + DNS CAA queries, and added strictly loopback-locked `smg idor --allow-mutations`.
+
+### Fixed
+- Eliminated Solidity `interface` & bodyless `abstract contract` false positives on `SMG-WEB3-FLASHLOAN-AUTH` and `SMG-WEB3-ERC4626-INFLATION` (verified on `OpenZeppelin/openzeppelin-contracts`).
+- Skipped secret-scanner rule config files (`.gitleaks.toml`, `gitleaks.toml`, `.trufflehog.yaml`, `.detect-secrets.cfg`) from credential findings (verified on `gitleaks/gitleaks`).
+- Fixed `file:` engine omission in `load_templates_dir` (verified on official `projectdiscovery/nuclei-templates`).
+- Fixed `--no-default-features` feature gating on `Commands::VerifyAttestation` and `current_year_u32`, and installed `rustls` ring provider in `proxy_tui::tests::replay_rejects_tls_tunnels` for Windows CI determinism.
+
 ## [0.3.0] - 2026-11-22
 
 ### Added (Phases 27–33: Ultra-Depth Formal, Systems, HW, Web3, AI/MCP, PQC, TEE & Sandbox Engines)

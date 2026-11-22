@@ -4,7 +4,7 @@
 >
 > **Non-Negotiable Rule:** **Never sacrifice accuracy or depth for artificial micro-speed.** Keep scans insanely fast by eliminating redundant work (delta caching, bounded parallelism, tiered execution), never by downgrading checks into shallow guesses.
 >
-> **Codebase Anchor:** Workspace v`0.3.0` (Rust 2024 edition, **11 workspace members**: unified `smg`/`shellmind-guard` root binary + 10 specialized crates including 4 isolated Frontier Domain crates `smg-hw`, `smg-web3`, `smg-pqc`, and `smg-enterprise`).
+> **Codebase Anchor:** Workspace v`0.4.0` (Rust 2024 edition, **11 workspace members**: unified `smg`/`shellmind-guard` root binary + 10 specialized crates including 4 isolated Frontier Domain crates `smg-hw`, `smg-web3`, `smg-pqc`, and `smg-enterprise`).
 
 ---
 

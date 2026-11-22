@@ -1649,6 +1649,7 @@ pub fn execute_network_block(
 // ssl: engine — TLS handshake attribute matching
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "pqc")]
 fn current_year_u32() -> u32 {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()

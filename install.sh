@@ -11,7 +11,7 @@ FROM_SOURCE=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --from-source) FROM_SOURCE=1; shift ;;
-    --version) VERSION="${2:?--version requires a tag like v0.3.0}"; shift 2 ;;
+    --version) VERSION="${2:?--version requires a tag like v0.4.0}"; shift 2 ;;
     --prefix) INSTALL_DIR="${2:?--prefix requires a directory}/bin"; shift 2 ;;
     -h|--help)
       echo "Usage: install.sh [--version vX.Y.Z] [--prefix DIR] [--from-source]"

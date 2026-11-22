@@ -11,8 +11,8 @@
     {
       "name": "shellmind-guard",
       "source": "./",
-      "description": "Deterministic 18-language security verifier: SMT (QF_BV/QF_LIA/Array) + k-CFA/SSA lattice, C/C++ UAF/bounds, Embedded HW WCSD/DMA/.ld, Web3/revm/Solana/Move, AI/MCP/Pickle/SSTI, PQC/X.509/STARTTLS/ELF, TEE attestation, OpenVEX, Bubblewrap/HTTP2 race proof & stdio MCP.",
-      "version": "0.3.0",
+      "description": "Deterministic 18-language security verifier: SMT (QF_BV/QF_LIA/Array) + k-CFA/SSA lattice, C/C++ UAF/bounds, Embedded HW WCSD/DMA/.ld, Web3/revm/Solana/Move, AI/MCP/Pickle/SSTI, PQC/X.509/STARTTLS/ELF, 78 Checkov IaC policies, Burp MITM CA, Chrome CDP SPA/DOM-XSS, Nuclei ssl/ws/headless/file/flow/OOB, GraphQL/multipart SQLi, TEE attestation, OpenVEX & stdio MCP.",
+      "version": "0.4.0",
       "author": {
         "name": "Qira-Dev",
         "url": "https://github.com/qira-dev/ShellMind-Guard"
