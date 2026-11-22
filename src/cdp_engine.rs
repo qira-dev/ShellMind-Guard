@@ -257,6 +257,23 @@ impl CdpSession {
         })
     }
 
+    /// Forwards authenticated crawl headers (e.g. Cookie, Authorization) to the
+    /// headless Chrome network stack via `Network.setExtraHTTPHeaders`.
+    pub fn set_extra_headers(
+        &mut self,
+        headers: &std::collections::HashMap<String, String>,
+    ) -> Result<()> {
+        if headers.is_empty() {
+            return Ok(());
+        }
+        let mut map = serde_json::Map::new();
+        for (k, v) in headers {
+            map.insert(k.clone(), Value::String(v.clone()));
+        }
+        let _ = self.call("Network.setExtraHTTPHeaders", json!({ "headers": map }))?;
+        Ok(())
+    }
+
     /// Enables Page/Runtime/Network and installs the source-sink
     /// instrumentation for every future document.
     fn enable_capture_domains(&mut self) -> Result<()> {
@@ -484,6 +501,19 @@ const SMG_SOURCE_SINK_JS: &str = r#"(() => {
     addSource('location.hash', location.hash);
     addSource('location.search', location.search);
     if (document.referrer) addSource('document.referrer', document.referrer);
+    if (window.name) addSource('window.name', window.name);
+    try {
+      for (let i = 0; i < Math.min(localStorage.length, 32); i++) {
+        const k = localStorage.key(i);
+        if (k) addSource('localStorage.' + k, localStorage.getItem(k));
+      }
+    } catch (_) {}
+    try {
+      for (let i = 0; i < Math.min(sessionStorage.length, 32); i++) {
+        const k = sessionStorage.key(i);
+        if (k) addSource('sessionStorage.' + k, sessionStorage.getItem(k));
+      }
+    } catch (_) {}
   };
   snapshot();
   window.addEventListener('hashchange', snapshot);

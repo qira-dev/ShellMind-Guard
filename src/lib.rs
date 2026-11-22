@@ -825,6 +825,18 @@ enum Commands {
         header: Vec<String>,
         #[arg(
             long,
+            value_name = "COOKIES",
+            help = "Cookie header for authenticated crawling, e.g. 'session=abc; csrf=xyz'"
+        )]
+        cookie: Option<String>,
+        #[arg(
+            long,
+            value_name = "VALUE",
+            help = "Authorization header value for authenticated crawling, e.g. 'Bearer <token>'"
+        )]
+        auth_header: Option<String>,
+        #[arg(
+            long,
             help = "Render pages in headless Chrome (SPA crawl): client-side routes, XHR/Fetch endpoints, DOM source-to-sink flows"
         )]
         spa: bool,
@@ -3347,15 +3359,27 @@ pub fn run_cli() -> Result<ExitCode> {
             max_depth,
             passive_only,
             header,
+            cookie,
+            auth_header,
             spa,
             allow_remote,
             json,
         } => {
-            let headers: HashMap<String, String> = header
+            let mut headers: HashMap<String, String> = header
                 .iter()
                 .filter_map(|h| h.split_once('='))
                 .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
                 .collect();
+            if let Some(c) = cookie
+                && !c.trim().is_empty()
+            {
+                headers.insert("Cookie".into(), c.trim().to_string());
+            }
+            if let Some(a) = auth_header
+                && !a.trim().is_empty()
+            {
+                headers.insert("Authorization".into(), a.trim().to_string());
+            }
             let report = dast_audit::run_dast_audit(&dast_audit::DastConfig {
                 seed_url: url.clone(),
                 headers,

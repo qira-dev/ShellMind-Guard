@@ -257,9 +257,10 @@ impl MitmCa {
     }
 
     /// Connects to `host:port` with TLS: OS trust store first, accept-all
-    /// fallback for lab origins with self-signed certificates. Each attempt
-    /// opens a fresh TCP connection — a failed validated handshake sends a
-    /// TLS alert that poisons the connection for any second handshake.
+    /// fallback ONLY for loopback / RFC1918 lab origins with self-signed
+    /// certificates (remote internet origins always require validated TLS).
+    /// Each attempt opens a fresh TCP connection — a failed validated handshake
+    /// sends a TLS alert that poisons the connection for any second handshake.
     pub fn connect_upstream(
         &self,
         host: &str,
@@ -267,11 +268,13 @@ impl MitmCa {
     ) -> Result<rustls::StreamOwned<rustls::ClientConnection, TcpStream>> {
         let name = ServerName::try_from(host.to_string())
             .with_context(|| format!("invalid upstream server name '{host}'"))?;
+        let allow_insecure_fallback = is_lab_host(host);
+        let mut configs = vec![Arc::clone(&self.upstream_validated)];
+        if allow_insecure_fallback {
+            configs.push(Arc::clone(&self.upstream_insecure));
+        }
         let mut last_err = None;
-        for cfg in [
-            Arc::clone(&self.upstream_validated),
-            Arc::clone(&self.upstream_insecure),
-        ] {
+        for cfg in configs {
             let mut attempt = match TcpStream::connect((host, port)) {
                 Ok(s) => s,
                 Err(e) => {
@@ -300,6 +303,22 @@ impl MitmCa {
                 .unwrap_or_else(|| "unknown".into())
         )
     }
+}
+
+/// Returns true only for loopback / RFC1918 private lab hosts where self-signed
+/// certificates are expected during local development.
+pub(crate) fn is_lab_host(host: &str) -> bool {
+    let h = host.trim().trim_matches(|c| c == '[' || c == ']');
+    if h.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if let Ok(ip) = h.parse::<IpAddr>() {
+        return match ip {
+            IpAddr::V4(v4) => v4.is_loopback() || v4.is_private(),
+            IpAddr::V6(v6) => v6.is_loopback(),
+        };
+    }
+    false
 }
 
 fn build_upstream_config(insecure: bool) -> Result<rustls::ClientConfig> {

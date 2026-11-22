@@ -203,6 +203,7 @@ enum ParamLocation {
     Query,
     Form,
     Json,
+    Multipart,
     Header,
     Cookie,
 }
@@ -213,6 +214,7 @@ impl ParamLocation {
             ParamLocation::Query => "query",
             ParamLocation::Form => "form",
             ParamLocation::Json => "json",
+            ParamLocation::Multipart => "multipart",
             ParamLocation::Header => "header",
             ParamLocation::Cookie => "cookie",
         }
@@ -362,6 +364,106 @@ fn set_json_leaf(root: &mut serde_json::Value, path: &str, value: &str) -> bool 
     false
 }
 
+/// Detects a multipart/form-data boundary from the Content-Type header or body prefix.
+fn multipart_boundary(cfg: &SqliAuditConfig) -> Option<String> {
+    if let Some((_, ct)) = cfg
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+    {
+        let low = ct.to_ascii_lowercase();
+        if let Some(pos) = low.find("boundary=") {
+            let raw = ct[pos + "boundary=".len()..].trim();
+            let b = raw.split(';').next().unwrap_or("").trim().trim_matches('"');
+            if !b.is_empty() {
+                return Some(b.to_string());
+            }
+        }
+    }
+    let body = cfg.body.as_deref()?;
+    if body.starts_with("--") && body.contains("Content-Disposition:") {
+        let first_line = body.lines().next()?.trim_end_matches('\r');
+        let b = first_line.strip_prefix("--")?.trim();
+        if !b.is_empty() {
+            return Some(b.to_string());
+        }
+    }
+    None
+}
+
+fn extract_multipart_name(head: &str) -> Option<String> {
+    let low = head.to_ascii_lowercase();
+    let pos = low.find("name=\"")?;
+    let rest = &head[pos + "name=\"".len()..];
+    let end = rest.find('"')?;
+    let name = rest[..end].trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+/// Extracts non-file text field `(name, value)` pairs from a multipart/form-data body.
+fn parse_multipart_fields(body: &str, boundary: &str) -> Vec<(String, String)> {
+    let delim = format!("--{boundary}");
+    let mut out = Vec::new();
+    for part in body.split(&delim) {
+        let trimmed = part.trim_start_matches("\r\n").trim_start_matches('\n');
+        if trimmed.is_empty() || trimmed.starts_with("--") {
+            continue;
+        }
+        let (head, val) = if let Some((h, v)) = trimmed.split_once("\r\n\r\n") {
+            (h, v.trim_end_matches("\r\n"))
+        } else if let Some((h, v)) = trimmed.split_once("\n\n") {
+            (h, v.trim_end_matches('\n'))
+        } else {
+            continue;
+        };
+        if head.to_ascii_lowercase().contains("filename=") {
+            continue;
+        }
+        if let Some(name) = extract_multipart_name(head) {
+            out.push((name, val.to_string()));
+        }
+    }
+    out
+}
+
+/// Replaces one text field value inside a multipart/form-data body while preserving boundary framing.
+fn set_multipart_field(body: &str, boundary: &str, target: &str, value: &str) -> Option<String> {
+    let delim = format!("--{boundary}");
+    let sep = if body.contains("\r\n") { "\r\n" } else { "\n" };
+    let head_sep = if sep == "\r\n" { "\r\n\r\n" } else { "\n\n" };
+    let mut found = false;
+    let mut rebuilt = String::with_capacity(body.len() + value.len());
+    let parts: Vec<&str> = body.split(&delim).collect();
+    for (idx, part) in parts.iter().enumerate() {
+        if idx > 0 {
+            rebuilt.push_str(&delim);
+        }
+        let trimmed = part.trim_start_matches("\r\n").trim_start_matches('\n');
+        if trimmed.is_empty() || trimmed.starts_with("--") {
+            rebuilt.push_str(part);
+            continue;
+        }
+        if let Some((head, _old_val)) = trimmed.split_once(head_sep)
+            && !head.to_ascii_lowercase().contains("filename=")
+            && extract_multipart_name(head).as_deref() == Some(target)
+        {
+            found = true;
+            rebuilt.push_str(sep);
+            rebuilt.push_str(head);
+            rebuilt.push_str(head_sep);
+            rebuilt.push_str(value);
+            rebuilt.push_str(sep);
+            continue;
+        }
+        rebuilt.push_str(part);
+    }
+    if found { Some(rebuilt) } else { None }
+}
+
 /// Detects a JSON request body: explicit Content-Type or a leading `{`/`[`.
 fn body_is_json(cfg: &SqliAuditConfig) -> bool {
     if let Some((_, ct)) = cfg
@@ -450,6 +552,15 @@ fn make_injectable(cfg: &SqliAuditConfig, pref: &ParamRef) -> Result<Injectable>
                 serde_json::from_str(body).context("Invalid JSON body")?;
             set_json_leaf(&mut parsed, &pref.name, "x")
         }
+        ParamLocation::Multipart => {
+            let body = cfg
+                .body
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("Multipart injection requires a --data body"))?;
+            let boundary = multipart_boundary(cfg)
+                .ok_or_else(|| anyhow::anyhow!("Multipart body is missing boundary"))?;
+            set_multipart_field(body, &boundary, &pref.name, "x").is_some()
+        }
         // Header names are opt-in via --test-headers, so presence is assumed:
         // the header may be injected into a request that never carried it
         // (sqlmap-style surface testing).
@@ -494,6 +605,24 @@ fn inject_value(cfg: &SqliAuditConfig, pref: &ParamRef, url_str: &str, value: &s
                 && set_json_leaf(&mut parsed, &pref.name, value)
             {
                 inj.body = Some(parsed.to_string());
+            }
+        }
+        ParamLocation::Multipart => {
+            if let Some(orig) = cfg.body.as_deref()
+                && let Some(boundary) = multipart_boundary(cfg)
+                && let Some(nb) = set_multipart_field(orig, &boundary, &pref.name, value)
+            {
+                inj.body = Some(nb);
+                if !cfg
+                    .headers
+                    .keys()
+                    .any(|k| k.eq_ignore_ascii_case("content-type"))
+                {
+                    inj.extra_headers.push((
+                        "content-type".into(),
+                        format!("multipart/form-data; boundary={boundary}"),
+                    ));
+                }
             }
         }
         ParamLocation::Header => {
@@ -544,12 +673,22 @@ fn send_injectable(
         req = req.header(k.as_str(), v.as_str());
     }
     if let Some(body) = &inj.body {
-        let content_type = if inj.body_is_json {
-            "application/json"
-        } else {
-            "application/x-www-form-urlencoded"
-        };
-        req = req.header("Content-Type", content_type).body(body.clone());
+        let has_ct = headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("content-type"))
+            || inj
+                .extra_headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("content-type"));
+        if !has_ct {
+            let content_type = if inj.body_is_json {
+                "application/json"
+            } else {
+                "application/x-www-form-urlencoded"
+            };
+            req = req.header("Content-Type", content_type);
+        }
+        req = req.body(body.clone());
     }
     let resp = req.send()?;
     let status = resp.status().as_u16();
@@ -711,6 +850,17 @@ fn original_value_of(cfg: &SqliAuditConfig, url: &reqwest::Url, pref: &ParamRef)
             .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
             .and_then(|v| get_json_leaf_str(&v, &pref.name))
             .unwrap_or_default(),
+        ParamLocation::Multipart => cfg
+            .body
+            .as_deref()
+            .zip(multipart_boundary(cfg))
+            .and_then(|(b, bnd)| {
+                parse_multipart_fields(b, &bnd)
+                    .into_iter()
+                    .find(|(k, _)| k == &pref.name)
+                    .map(|(_, v)| v)
+            })
+            .unwrap_or_default(),
         ParamLocation::Header => header_template_value(cfg, &pref.name).unwrap_or_default(),
         ParamLocation::Cookie => cookie_pairs(cfg)
             .into_iter()
@@ -801,14 +951,24 @@ pub fn run_sqli_audit(cfg: &SqliAuditConfig) -> Result<SqliAuditReport> {
                 .as_ref()
                 .map(|v| get_json_leaf_str(v, &json_path).is_some())
                 .unwrap_or(false);
+            let in_multipart = cfg
+                .body
+                .as_deref()
+                .zip(multipart_boundary(cfg))
+                .map(|(b, bnd)| set_multipart_field(b, &bnd, name, "x").is_some())
+                .unwrap_or(false);
             if in_query {
                 push_param(&mut prefs, name, ParamLocation::Query);
+            } else if in_multipart {
+                push_param(&mut prefs, name, ParamLocation::Multipart);
             } else if in_form {
                 push_param(&mut prefs, name, ParamLocation::Form);
             } else if in_json {
                 push_param(&mut prefs, &json_path, ParamLocation::Json);
             } else {
-                bail!("Parameter '{name}' not found in URL query, form body, or JSON body");
+                bail!(
+                    "Parameter '{name}' not found in URL query, form body, multipart body, or JSON body"
+                );
             }
         }
     } else {
@@ -816,10 +976,23 @@ pub fn run_sqli_audit(cfg: &SqliAuditConfig) -> Result<SqliAuditReport> {
             push_param(&mut prefs, &k, ParamLocation::Query);
         }
         if let Some(body) = cfg.body.as_deref() {
-            if body_is_json(cfg) {
+            if let Some(boundary) = multipart_boundary(cfg) {
+                for (name, _) in parse_multipart_fields(body, &boundary) {
+                    push_param(&mut prefs, &name, ParamLocation::Multipart);
+                }
+            } else if body_is_json(cfg) {
                 if let Some(v) = &json_value {
                     let mut paths = Vec::new();
-                    walk_json_params(v, "$", &mut paths);
+                    // GraphQL envelope: scope variable discovery to $.variables so
+                    // static query text and operationName are not mutated as user inputs.
+                    if v.get("query").is_some_and(|q| q.is_string())
+                        && let Some(vars) = v.get("variables")
+                        && vars.is_object()
+                    {
+                        walk_json_params(vars, "\x24.variables", &mut paths);
+                    } else {
+                        walk_json_params(v, "\x24", &mut paths);
+                    }
                     for p in paths {
                         push_param(&mut prefs, &p, ParamLocation::Json);
                     }
@@ -1440,5 +1613,31 @@ mod tests {
         assert_eq!(r.param, "session");
         assert_eq!(r.location, "cookie");
         assert!(r.error_based.is_some());
+    }
+
+    #[test]
+    fn multipart_form_data_field_parsing_and_replacement() {
+        let body = "--smgBnd\r\nContent-Disposition: form-data; name=\"user\"\r\n\r\nalice\r\n--smgBnd\r\nContent-Disposition: form-data; name=\"avatar\"; filename=\"a.png\"\r\nContent-Type: image/png\r\n\r\nPNGDATA\r\n--smgBnd--\r\n";
+        let fields = parse_multipart_fields(body, "smgBnd");
+        assert_eq!(fields, vec![("user".to_string(), "alice".to_string())]);
+        let updated = set_multipart_field(body, "smgBnd", "user", "bob'").unwrap();
+        assert!(updated.contains("bob'"));
+        assert!(updated.contains("PNGDATA"));
+        assert!(set_multipart_field(body, "smgBnd", "avatar", "x").is_none());
+    }
+
+    #[test]
+    fn graphql_envelope_scopes_variables_only() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"operationName":"GetUser","query":"query GetUser($id:ID!){user(id:$id){name}}","variables":{"id":"42","filter":{"role":"admin"}}}"#,
+        )
+        .unwrap();
+        let mut paths = Vec::new();
+        walk_json_params(v.get("variables").unwrap(), "\x24.variables", &mut paths);
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec!["\x24.variables.filter.role", "\x24.variables.id"]
+        );
     }
 }

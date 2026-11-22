@@ -789,7 +789,12 @@ pub fn run_dast_audit(cfg: &DastConfig) -> Result<DastReport> {
     if cfg.spa {
         match crate::cdp_engine::CdpEngine::launch() {
             Ok(engine) => match engine.session() {
-                Ok(session) => spa = Some((session, engine)),
+                Ok(mut session) => {
+                    if let Err(e) = session.set_extra_headers(&cfg.headers) {
+                        eprintln!("  smg dast: failed to apply extra headers to CDP session: {e}");
+                    }
+                    spa = Some((session, engine));
+                }
                 Err(e) => eprintln!(
                     "  smg dast: --spa requested but the CDP session failed: {e}; continuing with classic crawl"
                 ),

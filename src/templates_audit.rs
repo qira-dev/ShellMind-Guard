@@ -196,16 +196,26 @@ pub struct NucleiTemplate {
     pub ssl: Vec<SslBlock>,
     pub websocket: Vec<WsBlock>,
     pub headless: Vec<HeadlessBlock>,
+    pub file: Vec<FileBlock>,
+    pub flow: Option<String>,
     pub variables: HashMap<String, String>,
     pub constants: HashMap<String, String>,
     // Engines that are explicitly outside the defensive detection scope.
     pub javascript: Option<serde_yaml_ng::Value>,
     pub code: Option<serde_yaml_ng::Value>,
-    pub file: Option<serde_yaml_ng::Value>,
     pub whois: Option<serde_yaml_ng::Value>,
-    pub flow: Option<serde_yaml_ng::Value>,
     pub lua: Option<serde_yaml_ng::Value>,
     pub interactive: Option<bool>,
+}
+
+/// `file:` block — static local file content matching (defensive, zero code execution).
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct FileBlock {
+    pub extensions: Vec<String>,
+    pub matchers: Vec<Matcher>,
+    pub matchers_condition: Option<String>,
+    pub extractors: Vec<Extractor>,
 }
 
 /// `ssl:` block — TLS handshake attribute matching (version, cipher, CN/SAN,
@@ -1796,13 +1806,47 @@ pub fn execute_ws_block(
     if !url.starts_with("ws://") && !url.starts_with("wss://") {
         url = format!("ws://{url}");
     }
-    if url.starts_with("wss://") {
-        bail!(
-            "wss:// targets need a webpki-trusted certificate; lab ws:// targets are fully supported"
-        );
-    }
-    let (mut ws, _resp) =
-        tungstenite::connect(&url).with_context(|| format!("websocket connect to {url}"))?;
+    let (mut ws, _resp) = if url.starts_with("wss://") {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let parsed =
+            reqwest::Url::parse(&url).with_context(|| format!("invalid wss:// url '{url}'"))?;
+        let is_lab = parsed
+            .host_str()
+            .map(crate::proxy_mitm::is_lab_host)
+            .unwrap_or(false);
+        let tls_cfg = if is_lab {
+            rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(InsecureServerVerifier))
+                .with_no_client_auth()
+        } else {
+            let mut roots = rustls::RootCertStore::empty();
+            let loaded = rustls_native_certs::load_native_certs();
+            for cert in loaded.certs {
+                let _ = roots.add(cert);
+            }
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth()
+        };
+        let host_str = parsed
+            .host_str()
+            .ok_or_else(|| anyhow::anyhow!("wss:// url missing host: {url}"))?;
+        let port = parsed.port_or_known_default().unwrap_or(443);
+        let tcp = TcpStream::connect((host_str, port))
+            .with_context(|| format!("wss:// TCP connect to {host_str}:{port}"))?;
+        let _ = tcp.set_read_timeout(Some(timeout));
+        let _ = tcp.set_write_timeout(Some(timeout));
+        tungstenite::client_tls_with_config(
+            &url,
+            tcp,
+            None,
+            Some(tungstenite::Connector::Rustls(Arc::new(tls_cfg))),
+        )
+        .with_context(|| format!("wss:// connect to {url}"))?
+    } else {
+        tungstenite::connect(&url).with_context(|| format!("websocket connect to {url}"))?
+    };
     set_ws_socket_timeouts(&mut ws, timeout);
     for input in block.inputs.iter().flatten() {
         let data = substitute(&input.data, vars, extra)
@@ -1959,21 +2003,96 @@ fn unsupported_reason(t: &NucleiTemplate, _raw_text: &str) -> Option<String> {
     if t.code.is_some() {
         return Some("code-execution engine not supported".into());
     }
-    if t.file.is_some() {
-        return Some("file engine not supported".into());
-    }
     if t.whois.is_some() {
         return Some("whois engine not supported".into());
-    }
-    if t.flow.is_some() {
-        return Some("flow engine not supported".into());
     }
     if t.interactive == Some(true) {
         return Some("interactive template not supported".into());
     }
-    // ssl/websocket/headless are executed by dedicated engines now; OOB
+    // ssl/websocket/headless/file/flow are executed by dedicated engines; OOB
     // templates are gated at run time by `--oob-server` (see run_template_audit).
     None
+}
+
+/// Static local file matcher for `file:` templates (capped at 256 files, 512 KiB/file).
+pub fn execute_file_block(block: &FileBlock, target: &str) -> Result<Vec<(String, HttpResponse)>> {
+    let raw_path = target.strip_prefix("file://").unwrap_or(target);
+    let root = Path::new(raw_path);
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    const MAX_FILES: usize = 256;
+    const MAX_FILE_BYTES: u64 = 512 * 1024;
+    let allow_all = block.extensions.is_empty()
+        || block
+            .extensions
+            .iter()
+            .any(|e| e.eq_ignore_ascii_case("all"));
+    let mut files = Vec::new();
+    if root.is_file() {
+        files.push(root.to_path_buf());
+    } else {
+        fn walk_local(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
+            if depth > 8 || out.len() >= MAX_FILES {
+                return;
+            }
+            let Ok(rd) = fs::read_dir(dir) else {
+                return;
+            };
+            for entry in rd.flatten() {
+                if out.len() >= MAX_FILES {
+                    break;
+                }
+                let p = entry.path();
+                if let Ok(ft) = entry.file_type() {
+                    if ft.is_symlink() {
+                        continue;
+                    }
+                    if ft.is_dir() {
+                        walk_local(&p, out, depth + 1);
+                    } else if ft.is_file() {
+                        out.push(p);
+                    }
+                }
+            }
+        }
+        walk_local(root, &mut files, 0);
+    }
+    let mut out = Vec::new();
+    for p in files {
+        if !allow_all {
+            let ext = p
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let matched_ext = block
+                .extensions
+                .iter()
+                .any(|want| want.trim_start_matches('.').eq_ignore_ascii_case(&ext));
+            if !matched_ext {
+                continue;
+            }
+        }
+        let Ok(f) = fs::File::open(&p) else {
+            continue;
+        };
+        let mut buf = Vec::new();
+        if std::io::Read::read_to_end(&mut std::io::Read::take(f, MAX_FILE_BYTES), &mut buf)
+            .is_err()
+        {
+            continue;
+        }
+        out.push((
+            p.display().to_string(),
+            HttpResponse {
+                status: 200,
+                headers: format!("X-File-Path: {}\r\n", p.display()),
+                body: String::from_utf8_lossy(&buf).into_owned(),
+            },
+        ));
+    }
+    Ok(out)
 }
 
 fn collect_yaml_files(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
@@ -2098,7 +2217,12 @@ fn template_severity(t: &NucleiTemplate) -> String {
 }
 
 pub fn run_template_audit(cfg: &TemplateRunConfig) -> Result<TemplateRunReport> {
-    if !cfg.allow_remote && !crate::idor_audit::is_lab_or_loopback_url(&cfg.target)? {
+    let target_is_local_path =
+        cfg.target.starts_with("file://") || Path::new(cfg.target.as_str()).exists();
+    if !target_is_local_path
+        && !cfg.allow_remote
+        && !crate::idor_audit::is_lab_or_loopback_url(&cfg.target)?
+    {
         bail!(
             "Refusing remote target '{}' by default (template scans target loopback/private lab hosts unless `--allow-remote` is explicitly passed for your own staging server).",
             cfg.target
@@ -2107,7 +2231,11 @@ pub fn run_template_audit(cfg: &TemplateRunConfig) -> Result<TemplateRunReport> 
     let started = Instant::now();
     let (templates, mut skipped, parse_errors) =
         load_templates_dir(&cfg.templates_dir, cfg.max_templates.max(1))?;
-    let base_vars = parse_target(&cfg.target)?;
+    let base_vars = if target_is_local_path {
+        parse_target("http://127.0.0.1")?
+    } else {
+        parse_target(&cfg.target)?
+    };
     let runners = HttpRunners::build_with_scope(cfg.timeout, cfg.allow_remote)?;
     let oob_client =
         cfg.oob_server.as_ref().and_then(
@@ -2163,7 +2291,8 @@ pub fn run_template_audit(cfg: &TemplateRunConfig) -> Result<TemplateRunReport> 
             + tpl.network.len()
             + tpl.ssl.len()
             + tpl.websocket.len()
-            + tpl.headless.len();
+            + tpl.headless.len()
+            + tpl.file.len();
         // Per-run OOB tokens (blake3(run_nonce || template_id || target)) are
         // injected through the substitution extra-map.
         let mut extra: HashMap<String, String> = HashMap::new();
@@ -2176,9 +2305,20 @@ pub fn run_template_audit(cfg: &TemplateRunConfig) -> Result<TemplateRunReport> 
             oob_token = Some(token);
         }
 
-        for block in &tpl.http {
+        let flow_is_and_chain = tpl.flow.as_deref().is_some_and(|f| f.contains("&&"));
+        let mut flow_chain_failed = false;
+
+        for (block_idx, block) in tpl.http.iter().enumerate() {
+            if flow_is_and_chain && flow_chain_failed {
+                break;
+            }
             match execute_http_block(&runners, block, &vars, &extra) {
-                BlockOutcome::Skipped(reason) => block_skips.push(reason),
+                BlockOutcome::Skipped(reason) => {
+                    block_skips.push(reason);
+                    if flow_is_and_chain {
+                        flow_chain_failed = true;
+                    }
+                }
                 BlockOutcome::Response(resp) => {
                     executed += 1;
                     let result = evaluate_matchers(
@@ -2188,21 +2328,69 @@ pub fn run_template_audit(cfg: &TemplateRunConfig) -> Result<TemplateRunReport> 
                         &vars,
                     );
                     let extracted = run_extractors(&block.extractors, &resp);
+                    // Propagate extracted values into subsequent chained blocks (flow: / multi-step).
+                    for (k, v) in &extracted {
+                        extra.insert(k.clone(), v.clone());
+                    }
+                    let is_last_http = block_idx + 1 == tpl.http.len();
                     if result.matched {
-                        template_matched = true;
-                        matches.push(TemplateMatch {
-                            template_id: id.clone(),
-                            template_name: tpl.info.name.clone().unwrap_or_default(),
-                            severity: severity.clone(),
-                            template_path: loaded.path.display().to_string(),
-                            url: vars.base_url.clone(),
-                            engine: "http".into(),
-                            matcher_types: block.matchers.iter().map(|m| m.kind.clone()).collect(),
-                            evidence: result.evidence,
-                            extracted,
-                        });
-                        if block.stop_at_first_match {
+                        if !flow_is_and_chain || is_last_http {
+                            template_matched = true;
+                            matches.push(TemplateMatch {
+                                template_id: id.clone(),
+                                template_name: tpl.info.name.clone().unwrap_or_default(),
+                                severity: severity.clone(),
+                                template_path: loaded.path.display().to_string(),
+                                url: vars.base_url.clone(),
+                                engine: "http".into(),
+                                matcher_types: block
+                                    .matchers
+                                    .iter()
+                                    .map(|m| m.kind.clone())
+                                    .collect(),
+                                evidence: result.evidence,
+                                extracted,
+                            });
+                        }
+                        if block.stop_at_first_match && !flow_is_and_chain {
                             break;
+                        }
+                    } else if flow_is_and_chain {
+                        flow_chain_failed = true;
+                    }
+                }
+            }
+        }
+
+        for block in &tpl.file {
+            match execute_file_block(block, &cfg.target) {
+                Err(e) => block_skips.push(format!("file engine error: {e}")),
+                Ok(file_resps) => {
+                    for (fpath, resp) in file_resps {
+                        executed += 1;
+                        let result = evaluate_matchers(
+                            &block.matchers,
+                            block.matchers_condition.as_deref(),
+                            &resp,
+                            &vars,
+                        );
+                        if result.matched {
+                            template_matched = true;
+                            matches.push(TemplateMatch {
+                                template_id: id.clone(),
+                                template_name: tpl.info.name.clone().unwrap_or_default(),
+                                severity: severity.clone(),
+                                template_path: loaded.path.display().to_string(),
+                                url: fpath,
+                                engine: "file".into(),
+                                matcher_types: block
+                                    .matchers
+                                    .iter()
+                                    .map(|m| m.kind.clone())
+                                    .collect(),
+                                evidence: result.evidence,
+                                extracted: run_extractors(&block.extractors, &resp),
+                            });
                         }
                     }
                 }

@@ -587,9 +587,8 @@ fn parse_connect_target(target: &str) -> Result<(String, u16)> {
 
 /// Opt-in TLS termination of a CONNECT tunnel (`--mitm-ca`): presents an
 /// on-the-fly local-CA leaf for the tunnel host, opens an upstream TLS
-/// session, and runs the decrypted HTTP/1.1 request through the same
-/// interception pipeline as plain HTTP (one request per tunnel; the rebuilt
-/// upstream request forces `Connection: close`).
+/// session, and supports HTTP/1.1 keep-alive (up to 32 sequential requests per
+/// tunnel) plus WebSocket upgrade logging (`kind: "ws"`).
 fn tunnel_mitm(stream: &mut TcpStream, target: &str, mitm: &MitmCa, ctx: &ConnCtx) -> Result<()> {
     let (host, port) = parse_connect_target(target)?;
     // The tunnel is established first; the TLS handshake happens over it.
@@ -608,32 +607,56 @@ fn tunnel_mitm(stream: &mut TcpStream, target: &str, mitm: &MitmCa, ctx: &ConnCt
     crate::proxy_mitm::drive_client_handshake(&mut client_conn, &mut client_sock)?;
     let mut client_tls = rustls::StreamOwned::new(client_conn, client_sock);
 
-    let origin_tls = mitm.connect_upstream(&host, port)?;
-    let origin = OriginConn::Tls(Box::new(origin_tls));
+    const MAX_KEEPALIVE_REQS: usize = 32;
+    for req_idx in 0..MAX_KEEPALIVE_REQS {
+        if req_idx > 0 {
+            let _ = client_tls
+                .sock
+                .set_read_timeout(Some(Duration::from_millis(250)));
+        }
+        let (head, leftover) = match read_head(&mut client_tls) {
+            Ok(pair) => pair,
+            Err(_) if req_idx > 0 => break,
+            Err(e) => return Err(e),
+        };
+        if req_idx > 0 {
+            let _ = client_tls.sock.set_read_timeout(idle);
+        }
+        let request_line = head.lines().next().unwrap_or_default().trim().to_string();
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next().unwrap_or("").to_ascii_uppercase();
+        let req_target = parts.next().unwrap_or("").to_string();
+        if method.is_empty() || req_target.is_empty() {
+            if req_idx > 0 {
+                break;
+            }
+            bail!("malformed request inside CONNECT tunnel: {request_line:?}");
+        }
+        let head_low = head.to_ascii_lowercase();
+        let client_wants_close = head_low.contains("connection: close");
+        let is_ws_upgrade = head_low.contains("upgrade: websocket");
 
-    let (head, leftover) = read_head(&mut client_tls)?;
-    let request_line = head.lines().next().unwrap_or_default().trim().to_string();
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or("").to_ascii_uppercase();
-    let req_target = parts.next().unwrap_or("").to_string();
-    if method.is_empty() || req_target.is_empty() {
-        bail!("malformed request inside CONNECT tunnel: {request_line:?}");
+        let origin_tls = mitm.connect_upstream(&host, port)?;
+        let origin = OriginConn::Tls(Box::new(origin_tls));
+        let opts = InterceptOpts {
+            scheme: "https",
+            kind: if is_ws_upgrade { "ws" } else { "https" },
+            origin_override: Some((host.as_str(), port)),
+            origin_conn: Some(origin),
+        };
+        intercept_http(
+            &mut client_tls,
+            &head,
+            leftover,
+            &method,
+            &req_target,
+            ctx,
+            opts,
+        )?;
+        if client_wants_close || is_ws_upgrade {
+            break;
+        }
     }
-    let opts = InterceptOpts {
-        scheme: "https",
-        kind: "https",
-        origin_override: Some((host.as_str(), port)),
-        origin_conn: Some(origin),
-    };
-    intercept_http(
-        &mut client_tls,
-        &head,
-        leftover,
-        &method,
-        &req_target,
-        ctx,
-        opts,
-    )?;
     // Graceful TLS teardown on the client side.
     client_tls.conn.send_close_notify();
     let _ = client_tls.flush();
