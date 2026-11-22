@@ -156,6 +156,11 @@ pub fn analyze_solidity_ultra_depth(
         if FLASH_CALLBACKS.iter().any(|cb| line.contains(cb)) {
             let end = (idx + 20).min(lines.len());
             let body = lines[idx..end].join("\n");
+            // Skip pure interface / abstract function declarations (terminated by `;` before any `{`).
+            let sig_head = body.split('{').next().unwrap_or(&body);
+            if !body.contains('{') || sig_head.contains(';') {
+                continue;
+            }
             let checks_sender = body.contains("msg.sender ==")
                 || body.contains("msg.sender !=")
                 || body.contains("onlyPool")
@@ -255,8 +260,14 @@ pub fn analyze_solidity_ultra_depth(
     }
 
     // 6. ERC-4626 First-Depositor Share Inflation Attack
-    let is_erc4626 = stripped.contains("ERC4626")
-        || (stripped.contains("convertToShares") && stripped.contains("totalAssets"));
+    // Skip pure interface files (no `contract ` definition) and abstract extensions
+    // without a concrete `deposit(` implementation.
+    let has_concrete_contract = (stripped.contains("contract ")
+        && !stripped.contains("abstract contract "))
+        || (stripped.contains("contract ") && stripped.contains("function deposit("));
+    let is_erc4626 = has_concrete_contract
+        && (stripped.contains("ERC4626")
+            || (stripped.contains("convertToShares") && stripped.contains("totalAssets")));
     if is_erc4626 {
         let has_mitigation = stripped.contains("_decimalsOffset")
             || stripped.contains("MINIMUM_LIQUIDITY")

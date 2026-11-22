@@ -434,8 +434,22 @@ pub fn parse_file_ast_with_hash(
         None
     };
 
-    let mut static_findings =
-        crate::secrets_config::scan_secrets_and_config(&file.rel_path, source);
+    let is_scanner_rule_cfg = matches!(
+        std::path::Path::new(&file.rel_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(""),
+        ".gitleaks.toml"
+            | "gitleaks.toml"
+            | ".trufflehog.yaml"
+            | ".trufflehog.yml"
+            | ".detect-secrets.cfg"
+    );
+    let mut static_findings = if is_scanner_rule_cfg {
+        Vec::new()
+    } else {
+        crate::secrets_config::scan_secrets_and_config(&file.rel_path, source)
+    };
     if !matches!(file.language, Language::Solidity | Language::Move) {
         static_findings.extend(crate::infra_dos::scan_infra_dos_crypto_and_queues(
             &file.rel_path,
