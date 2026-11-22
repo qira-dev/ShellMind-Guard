@@ -38,6 +38,9 @@ pub struct IdorEndpointCheck {
     /// Optional marker substring expected in `user_a`'s own response (e.g. test record ID).
     #[serde(default)]
     pub owner_marker: Option<String>,
+    /// Optional JSON request body for loopback-only `--allow-mutations` checks.
+    #[serde(default)]
+    pub body: Option<serde_json::Value>,
     /// If true, tests vertical privilege escalation (BFLA): `user_b` must be denied even without `owner_marker`.
     #[serde(default)]
     pub admin_only: bool,
@@ -86,18 +89,53 @@ pub fn is_lab_or_loopback_url(base_url: &str) -> Result<bool> {
     Ok(false)
 }
 
-pub fn run_idor_audit(config_path: &Path, allow_remote: bool) -> Result<IdorAuditReport> {
+pub fn is_strictly_loopback_url(base_url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(base_url) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.trim_matches(['[', ']'])
+        .parse::<IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+pub fn run_idor_audit_with_options(
+    config_path: &Path,
+    allow_remote: bool,
+    allow_mutations: bool,
+) -> Result<IdorAuditReport> {
     let raw = fs::read_to_string(config_path)
         .with_context(|| format!("Failed reading IDOR config {}", config_path.display()))?;
     let cfg: IdorTestConfig = serde_json::from_str(&raw)
         .with_context(|| format!("Invalid JSON in {}", config_path.display()))?;
-    run_idor_audit_config(&cfg, allow_remote)
+    run_idor_audit_config_with_options(&cfg, allow_remote, allow_mutations)
 }
 
+#[cfg(test)]
 pub fn run_idor_audit_config(cfg: &IdorTestConfig, allow_remote: bool) -> Result<IdorAuditReport> {
+    run_idor_audit_config_with_options(cfg, allow_remote, false)
+}
+
+pub fn run_idor_audit_config_with_options(
+    cfg: &IdorTestConfig,
+    allow_remote: bool,
+    allow_mutations: bool,
+) -> Result<IdorAuditReport> {
     if !allow_remote && !is_lab_or_loopback_url(&cfg.base_url)? {
         bail!(
             "Refusing remote target '{}' by default (IDOR regression checks target loopback/private lab hosts unless `--allow-remote` is explicitly passed for your own staging server).",
+            cfg.base_url
+        );
+    }
+    if allow_mutations && !is_strictly_loopback_url(&cfg.base_url) {
+        bail!(
+            "Refusing `--allow-mutations` against non-loopback target '{}' (mutating IDOR/BOLA checks are strictly restricted to 127.0.0.1 / ::1 / localhost).",
             cfg.base_url
         );
     }
@@ -117,11 +155,20 @@ pub fn run_idor_audit_config(cfg: &IdorTestConfig, allow_remote: bool) -> Result
     for chk in &cfg.checks {
         let method = reqwest::Method::from_bytes(chk.method.trim().to_ascii_uppercase().as_bytes())
             .unwrap_or(reqwest::Method::GET);
-        // Strictly restrict to non-destructive read methods in automated regression mode
-        if !matches!(
+        // Strictly restrict to read methods unless `--allow-mutations` was explicitly passed on loopback
+        let is_read = matches!(
             method,
             reqwest::Method::GET | reqwest::Method::HEAD | reqwest::Method::OPTIONS
-        ) {
+        );
+        let is_allowed_mutation = allow_mutations
+            && matches!(
+                method,
+                reqwest::Method::POST
+                    | reqwest::Method::PUT
+                    | reqwest::Method::PATCH
+                    | reqwest::Method::DELETE
+            );
+        if !is_read && !is_allowed_mutation {
             outcomes.push(IdorCheckOutcome {
                 name: chk.name.clone(),
                 method: chk.method.clone(),
@@ -131,16 +178,29 @@ pub fn run_idor_audit_config(cfg: &IdorTestConfig, allow_remote: bool) -> Result
                 unauth_status: 0,
                 verdict: "INCONCLUSIVE".into(),
                 detail:
-                    "Skipped non-read HTTP method in safe regression mode (GET/HEAD/OPTIONS only)."
+                    "Skipped non-read HTTP method in safe regression mode (pass `--allow-mutations` on localhost to test POST/PUT/PATCH/DELETE)."
                         .into(),
             });
             continue;
         }
         let url = format!("{base}/{}", chk.path.trim_start_matches('/'));
 
-        let (st_a, body_a) = send_with_headers(&client, method.clone(), &url, &cfg.user_a_headers)?;
-        let (st_b, body_b) = send_with_headers(&client, method.clone(), &url, &cfg.user_b_headers)?;
-        let (st_u, body_u) = send_with_headers(&client, method, &url, &HashMap::new())?;
+        let (st_a, body_a) = send_with_headers(
+            &client,
+            method.clone(),
+            &url,
+            &cfg.user_a_headers,
+            chk.body.as_ref(),
+        )?;
+        let (st_b, body_b) = send_with_headers(
+            &client,
+            method.clone(),
+            &url,
+            &cfg.user_b_headers,
+            chk.body.as_ref(),
+        )?;
+        let (st_u, body_u) =
+            send_with_headers(&client, method, &url, &HashMap::new(), chk.body.as_ref())?;
 
         let marker_leaked_b = chk
             .owner_marker
@@ -212,8 +272,12 @@ fn send_with_headers(
     method: reqwest::Method,
     url: &str,
     headers: &HashMap<String, String>,
+    body: Option<&serde_json::Value>,
 ) -> Result<(u16, String)> {
     let mut req = client.request(method, url);
+    if let Some(json_body) = body {
+        req = req.json(json_body);
+    }
     for (k, v) in headers {
         req = req.header(k.as_str(), v.as_str());
     }
@@ -290,6 +354,7 @@ mod tests {
                     method: "GET".into(),
                     path: "/vuln/order/101".into(),
                     owner_marker: Some("ord-101".into()),
+                    body: None,
                     admin_only: false,
                 },
                 IdorEndpointCheck {
@@ -297,6 +362,7 @@ mod tests {
                     method: "GET".into(),
                     path: "/safe/order/101".into(),
                     owner_marker: Some("ord-101".into()),
+                    body: None,
                     admin_only: false,
                 },
             ],

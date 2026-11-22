@@ -45,8 +45,119 @@ pub fn scan_mobile_config(rel_path: &str, source: &str) -> Vec<LocalStaticFindin
         scan_network_security_config(rel_path, source, &mut findings);
     } else if fname == "Info.plist" {
         scan_info_plist(rel_path, source, &mut findings);
+    } else if fname == "build.gradle" || fname == "build.gradle.kts" {
+        scan_android_gradle(rel_path, source, &mut findings);
+    } else if fname == "Podfile" {
+        scan_ios_podfile(rel_path, source, &mut findings);
+    } else if fname == "pubspec.yaml" {
+        scan_flutter_pubspec(rel_path, source, &mut findings);
     }
     findings
+}
+
+fn scan_android_gradle(rel_path: &str, source: &str, out: &mut Vec<LocalStaticFinding>) {
+    let mut in_release_block = false;
+    for (idx, line) in source.lines().enumerate() {
+        let low = line.trim().to_ascii_lowercase();
+        if low.starts_with("//") {
+            continue;
+        }
+        if low.contains("release") && low.contains('{') {
+            in_release_block = true;
+        } else if in_release_block && low == "}" {
+            in_release_block = false;
+        }
+        if in_release_block
+            && (low.contains("minifyenabled false") || low.contains("isminifyenabled = false"))
+        {
+            out.push(make_phase9_finding(
+                "SMG-MOB-STORAGE",
+                "MEDIUM",
+                "Android release build disables R8/ProGuard code obfuscation (`minifyEnabled false`)".into(),
+                rel_path,
+                idx + 1,
+                "build.gradle",
+                SinkKind::MobileSecurity,
+                GuardKind::MobilePolicy,
+                Confidence::Confirmed,
+                "Set `minifyEnabled true` (or `isMinifyEnabled = true`) in the Android `release` buildType.",
+            ));
+        }
+        if in_release_block && (low.contains("debuggable true") || low.contains("isdebuggable = true")) {
+            out.push(make_phase9_finding(
+                "SMG-MOB-IPC",
+                "HIGH",
+                "Android release build explicitly enables `debuggable true`".into(),
+                rel_path,
+                idx + 1,
+                "build.gradle",
+                SinkKind::MobileSecurity,
+                GuardKind::MobilePolicy,
+                Confidence::Confirmed,
+                "Set `debuggable false` for all release builds.",
+            ));
+        }
+        if low.contains("http://") && (low.contains("maven") || low.contains("url")) {
+            out.push(make_phase9_finding(
+                "SMG-MOB-TLS",
+                "HIGH",
+                "Android Gradle repository uses insecure cleartext `http://` URL (MITM dependency risk)".into(),
+                rel_path,
+                idx + 1,
+                "build.gradle",
+                SinkKind::MobileSecurity,
+                GuardKind::MobilePolicy,
+                Confidence::Confirmed,
+                "Use `https://` for all Gradle Maven repositories.",
+            ));
+        }
+    }
+}
+
+fn scan_ios_podfile(rel_path: &str, source: &str, out: &mut Vec<LocalStaticFinding>) {
+    for (idx, line) in source.lines().enumerate() {
+        let low = line.trim().to_ascii_lowercase();
+        if low.starts_with('#') {
+            continue;
+        }
+        if low.starts_with("source ") && low.contains("http://") {
+            out.push(make_phase9_finding(
+                "SMG-MOB-TLS",
+                "HIGH",
+                "iOS `Podfile` pulls CocoaPods specs over cleartext `http://`".into(),
+                rel_path,
+                idx + 1,
+                "Podfile",
+                SinkKind::MobileSecurity,
+                GuardKind::MobilePolicy,
+                Confidence::Confirmed,
+                "Use `https://cdn.cocoapods.org/` or HTTPS git remotes in `Podfile`.",
+            ));
+        }
+    }
+}
+
+fn scan_flutter_pubspec(rel_path: &str, source: &str, out: &mut Vec<LocalStaticFinding>) {
+    for (idx, line) in source.lines().enumerate() {
+        let low = line.trim().to_ascii_lowercase();
+        if low.starts_with('#') {
+            continue;
+        }
+        if low.contains("url:") && low.contains("http://") {
+            out.push(make_phase9_finding(
+                "SMG-MOB-TLS",
+                "HIGH",
+                "Flutter `pubspec.yaml` references dependency over cleartext `http://`".into(),
+                rel_path,
+                idx + 1,
+                "pubspec.yaml",
+                SinkKind::MobileSecurity,
+                GuardKind::MobilePolicy,
+                Confidence::Confirmed,
+                "Use `https://` URLs for all Flutter git/hosted package dependencies.",
+            ));
+        }
+    }
 }
 
 fn blank_xml_comments(src: &str) -> String {

@@ -511,6 +511,30 @@ fn inspect_https_headers_and_certs(host: &str, port: u16) -> (Option<String>, us
     (hsts, chain)
 }
 
+/// Builds a minimal RFC 1035 + RFC 8659 DNS wire query for `CAA` (QTYPE = 257) records.
+#[allow(dead_code)]
+pub fn build_dns_caa_query(host: &str) -> Vec<u8> {
+    let mut pkt = vec![
+        0x5A, 0xA5, // Transaction ID
+        0x01, 0x00, // Standard query, RD=1
+        0x00, 0x01, // QDCOUNT=1
+        0x00, 0x00, // ANCOUNT=0
+        0x00, 0x00, // NSCOUNT=0
+        0x00, 0x00, // ARCOUNT=0
+    ];
+    for label in host.trim_end_matches('.').split('.') {
+        if label.is_empty() || label.len() > 63 {
+            continue;
+        }
+        pkt.push(label.len() as u8);
+        pkt.extend_from_slice(label.as_bytes());
+    }
+    pkt.push(0x00); // Root label
+    pkt.extend_from_slice(&257u16.to_be_bytes()); // QTYPE = CAA (257)
+    pkt.extend_from_slice(&1u16.to_be_bytes()); // QCLASS = IN (1)
+    pkt
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -15,6 +15,8 @@ pub struct DerCertAudit {
     pub has_pqc_slh_dsa: bool,
     pub has_san_extension: bool,
     pub has_wildcard_san: bool,
+    pub has_ct_sct_extension: bool,
+    pub has_ocsp_must_staple: bool,
     pub not_after_year: Option<u32>,
     pub expired: bool,
 }
@@ -41,11 +43,17 @@ pub fn inspect_x509_der(
     const OID_ML_DSA_PREFIX: &[u8] = &[0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03];
     // Subject Alternative Name extension: 2.5.29.17
     const OID_SAN: &[u8] = &[0x06, 0x03, 0x55, 0x1D, 0x11];
+    // Certificate Transparency SCT List extension: 1.3.6.1.4.1.11129.2.4.2
+    const OID_CT_SCT: &[u8] = &[0x06, 0x0A, 0x2B, 0x06, 0x01, 0x04, 0x01, 0xD6, 0x79, 0x02, 0x04, 0x02];
+    // TLS Feature (OCSP Must-Staple): 1.3.6.1.5.5.7.1.24
+    const OID_OCSP_MUST_STAPLE: &[u8] = &[0x06, 0x08, 0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x18];
 
     let has_sha1_sig = contains_subslice(der, OID_SHA1_RSA) || contains_subslice(der, OID_SHA1_ECDSA);
     let has_md5_sig = contains_subslice(der, OID_MD5_RSA);
     let has_san_extension = contains_subslice(der, OID_SAN);
     let has_wildcard_san = has_san_extension && contains_subslice(der, b"*.");
+    let has_ct_sct_extension = contains_subslice(der, OID_CT_SCT);
+    let has_ocsp_must_staple = contains_subslice(der, OID_OCSP_MUST_STAPLE);
 
     let mut has_pqc_ml_dsa = false;
     let mut has_pqc_slh_dsa = false;
@@ -155,6 +163,8 @@ pub fn inspect_x509_der(
         has_pqc_slh_dsa,
         has_san_extension,
         has_wildcard_san,
+        has_ct_sct_extension,
+        has_ocsp_must_staple,
         not_after_year,
         expired,
     };

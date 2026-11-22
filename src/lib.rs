@@ -660,6 +660,11 @@ enum Commands {
             help = "Allow targeting a non-loopback staging URL (default restricts to loopback/private lab hosts)"
         )]
         allow_remote: bool,
+        #[arg(
+            long,
+            help = "Allow POST/PUT/PATCH/DELETE IDOR/BOLA regression checks (strictly restricted to localhost/loopback)"
+        )]
+        allow_mutations: bool,
         #[arg(long, help = "Emit machine-readable JSON report")]
         json: bool,
     },
@@ -3070,9 +3075,11 @@ pub fn run_cli() -> Result<ExitCode> {
         Commands::Idor {
             config,
             allow_remote,
+            allow_mutations,
             json,
         } => {
-            let report = idor_audit::run_idor_audit(&config, allow_remote)?;
+            let report =
+                idor_audit::run_idor_audit_with_options(&config, allow_remote, allow_mutations)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {

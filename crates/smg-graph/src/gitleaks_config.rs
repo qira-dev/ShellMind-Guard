@@ -171,17 +171,111 @@ pub struct CompiledCustomRule {
 pub struct GitleaksConfig {
     pub allowlists: Vec<CompiledAllowlist>,
     pub custom_rules: Vec<CompiledCustomRule>,
+    /// Fingerprints loaded from `.gitleaksignore` (`<commit>:<file>:<rule>:<line>` or `<file>:<rule>:<line>`).
+    pub ignored_fingerprints: std::collections::HashSet<String>,
 }
 
 impl GitleaksConfig {
-    /// Auto-loads `.gitleaks.toml` from `repo_root` (or an explicit override file if provided).
+    /// Auto-loads `.gitleaks.toml` (and optional `.gitleaksignore` fingerprints) from `repo_root`.
     pub fn load(repo_root: &Path, explicit_path: Option<&Path>) -> Option<Self> {
         let candidate = match explicit_path {
             Some(p) => p.to_path_buf(),
             None => repo_root.join(".gitleaks.toml"),
         };
-        let text = fs::read_to_string(&candidate).ok()?;
-        Self::parse_toml(&text).ok()
+        let mut cfg = fs::read_to_string(&candidate)
+            .ok()
+            .and_then(|text| Self::parse_toml(&text).ok())
+            .unwrap_or_default();
+        let ignore_path = repo_root.join(".gitleaksignore");
+        if let Ok(ign) = fs::read_to_string(&ignore_path) {
+            cfg.load_gitleaksignore_str(&ign);
+        }
+        if cfg.allowlists.is_empty()
+            && cfg.custom_rules.is_empty()
+            && cfg.ignored_fingerprints.is_empty()
+        {
+            None
+        } else {
+            Some(cfg)
+        }
+    }
+
+    /// Parses `.gitleaksignore` lines (ignoring `#` comments and blank lines).
+    pub fn load_gitleaksignore_str(&mut self, content: &str) {
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            self.ignored_fingerprints.insert(trimmed.to_string());
+        }
+    }
+
+    /// Returns true if a finding fingerprint is suppressed in `.gitleaksignore`.
+    pub fn is_fingerprint_ignored(
+        &self,
+        commit_sha: Option<&str>,
+        rel_path: &str,
+        rule_id: &str,
+        line: usize,
+    ) -> bool {
+        if self.ignored_fingerprints.is_empty() {
+            return false;
+        }
+        let short_fp = format!("{rel_path}:{rule_id}:{line}");
+        if self.ignored_fingerprints.contains(&short_fp) {
+            return true;
+        }
+        if let Some(sha) = commit_sha {
+            let full_fp = format!("{sha}:{rel_path}:{rule_id}:{line}");
+            if self.ignored_fingerprints.contains(&full_fp) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Evaluates custom rules across full multi-line file content (for `(?s)` / `\n` secret patterns).
+    pub fn scan_multiline_custom_rules(
+        &self,
+        rel_path: &str,
+        full_source: &str,
+    ) -> Vec<LocalStaticFinding> {
+        let mut out = Vec::new();
+        for rule in &self.custom_rules {
+            if !rule.regex.as_str().contains("\\n") && !rule.regex.as_str().contains("(?s") {
+                continue;
+            }
+            for m in rule.regex.find_iter(full_source) {
+                let line_num = full_source[..m.start()].bytes().filter(|&b| b == b'\n').count() + 1;
+                let tok = m.as_str();
+                if self.is_fingerprint_ignored(None, rel_path, &rule.id, line_num) {
+                    continue;
+                }
+                if let Some(min_e) = rule.min_entropy
+                    && shannon_entropy(tok) < min_e
+                {
+                    continue;
+                }
+                out.push(LocalStaticFinding {
+                    rule_id: format!("SMG-GITLEAKS-{}", rule.id.to_ascii_uppercase()),
+                    severity: "HIGH".into(),
+                    title: if rule.description.is_empty() {
+                        format!("Multi-line secret matched custom Gitleaks rule `{}`", rule.id)
+                    } else {
+                        rule.description.clone()
+                    },
+                    rel_path: rel_path.to_string(),
+                    line: line_num,
+                    symbol: rule.id.clone(),
+                    sink_kind: SinkKind::SecretLeak,
+                    missing_guard: GuardKind::SecretPolicy,
+                    confidence: Confidence::Confirmed,
+                    remediation: "Revoke the exposed credential and move it to a secure secrets manager.".into(),
+                });
+            }
+        }
+        out
     }
 
     pub fn parse_toml(toml_str: &str) -> Result<Self, toml::de::Error> {
@@ -225,6 +319,7 @@ impl GitleaksConfig {
         Ok(Self {
             allowlists,
             custom_rules,
+            ignored_fingerprints: std::collections::HashSet::new(),
         })
     }
 
