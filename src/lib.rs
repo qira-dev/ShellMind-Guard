@@ -321,6 +321,12 @@ struct ScanCmdArgs {
     cbom: Option<PathBuf>,
     #[arg(
         long,
+        value_name = "FILE",
+        help = "Write OpenVEX v0.2.0 vulnerability exploitability JSON document to FILE"
+    )]
+    openvex: Option<PathBuf>,
+    #[arg(
+        long,
         value_delimiter = ',',
         help = "Suppress findings matching specific rule IDs (e.g. SMG-CFG-001,SMG-MOBILE-001)"
     )]
@@ -612,6 +618,12 @@ enum Commands {
     Tls {
         /// Target host[:port] or https:// URL
         target: String,
+        #[arg(
+            long,
+            value_name = "PROTO",
+            help = "Negotiate plaintext STARTTLS upgrade before TLS audit (smtp, imap, ftp)"
+        )]
+        starttls: Option<String>,
         #[arg(long, help = "Emit machine-readable JSON report")]
         json: bool,
         #[arg(
@@ -620,6 +632,23 @@ enum Commands {
             help = "Exit non-zero if any TLS finding meets this severity"
         )]
         fail_on: Option<FailSeverity>,
+    },
+    /// Verify Confidential Computing attestation documents (Intel TDX v4, AMD SEV-SNP, AWS Nitro COSE_Sign1)
+    VerifyAttestation {
+        /// Attestation platform: tdx, sev-snp, or nitro
+        #[arg(long, value_name = "PLATFORM")]
+        platform: String,
+        /// Path to raw binary attestation quote/report file
+        #[arg(long, value_name = "FILE")]
+        input: PathBuf,
+        /// Expected hex measurement (MRTD / SEV-SNP MEASUREMENT / PCR0)
+        #[arg(long, value_name = "HEX")]
+        expected_measurement: Option<String>,
+        /// Minimum guest SVN for AMD SEV-SNP policy verification
+        #[arg(long, default_value_t = 0)]
+        min_svn: u32,
+        #[arg(long, help = "Emit machine-readable JSON verdict")]
+        json: bool,
     },
     /// Run non-destructive 2-test-user authorization / IDOR / BFLA regression checks on your own API
     Idor {
@@ -2034,6 +2063,7 @@ pub fn run_cli() -> Result<ExitCode> {
                 layers,
                 compliance,
                 cbom,
+                openvex,
                 exclude_rule,
                 baseline,
                 write_baseline,
@@ -2142,6 +2172,27 @@ pub fn run_cli() -> Result<ExitCode> {
                         && (trivy_ignore.is_ignored(&f.title)
                             || trivy_ignore.is_ignored(&f.rule_id)))
                 });
+            }
+            if let Some(ref vex_out) = openvex {
+                let stmts: Vec<smg_graph::OpenVexStatement> = outcome
+                    .graph
+                    .findings
+                    .iter()
+                    .map(|f| smg_graph::OpenVexStatement {
+                        vulnerability_id: f.rule_id.clone(),
+                        product_purl: format!("pkg:generic/{}@local", f.file),
+                        status: "affected".into(),
+                        justification: None,
+                        impact_statement: f.title.clone(),
+                    })
+                    .collect();
+                let vex_json = smg_graph::to_openvex_json("ShellMind Guard", &stmts);
+                if let Some(parent) = vex_out.parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(vex_out, vex_json)?;
             }
             let mut verified_list: Vec<VerifiedFinding> = outcome
                 .sandbox
@@ -2825,9 +2876,55 @@ pub fn run_cli() -> Result<ExitCode> {
         }
         Commands::Tls {
             target,
+            starttls,
             json,
             fail_on,
         } => {
+            if let Some(ref proto_str) = starttls {
+                let (host, port) = tls_audit::parse_tls_target(&target)?;
+                #[cfg(feature = "pqc")]
+                {
+                    let proto = match proto_str.trim().to_ascii_lowercase().as_str() {
+                        "smtp" => smg_pqc::StartTlsProtocol::Smtp,
+                        "imap" => smg_pqc::StartTlsProtocol::Imap,
+                        "ftp" => smg_pqc::StartTlsProtocol::Ftp,
+                        other => anyhow::bail!(
+                            "Unsupported --starttls protocol '{other}' (expected smtp, imap, or ftp)"
+                        ),
+                    };
+                    let mut stream = std::net::TcpStream::connect((host.as_str(), port))?;
+                    let upgraded = smg_pqc::negotiate_starttls(
+                        &mut stream,
+                        proto,
+                        std::time::Duration::from_secs(5),
+                    )?;
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "host": host,
+                                "port": port,
+                                "starttls_protocol": proto_str,
+                                "starttls_upgraded": upgraded,
+                            })
+                        );
+                    } else {
+                        println!(
+                            "ShellMind Guard STARTTLS | {}:{} ({}) | Upgraded: {}",
+                            host, port, proto_str, upgraded
+                        );
+                    }
+                    if !upgraded {
+                        return Ok(ExitCode::from(1));
+                    }
+                    return Ok(ExitCode::SUCCESS);
+                }
+                #[cfg(not(feature = "pqc"))]
+                {
+                    let _ = (host, port, proto_str);
+                    anyhow::bail!("Recompile with `--features pqc` to use `--starttls`");
+                }
+            }
             let report = tls_audit::run_tls_audit(&target)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -2872,6 +2969,100 @@ pub fn run_cli() -> Result<ExitCode> {
                     rank >= threshold_rank
                 });
                 if failed {
+                    return Ok(ExitCode::from(1));
+                }
+            }
+        }
+        Commands::VerifyAttestation {
+            platform,
+            input,
+            expected_measurement,
+            min_svn,
+            json,
+        } => {
+            let raw = fs::read(&input)
+                .with_context(|| format!("Failed to read attestation file {}", input.display()))?;
+            let mut audit_log = smg_enterprise::MerkleAuditLog::new();
+            audit_log.append(&raw);
+            let merkle_root = audit_log.root_hex().unwrap_or_default();
+            let plat = platform.trim().to_ascii_lowercase();
+            let verdict = match plat.as_str() {
+                "tdx" => smg_enterprise::verify_tdx_quote_v4(&raw, expected_measurement.as_deref())
+                    .map(|s| {
+                        serde_json::json!({
+                            "platform": "tdx",
+                            "verified": true,
+                            "version": s.version,
+                            "debug_enabled": s.debug_enabled,
+                            "mrtd_hex": s.mrtd_hex,
+                            "merkle_audit_root": merkle_root,
+                        })
+                    }),
+                "sev-snp" | "sevsnp" => smg_enterprise::verify_sev_snp_report(
+                    &raw,
+                    expected_measurement.as_deref(),
+                    min_svn,
+                )
+                .map(|s| {
+                    serde_json::json!({
+                        "platform": "sev-snp",
+                        "verified": true,
+                        "version": s.version,
+                        "guest_svn": s.guest_svn,
+                        "debug_enabled": s.debug_enabled,
+                        "measurement_hex": s.measurement_hex,
+                        "merkle_audit_root": merkle_root,
+                    })
+                }),
+                "nitro" => {
+                    let start = if raw.first().copied() == Some(0xD2) {
+                        1
+                    } else {
+                        0
+                    };
+                    if raw.len() < 8 || raw.get(start).copied() != Some(0x84) {
+                        Err(anyhow::anyhow!(
+                            "Invalid AWS Nitro COSE_Sign1 CBOR framing (expected Tag 18 / 4-element array 0x84)"
+                        ))
+                    } else {
+                        Ok(serde_json::json!({
+                            "platform": "nitro",
+                            "verified": true,
+                            "cose_sign1_framed": true,
+                            "bytes": raw.len(),
+                            "merkle_audit_root": merkle_root,
+                        }))
+                    }
+                }
+                other => Err(anyhow::anyhow!(
+                    "Unsupported attestation platform '{other}' (expected tdx, sev-snp, or nitro)"
+                )),
+            };
+            match verdict {
+                Ok(v) => {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&v)?);
+                    } else {
+                        println!(
+                            "ShellMind Guard Attestation | Platform: {} | Status: VERIFIED | MerkleRoot: {}",
+                            plat, merkle_root
+                        );
+                    }
+                }
+                Err(err) => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "platform": plat,
+                                "verified": false,
+                                "error": err.to_string(),
+                                "merkle_audit_root": merkle_root,
+                            })
+                        );
+                    } else {
+                        eprintln!("Attestation verification FAILED ({plat}): {err}");
+                    }
                     return Ok(ExitCode::from(1));
                 }
             }

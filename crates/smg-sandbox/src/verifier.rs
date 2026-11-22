@@ -602,6 +602,38 @@ pub async fn verify_concurrency_invariant(
     .await
 }
 
+/// Dispatches an RFC 9113 HTTP/2 single-packet `END_STREAM` race burst strictly against
+/// `127.0.0.1:{port}` for the target finding's route (Phase 33 wiring of `h2_race_snapshot`).
+pub fn dispatch_h2_single_packet_race_for_finding(
+    port: u16,
+    finding: &LatticeFinding,
+    concurrency: usize,
+    cfg: &SandboxProbeConfig,
+) -> Result<usize> {
+    let (method, raw_path) = parse_route(&finding.entry_route);
+    let path = substitute_route_params(raw_path);
+    let synthesized = crate::wire_oracle::synthesize_schema_poc_body(finding, &cfg.fuzz_routes);
+    let body = cfg
+        .probe_body
+        .as_deref()
+        .or(synthesized.as_deref())
+        .unwrap_or(r#"{"userId":"test-user-1","amount":80}"#);
+    let authority = format!("127.0.0.1:{port}");
+    let burst = crate::h2_race_snapshot::build_h2_single_packet_burst(
+        method,
+        &path,
+        &authority,
+        body.as_bytes(),
+        concurrency.clamp(1, 64),
+    )?;
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse()?;
+    crate::h2_race_snapshot::execute_loopback_h2_single_packet_race(
+        addr,
+        &burst,
+        Duration::from_secs(3),
+    )
+}
+
 pub async fn verify_concurrency_invariant_with_config(
     port: u16,
     finding: &LatticeFinding,

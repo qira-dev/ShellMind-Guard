@@ -25,7 +25,8 @@ pub use bwrap::{
 pub use verifier::{
     FuzzProbeHit, MockShimHandle, SandboxProbeConfig, StatefulWorkflowConfig,
     StatefulWorkflowResult, StatefulWorkflowViolation, VerificationStatus, VerifiedFinding,
-    apply_wire_diff_corroboration, classify_boot_failure, mock_shim_env_vars,
+    apply_wire_diff_corroboration, classify_boot_failure,
+    dispatch_h2_single_packet_race_for_finding, mock_shim_env_vars,
     spawn_mock_shim_server, spawn_mock_shim_server_on_port, verify_finding,
     verify_finding_with_config, verify_route_fuzz_with_config, verify_stateful_http_workflow,
 };
