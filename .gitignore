@@ -4,3 +4,7 @@
 *.db-wal
 *.db-shm
 .DS_Store
+AI_DEEP_AUDIT_FORMS.md
+AUDIT/
+HANDOFF_*.md
+

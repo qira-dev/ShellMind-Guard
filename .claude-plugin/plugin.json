@@ -1,6 +1,6 @@
 {
   "name": "shellmind-guard",
-  "version": "0.4.0",
+  "version": "1.4.1",
   "description": "Zero-AI multi-file security, business-logic, concurrency & frontier-domain verifier across 18 languages: SMT (QF_BV/QF_LIA/Array) + k-CFA/SSA lattice, C/C++ memory typestate, Rust async-mutex, Embedded HW WCSD/DMA/.ld, Web3/revm/Solana/Move, AI Indirect-Prompt/MCP/Pickle/SSTI, PQC/X.509-DER/STARTTLS/ELF, 78 Checkov IaC policies, .gitleaksignore, MobSF mobile, opt-in Burp MITM CA, headless Chrome CDP SPA/DOM-XSS, Nuclei ssl/ws/headless/file/flow/OOB, GraphQL/multipart SQLi, OpenVEX v0.2.0 & stdio MCP.",
   "author": {
     "name": "Qira-Dev",

@@ -1,6 +1,6 @@
 # ShellMind-Guard — Roadmap & Status (Phases 21–26)
 
-- **Repository:** `/home/km-abdullah/ShellMind-Guard` (`https://github.com/qira-dev/ShellMind-Guard`)
+- **Repository:** `https://github.com/qira-dev/ShellMind-Guard`
 - **Binary Footprint:** `42M` single Rust release binary (`~/.cargo/bin/smg` & `~/.cargo/bin/shellmind-guard`)
 - **Core Principles:** Offline-first, single Rust binary, zero LLM hallucination, zero clippy warnings (`-D warnings`), deterministic parsers & proof-based verification.
 

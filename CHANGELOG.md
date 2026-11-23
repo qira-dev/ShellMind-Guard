@@ -8,6 +8,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-11-24
+
+### Security & Soundness (6-Batch Full-Workspace Audit Remediation)
+- **Batch 1 — P0 Containment, Trust-Loader & Benchmark Honesty:** Fixed UTF-8 boundary/slice panics, enforced `load_trusted_from_dir` stripping untrusted `ignore_paths` on untrusted repos, tightened sandbox/live-engine containment, and locked `SMG_ENFORCE_PRECISION_GATE=1` benchmark verification.
+- **Batch 2 — Bounded Sensitive-File Discovery & Supply-Chain Hardening:** Preserved `.gitignore` on normal source walks while adding a separate bounded sensitive-file discovery pass + optional `--no-gitignore`, hardened distro-aware OSV matching, YAML document budgets, git-history scanning, and OCI image parsing.
+- **Batch 3 — Static Engine Soundness (`smg-graph`):** Fixed CFG guard-union polarity and `budget_exhausted` propagation, upgraded middleware guard propagation to a true convergence fixpoint worklist, blocked `public_routes = ["/*"]` wildcard bypasses, hardened JSX `dangerouslySetInnerHTML` sanitizer checks, fixed taint field-clear/early-return polarity and recursion caps, fixed OpenAPI schema merge ordering, prevented SMT `&&` partial-parse false UNSAT, and eliminated `i128::MIN` GCD overflow in `smt_advanced.rs`.
+- **Batch 4 — Domain Scanners, AI Patcher & Rule Catalog Sync:** Hardened IaC policies (`iac_policy.rs`, HCL, K8s, CI/CD), AI/MCP/ML detectors (`ai_mcp_model.rs`, `smg-ai` codemods & semantic patcher), Mobile (`phase9`), Web3 (`smg-web3`), Embedded Hardware (`smg-hw`), Post-Quantum/X.509 (`smg-pqc`), and synchronized `RULE_CATALOG`.
+- **Batch 5 — Live Engines, Fail-Closed TEE Attestation, Sandbox & Reports:** Enforced unconditional IMDS/link-local deny across all live engines on final substituted destinations (even with `--allow-remote`), removed OS-shell CMDi metacharacter payloads from default safe DAST mode, enforced fail-closed TEE attestation in `smg-enterprise` (`verified: false`, `cryptographically_verified: false`, non-zero exit) with TDX `48+120` offset fix, and hardened `smg-sandbox`, `smg-report`, and `proxy_tui`.
+- **Batch 6 — MCP/TUI Hardening, Fail-Closed Hooks/Installers & CI/CD:** Fixed MCP >4 MiB line drain OOM (`drain_to_newline`), `InvalidData` UTF-8 `-32700` handling, strict JSON-RPC `"2.0"` validation, trust-loader parity, and 32 KiB envelope cap; scoped TUI panic hook to the UI thread, added browser child reaping, symlink refusal on session/baseline files, and 64 KiB OSC 52 cap; made `hooks/hooks.json` fail-closed (`timeout: 60`, `onFailure: "block"`); hardened `install.sh` & `install.ps1` (fail-closed checksum verification, 64-hex validation, no unpinned `main` fallback, strict TLS 1.2); hardened `ci.yml` & `release.yml` (tag parity gate, `persist-credentials: false`, `SHA256SUMS.txt` provenance attestation); and aligned `SECURITY.md`.
+
 ## [0.4.0] - 2026-11-23
 
 ### Added (Phases 36–39 — 9-Tool Defensive Parity & Live Engines)
