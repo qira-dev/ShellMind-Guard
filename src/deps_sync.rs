@@ -7,15 +7,14 @@ use smg_core::{
 use smg_graph::deps::{ResolvedDependency, extract_resolved_dependencies};
 use std::collections::BTreeSet;
 use std::fs;
-use std::net::IpAddr;
 use std::path::Path;
-use std::sync::Once;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const DEFAULT_OSV_BASE_URL: &str = "https://api.osv.dev";
 const QUERYBATCH_CHUNK_SIZE: usize = 500;
 const OSV_HTTP_TIMEOUT_SECS: u64 = 30;
-static RUSTLS_INIT: Once = Once::new();
+const MAX_OFFLINE_OSV_IMPORT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_CONSECUTIVE_VULN_FETCH_ERRORS: usize = 10;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct DepsSyncSummary {
@@ -24,25 +23,9 @@ pub struct DepsSyncSummary {
     pub records_upserted: usize,
 }
 
-fn ensure_rustls_provider() {
-    RUSTLS_INIT.call_once(|| {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-    });
-}
-
-fn is_loopback_host(host: &str) -> bool {
-    let trimmed = host.trim().trim_start_matches('[').trim_end_matches(']');
-    if trimmed.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    trimmed
-        .parse::<IpAddr>()
-        .map(|ip| ip.is_loopback())
-        .unwrap_or(false)
-}
-
-/// Validates the OSV endpoint URL, enforcing HTTPS for all remote hosts and
-/// permitting plain HTTP only for loopback test endpoints.
+/// Validates the OSV endpoint URL, enforcing HTTPS for all remote hosts,
+/// permitting plain HTTP only for strictly-loopback test endpoints, and
+/// unconditionally denying cloud metadata / link-local / unspecified hosts (Council T5).
 pub fn validate_osv_base_url(base_url: &str) -> Result<reqwest::Url> {
     let trimmed = base_url.trim();
     if trimmed.is_empty() {
@@ -56,9 +39,18 @@ pub fn validate_osv_base_url(base_url: &str) -> Result<reqwest::Url> {
     let host = url
         .host_str()
         .ok_or_else(|| anyhow::anyhow!("OSV base URL '{}' is missing host", trimmed))?;
+    if crate::idor_audit::is_forbidden_metadata_or_special_host(host) {
+        bail!(
+            "Refusing cloud metadata / link-local / unspecified OSV endpoint '{}'",
+            host
+        );
+    }
     match url.scheme() {
-        "https" => Ok(url),
-        "http" if is_loopback_host(host) => Ok(url),
+        "https" => {
+            crate::idor_audit::validate_live_target_url(url.as_str(), true)?;
+            Ok(url)
+        }
+        "http" if crate::idor_audit::is_strictly_loopback_url(url.as_str()) => Ok(url),
         "http" => bail!(
             "Remote OSV endpoint '{}' must use https:// (http:// is allowed only on loopback hosts)",
             host
@@ -68,11 +60,11 @@ pub fn validate_osv_base_url(base_url: &str) -> Result<reqwest::Url> {
 }
 
 fn build_osv_http_client() -> Result<reqwest::blocking::Client> {
-    ensure_rustls_provider();
+    crate::idor_audit::ensure_rustls_ring_provider();
     reqwest::blocking::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(OSV_HTTP_TIMEOUT_SECS))
-        .user_agent("shellmind-guard/0.1")
+        .user_agent(concat!("ShellMind-Guard/", env!("CARGO_PKG_VERSION")))
         .build()
         .context("Failed to initialize HTTPS/TLS client for OSV sync")
 }
@@ -243,17 +235,49 @@ pub fn sync_osv_to_store(
         .unwrap_or(0);
 
     let mut records_upserted = 0usize;
+    let mut fetched_ok = 0usize;
+    let mut consecutive_errors = 0usize;
     let mut batch: Vec<AdvisoryRecord> = Vec::new();
     const UPSERT_BATCH_SIZE: usize = 25;
     for vuln_id in unique_ids.iter().take(2000) {
         let vuln_url = append_endpoint_segments(&base_url, &["v1", "vulns", vuln_id])?;
-        let resp = client
-            .get(vuln_url.clone())
-            .send()
-            .with_context(|| format!("OSV vuln fetch for '{}' failed", vuln_id))?;
+        let resp = match client.get(vuln_url.clone()).send() {
+            Ok(r) => r,
+            Err(e) => {
+                consecutive_errors += 1;
+                if consecutive_errors >= MAX_CONSECUTIVE_VULN_FETCH_ERRORS {
+                    if !batch.is_empty() {
+                        let _ = store.upsert_advisories(&batch)?;
+                        batch.clear();
+                    }
+                    return Err(e).with_context(|| {
+                        format!(
+                            "OSV vuln fetch aborted after {consecutive_errors} consecutive transport errors (last: '{vuln_id}')"
+                        )
+                    });
+                }
+                continue;
+            }
+        };
         let status = resp.status();
         let body = read_bounded_osv_body(resp)?;
         if status.as_u16() == 404 || status.as_u16() == 410 {
+            consecutive_errors = 0;
+            continue;
+        }
+        if status.as_u16() == 429 || status.is_server_error() {
+            consecutive_errors += 1;
+            if consecutive_errors >= MAX_CONSECUTIVE_VULN_FETCH_ERRORS {
+                if !batch.is_empty() {
+                    let _ = store.upsert_advisories(&batch)?;
+                    batch.clear();
+                }
+                bail!(
+                    "OSV vuln endpoint returned HTTP {} for '{}' ({consecutive_errors} consecutive transient failures)",
+                    status.as_u16(),
+                    vuln_id
+                );
+            }
             continue;
         }
         if !status.is_success() {
@@ -266,9 +290,11 @@ pub fn sync_osv_to_store(
                 vuln_id
             );
         }
+        consecutive_errors = 0;
         let val: Value = serde_json::from_str(&body)
             .with_context(|| format!("OSV vuln '{}' returned invalid JSON", vuln_id))?;
         let mut parsed_records = parse_osv_value_into_records(&val, now_epoch)?;
+        fetched_ok += 1;
         batch.append(&mut parsed_records);
         if batch.len() >= UPSERT_BATCH_SIZE {
             records_upserted += store.upsert_advisories(&batch)?;
@@ -281,15 +307,29 @@ pub fn sync_osv_to_store(
 
     Ok(DepsSyncSummary {
         dependencies_queried: deps.len(),
-        unique_vulns_fetched: unique_ids.len().min(2000),
+        unique_vulns_fetched: fetched_ok,
         records_upserted,
     })
 }
 
-/// Imports an offline OSV JSON bundle/entry file into the SQLite `AdvisoryStore`.
+/// Imports an offline OSV JSON bundle/entry file into the SQLite `AdvisoryStore` (bounded to 64 MiB).
 pub fn import_osv_file_to_store(file: &Path, store: &mut AdvisoryStore) -> Result<usize> {
-    let raw = fs::read_to_string(file)
+    use std::io::Read;
+    let fh = fs::File::open(file)
         .with_context(|| format!("Failed to read OSV JSON file {}", file.display()))?;
+    let mut bytes = Vec::new();
+    fh.take((MAX_OFFLINE_OSV_IMPORT_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("Failed to read OSV JSON file {}", file.display()))?;
+    if bytes.len() > MAX_OFFLINE_OSV_IMPORT_BYTES {
+        bail!(
+            "OSV JSON file {} exceeds {} byte safety cap",
+            file.display(),
+            MAX_OFFLINE_OSV_IMPORT_BYTES
+        );
+    }
+    let raw = String::from_utf8(bytes)
+        .with_context(|| format!("OSV JSON file {} is not valid UTF-8", file.display()))?;
     store
         .import_osv_json(&raw)
         .with_context(|| format!("Failed to import OSV records from {}", file.display()))
@@ -347,6 +387,9 @@ mod tests {
 
         assert!(validate_osv_base_url("http://api.osv.dev").is_err());
         assert!(validate_osv_base_url("https://user:pass@api.osv.dev").is_err());
+        assert!(validate_osv_base_url("https://169.254.169.254").is_err());
+        assert!(validate_osv_base_url("https://metadata.google.internal").is_err());
+        assert!(validate_osv_base_url("https://[fd00:ec2::254]").is_err());
         assert!(validate_osv_base_url("file:///etc/passwd").is_err());
         assert!(validate_osv_base_url("").is_err());
     }

@@ -51,7 +51,7 @@ pub fn redact_token(raw: &str) -> String {
 }
 
 fn build_verify_client() -> anyhow::Result<Client> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    crate::idor_audit::ensure_rustls_ring_provider();
     let client = Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(8))
@@ -324,7 +324,15 @@ pub fn verify_single_token(
     };
 
     let target_url = match (override_url, spec.auth) {
-        (Some(u), _) => u.to_string(),
+        (Some(u), _) => {
+            if let Err(e) = crate::idor_audit::validate_live_target_url(u, false) {
+                return LiveVerifyStatus::Unverified {
+                    provider: spec.provider,
+                    reason: format!("rejected override URL: {e}"),
+                };
+            }
+            u.to_string()
+        }
         (None, AuthStyle::TelegramGetMe) => format!("{}/bot{token}/getMe", spec.url),
         (None, AuthStyle::QueryKey(k)) => format!("{}?{k}={token}", spec.url),
         (None, _) => spec.url.to_string(),
@@ -377,25 +385,38 @@ pub fn verify_single_token(
     let status = resp.status().as_u16();
     let body = read_response_bounded(resp, 256 * 1024);
 
-    // Slack returns HTTP 200 with {"ok": false} for revoked tokens
-    if matches!(spec.auth, AuthStyle::SlackAuthTest)
-        && status == 200
-        && let Ok(val) = serde_json::from_str::<serde_json::Value>(&body)
-        && let Some(ok) = val.get("ok").and_then(|v| v.as_bool())
+    // Slack & Telegram return HTTP 200 with {"ok": true|false}
+    if matches!(
+        spec.auth,
+        AuthStyle::SlackAuthTest | AuthStyle::TelegramGetMe
+    ) && status == 200
     {
-        if ok {
-            return LiveVerifyStatus::VerifiedLive {
-                provider: spec.provider,
-                identity_hint: extract_identity_hint(&body),
-            };
+        match serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|val| val.get("ok").and_then(|v| v.as_bool()))
+        {
+            Some(true) => {
+                return LiveVerifyStatus::VerifiedLive {
+                    provider: spec.provider,
+                    identity_hint: extract_identity_hint(&body),
+                };
+            }
+            Some(false) => {
+                return LiveVerifyStatus::Inactive {
+                    provider: spec.provider,
+                    http_status: 401,
+                };
+            }
+            None => {
+                return LiveVerifyStatus::Unverified {
+                    provider: spec.provider,
+                    reason: "HTTP 200 response missing boolean `ok` field".to_string(),
+                };
+            }
         }
-        return LiveVerifyStatus::Inactive {
-            provider: spec.provider,
-            http_status: 401,
-        };
     }
 
-    // Linear GraphQL returns 200 with "errors" on bad key
+    // Linear GraphQL returns 200 with "errors" on bad key or malformed GraphQL response
     if matches!(spec.auth, AuthStyle::LinearGraphQl) {
         if status == 200 && body.contains("\"viewer\"") && !body.contains("\"errors\"") {
             return LiveVerifyStatus::VerifiedLive {
@@ -407,6 +428,12 @@ pub fn verify_single_token(
             return LiveVerifyStatus::Inactive {
                 provider: spec.provider,
                 http_status: 401,
+            };
+        }
+        if status == 200 {
+            return LiveVerifyStatus::Unverified {
+                provider: spec.provider,
+                reason: "Linear GraphQL HTTP 200 response lacked valid viewer payload".to_string(),
             };
         }
     }
@@ -566,13 +593,17 @@ pub fn run_live_secret_verification(
         unverified: 0,
     };
 
-    // Index history candidates by (file, line)
-    let mut hist_map: HashMap<(String, usize), &SecretCandidate> = HashMap::new();
+    // Index history candidates by (file, line, rule_id) with commit SHA matching so
+    // git-history entries never collide across commits or shadow working-tree tokens.
+    let mut hist_map: HashMap<(String, usize, String), Vec<&SecretCandidate>> = HashMap::new();
     for c in history_candidates {
-        hist_map.insert((c.file.clone(), c.line), c);
+        hist_map
+            .entry((c.file.clone(), c.line, c.rule_id.clone()))
+            .or_default()
+            .push(c);
     }
 
-    // Cache file reads for working-tree token extraction
+    // Cache file reads for working-tree token extraction (bounded to 2 MiB per file)
     let mut file_cache: HashMap<String, String> = HashMap::new();
     // Cache live verification verdicts by raw token hash so duplicate findings only probe once
     let mut verdict_cache: HashMap<String, LiveVerifyStatus> = HashMap::new();
@@ -584,11 +615,36 @@ pub fn run_live_secret_verification(
             continue;
         }
 
-        let (raw_token, paired_secret) = if let Some(cand) = hist_map.get(&(f.file.clone(), f.line))
-        {
+        let hist_short_sha = f
+            .title
+            .strip_prefix("[git-history ")
+            .and_then(|rest| rest.split([' ', '|', ']']).next())
+            .filter(|s| !s.is_empty());
+
+        let matched_hist = hist_short_sha.and_then(|short_sha| {
+            hist_map
+                .get(&(f.file.clone(), f.line, f.rule_id.clone()))
+                .and_then(|cands| {
+                    cands.iter().copied().find(|c| {
+                        c.commit_sha
+                            .as_deref()
+                            .is_some_and(|sha| sha.starts_with(short_sha))
+                    })
+                })
+        });
+
+        let (raw_token, paired_secret) = if let Some(cand) = matched_hist {
             (cand.raw_token.clone(), cand.paired_secret.clone())
+        } else if hist_short_sha.is_some() {
+            // Git-history finding without a matching SecretCandidate: never fall back
+            // to reading a different working-tree token at the same line.
+            if only_verified {
+                verified_indices[idx] = false;
+            }
+            continue;
         } else {
             let content = file_cache.entry(f.file.clone()).or_insert_with(|| {
+                use std::io::Read;
                 let Ok(canon_root) = fs::canonicalize(repo_root) else {
                     return String::new();
                 };
@@ -598,7 +654,12 @@ pub fn run_live_secret_verification(
                 if !canon_file.starts_with(&canon_root) {
                     return String::new();
                 }
-                fs::read_to_string(&canon_file).unwrap_or_default()
+                let Ok(file) = fs::File::open(&canon_file) else {
+                    return String::new();
+                };
+                let mut buf = Vec::new();
+                let _ = file.take(2 * 1024 * 1024).read_to_end(&mut buf);
+                String::from_utf8_lossy(&buf).into_owned()
             });
             let lines: Vec<&str> = content.lines().collect();
             let line_idx = f.line.saturating_sub(1);

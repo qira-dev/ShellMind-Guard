@@ -262,6 +262,21 @@ pub fn verify_tee_attestation_quote(
     })
 }
 
+fn is_forbidden_tee_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_link_local() || v4.is_unspecified(),
+        IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                mapped.is_link_local() || mapped.is_unspecified()
+            } else {
+                let segs = v6.segments();
+                let is_aws_imds_v6 = segs == [0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254];
+                v6.is_unspecified() || (segs[0] & 0xffc0) == 0xfe80 || is_aws_imds_v6
+            }
+        }
+    }
+}
+
 fn is_url_strictly_loopback(url: &Url) -> bool {
     let Some(raw_host) = url.host_str() else {
         return false;
@@ -276,7 +291,8 @@ fn is_url_strictly_loopback(url: &Url) -> bool {
             let vec: Vec<_> = addrs.collect();
             return !vec.is_empty() && vec.iter().all(|a| a.ip().is_loopback());
         }
-        return true;
+        // Fail closed when `localhost` cannot be resolved cleanly.
+        return false;
     }
     false
 }
@@ -293,24 +309,18 @@ pub fn validate_tee_endpoint(raw_url: &str) -> Result<Url> {
         let clean = host.trim().trim_matches(['[', ']']).to_ascii_lowercase();
         if matches!(
             clean.as_str(),
-            "metadata.google.internal" | "metadata.goog" | "metadata.azure.com" | "169.254.169.254"
+            "metadata.google.internal"
+                | "metadata.goog"
+                | "metadata.azure.com"
+                | "169.254.169.254"
+                | "fd00:ec2::254"
         ) {
             bail!("refusing cloud metadata host `{host}` for remote TEE endpoint");
         }
-        if let Ok(ip) = clean.parse::<std::net::IpAddr>() {
-            let forbidden = match ip {
-                std::net::IpAddr::V4(v4) => v4.is_link_local() || v4.is_unspecified(),
-                std::net::IpAddr::V6(v6) => {
-                    if let Some(mapped) = v6.to_ipv4_mapped() {
-                        mapped.is_link_local() || mapped.is_unspecified()
-                    } else {
-                        v6.is_unspecified() || (v6.segments()[0] & 0xffc0) == 0xfe80
-                    }
-                }
-            };
-            if forbidden {
-                bail!("refusing link-local/unspecified IP `{host}` for remote TEE endpoint");
-            }
+        if let Ok(ip) = clean.parse::<IpAddr>()
+            && is_forbidden_tee_ip(ip)
+        {
+            bail!("refusing link-local/unspecified/IMDS IP `{host}` for remote TEE endpoint");
         }
     }
     let is_loopback = is_url_strictly_loopback(&url);
@@ -369,6 +379,19 @@ pub fn execute_remote_tee_scan(
     }
 
     let mut base_url = validate_tee_endpoint(endpoint_url)?;
+    // Verify DNS-resolved destination IPs immediately before outbound connection to block
+    // DNS-rebinding or `/etc/hosts` aliases pointing at cloud IMDS / link-local ranges.
+    if let Some(host) = base_url.host_str() {
+        let clean = host.trim_matches(['[', ']']);
+        let port = base_url.port_or_known_default().unwrap_or(443);
+        let resolved: Vec<_> = (clean, port)
+            .to_socket_addrs()
+            .with_context(|| format!("failed to resolve remote TEE host `{host}`"))?
+            .collect();
+        if resolved.is_empty() || resolved.iter().any(|sa| is_forbidden_tee_ip(sa.ip())) {
+            bail!("refusing remote TEE host `{host}` resolving to link-local/IMDS/unspecified IP");
+        }
+    }
     if !base_url.path().ends_with('/') {
         let with_slash = format!("{}/", base_url.path());
         base_url.set_path(&with_slash);

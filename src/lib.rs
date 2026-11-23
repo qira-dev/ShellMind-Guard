@@ -1039,7 +1039,7 @@ fn handle_enterprise_command(action: EnterpriseAction) -> Result<()> {
         } => {
             let pk = smg_enterprise::decode_pubkey_32(&pubkey)?;
             let plat = smg_enterprise::TeePlatform::parse(&platform)?;
-            let cfg = ShellMindGuardConfig::load_from_dir(&path)?;
+            let cfg = ShellMindGuardConfig::load_trusted_from_dir(&path, false)?;
             let summary = scan_repository(&path, &cfg)?;
             let lic_raw = match license {
                 Some(p) => {
@@ -1851,15 +1851,10 @@ pub(crate) fn execute_scan_pipeline_full(
         Vec::new()
     };
     let probe_cfg = probe_config_from_opts(&cfg, &opts, fuzz_routes);
-    let has_dynamic_targets = graph_res.findings.iter().any(|f| {
-        matches!(
-            f.missing_guard,
-            GuardKind::Auth
-                | GuardKind::TxLock
-                | GuardKind::OwnershipCheck
-                | GuardKind::SsrfSanitizer
-        )
-    });
+    let has_dynamic_targets = graph_res
+        .findings
+        .iter()
+        .any(smg_sandbox::is_dynamic_probe_target);
 
     let mut sandbox_res: Option<(bool, Vec<VerifiedFinding>)> = None;
     if let Some(cmd) = effective_boot {
@@ -2120,7 +2115,7 @@ pub fn run_cli() -> Result<ExitCode> {
             }
         }
         Commands::Index { path, json } => {
-            let cfg = ShellMindGuardConfig::load_from_dir(&path)?;
+            let cfg = ShellMindGuardConfig::load_trusted_from_dir(&path, false)?;
             let summary = scan_repository(&path, &cfg)?;
             let mut store = StateStore::open(&path)?;
             let (delta, _changed) = store.sync_files(&summary.files)?;
@@ -2354,7 +2349,7 @@ pub fn run_cli() -> Result<ExitCode> {
                 fs::write(sarif_path, payload)?;
             }
             if let Some(ref cdx_path) = cyclonedx {
-                let cfg = ShellMindGuardConfig::load_from_dir(&path)?;
+                let cfg = ShellMindGuardConfig::load_trusted_from_dir(&path, false)?;
                 let dep_summary =
                     scan_repository_with_options(&path, &cfg, &ScanOptions { include_generated })?;
                 let mut resolved_deps = Vec::new();
@@ -2571,7 +2566,7 @@ pub fn run_cli() -> Result<ExitCode> {
             patch_file,
             apply_check,
         } => {
-            let cfg = ShellMindGuardConfig::load_from_dir(&path)?;
+            let cfg = ShellMindGuardConfig::load_trusted_from_dir(&path, false)?;
             let mut store = StateStore::open(&path)?;
             let finding = resolve_finding_for_replay(&path, &finding_id, &cfg, &mut store)?;
             let effective_boot = boot_cmd.or_else(|| {
@@ -3082,8 +3077,15 @@ pub fn run_cli() -> Result<ExitCode> {
             min_svn,
             json,
         } => {
-            let raw = fs::read(&input)
-                .with_context(|| format!("Failed to read attestation file {}", input.display()))?;
+            let raw = {
+                use std::io::Read;
+                let f = fs::File::open(&input).with_context(|| {
+                    format!("Failed to read attestation file {}", input.display())
+                })?;
+                let mut buf = Vec::new();
+                f.take(2 * 1024 * 1024).read_to_end(&mut buf)?;
+                buf
+            };
             let mut audit_log = smg_enterprise::MerkleAuditLog::new();
             audit_log.append(&raw);
             let merkle_root = audit_log.root_hex().unwrap_or_default();
@@ -3094,7 +3096,7 @@ pub fn run_cli() -> Result<ExitCode> {
                         serde_json::json!({
                             "platform": "tdx",
                             "verified": false,
-                            "cryptographically_verified": false,
+                            "cryptographically_verified": s.cryptographically_verified,
                             "structural_valid": true,
                             "reason": "Structural TDX v4 header/MRTD check passed; Intel DCAP PCK signature/TCB verification is not yet enabled (fail-closed)",
                             "version": s.version,
@@ -3112,7 +3114,7 @@ pub fn run_cli() -> Result<ExitCode> {
                     serde_json::json!({
                         "platform": "sev-snp",
                         "verified": false,
-                        "cryptographically_verified": false,
+                        "cryptographically_verified": s.cryptographically_verified,
                         "structural_valid": true,
                         "reason": "Structural SEV-SNP header/policy check passed; AMD VCEK signature verification is not yet enabled (fail-closed)",
                         "version": s.version,
@@ -3138,6 +3140,7 @@ pub fn run_cli() -> Result<ExitCode> {
                             "verified": false,
                             "cryptographically_verified": false,
                             "structural_valid": true,
+                            "expected_measurement_checked": false,
                             "reason": "Structural CBOR COSE_Sign1 framing only; AWS Nitro Root CA / PCR cryptographic verification is not yet enabled (fail-closed)",
                             "cose_sign1_framed": true,
                             "bytes": raw.len(),
@@ -3169,7 +3172,7 @@ pub fn run_cli() -> Result<ExitCode> {
                         );
                     }
                     if !crypto_ok {
-                        std::process::exit(1);
+                        return Ok(ExitCode::from(1));
                     }
                 }
                 Err(err) => {
@@ -3179,6 +3182,8 @@ pub fn run_cli() -> Result<ExitCode> {
                             serde_json::json!({
                                 "platform": plat,
                                 "verified": false,
+                                "cryptographically_verified": false,
+                                "structural_valid": false,
                                 "error": err.to_string(),
                                 "merkle_audit_root": merkle_root,
                             })
@@ -3645,7 +3650,7 @@ pub fn run_cli() -> Result<ExitCode> {
                         total
                     );
                 } else {
-                    let cfg = ShellMindGuardConfig::load_from_dir(&path)?;
+                    let cfg = ShellMindGuardConfig::load_trusted_from_dir(&path, false)?;
                     let deps = deps_sync::extract_project_dependencies(&path, &cfg)?;
                     if deps.is_empty() {
                         println!(
@@ -5107,26 +5112,34 @@ fn run_doctor(path: &Path, probe_ai: bool) {
                     match provider_from_config(&cfg.ai) {
                         Ok(smg_ai::AiProvider::Ollama { endpoint, model }) => {
                             let ping_url = format!("{}/api/tags", endpoint.trim_end_matches('/'));
-                            let probe_res = reqwest::blocking::Client::builder()
-                                .redirect(reqwest::redirect::Policy::none())
-                                .timeout(std::time::Duration::from_secs(2))
-                                .build()
-                                .and_then(|c| c.get(&ping_url).send());
-                            match probe_res {
-                                Ok(r) if r.status().is_success() => println!(
-                                    "  AI Provider     : Ollama reachable ({}) · model={}",
-                                    endpoint, model
-                                ),
-                                Ok(r) => println!(
-                                    "  AI Provider     : Ollama HTTP {} at {} · model={}",
-                                    r.status(),
-                                    endpoint,
-                                    model
-                                ),
-                                Err(e) => println!(
-                                    "  AI Provider     : Ollama unreachable at {} ({})",
+                            if let Err(e) = idor_audit::validate_live_target_url(&ping_url, false) {
+                                println!(
+                                    "  AI Provider     : Ollama endpoint rejected ({}): {}",
                                     endpoint, e
-                                ),
+                                );
+                            } else {
+                                idor_audit::ensure_rustls_ring_provider();
+                                let probe_res = reqwest::blocking::Client::builder()
+                                    .redirect(reqwest::redirect::Policy::none())
+                                    .timeout(std::time::Duration::from_secs(2))
+                                    .build()
+                                    .and_then(|c| c.get(&ping_url).send());
+                                match probe_res {
+                                    Ok(r) if r.status().is_success() => println!(
+                                        "  AI Provider     : Ollama reachable ({}) · model={}",
+                                        endpoint, model
+                                    ),
+                                    Ok(r) => println!(
+                                        "  AI Provider     : Ollama HTTP {} at {} · model={}",
+                                        r.status(),
+                                        endpoint,
+                                        model
+                                    ),
+                                    Err(e) => println!(
+                                        "  AI Provider     : Ollama unreachable at {} ({})",
+                                        endpoint, e
+                                    ),
+                                }
                             }
                         }
                         Ok(other) => {

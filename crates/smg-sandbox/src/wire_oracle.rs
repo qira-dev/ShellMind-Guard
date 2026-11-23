@@ -170,14 +170,26 @@ impl Drop for WireDiffProxy {
 }
 
 /// Captures non-symlink BLAKE3 digests inside a temp workspace/DB directory before vs after sandbox probing.
+/// Checks file metadata size (`<= 4 MiB` per file, `<= 64 MiB` and `<= 2048` files total) *before* reading.
 pub fn capture_fs_digests(root: &Path) -> BTreeMap<String, String> {
+    const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
+    const MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+    const MAX_FILES: usize = 2048;
+
     let mut map = BTreeMap::new();
+    let mut total_bytes: u64 = 0;
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
+        if map.len() >= MAX_FILES || total_bytes >= MAX_TOTAL_BYTES {
+            break;
+        }
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
         for ent in entries.flatten() {
+            if map.len() >= MAX_FILES || total_bytes >= MAX_TOTAL_BYTES {
+                break;
+            }
             let Ok(ft) = ent.file_type() else {
                 continue;
             };
@@ -188,14 +200,24 @@ pub fn capture_fs_digests(root: &Path) -> BTreeMap<String, String> {
             if ft.is_dir() {
                 stack.push(p);
             } else if ft.is_file()
-                && let Ok(bytes) = std::fs::read(&p)
-                && bytes.len() <= 4 * 1024 * 1024
+                && let Ok(meta) = std::fs::symlink_metadata(&p)
+                && meta.is_file()
+                && meta.len() <= MAX_FILE_BYTES
+                && total_bytes.saturating_add(meta.len()) <= MAX_TOTAL_BYTES
                 && let Ok(rel) = p.strip_prefix(root)
+                && let Ok(f) = std::fs::File::open(&p)
             {
-                map.insert(
-                    rel.to_string_lossy().replace('\\', "/"),
-                    blake3::hash(&bytes).to_hex().to_string(),
-                );
+                use std::io::Read;
+                let mut bytes = Vec::with_capacity(meta.len().min(MAX_FILE_BYTES) as usize);
+                if f.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes).is_ok()
+                    && (bytes.len() as u64) <= MAX_FILE_BYTES
+                {
+                    total_bytes = total_bytes.saturating_add(bytes.len() as u64);
+                    map.insert(
+                        rel.to_string_lossy().replace('\\', "/"),
+                        blake3::hash(&bytes).to_hex().to_string(),
+                    );
+                }
             }
         }
     }

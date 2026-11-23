@@ -475,6 +475,29 @@ mod imp {
         }
     }
 
+    fn create_private_dir_0700(path: &Path) -> Result<()> {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+            .with_context(|| format!("failed to create private probe dir {}", path.display()))?;
+        Ok(())
+    }
+
+    fn write_private_file_0600(path: &Path, bytes: &[u8]) -> Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("failed to create private probe file {}", path.display()))?;
+        f.write_all(bytes)?;
+        Ok(())
+    }
+
     fn execute_in_isolated_netns(
         project_root: &Path,
         boot_cmd: &str,
@@ -484,7 +507,6 @@ mod imp {
         finding_json: Option<&str>,
         probe_cfg: &SandboxProbeConfig,
     ) -> Result<String> {
-        use std::os::unix::fs::PermissionsExt;
         let bwrap_bin_opt = find_bwrap_path();
         let has_macos_seatbelt =
             cfg!(target_os = "macos") && Path::new("/usr/bin/sandbox-exec").exists();
@@ -498,20 +520,20 @@ mod imp {
             std::env::current_exe().context("Cannot locate current shellmind-guard executable")?;
         let probe_cfg_json = serde_json::to_string(probe_cfg)?;
 
-        // Keep probe tokens/config out of `/proc/<pid>/cmdline` via a 0700 temp dir ro-bound into /tmp
+        // Keep probe tokens, config, and boot command out of `/proc/<pid>/cmdline` via an
+        // atomically-created 0700 temp dir + 0600 files ro-bound into `/tmp`.
         let seq = CGROUP_UNIT_SEQ.fetch_add(1, Ordering::Relaxed);
         let probe_dir =
             std::env::temp_dir().join(format!("smg-probe-{}-{}-{}", std::process::id(), seq, port));
-        std::fs::create_dir_all(&probe_dir)?;
-        let _ = std::fs::set_permissions(&probe_dir, std::fs::Permissions::from_mode(0o700));
+        create_private_dir_0700(&probe_dir)?;
         let _probe_dir_guard = ProbeTempDirGuard(probe_dir.clone());
         let probe_cfg_file = probe_dir.join("probe_cfg.json");
-        std::fs::write(&probe_cfg_file, probe_cfg_json.as_bytes())?;
-        let _ = std::fs::set_permissions(&probe_cfg_file, std::fs::Permissions::from_mode(0o600));
+        write_private_file_0600(&probe_cfg_file, probe_cfg_json.as_bytes())?;
+        let boot_cmd_file = probe_dir.join("boot_cmd.sh");
+        write_private_file_0600(&boot_cmd_file, boot_cmd.as_bytes())?;
         let finding_file = probe_dir.join("finding.json");
         if let Some(fj) = finding_json {
-            std::fs::write(&finding_file, fj.as_bytes())?;
-            let _ = std::fs::set_permissions(&finding_file, std::fs::Permissions::from_mode(0o600));
+            write_private_file_0600(&finding_file, fj.as_bytes())?;
         }
 
         let sandbox_path = build_sandbox_path();
@@ -619,14 +641,20 @@ mod imp {
             #[cfg(not(target_os = "linux"))]
             let _ = used_cgroup;
 
-            c.args(["--setenv", "SMG_BOOT_CMD", boot_cmd]);
+            c.args([
+                "--ro-bind",
+                &boot_cmd_file.to_string_lossy(),
+                "/tmp/smg-boot-cmd.sh",
+            ]);
             let shell_script = format!(
-                "{shim_exports}/bin/sh -c \"$SMG_BOOT_CMD\" >/tmp/smg-boot.log 2>&1 & SMG_SRV_PID=$!; export SMG_SRV_PID; export SMG_BOOT_LOG=/tmp/smg-boot.log; trap 'kill -9 $SMG_SRV_PID 2>/dev/null || true' EXIT; /tmp/smg-probe __probe-netns --port {port} --mode {mode} --sync-race {concurrency}; EC=$?; kill -9 $SMG_SRV_PID 2>/dev/null || true; exit $EC"
+                "{shim_exports}/bin/sh /tmp/smg-boot-cmd.sh >/tmp/smg-boot.log 2>&1 & SMG_SRV_PID=$!; export SMG_SRV_PID; export SMG_BOOT_LOG=/tmp/smg-boot.log; trap 'kill -9 $SMG_SRV_PID 2>/dev/null || true' EXIT; /tmp/smg-probe __probe-netns --port {port} --mode {mode} --sync-race {concurrency}; EC=$?; kill -9 $SMG_SRV_PID 2>/dev/null || true; exit $EC"
             );
             c.args(["--", "/bin/sh", "-c", &shell_script]);
             c
         } else {
             // macOS Seatbelt (`/usr/bin/sandbox-exec`) isolated verify/fuzz execution
+            let private_tmp = probe_dir.join("tmp");
+            create_private_dir_0700(&private_tmp)?;
             let mut extra_ro: Vec<&Path> = vec![&probe_dir];
             if let Some(exe_dir) = self_exe.parent() {
                 extra_ro.push(exe_dir);
@@ -653,12 +681,12 @@ mod imp {
             c.process_group(0)
                 .env_clear()
                 .env("PATH", &sandbox_path)
-                .env("HOME", "/tmp")
+                .env("HOME", &private_tmp)
+                .env("TMPDIR", &private_tmp)
                 .env("PORT", port.to_string())
                 .env("HOST", "127.0.0.1")
                 .env("NODE_ENV", "test")
                 .env("SMG_PROBE_CONFIG_FILE", &probe_cfg_file)
-                .env("SMG_BOOT_CMD", boot_cmd)
                 .env("SMG_BOOT_LOG", &boot_log_path)
                 .current_dir(&abs_root);
             if finding_json.is_some() {
@@ -666,8 +694,9 @@ mod imp {
             }
             let self_exe_escaped = self_exe.to_string_lossy().replace('\'', "'\\''");
             let boot_log_escaped = boot_log_path.to_string_lossy().replace('\'', "'\\''");
+            let boot_cmd_escaped = boot_cmd_file.to_string_lossy().replace('\'', "'\\''");
             let shell_script = format!(
-                "{shim_exports}/bin/sh -c \"$SMG_BOOT_CMD\" >'{boot_log_escaped}' 2>&1 & SMG_SRV_PID=$!; export SMG_SRV_PID; trap 'kill -9 $SMG_SRV_PID 2>/dev/null || true' EXIT; '{self_exe_escaped}' __probe-netns --port {port} --mode {mode} --sync-race {concurrency}; EC=$?; kill -9 $SMG_SRV_PID 2>/dev/null || true; exit $EC"
+                "{shim_exports}/bin/sh '{boot_cmd_escaped}' >'{boot_log_escaped}' 2>&1 & SMG_SRV_PID=$!; export SMG_SRV_PID; trap 'kill -9 $SMG_SRV_PID 2>/dev/null || true' EXIT; '{self_exe_escaped}' __probe-netns --port {port} --mode {mode} --sync-race {concurrency}; EC=$?; kill -9 $SMG_SRV_PID 2>/dev/null || true; exit $EC"
             );
             c.args(["-p", &profile, "/bin/sh", "-c", &shell_script]);
             c
@@ -1085,15 +1114,19 @@ mod imp {
     impl Drop for SandboxGuard {
         fn drop(&mut self) {
             if let Some(ref mut c) = self.child {
-                let pid = c.id();
-                let _ = Command::new("taskkill")
-                    .args(["/F", "/T", "/PID", &pid.to_string()])
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
-                let _ = c.kill();
-                let _ = c.wait();
+                // Only invoke `taskkill /PID` while the child is still alive in the OS process
+                // table so we never terminate an unrelated process on PID reuse.
+                if matches!(c.try_wait(), Ok(None)) {
+                    let pid = c.id();
+                    let _ = Command::new("taskkill")
+                        .args(["/F", "/T", "/PID", &pid.to_string()])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                    let _ = c.kill();
+                    let _ = c.wait();
+                }
             }
             let _ = (self.port, self.isolated_bwrap);
         }
@@ -1157,12 +1190,21 @@ mod imp {
         let wsl_root = String::from_utf8_lossy(&wsl_root_out.stdout)
             .trim()
             .to_string();
+        struct WinProbeDirGuard(std::path::PathBuf);
+        impl Drop for WinProbeDirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
         let seq = WIN_PROBE_SEQ.fetch_add(1, Ordering::Relaxed);
         let probe_dir =
             std::env::temp_dir().join(format!("smg-wsl-{}-{}", std::process::id(), seq));
         std::fs::create_dir_all(&probe_dir)?;
+        let _probe_guard = WinProbeDirGuard(probe_dir.clone());
         let cfg_file = probe_dir.join("probe_cfg.json");
         std::fs::write(&cfg_file, serde_json::to_string(probe_cfg)?.as_bytes())?;
+        let boot_cmd_file = probe_dir.join("boot_cmd.sh");
+        std::fs::write(&boot_cmd_file, boot_cmd.as_bytes())?;
         let finding_file = probe_dir.join("finding.json");
         if let Some(fj) = finding_json {
             std::fs::write(&finding_file, fj.as_bytes())?;
@@ -1170,6 +1212,14 @@ mod imp {
         let wsl_cfg = String::from_utf8_lossy(
             &Command::new("wsl.exe")
                 .args(["-e", "wslpath", "-u", &cfg_file.to_string_lossy()])
+                .output()?
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        let wsl_boot_cmd = String::from_utf8_lossy(
+            &Command::new("wsl.exe")
+                .args(["-e", "wslpath", "-u", &boot_cmd_file.to_string_lossy()])
                 .output()?
                 .stdout,
         )
@@ -1192,7 +1242,7 @@ mod imp {
 
         let port_str = port.to_string();
         let inner_script = format!(
-            "eval \"$SMG_BOOT_CMD\" >/tmp/smg-boot.log 2>&1 & SMG_SRV_PID=$!; export SMG_SRV_PID; export SMG_BOOT_LOG=/tmp/smg-boot.log; trap 'kill -9 $SMG_SRV_PID 2>/dev/null || true' EXIT; smg __probe-netns --port {port} --mode {mode} --sync-race {concurrency}; EC=$?; kill -9 $SMG_SRV_PID 2>/dev/null || true; exit $EC"
+            "/bin/sh /tmp/smg-boot-cmd.sh >/tmp/smg-boot.log 2>&1 & SMG_SRV_PID=$!; export SMG_SRV_PID; export SMG_BOOT_LOG=/tmp/smg-boot.log; trap 'kill -9 $SMG_SRV_PID 2>/dev/null || true' EXIT; smg __probe-netns --port {port} --mode {mode} --sync-race {concurrency}; EC=$?; kill -9 $SMG_SRV_PID 2>/dev/null || true; exit $EC"
         );
         let mut cmd = Command::new("wsl.exe");
         cmd.args([
@@ -1226,12 +1276,12 @@ mod imp {
             "--ro-bind",
             &wsl_cfg,
             "/tmp/smg-probe-cfg.json",
+            "--ro-bind",
+            &wsl_boot_cmd,
+            "/tmp/smg-boot-cmd.sh",
             "--setenv",
             "SMG_PROBE_CONFIG_FILE",
             "/tmp/smg-probe-cfg.json",
-            "--setenv",
-            "SMG_BOOT_CMD",
-            boot_cmd,
             "--setenv",
             "PORT",
             &port_str,
@@ -1252,18 +1302,65 @@ mod imp {
                 "/tmp/smg-finding.json",
             ]);
         }
-        cmd.args(["--", "/bin/sh", "-c", &inner_script]);
-        let out = cmd
-            .output()
-            .context("Failed to execute WSL2 bwrap isolated probe")?;
-        let _ = std::fs::remove_dir_all(&probe_dir);
-        if !out.status.success() {
-            anyhow::bail!(
-                "WSL2 bwrap isolated probe failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
+        cmd.args(["--", "/bin/sh", "-c", &inner_script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd
+            .spawn()
+            .context("Failed to spawn WSL2 bwrap isolated probe")?;
+        let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+            pipe.map(|mut r| {
+                std::thread::spawn(move || {
+                    use std::io::Read;
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 8192];
+                    while let Ok(n) = r.read(&mut chunk) {
+                        if n == 0 {
+                            break;
+                        }
+                        if buf.len() < 512 * 1024 {
+                            let take = n.min(512 * 1024 - buf.len());
+                            buf.extend_from_slice(&chunk[..take]);
+                        }
+                    }
+                    String::from_utf8_lossy(&buf).into_owned()
+                })
+            })
+        };
+        let stdout_h = drain(
+            child
+                .stdout
+                .take()
+                .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
+        );
+        let stderr_h = drain(
+            child
+                .stderr
+                .take()
+                .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
+        );
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(st)) => break st,
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        anyhow::bail!("WSL2 bwrap isolated probe timed out after 20s");
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        };
+        let stdout_str = stdout_h.and_then(|h| h.join().ok()).unwrap_or_default();
+        let stderr_str = stderr_h.and_then(|h| h.join().ok()).unwrap_or_default();
+        if !status.success() {
+            anyhow::bail!("WSL2 bwrap isolated probe failed: {}", stderr_str.trim());
         }
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        Ok(stdout_str)
     }
 
     pub fn run_finding_in_isolated_netns(

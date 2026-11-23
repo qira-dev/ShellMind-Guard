@@ -139,6 +139,73 @@ pub fn decode_all(text: &str) -> Vec<(String, String)> {
     out
 }
 
+fn is_forbidden_imds_or_link_local_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_link_local() || v4.is_unspecified(),
+        std::net::IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                mapped.is_link_local() || mapped.is_unspecified()
+            } else {
+                let segs = v6.segments();
+                v6.is_unspecified()
+                    || (segs[0] & 0xffc0) == 0xfe80
+                    || segs == [0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254]
+            }
+        }
+    }
+}
+
+/// Unconditional IMDS / link-local / unspecified host deny on final substituted
+/// Repeater & Intruder destination URLs (Council T5).
+fn validate_proxy_tui_url(raw_url: &str) -> Result<reqwest::Url> {
+    use std::net::ToSocketAddrs;
+    let parsed = reqwest::Url::parse(raw_url.trim())
+        .with_context(|| format!("invalid target URL '{raw_url}'"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        bail!("unsupported URL scheme '{}'", parsed.scheme());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        bail!("refusing URL with embedded credentials");
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("target URL is missing host"))?;
+    let clean = host
+        .trim()
+        .trim_matches(['[', ']'])
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if matches!(
+        clean.as_str(),
+        "metadata.google.internal"
+            | "metadata.goog"
+            | "metadata.azure.com"
+            | "169.254.169.254"
+            | "instance-data"
+            | "instance-data.ec2.internal"
+    ) {
+        bail!("refusing cloud metadata host '{host}'");
+    }
+    if let Ok(ip) = clean.parse::<std::net::IpAddr>() {
+        if is_forbidden_imds_or_link_local_ip(ip) {
+            bail!("refusing cloud metadata / link-local / unspecified IP '{ip}'");
+        }
+        return Ok(parsed);
+    }
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    if let Ok(addrs) = (clean.as_str(), port).to_socket_addrs() {
+        for addr in addrs {
+            if is_forbidden_imds_or_link_local_ip(addr.ip()) {
+                bail!(
+                    "refusing host '{host}' resolving to cloud metadata / link-local IP '{}'",
+                    addr.ip()
+                );
+            }
+        }
+    }
+    Ok(parsed)
+}
+
 /// Replays a captured intercepted-HTTP request (Repeater). Returns a new entry
 /// with `replay_of` pointing at the original id; the caller assigns the id.
 /// `--mitm-ca` sessions are decrypted into `kind: "https"` entries and replay
@@ -151,6 +218,7 @@ pub fn replay_entry(client: &Client, entry: &ProxyEntry) -> Result<ProxyEntry> {
             entry.kind
         );
     }
+    let _ = validate_proxy_tui_url(&entry.url)?;
     let method = reqwest::Method::from_bytes(entry.method.as_bytes())
         .with_context(|| format!("invalid replay method '{}'", entry.method))?;
     let mut req = client.request(method, &entry.url);
@@ -229,11 +297,19 @@ pub fn intruder_run(
     let mut results = Vec::new();
     for word in words.iter().take(MAX_INTRUDER_WORDS) {
         let url = url_template.replace("{FUZZ}", word);
+        if validate_proxy_tui_url(&url).is_err() {
+            results.push((word.clone(), 0, 0));
+            continue;
+        }
         let outcome = match client.get(&url).send() {
             Ok(resp) => {
                 let status = resp.status().as_u16();
-                let len = resp.bytes().map(|b| b.len()).unwrap_or(0);
-                (word.clone(), status, len)
+                let mut buf = Vec::new();
+                let _ = std::io::Read::read_to_end(
+                    &mut std::io::Read::take(resp, MAX_CAPTURE_IN_VIEW as u64),
+                    &mut buf,
+                );
+                (word.clone(), status, buf.len())
             }
             Err(_) => (word.clone(), 0, 0),
         };

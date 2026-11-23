@@ -31,6 +31,7 @@ use std::time::Duration;
 const CA_CERT_FILE: &str = "ca-cert.pem";
 const CA_KEY_FILE: &str = "ca-key.pem";
 const UPSTREAM_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_CERT_CACHE_ENTRIES: usize = 512;
 
 fn current_year() -> i32 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -145,11 +146,19 @@ impl std::fmt::Debug for MitmCa {
 impl MitmCa {
     /// Loads the existing local CA or generates one. Idempotent.
     pub fn load_or_create(ca_dir: &Path) -> Result<Self> {
-        std::fs::create_dir_all(ca_dir)
+        crate::idor_audit::ensure_rustls_ring_provider();
+        create_private_dir_0700(ca_dir)
             .with_context(|| format!("failed to create CA dir {}", ca_dir.display()))?;
         restrict_dir(ca_dir);
         let cert_pem_path = ca_dir.join(CA_CERT_FILE);
         let key_pem_path = ca_dir.join(CA_KEY_FILE);
+        for p in [&cert_pem_path, &key_pem_path] {
+            if let Ok(meta) = std::fs::symlink_metadata(p)
+                && meta.file_type().is_symlink()
+            {
+                bail!("Refusing symlinked CA material at {}", p.display());
+            }
+        }
 
         let (issuer_cert, ca_key) = if cert_pem_path.exists() && key_pem_path.exists() {
             let key = KeyPair::from_pem(&std::fs::read_to_string(&key_pem_path)?)
@@ -172,7 +181,7 @@ impl MitmCa {
             let cert = params.self_signed(&key).context("signing local root CA")?;
             std::fs::write(&cert_pem_path, cert.pem())
                 .with_context(|| format!("writing {}", cert_pem_path.display()))?;
-            std::fs::write(&key_pem_path, key.serialize_pem())
+            write_private_file_0600(&key_pem_path, key.serialize_pem().as_bytes())
                 .with_context(|| format!("writing {}", key_pem_path.display()))?;
             restrict_file(&key_pem_path);
             (cert, key)
@@ -200,7 +209,12 @@ impl MitmCa {
 
     /// Signs (or fetches from cache) the on-the-fly leaf for `host`.
     fn leaf_certified_key(&self, host: &str) -> Result<Arc<CertifiedKey>> {
-        if let Some(key) = self.leaf_cache.lock().unwrap().get(host) {
+        if let Some(key) = self
+            .leaf_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(host)
+        {
             return Ok(Arc::clone(key));
         }
         let mut params = CertificateParams::default();
@@ -230,17 +244,23 @@ impl MitmCa {
         let signing_key = rustls::crypto::ring::sign::any_supported_type(&self.leaf_key_der)
             .map_err(|e| anyhow::anyhow!("leaf signing key unsupported: {e}"))?;
         let key = Arc::new(CertifiedKey::new(vec![cert.der().clone()], signing_key));
-        self.leaf_cache
-            .lock()
-            .unwrap()
-            .insert(host.to_string(), Arc::clone(&key));
+        let mut cache = self.leaf_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.len() >= MAX_CERT_CACHE_ENTRIES {
+            cache.clear();
+        }
+        cache.insert(host.to_string(), Arc::clone(&key));
         Ok(key)
     }
 
     /// A cached rustls server config serving this host's leaf, ALPN pinned to
     /// HTTP/1.1.
     pub fn server_config_for(&self, host: &str) -> Result<Arc<rustls::ServerConfig>> {
-        if let Some(cfg) = self.server_cache.lock().unwrap().get(host) {
+        if let Some(cfg) = self
+            .server_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(host)
+        {
             return Ok(Arc::clone(cfg));
         }
         let key = self.leaf_certified_key(host)?;
@@ -249,33 +269,35 @@ impl MitmCa {
             .with_cert_resolver(Arc::new(FixedCertResolver { key }));
         cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
         let cfg = Arc::new(cfg);
-        self.server_cache
-            .lock()
-            .unwrap()
-            .insert(host.to_string(), Arc::clone(&cfg));
+        let mut cache = self.server_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.len() >= MAX_CERT_CACHE_ENTRIES {
+            cache.clear();
+        }
+        cache.insert(host.to_string(), Arc::clone(&cfg));
         Ok(cfg)
     }
 
     /// Connects to `host:port` with TLS: OS trust store first, accept-all
     /// fallback ONLY for loopback / RFC1918 lab origins with self-signed
     /// certificates (remote internet origins always require validated TLS).
-    /// Each attempt opens a fresh TCP connection — a failed validated handshake
-    /// sends a TLS alert that poisons the connection for any second handshake.
+    /// Unconditionally denies cloud metadata / link-local / unspecified destinations.
     pub fn connect_upstream(
         &self,
         host: &str,
         port: u16,
     ) -> Result<rustls::StreamOwned<rustls::ClientConnection, TcpStream>> {
+        let addrs = crate::idor_audit::resolve_and_validate_live_addrs(host, port, true)?;
+        let addr = addrs[0];
         let name = ServerName::try_from(host.to_string())
             .with_context(|| format!("invalid upstream server name '{host}'"))?;
-        let allow_insecure_fallback = is_lab_host(host);
+        let allow_insecure_fallback = crate::idor_audit::is_lab_ip(addr.ip());
         let mut configs = vec![Arc::clone(&self.upstream_validated)];
         if allow_insecure_fallback {
             configs.push(Arc::clone(&self.upstream_insecure));
         }
         let mut last_err = None;
         for cfg in configs {
-            let mut attempt = match TcpStream::connect((host, port)) {
+            let mut attempt = match TcpStream::connect_timeout(&addr, UPSTREAM_HANDSHAKE_TIMEOUT) {
                 Ok(s) => s,
                 Err(e) => {
                     last_err = Some(anyhow::Error::new(e).context("upstream TCP connect"));
@@ -303,22 +325,6 @@ impl MitmCa {
                 .unwrap_or_else(|| "unknown".into())
         )
     }
-}
-
-/// Returns true only for loopback / RFC1918 private lab hosts where self-signed
-/// certificates are expected during local development.
-pub(crate) fn is_lab_host(host: &str) -> bool {
-    let h = host.trim().trim_matches(|c| c == '[' || c == ']');
-    if h.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    if let Ok(ip) = h.parse::<IpAddr>() {
-        return match ip {
-            IpAddr::V4(v4) => v4.is_loopback() || v4.is_private(),
-            IpAddr::V6(v6) => v6.is_loopback(),
-        };
-    }
-    false
 }
 
 fn build_upstream_config(insecure: bool) -> Result<rustls::ClientConfig> {
@@ -373,7 +379,8 @@ pub fn drive_client_handshake(
 
 pub fn default_ca_dir() -> Result<PathBuf> {
     let home = std::env::var("HOME")
-        .context("HOME environment variable is not set; cannot locate ~/.config/smg")?;
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .context("HOME/USERPROFILE environment variable is not set; cannot locate ~/.config/smg")?;
     Ok(PathBuf::from(home).join(".config").join("smg"))
 }
 
@@ -413,6 +420,30 @@ pub fn export_ca(out: Option<&Path>) -> Result<()> {
         ca.cert_pem_path.display()
     );
     Ok(())
+}
+
+fn create_private_dir_0700(path: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
+fn write_private_file_0600(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(path)?;
+    file.write_all(data)
 }
 
 #[cfg(unix)]

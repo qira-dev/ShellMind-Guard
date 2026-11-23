@@ -80,7 +80,7 @@ pub struct HttpAuditReport {
 }
 
 fn client_build(timeout: Duration, headers: &HashMap<String, String>) -> Result<Client> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    crate::idor_audit::ensure_rustls_ring_provider();
     let builder = Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(timeout)
@@ -361,11 +361,11 @@ fn probe_graphql_introspection(client: &Client, endpoint: &str, findings: &mut V
 pub fn run_http_audit(cfg: &HttpAuditConfig) -> Result<HttpAuditReport> {
     let started = Instant::now();
     let offline_only = cfg.url.is_empty();
-    if !offline_only && !cfg.allow_remote && !crate::idor_audit::is_lab_or_loopback_url(&cfg.url)? {
-        bail!(
-            "Refusing remote target '{}' by default (passive posture audits target loopback/private lab hosts unless `--allow-remote` is explicitly passed for your own staging server).",
-            cfg.url
-        );
+    if !offline_only {
+        let parsed = crate::idor_audit::validate_live_target_url(&cfg.url, cfg.allow_remote)?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            bail!("HTTP audit requires an http:// or https:// target URL");
+        }
     }
 
     let client = client_build(cfg.timeout, &cfg.headers)?;
@@ -427,6 +427,17 @@ pub fn run_http_audit(cfg: &HttpAuditConfig) -> Result<HttpAuditReport> {
             let Ok(schema_url) = parsed.join(path) else {
                 continue;
             };
+            if schema_url.scheme() != parsed.scheme()
+                || schema_url.host_str() != parsed.host_str()
+                || schema_url.port_or_known_default() != parsed.port_or_known_default()
+                || crate::idor_audit::validate_live_target_url(
+                    schema_url.as_str(),
+                    cfg.allow_remote,
+                )
+                .is_err()
+            {
+                continue;
+            }
             let Ok(resp) = client.get(schema_url.as_str()).send() else {
                 continue;
             };
@@ -456,12 +467,7 @@ pub fn run_http_audit(cfg: &HttpAuditConfig) -> Result<HttpAuditReport> {
             .clone()
             .or_else(|| parsed.join("graphql").ok().map(|u| u.to_string()));
         if let Some(endpoint) = gql {
-            if !cfg.allow_remote && !crate::idor_audit::is_lab_or_loopback_url(&endpoint)? {
-                bail!(
-                    "Refusing remote --graphql endpoint '{}' by default (pass `--allow-remote` to probe non-loopback staging targets).",
-                    endpoint
-                );
-            }
+            crate::idor_audit::validate_live_target_url(&endpoint, cfg.allow_remote)?;
             probe_graphql_introspection(&client, &endpoint, &mut schema_findings);
         }
     }
@@ -714,6 +720,20 @@ mod tests {
             spa: false,
             timeout: Duration::from_secs(5),
             allow_remote: false,
+        });
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn refuses_imds_even_with_allow_remote() {
+        let err = run_http_audit(&HttpAuditConfig {
+            url: "http://169.254.169.254/latest/meta-data/".into(),
+            headers: HashMap::new(),
+            schema_file: None,
+            graphql_endpoint: None,
+            spa: false,
+            timeout: Duration::from_secs(5),
+            allow_remote: true,
         });
         assert!(err.is_err());
     }

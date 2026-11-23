@@ -7,15 +7,32 @@ use std::collections::HashMap;
 fn compute_attestation_digest(findings: &[LatticeFinding], verified: &[VerifiedFinding]) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
+    hasher.update(&[0u8]);
+    hasher.update(&(findings.len() as u64).to_le_bytes());
     for f in findings {
-        hasher.update(f.id.as_bytes());
-        hasher.update(f.rule_id.as_bytes());
-        hasher.update(f.file.as_bytes());
+        for field in [
+            f.id.as_str(),
+            f.rule_id.as_str(),
+            f.severity.as_str(),
+            f.status.as_str(),
+            f.confidence.as_str(),
+            f.title.as_str(),
+            f.file.as_str(),
+        ] {
+            hasher.update(field.as_bytes());
+            hasher.update(&[0u8]);
+        }
         hasher.update(&f.line.to_le_bytes());
+        hasher.update(&[0u8]);
     }
+    hasher.update(&(verified.len() as u64).to_le_bytes());
     for v in verified {
         hasher.update(v.finding_id.as_bytes());
+        hasher.update(&[0u8]);
         hasher.update(format!("{:?}", v.status).as_bytes());
+        hasher.update(&[0u8]);
+        hasher.update(v.evidence.as_bytes());
+        hasher.update(&[0u8]);
     }
     hasher.finalize().to_hex().to_string()
 }
@@ -137,9 +154,10 @@ pub fn to_sarif_json(findings: &[LatticeFinding], verified: &[VerifiedFinding]) 
                 None => format!("[{}/{}] {}", status_tag, conf_tag, f.title),
             };
 
+            let norm_raw_file = raw_file.replace('\\', "/");
             let fingerprint = fnv1a_hex(&format!(
                 "{}|{}|{}|{}",
-                f.rule_id, raw_file, start_line, f.entry_route
+                f.rule_id, norm_raw_file, start_line, f.entry_route
             ));
 
             let vex_tier = if f.proof_reasons.iter().any(|r| r == "ProvenRouteSymbolVEX") {
@@ -162,7 +180,7 @@ pub fn to_sarif_json(findings: &[LatticeFinding], verified: &[VerifiedFinding]) 
                 None
             };
 
-            json!({
+            let mut entry = json!({
                 "ruleId": f.rule_id,
                 "ruleIndex": seen_rules.get(&f.rule_id).copied().unwrap_or(0),
                 "level": level,
@@ -182,13 +200,23 @@ pub fn to_sarif_json(findings: &[LatticeFinding], verified: &[VerifiedFinding]) 
                         "artifactLocation": { "uri": uri },
                         "region": { "startLine": start_line }
                     }
-                }],
-                "codeFlows": [{
-                    "threadFlows": [{
-                        "locations": thread_locations
-                    }]
                 }]
-            })
+            });
+            // SARIF 2.1.0 requires `threadFlow.locations` to have `minItems: 1`, so only emit
+            // `codeFlows` when a concrete multi-hop witness path exists.
+            if !thread_locations.is_empty()
+                && let Some(obj) = entry.as_object_mut()
+            {
+                obj.insert(
+                    "codeFlows".to_string(),
+                    json!([{
+                        "threadFlows": [{
+                            "locations": thread_locations
+                        }]
+                    }]),
+                );
+            }
+            entry
         })
         .collect();
 
@@ -259,6 +287,34 @@ fn title_matches_package(title: &str, pkg: &str) -> bool {
     false
 }
 
+fn percent_encode_purl_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        let safe = b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~');
+        if safe {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{:02X}", b));
+        }
+    }
+    out
+}
+
+fn build_purl(ecosystem: &str, name: &str, version: &str) -> String {
+    let eco = percent_encode_purl_component(purl_ecosystem(ecosystem));
+    let encoded_name = name
+        .split('/')
+        .map(percent_encode_purl_component)
+        .collect::<Vec<_>>()
+        .join("/");
+    let encoded_ver = percent_encode_purl_component(version);
+    if encoded_ver.is_empty() {
+        format!("pkg:{eco}/{encoded_name}")
+    } else {
+        format!("pkg:{eco}/{encoded_name}@{encoded_ver}")
+    }
+}
+
 /// `ImportedUnprovenSymbol`, `DeclaredUnused`), sealed with a deterministic BLAKE3 digest.
 pub fn to_cyclonedx_vex_json(
     project_name: &str,
@@ -273,17 +329,18 @@ pub fn to_cyclonedx_vex_json(
     let components: Vec<serde_json::Value> = deps
         .iter()
         .map(|d| {
-            let purl_eco = purl_ecosystem(&d.ecosystem);
+            let purl = build_purl(&d.ecosystem, &d.name, &d.version);
             json!({
                 "type": "library",
-                "bom-ref": format!("pkg:{}/{}@{}", purl_eco, d.name, d.version),
+                "bom-ref": purl,
                 "name": d.name,
                 "version": d.version,
-                "purl": format!("pkg:{}/{}@{}", purl_eco, d.name, d.version),
+                "purl": purl,
             })
         })
         .collect();
 
+    let root_purl = build_purl("generic", project_name, "");
     let vulnerabilities: Vec<serde_json::Value> = findings
         .iter()
         .filter(|f| f.rule_id.starts_with("SMG-DEP-") || f.rule_id.starts_with("SMG-CICD-"))
@@ -312,7 +369,7 @@ pub fn to_cyclonedx_vex_json(
             } else if is_safe_api_only {
                 (
                     "not_affected",
-                    "vulnerable_code_not_in_execute_path",
+                    "code_not_reachable",
                     "Package imported in codebase, but only non-vulnerable safe APIs are invoked",
                 )
             } else if is_declared_unused {
@@ -328,16 +385,12 @@ pub fn to_cyclonedx_vex_json(
                     "Package imported in codebase; vulnerable symbol usage is unconfirmed",
                 )
             };
-            let root_ref = format!("pkg:generic/{project_name}");
             let matched_comp_ref = deps
                 .iter()
                 .filter(|d| title_matches_package(&f.title, &d.name))
                 .max_by_key(|d| d.name.len())
-                .map(|d| {
-                    let purl_eco = purl_ecosystem(&d.ecosystem);
-                    format!("pkg:{}/{}@{}", purl_eco, d.name, d.version)
-                })
-                .unwrap_or(root_ref);
+                .map(|d| build_purl(&d.ecosystem, &d.name, &d.version))
+                .unwrap_or_else(|| root_purl.clone());
             json!({
                 "id": f.id,
                 "source": { "name": "ShellMind Guard", "url": "https://github.com/qira-dev/ShellMind-Guard" },
@@ -351,7 +404,7 @@ pub fn to_cyclonedx_vex_json(
                 },
                 "properties": [
                     { "name": "smg:rule_id", "value": f.rule_id },
-                    { "name": "smg:file", "value": f.file },
+                    { "name": "smg:file", "value": f.file.replace('\\', "/") },
                     { "name": "smg:proof_reasons", "value": f.proof_reasons.join(",") }
                 ]
             })
@@ -366,7 +419,7 @@ pub fn to_cyclonedx_vex_json(
         "metadata": {
             "component": {
                 "type": "application",
-                "bom-ref": format!("pkg:generic/{project_name}"),
+                "bom-ref": root_purl,
                 "name": project_name
             },
             "tools": [{
@@ -402,7 +455,8 @@ pub fn to_html_graph(
         .count();
 
     let mut cards = String::new();
-    for f in &graph.findings {
+    for (card_idx, f) in graph.findings.iter().enumerate() {
+        let marker_id = format!("arrow-{card_idx}");
         let v_opt = ver_map.get(f.id.as_str()).copied();
         let (badge, badge_cls, evidence_html) = match v_opt {
             Some(v) if v.status == VerificationStatus::Proven => (
@@ -440,8 +494,8 @@ pub fn to_html_graph(
             if idx > 0 {
                 let prev_x = x - 35;
                 svg_nodes.push_str(&format!(
-                    "<line x1=\"{}\" y1=\"45\" x2=\"{}\" y2=\"45\" stroke=\"#58a6ff\" stroke-width=\"2\" marker-end=\"url(#arrow)\"/>",
-                    prev_x, x
+                    "<line x1=\"{}\" y1=\"45\" x2=\"{}\" y2=\"45\" stroke=\"#58a6ff\" stroke-width=\"2\" marker-end=\"url(#{})\"/>",
+                    prev_x, x, marker_id
                 ));
             }
             svg_nodes.push_str(&format!(
@@ -469,7 +523,7 @@ pub fn to_html_graph(
               <div class=\"route\">Entry: <code>{entry}</code></div>\
               <div class=\"svg-wrap\">\
                 <svg width=\"{hops_w}\" height=\"92\" xmlns=\"http://www.w3.org/2000/svg\">\
-                  <defs><marker id=\"arrow\" markerWidth=\"8\" markerHeight=\"8\" refX=\"6\" refY=\"3\" orient=\"auto\"><path d=\"M0,0 L0,6 L6,3 z\" fill=\"#58a6ff\"/></marker></defs>\
+                  <defs><marker id=\"{marker_id}\" markerWidth=\"8\" markerHeight=\"8\" refX=\"6\" refY=\"3\" orient=\"auto\"><path d=\"M0,0 L0,6 L6,3 z\" fill=\"#58a6ff\"/></marker></defs>\
                   {svg_nodes}\
                 </svg>\
               </div>\
@@ -589,6 +643,7 @@ fn escape_html(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 #[cfg(test)]
@@ -747,9 +802,21 @@ mod tests {
         assert!(vex.contains("pkg:pub/http_parser@4.0.2"));
         assert!(vex.contains("pkg:nuget/Newtonsoft.Json@12.0.1"));
         assert!(vex.contains("\"state\": \"exploitable\""));
-        assert!(vex.contains("vulnerable_code_not_in_execute_path"));
+        assert!(vex.contains("\"justification\": \"code_not_reachable\""));
+        assert!(!vex.contains("vulnerable_code_not_in_execute_path"));
         let sarif = to_sarif_json(&findings, &[]);
         assert!(sarif.contains("\"vexProvenance\": \"ProvenRouteSymbol\""));
         assert!(sarif.contains("\"vexProvenance\": \"ImportedSafeApiOnly\""));
+        // SARIF 2.1.0: empty witness_path must omit `codeFlows` completely
+        assert!(
+            !sarif.contains("\"codeFlows\""),
+            "empty witness_path must omit codeFlows in SARIF 2.1.0"
+        );
+        // Scoped npm PURL percent-encodes `@` cleanly and escape_html escapes single quotes
+        assert_eq!(
+            build_purl("npm", "@scope/pkg", "1.2.3"),
+            "pkg:npm/%40scope/pkg@1.2.3"
+        );
+        assert_eq!(escape_html("a'b\"c<d>"), "a&#39;b&quot;c&lt;d&gt;");
     }
 }

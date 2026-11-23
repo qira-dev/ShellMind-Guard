@@ -8,13 +8,14 @@
 //!   clickjacking, nosniff, Referrer-Policy, Permissions-Policy, Set-Cookie
 //!   flags, Server/X-Powered-By banners, permissive CORS).
 //! - Proof-based active checks run ONLY against loopback / RFC1918 lab hosts
-//!   (`--allow-remote` opt-in for the owner's own staging server), with
-//!   deterministic single-payload proofs (reflected XSS marker, open redirect
-//!   to a dedicated invalid domain, SSTI math proof, read-only path traversal
-//!   marker, echo-based command proof, error-based SQLi signature) — no
+//!   (`--allow-remote` opt-in for the owner's own staging server; cloud metadata
+//!   & link-local hosts are unconditionally denied), with deterministic
+//!   single-payload proofs (reflected XSS marker, open redirect to a dedicated
+//!   invalid domain, SSTI math proof, read-only path traversal marker,
+//!   error-based SQLi signature) — no OS-shell CMDi metacharacter payloads, no
 //!   WAF-evasion catalogs, no data extraction, no destructive payloads.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use regex::Regex;
 use reqwest::blocking::Client;
 use reqwest::header::HeaderMap;
@@ -126,11 +127,16 @@ pub(crate) struct PageResponse {
 struct HttpHelper {
     client: Client,
     headers: HashMap<String, String>,
+    allow_remote: bool,
 }
 
 impl HttpHelper {
-    fn build(timeout: Duration, headers: HashMap<String, String>) -> Result<HttpHelper> {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+    fn build(
+        timeout: Duration,
+        headers: HashMap<String, String>,
+        allow_remote: bool,
+    ) -> Result<HttpHelper> {
+        crate::idor_audit::ensure_rustls_ring_provider();
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(5))
             .timeout(timeout)
@@ -141,10 +147,15 @@ impl HttpHelper {
                 ")"
             ))
             .build()?;
-        Ok(HttpHelper { client, headers })
+        Ok(HttpHelper {
+            client,
+            headers,
+            allow_remote,
+        })
     }
 
     fn get(&self, url: &str) -> Result<PageResponse> {
+        crate::idor_audit::validate_live_target_url(url, self.allow_remote)?;
         let mut req = self.client.get(url);
         for (k, v) in &self.headers {
             req = req.header(k.as_str(), v.as_str());
@@ -154,6 +165,7 @@ impl HttpHelper {
     }
 
     fn post_urlencoded(&self, url: &str, body: &str) -> Result<PageResponse> {
+        crate::idor_audit::validate_live_target_url(url, self.allow_remote)?;
         let mut req = self.client.post(url);
         for (k, v) in &self.headers {
             req = req.header(k.as_str(), v.as_str());
@@ -166,6 +178,7 @@ impl HttpHelper {
     }
 
     fn post_json(&self, url: &str, body: &str) -> Result<PageResponse> {
+        crate::idor_audit::validate_live_target_url(url, self.allow_remote)?;
         let mut req = self.client.post(url);
         for (k, v) in &self.headers {
             req = req.header(k.as_str(), v.as_str());
@@ -240,6 +253,12 @@ fn extract_forms(html: &str) -> Vec<Form> {
     forms
 }
 
+fn same_origin(a: &reqwest::Url, b: &reqwest::Url) -> bool {
+    a.scheme() == b.scheme()
+        && a.host_str() == b.host_str()
+        && a.port_or_known_default() == b.port_or_known_default()
+}
+
 fn resolve_url(base: &reqwest::Url, candidate: &str) -> Option<String> {
     let trimmed = candidate.trim();
     if trimmed.is_empty()
@@ -253,7 +272,7 @@ fn resolve_url(base: &reqwest::Url, candidate: &str) -> Option<String> {
     }
     match base.join(trimmed) {
         Ok(mut u) => {
-            if u.host_str() == base.host_str() {
+            if same_origin(&u, base) {
                 u.set_fragment(None);
                 Some(u.to_string())
             } else {
@@ -576,7 +595,11 @@ fn active_findings_for_target(
     ] {
         if let Ok(resp) = send(payload) {
             let loc = header_value(&resp.headers, "Location").unwrap_or_default();
-            if (300..400).contains(&resp.status) && loc.contains("evil.shellmind.invalid") {
+            let loc_trim = loc.trim_start();
+            let redirects_to_proof_domain = loc_trim.starts_with("https://evil.shellmind.invalid")
+                || loc_trim.starts_with("http://evil.shellmind.invalid")
+                || loc_trim.starts_with("//evil.shellmind.invalid");
+            if (300..400).contains(&resp.status) && redirects_to_proof_domain {
                 dedup_insert(
                     findings,
                     DastFinding {
@@ -594,11 +617,10 @@ fn active_findings_for_target(
         }
     }
 
-    // 3. SSTI math proof (compare against baseline to eliminate pages that already contain "49")
-    let baseline_has_49 = send("smg_ssti_baseline")
-        .map(|r| r.body.contains("49"))
-        .unwrap_or(false);
-    if !baseline_has_49 {
+    // 3. SSTI math proof (require successful baseline free of "49" to avoid false positives)
+    if let Ok(base_resp) = send("smg_ssti_baseline")
+        && !base_resp.body.contains("49")
+    {
         for payload in ["{{7*7}}", "\x24{7*7}", "<%= 7*7 %>"] {
             if let Ok(resp) = send(payload)
                 && resp.body.contains("49")
@@ -702,6 +724,18 @@ fn harvest_openapi(helper: &HttpHelper, base: &reqwest::Url, out: &mut Vec<Param
             continue;
         };
         for (path_str, ops) in paths {
+            // Only accept root-relative OpenAPI paths that stay strictly on the seed origin
+            // (prevents `@169.254.169.254` or `//evil.host` authority hijacking).
+            if !path_str.starts_with('/') || path_str.starts_with("//") {
+                continue;
+            }
+            let Ok(joined) = base.join(path_str) else {
+                continue;
+            };
+            if !same_origin(&joined, base) {
+                continue;
+            }
+            let full = joined.to_string();
             let op = ops.get("get").or_else(|| ops.get("post"));
             let params = op.and_then(|o| o.get("parameters"));
             for param in params.and_then(|p| p.as_array()).into_iter().flatten() {
@@ -709,28 +743,16 @@ fn harvest_openapi(helper: &HttpHelper, base: &reqwest::Url, out: &mut Vec<Param
                     continue;
                 };
                 let location = param.get("in").and_then(|l| l.as_str()).unwrap_or("query");
-                // Schema paths are always joined against the bare origin
-                // (scheme://host:port) — never against a seed URL that already
-                // carries a path or query string.
-                let mut origin = format!(
-                    "{}://{}",
-                    base.scheme(),
-                    base.host_str().unwrap_or_default()
-                );
-                if let Some(port) = base.port() {
-                    origin = format!("{origin}:{port}");
-                }
-                let full = format!("{}{}", origin, path_str);
                 if location == "query" {
                     let sep = if full.contains('?') { '&' } else { '?' };
                     out.push(ParamTarget {
-                        url_template: format!("{}{sep}{name}={{VALUE}}", full),
+                        url_template: format!("{full}{sep}{name}={{VALUE}}"),
                         body_template: None,
                         param: name.to_string(),
                     });
                 } else if location == "formData" || location == "body" {
                     out.push(ParamTarget {
-                        url_template: full,
+                        url_template: full.clone(),
                         body_template: Some(format!("{name}={{VALUE}}")),
                         param: name.to_string(),
                     });
@@ -744,15 +766,11 @@ fn harvest_openapi(helper: &HttpHelper, base: &reqwest::Url, out: &mut Vec<Param
 }
 
 pub fn run_dast_audit(cfg: &DastConfig) -> Result<DastReport> {
-    if !cfg.allow_remote && !crate::idor_audit::is_lab_or_loopback_url(&cfg.seed_url)? {
-        bail!(
-            "Refusing remote target '{}' by default (DAST auditing targets loopback/private lab hosts unless `--allow-remote` is explicitly passed for your own staging server).",
-            cfg.seed_url
-        );
+    let base = crate::idor_audit::validate_live_target_url(&cfg.seed_url, cfg.allow_remote)?;
+    if !matches!(base.scheme(), "http" | "https") {
+        bail!("DAST audit requires an http:// or https:// seed URL");
     }
-    let base = reqwest::Url::parse(cfg.seed_url.trim())
-        .with_context(|| format!("Invalid seed URL '{}'", cfg.seed_url))?;
-    let helper = HttpHelper::build(cfg.timeout, cfg.headers.clone())?;
+    let helper = HttpHelper::build(cfg.timeout, cfg.headers.clone(), cfg.allow_remote)?;
     let started = Instant::now();
 
     // Optional headless-browser plane (`--spa`). The engine must outlive the
@@ -899,6 +917,12 @@ pub fn run_dast_audit(cfg: &DastConfig) -> Result<DastReport> {
                 }
             } else if let Some(t) = make_param_target(form_url, None, name) {
                 targets.push(t);
+            } else {
+                let sep = if form_url.contains('?') { '&' } else { '?' };
+                let get_url = format!("{form_url}{sep}{name}={}", percent_encode_value(value));
+                if let Some(t) = make_param_target(&get_url, None, name) {
+                    targets.push(t);
+                }
             }
         }
     }
@@ -1169,7 +1193,7 @@ mod tests {
     fn detects_reflected_xss_and_no_finding_on_escaped_page() {
         let base = mock_site();
         let target = make_param_target(&format!("{base}/vuln?x=1"), None, "x").unwrap();
-        let helper = HttpHelper::build(Duration::from_secs(5), HashMap::new()).unwrap();
+        let helper = HttpHelper::build(Duration::from_secs(5), HashMap::new(), false).unwrap();
         let mut findings = Vec::new();
         active_findings_for_target(&helper, &target, &mut findings).unwrap();
         assert!(findings.iter().any(|f| f.id == "SMG-DAST-XSS"));
@@ -1184,7 +1208,7 @@ mod tests {
     fn detects_open_redirect_via_location_header() {
         let base = mock_site();
         let target = make_param_target(&format!("{base}/redirect?to=/home"), None, "to").unwrap();
-        let helper = HttpHelper::build(Duration::from_secs(5), HashMap::new()).unwrap();
+        let helper = HttpHelper::build(Duration::from_secs(5), HashMap::new(), false).unwrap();
         let mut findings = Vec::new();
         active_findings_for_target(&helper, &target, &mut findings).unwrap();
         assert!(findings.iter().any(|f| f.id == "SMG-DAST-REDIRECT"));
@@ -1193,7 +1217,7 @@ mod tests {
     #[test]
     fn detects_cmdi_ssti_and_lfi_markers() {
         let base = mock_site();
-        let helper = HttpHelper::build(Duration::from_secs(5), HashMap::new()).unwrap();
+        let helper = HttpHelper::build(Duration::from_secs(5), HashMap::new(), false).unwrap();
 
         let cmd = make_param_target(&format!("{base}/cmd?host=127.0.0.1"), None, "host").unwrap();
         let mut findings = Vec::new();
@@ -1217,7 +1241,7 @@ mod tests {
     #[test]
     fn graphql_introspection_probe_succeeds() {
         let base = mock_site();
-        let helper = HttpHelper::build(Duration::from_secs(5), HashMap::new()).unwrap();
+        let helper = HttpHelper::build(Duration::from_secs(5), HashMap::new(), false).unwrap();
         let resp = helper
             .post_json(&format!("{base}/graphql"), GRAPHQL_INTROSPECTION_QUERY)
             .unwrap();
@@ -1257,5 +1281,26 @@ mod tests {
             ..DastConfig::default()
         });
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn refuses_imds_even_with_allow_remote_and_enforces_full_origin_equality() {
+        let err = run_dast_audit(&DastConfig {
+            seed_url: "http://169.254.169.254/latest/meta-data/".into(),
+            allow_remote: true,
+            ..DastConfig::default()
+        });
+        assert!(err.is_err());
+
+        let base = reqwest::Url::parse("https://127.0.0.1:8443/app").unwrap();
+        assert!(resolve_url(&base, "/next").is_some());
+        assert!(
+            resolve_url(&base, "http://127.0.0.1:8443/downgrade").is_none(),
+            "scheme downgrade must be rejected"
+        );
+        assert!(
+            resolve_url(&base, "https://127.0.0.1:6379/redis").is_none(),
+            "different port on same host must be rejected"
+        );
     }
 }

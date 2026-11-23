@@ -21,7 +21,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -31,6 +31,16 @@ pub const DEFAULT_OOB_LISTEN: &str = "127.0.0.1:8877";
 const MAX_HITS: usize = 100_000;
 const MAX_HIT_PAYLOAD: usize = 4096;
 const MAX_HEAD: usize = 32 * 1024;
+const MAX_CONCURRENT_TCP_CONNS: usize = 64;
+const MAX_CHECK_HITS_RETURNED: usize = 64;
+const MAX_CHECK_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
+
+struct ActiveConnGuard(Arc<AtomicUsize>);
+impl Drop for ActiveConnGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct OobHit {
@@ -136,9 +146,19 @@ pub fn start_oob_server(listen: SocketAddr, log_path: Option<PathBuf>) -> Result
 
     let log: Option<Arc<Mutex<std::fs::File>>> = match log_path {
         Some(p) => {
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
+            if let Ok(meta) = std::fs::symlink_metadata(&p)
+                && meta.file_type().is_symlink()
+            {
+                bail!("Refusing to write OOB log to symlink {}", p.display());
+            }
+            let mut opts = std::fs::OpenOptions::new();
+            opts.create(true).append(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let file = opts
                 .open(&p)
                 .with_context(|| format!("failed to open OOB JSONL log at {}", p.display()))?;
             Some(Arc::new(Mutex::new(file)))
@@ -148,10 +168,12 @@ pub fn start_oob_server(listen: SocketAddr, log_path: Option<PathBuf>) -> Result
 
     let store = HitStore::default();
     let stop = Arc::new(AtomicBool::new(false));
+    let active_conns = Arc::new(AtomicUsize::new(0));
 
     let tcp_store = store.clone();
     let tcp_log = log.clone();
     let tcp_stop = Arc::clone(&stop);
+    let tcp_active = Arc::clone(&active_conns);
     let tcp_thread = thread::spawn(move || {
         loop {
             if tcp_stop.load(Ordering::Relaxed) {
@@ -159,11 +181,19 @@ pub fn start_oob_server(listen: SocketAddr, log_path: Option<PathBuf>) -> Result
             }
             match tcp_listener.accept() {
                 Ok((mut stream, peer)) => {
+                    let prev = tcp_active.fetch_add(1, Ordering::AcqRel);
+                    if prev >= MAX_CONCURRENT_TCP_CONNS {
+                        tcp_active.fetch_sub(1, Ordering::AcqRel);
+                        drop(stream);
+                        continue;
+                    }
                     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
                     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
                     let store = tcp_store.clone();
                     let log = tcp_log.clone();
+                    let guard = ActiveConnGuard(Arc::clone(&tcp_active));
                     thread::spawn(move || {
+                        let _guard = guard;
                         handle_tcp_callback(&mut stream, peer, &store, &log);
                     });
                 }
@@ -272,10 +302,14 @@ fn handle_tcp_callback(
                     .find_map(|kv| kv.strip_prefix("token=").map(|t| t.trim().to_string()))
             })
             .unwrap_or_default();
-        let hits = if token.is_empty() {
+        let hits: Vec<OobHit> = if token.len() < 12 {
             Vec::new()
         } else {
-            store.matching(&token)
+            store
+                .matching(&token)
+                .into_iter()
+                .take(MAX_CHECK_HITS_RETURNED)
+                .collect()
         };
         let body = serde_json::to_string(&serde_json::json!({ "hits": hits }))
             .unwrap_or_else(|_| "{\"hits\":[]}".into());
@@ -309,22 +343,32 @@ fn handle_tcp_callback(
 // Client side (templates engine)
 // ---------------------------------------------------------------------------
 
-/// 16 bytes of OS entropy; falls back to time+pid when /dev/urandom is absent.
+/// 16 bytes of cross-platform OS CSPRNG entropy (via `rustls::crypto::ring::default_provider().secure_random`).
 pub fn run_nonce() -> [u8; 16] {
-    use std::io::Read as _;
     let mut nonce = [0u8; 16];
+    if rustls::crypto::ring::default_provider()
+        .secure_random
+        .fill(&mut nonce)
+        .is_ok()
+    {
+        return nonce;
+    }
     if let Ok(mut f) = std::fs::File::open("/dev/urandom")
         && f.read_exact(&mut nonce).is_ok()
     {
         return nonce;
     }
-    let seed = SystemTime::now()
+    static FALLBACK_COUNTER: AtomicUsize = AtomicUsize::new(1);
+    let seq = FALLBACK_COUNTER.fetch_add(1, Ordering::Relaxed) as u64;
+    let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-        ^ ((std::process::id() as u64) << 32);
-    nonce[..8].copy_from_slice(&seed.to_le_bytes());
-    nonce[8..].copy_from_slice(&seed.to_be_bytes());
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut h = Hasher::new();
+    h.update(&nanos.to_le_bytes());
+    h.update(&std::process::id().to_le_bytes());
+    h.update(&seq.to_le_bytes());
+    nonce.copy_from_slice(&h.finalize().as_bytes()[..16]);
     nonce
 }
 
@@ -369,9 +413,15 @@ impl OobClient {
         if !host.contains(':') {
             bail!("--oob-server spec '{spec}' must carry a port (host:port)");
         }
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        // Unconditionally deny IMDS/link-local/unspecified/embedded-cred OOB specs (Council T5).
+        let parsed = crate::idor_audit::validate_live_target_url(&base, true)?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            bail!("--oob-server must use http:// or https://");
+        }
+        crate::idor_audit::ensure_rustls_ring_provider();
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(4))
+            .redirect(reqwest::redirect::Policy::none())
             .build()?;
         Ok(Self {
             base,
@@ -402,7 +452,16 @@ impl OobClient {
             .get(format!("{}/smg-check?token={token}", self.base))
             .send()?;
         let status = resp.status();
-        let body: serde_json::Value = resp.json().with_context(|| {
+        let mut raw = Vec::new();
+        resp.take(MAX_CHECK_RESPONSE_BYTES)
+            .read_to_end(&mut raw)
+            .with_context(|| {
+                format!(
+                    "reading /smg-check response (HTTP {status}) from {}",
+                    self.base
+                )
+            })?;
+        let body: serde_json::Value = serde_json::from_slice(&raw).with_context(|| {
             format!(
                 "parsing /smg-check response (HTTP {status}) from {}",
                 self.base
@@ -525,5 +584,12 @@ mod tests {
     fn refuses_non_loopback_bind() {
         let err = start_oob_server("0.0.0.0:0".parse().unwrap(), None);
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn oob_client_rejects_imds_and_credentials() {
+        assert!(OobClient::from_server_spec("169.254.169.254:80").is_err());
+        assert!(OobClient::from_server_spec("http://[fd00:ec2::254]:80").is_err());
+        assert!(OobClient::from_server_spec("http://user:pass@127.0.0.1:8877").is_err());
     }
 }

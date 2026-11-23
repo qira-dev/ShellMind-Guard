@@ -35,7 +35,17 @@ pub use wire_oracle::{
     verify_ssrf_oob_with_config,
 };
 
-fn is_dynamic_probe_target(finding: &LatticeFinding) -> bool {
+pub fn is_dynamic_probe_target(finding: &LatticeFinding) -> bool {
+    let rule = finding.rule_id.as_str();
+    let title_low = finding.title.to_ascii_lowercase();
+    if rule.starts_with("SMG-OAUTH-")
+        || rule.starts_with("SMG-CSRF-")
+        || rule.starts_with("SMG-REDIRECT-")
+        || (rule.starts_with("SMG-API-")
+            && (title_low.contains("graphql") || title_low.contains("websocket")))
+    {
+        return true;
+    }
     matches!(
         finding.missing_guard,
         smg_graph::GuardKind::Auth

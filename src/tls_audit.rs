@@ -11,7 +11,7 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -43,23 +43,69 @@ pub struct TlsAuditReport {
     pub findings: Vec<TlsFinding>,
 }
 
-/// Parses `host[:port]` or `https://host[:port]/...` into `(host, port)`.
+/// Parses `host[:port]`, `[ipv6][:port]`, or `https://host[:port]/...` into `(host, port)`.
 pub fn parse_tls_target(raw: &str) -> Result<(String, u16)> {
     let trimmed = raw
         .trim()
         .trim_start_matches("https://")
         .trim_start_matches("http://");
-    let authority = trimmed.split('/').next().unwrap_or(trimmed).trim();
+    let authority = trimmed
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(trimmed)
+        .trim();
     if authority.is_empty() {
         bail!("TLS target must not be empty");
     }
-    if let Some((h, p)) = authority.rsplit_once(':')
-        && !h.is_empty()
-        && let Ok(port) = p.parse::<u16>()
+    if authority.contains('@')
+        || authority
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control())
     {
-        return Ok((h.trim_matches(['[', ']']).to_string(), port));
+        bail!("TLS target authority '{authority}' must not contain credentials or whitespace");
     }
-    Ok((authority.trim_matches(['[', ']']).to_string(), 443))
+    if let Some(rest) = authority.strip_prefix('[') {
+        let Some((ip_part, tail)) = rest.split_once(']') else {
+            bail!("Malformed bracketed IPv6 TLS target '{authority}'");
+        };
+        if ip_part.is_empty() {
+            bail!("Empty IPv6 host in TLS target '{authority}'");
+        }
+        let port = if tail.is_empty() {
+            443
+        } else if let Some(p_str) = tail.strip_prefix(':') {
+            let port: u16 = p_str
+                .parse()
+                .with_context(|| format!("Invalid port '{p_str}' in TLS target '{authority}'"))?;
+            if port == 0 {
+                bail!("TLS target port must be non-zero");
+            }
+            port
+        } else {
+            bail!("Unexpected trailing characters '{tail}' in TLS target '{authority}'");
+        };
+        return Ok((ip_part.to_string(), port));
+    }
+    if authority.matches(':').count() > 1 {
+        // Unbracketed IPv6 literal (e.g. `::1` or `2001:db8::1`) -> default port 443.
+        let ip: IpAddr = authority
+            .parse()
+            .with_context(|| format!("Invalid IPv6 TLS target '{authority}' (use [ipv6]:port)"))?;
+        return Ok((ip.to_string(), 443));
+    }
+    if let Some((h, p)) = authority.rsplit_once(':') {
+        if h.is_empty() {
+            bail!("TLS target '{authority}' is missing host");
+        }
+        let port: u16 = p
+            .parse()
+            .with_context(|| format!("Invalid port '{p}' in TLS target '{authority}'"))?;
+        if port == 0 {
+            bail!("TLS target port must be non-zero");
+        }
+        return Ok((h.to_string(), port));
+    }
+    Ok((authority.to_string(), 443))
 }
 
 /// Builds a minimal standards-compliant TLS `ClientHello` record for protocol/cipher/PQC probing.
@@ -69,15 +115,22 @@ pub fn build_client_hello(
     ciphers: &[u16],
     offer_tls13: bool,
     named_groups: &[u16],
-) -> Vec<u8> {
+) -> Result<Vec<u8>> {
+    if host.len() > 253 {
+        bail!("RFC 1035 hostname exceeds 253 bytes ({} bytes)", host.len());
+    }
     let mut body = Vec::with_capacity(256);
     body.extend_from_slice(&legacy_version);
     body.extend_from_slice(&[0x53, 0x4d, 0x47, 0x54, 0x4c, 0x53, 0x31, 0x33]);
     body.extend_from_slice(&[0x42u8; 24]);
     body.push(0x00); // empty session_id
 
-    let cs_len = (ciphers.len() * 2) as u16;
-    body.extend_from_slice(&cs_len.to_be_bytes());
+    let cs_bytes = ciphers
+        .len()
+        .checked_mul(2)
+        .and_then(|n| u16::try_from(n).ok())
+        .ok_or_else(|| anyhow::anyhow!("cipher suite list exceeds TLS u16 length limit"))?;
+    body.extend_from_slice(&cs_bytes.to_be_bytes());
     for &cs in ciphers {
         body.extend_from_slice(&cs.to_be_bytes());
     }
@@ -85,21 +138,37 @@ pub fn build_client_hello(
     body.push(0x00); // null compression
 
     let mut exts = Vec::new();
-    if !host.is_empty() && host.len() <= 253 && host.parse::<std::net::IpAddr>().is_err() {
+    if !host.is_empty()
+        && host.is_ascii()
+        && !host.chars().any(|c| c.is_whitespace() || c.is_control())
+        && host.parse::<IpAddr>().is_err()
+    {
         let hbytes = host.as_bytes();
-        let list_len = (hbytes.len() + 3) as u16;
-        let ext_len = list_len + 2;
+        let hlen = u16::try_from(hbytes.len())
+            .map_err(|_| anyhow::anyhow!("SNI hostname exceeds u16 length"))?;
+        let list_len = hlen
+            .checked_add(3)
+            .ok_or_else(|| anyhow::anyhow!("SNI list length overflow"))?;
+        let ext_len = list_len
+            .checked_add(2)
+            .ok_or_else(|| anyhow::anyhow!("SNI extension length overflow"))?;
         exts.extend_from_slice(&0x0000u16.to_be_bytes());
         exts.extend_from_slice(&ext_len.to_be_bytes());
         exts.extend_from_slice(&list_len.to_be_bytes());
         exts.push(0x00);
-        exts.extend_from_slice(&(hbytes.len() as u16).to_be_bytes());
+        exts.extend_from_slice(&hlen.to_be_bytes());
         exts.extend_from_slice(hbytes);
     }
 
     if !named_groups.is_empty() {
-        let glist_len = (named_groups.len() * 2) as u16;
-        let ext_len = glist_len + 2;
+        let glist_len = named_groups
+            .len()
+            .checked_mul(2)
+            .and_then(|n| u16::try_from(n).ok())
+            .ok_or_else(|| anyhow::anyhow!("named_groups list exceeds TLS u16 length"))?;
+        let ext_len = glist_len
+            .checked_add(2)
+            .ok_or_else(|| anyhow::anyhow!("supported_groups extension overflow"))?;
         exts.extend_from_slice(&0x000au16.to_be_bytes());
         exts.extend_from_slice(&ext_len.to_be_bytes());
         exts.extend_from_slice(&glist_len.to_be_bytes());
@@ -109,7 +178,8 @@ pub fn build_client_hello(
     }
 
     let sig_algs: &[u16] = &[0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0201];
-    let sig_list_len = (sig_algs.len() * 2) as u16;
+    let sig_list_len = u16::try_from(sig_algs.len() * 2)
+        .map_err(|_| anyhow::anyhow!("signature_algorithms length overflow"))?;
     exts.extend_from_slice(&0x000du16.to_be_bytes());
     exts.extend_from_slice(&(sig_list_len + 2).to_be_bytes());
     exts.extend_from_slice(&sig_list_len.to_be_bytes());
@@ -123,19 +193,39 @@ pub fn build_client_hello(
         exts.push(0x02);
         exts.extend_from_slice(&[0x03, 0x04]);
 
+        // Offer a valid 32-byte x25519 key share when x25519 (0x001d) is in
+        // `named_groups` so standard TLS 1.3 servers respond directly without
+        // requiring HRR; for PQC-only group probes send an empty key_share list
+        // per RFC 8446 §4.2.8 to elicit HelloRetryRequest group selection.
         exts.extend_from_slice(&0x0033u16.to_be_bytes());
-        exts.extend_from_slice(&0x0002u16.to_be_bytes());
-        exts.extend_from_slice(&0x0000u16.to_be_bytes());
+        if named_groups.contains(&0x001d) {
+            let mut x25519_pub = [0u8; 32];
+            x25519_pub[0] = 9; // RFC 7748 Curve25519 basepoint u=9
+            // client_shares_len = 2 (group) + 2 (key_len) + 32 (key) = 36
+            exts.extend_from_slice(&38u16.to_be_bytes());
+            exts.extend_from_slice(&36u16.to_be_bytes());
+            exts.extend_from_slice(&0x001du16.to_be_bytes());
+            exts.extend_from_slice(&32u16.to_be_bytes());
+            exts.extend_from_slice(&x25519_pub);
+        } else {
+            exts.extend_from_slice(&0x0002u16.to_be_bytes());
+            exts.extend_from_slice(&0x0000u16.to_be_bytes());
+        }
     }
 
     if !exts.is_empty() {
-        body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+        let exts_len = u16::try_from(exts.len())
+            .map_err(|_| anyhow::anyhow!("TLS extensions exceed u16 length"))?;
+        body.extend_from_slice(&exts_len.to_be_bytes());
         body.extend_from_slice(&exts);
     }
 
-    let mut hs = Vec::with_capacity(4 + body.len());
-    hs.push(0x01);
     let blen = body.len();
+    if blen > 16_380 {
+        bail!("TLS ClientHello handshake payload exceeds single-record limit ({blen} bytes)");
+    }
+    let mut hs = Vec::with_capacity(4 + blen);
+    hs.push(0x01);
     hs.push(((blen >> 16) & 0xff) as u8);
     hs.push(((blen >> 8) & 0xff) as u8);
     hs.push((blen & 0xff) as u8);
@@ -146,12 +236,14 @@ pub fn build_client_hello(
     } else {
         [0x03, 0x01]
     };
+    let hs_len =
+        u16::try_from(hs.len()).map_err(|_| anyhow::anyhow!("TLS record length exceeds u16"))?;
     let mut record = Vec::with_capacity(5 + hs.len());
     record.push(0x16);
     record.extend_from_slice(&rec_ver);
-    record.extend_from_slice(&(hs.len() as u16).to_be_bytes());
+    record.extend_from_slice(&hs_len.to_be_bytes());
     record.extend_from_slice(&hs);
-    record
+    Ok(record)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,17 +312,17 @@ pub fn parse_server_hello(buf: &[u8]) -> Option<ServerHelloSummary> {
 }
 
 fn probe_raw_tls(
-    addr: &std::net::SocketAddr,
+    addr: &SocketAddr,
     host: &str,
     legacy_version: [u8; 2],
     ciphers: &[u16],
     offer_tls13: bool,
     named_groups: &[u16],
 ) -> Option<ServerHelloSummary> {
+    let ch = build_client_hello(host, legacy_version, ciphers, offer_tls13, named_groups).ok()?;
     let mut stream = TcpStream::connect_timeout(addr, CONNECT_TIMEOUT).ok()?;
     let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
-    let ch = build_client_hello(host, legacy_version, ciphers, offer_tls13, named_groups);
     stream.write_all(&ch).ok()?;
     let mut buf = [0u8; 4096];
     let n = stream.read(&mut buf).ok()?;
@@ -273,10 +365,10 @@ pub fn named_group_name(code: u16) -> String {
 /// Runs a full defensive TLS/SSL & PQC audit against `target` (`host[:port]` or `https://...`).
 pub fn run_tls_audit(target: &str) -> Result<TlsAuditReport> {
     let (host, port) = parse_tls_target(target)?;
-    let addr = (host.as_str(), port)
-        .to_socket_addrs()
-        .with_context(|| format!("Failed to resolve {host}:{port}"))?
-        .next()
+    // Unconditionally deny cloud metadata / link-local / unspecified hosts & resolved IPs (Council T5).
+    let addrs = crate::idor_audit::resolve_and_validate_live_addrs(&host, port, true)?;
+    let addr = *addrs
+        .first()
         .ok_or_else(|| anyhow::anyhow!("No socket address resolved for {host}:{port}"))?;
 
     let modern_ciphers: &[u16] = &[
@@ -393,7 +485,7 @@ pub fn run_tls_audit(target: &str) -> Result<TlsAuditReport> {
         });
     }
 
-    let (hsts_header, cert_chain_len) = inspect_https_headers_and_certs(&host, port);
+    let (hsts_header, cert_chain_len) = inspect_https_headers_and_certs(&addr, &host);
     if hsts_header.is_none() && !protocols_supported.is_empty() {
         findings.push(TlsFinding {
             id: "SMG-TLS-HSTS".into(),
@@ -467,8 +559,8 @@ impl rustls::client::danger::ServerCertVerifier for CertCollectorVerifier {
     }
 }
 
-fn inspect_https_headers_and_certs(host: &str, port: u16) -> (Option<String>, usize) {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+fn inspect_https_headers_and_certs(addr: &SocketAddr, host: &str) -> (Option<String>, usize) {
+    crate::idor_audit::ensure_rustls_ring_provider();
     let collector = Arc::new(CertCollectorVerifier {
         chain_len: std::sync::Mutex::new(0),
     });
@@ -482,13 +574,7 @@ fn inspect_https_headers_and_certs(host: &str, port: u16) -> (Option<String>, us
     let Ok(mut conn) = rustls::ClientConnection::new(Arc::new(cfg), server_name) else {
         return (None, 0);
     };
-    let Ok(mut addrs) = (host, port).to_socket_addrs() else {
-        return (None, 0);
-    };
-    let Some(addr) = addrs.next() else {
-        return (None, 0);
-    };
-    let Ok(mut sock) = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) else {
+    let Ok(mut sock) = TcpStream::connect_timeout(addr, CONNECT_TIMEOUT) else {
         return (None, 0);
     };
     let _ = sock.set_read_timeout(Some(IO_TIMEOUT));
@@ -511,30 +597,6 @@ fn inspect_https_headers_and_certs(host: &str, port: u16) -> (Option<String>, us
     (hsts, chain)
 }
 
-/// Builds a minimal RFC 1035 + RFC 8659 DNS wire query for `CAA` (QTYPE = 257) records.
-#[allow(dead_code)]
-pub fn build_dns_caa_query(host: &str) -> Vec<u8> {
-    let mut pkt = vec![
-        0x5A, 0xA5, // Transaction ID
-        0x01, 0x00, // Standard query, RD=1
-        0x00, 0x01, // QDCOUNT=1
-        0x00, 0x00, // ANCOUNT=0
-        0x00, 0x00, // NSCOUNT=0
-        0x00, 0x00, // ARCOUNT=0
-    ];
-    for label in host.trim_end_matches('.').split('.') {
-        if label.is_empty() || label.len() > 63 {
-            continue;
-        }
-        pkt.push(label.len() as u8);
-        pkt.extend_from_slice(label.as_bytes());
-    }
-    pkt.push(0x00); // Root label
-    pkt.extend_from_slice(&257u16.to_be_bytes()); // QTYPE = CAA (257)
-    pkt.extend_from_slice(&1u16.to_be_bytes()); // QCLASS = IN (1)
-    pkt
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -549,9 +611,32 @@ mod tests {
             parse_tls_target("https://api.local:8443/v1").unwrap(),
             ("api.local".into(), 8443)
         );
-        let ch = build_client_hello("example.com", [0x03, 0x03], &[0x1301], true, &[0x11ec]);
+        assert_eq!(
+            parse_tls_target("[::1]:8443").unwrap(),
+            ("::1".into(), 8443)
+        );
+        assert_eq!(parse_tls_target("::1").unwrap(), ("::1".into(), 443));
+        assert!(parse_tls_target("user:pass@example.com:443").is_err());
+        assert!(parse_tls_target("example.com:notaport").is_err());
+
+        let ch =
+            build_client_hello("example.com", [0x03, 0x03], &[0x1301], true, &[0x11ec]).unwrap();
         assert_eq!(ch[0], 0x16);
         assert_eq!(ch[5], 0x01);
+
+        let oversized_host = "a".repeat(260);
+        assert!(
+            build_client_hello(&oversized_host, [0x03, 0x03], &[0x1301], true, &[0x001d]).is_err()
+        );
+    }
+
+    #[test]
+    fn tls_audit_denies_imds_and_link_local_targets() {
+        assert!(run_tls_audit("169.254.169.254:443").is_err());
+        assert!(run_tls_audit("[fe80::1]:443").is_err());
+        assert!(run_tls_audit("[fd00:ec2::254]:443").is_err());
+        assert!(run_tls_audit("metadata.google.internal:443").is_err());
+        assert!(run_tls_audit("0.0.0.0:443").is_err());
     }
 
     #[test]

@@ -21,9 +21,14 @@ pub struct NitroCoseAttestation {
     pub cabundle_count: usize,
 }
 
-/// Verifies the structural framing of a CBOR `COSE_Sign1` envelope (optional Tag 18 `0xD2`,
-/// followed by 4-element CBOR array `0x84`: `[protected_bstr, unprotected_map, payload_bstr, sig_bstr]`)
-/// and validates Nitro attestation claims (PCR0/1/2 allowlist, non-empty signature & cert chain, timestamp).
+/// Performs structural framing & claims pre-validation on a CBOR `COSE_Sign1` envelope
+/// (optional Tag 18 `0xD2`, followed by 4-element CBOR array `0x84`:
+/// `[protected_bstr, unprotected_map, payload_bstr, sig_bstr]`) and validates Nitro claims
+/// (PCR0 allowlist, non-empty signature & cert chain, non-future/non-stale timestamp).
+///
+/// NOTE (v0.4.1 fail-closed boundary): This function performs structural & claims pre-checks
+/// ONLY — full cryptographic COSE_Sign1 P-384 + AWS Nitro Root CA chain verification is
+/// deferred to v0.5 and callers MUST treat `cryptographically_verified` as `false`.
 pub fn verify_nitro_cose_sign1(
     cose_bytes: &[u8],
     payload_json_or_cbor_claims: &NitroCoseAttestation,
@@ -50,9 +55,10 @@ pub fn verify_nitro_cose_sign1(
         bail!("Nitro attestation missing leaf certificate or AWS root CA bundle");
     }
     if payload_json_or_cbor_claims.timestamp_ms == 0
+        || payload_json_or_cbor_claims.timestamp_ms > now_ms.saturating_add(300_000)
         || now_ms.saturating_sub(payload_json_or_cbor_claims.timestamp_ms) > max_age_ms
     {
-        bail!("Nitro attestation timestamp stale or missing");
+        bail!("Nitro attestation timestamp missing, stale, or too far in the future");
     }
     if let Some(expected_pcr0) = expected_pcr0_hex {
         let Some(actual) = payload_json_or_cbor_claims.pcrs.get(&0) else {
@@ -65,20 +71,24 @@ pub fn verify_nitro_cose_sign1(
     Ok(())
 }
 
-/// Verified Intel TDX Quote v4 header & TD measurement summary.
+/// Structurally parsed Intel TDX Quote v4 header & TD measurement summary.
+/// Note: `cryptographically_verified` is always `false` in v0.4.1 (structural header/MRTD check only;
+/// Intel DCAP PCK signature & TCB chain verification is deferred to v0.5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TdxQuoteV4Summary {
     pub version: u16,
     pub tee_type: u32,
     pub debug_enabled: bool,
     pub mrtd_hex: String,
+    pub cryptographically_verified: bool,
 }
 
-/// Parses and fail-closed verifies an Intel TDX v4 Quote binary buffer:
+/// Parses and structurally checks an Intel TDX v4 Quote binary buffer (fail-closed):
 /// - Bytes `0..2`: `version == 4` (little-endian)
 /// - Bytes `4..8`: `tee_type == 0x0000_0081` (TDX)
 /// - Rejects debuggable TDs (`TD_ATTR_DEBUG` bit 0 set in `td_attributes` at offset `48 + 120..48 + 128`)
 /// - Extracts 48-byte `MRTD` measurement (offset `48 + 136..48 + 184`) and matches expected hex if provided.
+/// - Always sets `cryptographically_verified: false` until full Intel DCAP PCK verification lands.
 pub fn verify_tdx_quote_v4(
     quote: &[u8],
     expected_mrtd_hex: Option<&str>,
@@ -114,31 +124,38 @@ pub fn verify_tdx_quote_v4(
         tee_type,
         debug_enabled,
         mrtd_hex,
+        cryptographically_verified: false,
     })
 }
 
-/// Verified AMD SEV-SNP Attestation Report summary.
+/// Structurally parsed AMD SEV-SNP Attestation Report summary.
+/// Note: `cryptographically_verified` is always `false` in v0.4.1 (structural header/policy check only;
+/// AMD VCEK ECDSA P-384 chain verification is deferred to v0.5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SevSnpReportSummary {
     pub version: u32,
     pub guest_svn: u32,
     pub debug_enabled: bool,
     pub measurement_hex: String,
+    pub cryptographically_verified: bool,
 }
 
-/// Parses and fail-closed verifies an AMD SEV-SNP Attestation Report binary buffer:
+/// Parses and structurally checks an AMD SEV-SNP Attestation Report binary buffer (fail-closed):
+/// - Full AMD SEV-SNP v2 ABI report size (`>= 1184` bytes / `0x4A0`, covering the 512-byte signature tail)
 /// - Bytes `0..4`: `version >= 2`
 /// - Bytes `4..8`: `guest_svn`
 /// - Bytes `8..16`: `policy` (bit 19 = `DEBUG`; must be 0!)
 /// - Bytes `144..192`: 48-byte SHA-384 `MEASUREMENT`
+/// - Always sets `cryptographically_verified: false` until full AMD VCEK verification lands.
 pub fn verify_sev_snp_report(
     report: &[u8],
     expected_measurement_hex: Option<&str>,
     min_guest_svn: u32,
 ) -> Result<SevSnpReportSummary> {
-    if report.len() < 192 {
+    const MIN_SEV_SNP_REPORT_LEN: usize = 1184;
+    if report.len() < MIN_SEV_SNP_REPORT_LEN {
         bail!(
-            "AMD SEV-SNP attestation report too short ({} < 192 bytes)",
+            "AMD SEV-SNP attestation report too short ({} < {MIN_SEV_SNP_REPORT_LEN} bytes)",
             report.len()
         );
     }
@@ -166,6 +183,7 @@ pub fn verify_sev_snp_report(
         guest_svn,
         debug_enabled,
         measurement_hex,
+        cryptographically_verified: false,
     })
 }
 
@@ -220,13 +238,17 @@ impl MerkleAuditLog {
         if self.leaves.is_empty() {
             return None;
         }
+        // Promote unpaired trailing nodes directly without self-duplication (eliminating
+        // CVE-2012-2459 duplicate-tail root collisions while keeping `0x00`/`0x01` domain separation).
         let mut level = self.leaves.clone();
         while level.len() > 1 {
             let mut next = Vec::with_capacity(level.len().div_ceil(2));
             for chunk in level.chunks(2) {
-                let left = chunk[0];
-                let right = if chunk.len() == 2 { chunk[1] } else { chunk[0] };
-                next.push(hash_node(&left, &right));
+                if chunk.len() == 2 {
+                    next.push(hash_node(&chunk[0], &chunk[1]));
+                } else {
+                    next.push(chunk[0]);
+                }
             }
             level = next;
         }
@@ -242,22 +264,24 @@ impl MerkleAuditLog {
         let mut level = self.leaves.clone();
         while level.len() > 1 {
             let is_right_child = index % 2 == 1;
-            let sibling_idx = if is_right_child {
-                index - 1
+            if is_right_child {
+                proof.push(MerkleProofStep {
+                    sibling_hex: hex::encode(level[index - 1]),
+                    is_left: true,
+                });
             } else if index + 1 < level.len() {
-                index + 1
-            } else {
-                index
-            };
-            proof.push(MerkleProofStep {
-                sibling_hex: hex::encode(level[sibling_idx]),
-                is_left: is_right_child,
-            });
+                proof.push(MerkleProofStep {
+                    sibling_hex: hex::encode(level[index + 1]),
+                    is_left: false,
+                });
+            }
             let mut next = Vec::with_capacity(level.len().div_ceil(2));
             for chunk in level.chunks(2) {
-                let left = chunk[0];
-                let right = if chunk.len() == 2 { chunk[1] } else { chunk[0] };
-                next.push(hash_node(&left, &right));
+                if chunk.len() == 2 {
+                    next.push(hash_node(&chunk[0], &chunk[1]));
+                } else {
+                    next.push(chunk[0]);
+                }
             }
             level = next;
             index /= 2;
@@ -325,6 +349,12 @@ mod tests {
             verify_nitro_cose_sign1(&cose, &att, Some("deadbeef"), 1_700_000_010_000, 60_000)
                 .is_err()
         );
+        // Future Nitro timestamp (> +5m skew) fails closed
+        let mut future_att = att.clone();
+        future_att.timestamp_ms = 1_700_000_500_000;
+        assert!(
+            verify_nitro_cose_sign1(&cose, &future_att, None, 1_700_000_000_000, 60_000).is_err()
+        );
 
         // 2. Intel TDX v4 Quote
         let mut tdx = vec![0u8; 256];
@@ -335,16 +365,21 @@ mod tests {
         tdx[48 + 128] = 0x03;
         let tdx_ok = verify_tdx_quote_v4(&tdx, Some(&"5a".repeat(48))).unwrap();
         assert!(!tdx_ok.debug_enabled);
+        assert!(!tdx_ok.cryptographically_verified);
         // Setting TD_ATTR_DEBUG at real td_attributes offset 48+120 fails closed
         tdx[48 + 120] = 1;
         assert!(verify_tdx_quote_v4(&tdx, None).is_err());
 
-        // 3. AMD SEV-SNP Report
-        let mut snp = vec![0u8; 256];
+        // 3. AMD SEV-SNP Report (requires full 1184-byte ABI report)
+        let short_snp = vec![0u8; 256];
+        assert!(verify_sev_snp_report(&short_snp, None, 0).is_err());
+
+        let mut snp = vec![0u8; 1184];
         snp[0..4].copy_from_slice(&2u32.to_le_bytes());
         snp[4..8].copy_from_slice(&3u32.to_le_bytes());
         snp[144..192].fill(0xAB);
-        assert!(verify_sev_snp_report(&snp, Some(&"ab".repeat(48)), 2).is_ok());
+        let snp_ok = verify_sev_snp_report(&snp, Some(&"ab".repeat(48)), 2).unwrap();
+        assert!(!snp_ok.cryptographically_verified);
         // Setting policy DEBUG bit 19 fails closed
         snp[8..16].copy_from_slice(&(1u64 << 19).to_le_bytes());
         assert!(verify_sev_snp_report(&snp, None, 2).is_err());
@@ -352,17 +387,35 @@ mod tests {
 
     #[test]
     fn merkle_audit_log_proves_inclusion_and_detects_tampering() {
-        let mut log = MerkleAuditLog::new();
-        for i in 0..5 {
-            log.append(format!("scan-event-{i}").as_bytes());
+        for n in 1..=9 {
+            let mut log = MerkleAuditLog::new();
+            for i in 0..n {
+                log.append(format!("scan-event-{i}").as_bytes());
+            }
+            let root = log.root_hex().unwrap();
+            for i in 0..n {
+                let proof = log.inclusion_proof(i).unwrap();
+                assert!(
+                    verify_merkle_inclusion(format!("scan-event-{i}").as_bytes(), &proof, &root),
+                    "inclusion failed for n={n}, i={i}"
+                );
+                assert!(!verify_merkle_inclusion(
+                    format!("scan-event-{i}-TAMPERED").as_bytes(),
+                    &proof,
+                    &root
+                ));
+            }
         }
-        let root = log.root_hex().unwrap();
-        let proof = log.inclusion_proof(3).unwrap();
-        assert!(verify_merkle_inclusion(b"scan-event-3", &proof, &root));
-        assert!(!verify_merkle_inclusion(
-            b"scan-event-3-TAMPERED",
-            &proof,
-            &root
-        ));
+        // CVE-2012-2459 regression: [A, B, C] and [A, B, C, C] MUST produce distinct roots
+        let mut odd = MerkleAuditLog::new();
+        odd.append(b"A");
+        odd.append(b"B");
+        odd.append(b"C");
+        let mut dup = MerkleAuditLog::new();
+        dup.append(b"A");
+        dup.append(b"B");
+        dup.append(b"C");
+        dup.append(b"C");
+        assert_ne!(odd.root_hex(), dup.root_hex());
     }
 }

@@ -1023,12 +1023,29 @@ async fn discover_user_a_resource_id(
     }
 }
 
+/// Sanitizes a target-returned identifier before interpolating it into a probe URL path,
+/// preventing CRLF/request-splitting, query/fragment injection, or path traversal.
+fn sanitize_path_segment_id(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    if s.is_empty() || s.len() > 128 || s == "." || s == ".." || s.contains("..") {
+        return None;
+    }
+    if s.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        Some(s.to_string())
+    } else {
+        None
+    }
+}
+
 fn substitute_route_params_with_id(raw_path: &str, id_val: &str) -> String {
+    let safe_id = sanitize_path_segment_id(id_val).unwrap_or_else(|| "1".to_string());
     let segs: Vec<String> = raw_path
         .split('/')
         .map(|seg| {
             if seg.starts_with(':') || (seg.starts_with('{') && seg.ends_with('}')) {
-                id_val.to_string()
+                safe_id.clone()
             } else {
                 seg.to_string()
             }
@@ -1037,13 +1054,15 @@ fn substitute_route_params_with_id(raw_path: &str, id_val: &str) -> String {
     segs.join("/")
 }
 
-/// Sends a raw HTTP/1.1 request over loopback with custom headers and `<= 3s` timeout,
+/// Sends a raw HTTP/1.1 request over loopback (HTTP or TLS) with custom headers and `<= 3s` timeout,
 /// returning `(status_code, raw_response_head, response_body)`.
-async fn send_raw_protocol_probe(port: u16, raw_req: &str) -> Result<(u16, String, String)> {
-    let addr = format!("127.0.0.1:{port}");
-    let mut stream = tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(&addr))
+async fn send_raw_protocol_probe(
+    port: u16,
+    use_tls: bool,
+    raw_req: &str,
+) -> Result<(u16, String, String)> {
+    let mut stream = connect_probe_stream(port, use_tls)
         .await
-        .context("protocol probe connect timeout")?
         .context("protocol probe connect failed")?;
     tokio::time::timeout(Duration::from_secs(3), stream.write_all(raw_req.as_bytes()))
         .await
@@ -1089,18 +1108,26 @@ async fn send_raw_protocol_probe(port: u16, raw_req: &str) -> Result<(u16, Strin
 
 /// Signal-gated GraphQL introspection & depth-11 probe (`SMG-API-*` / GraphQL).
 pub async fn verify_graphql_probe(port: u16, finding: &LatticeFinding) -> Result<VerifiedFinding> {
+    verify_graphql_probe_with_tls(port, finding, false).await
+}
+
+async fn verify_graphql_probe_with_tls(
+    port: u16,
+    finding: &LatticeFinding,
+    use_tls: bool,
+) -> Result<VerifiedFinding> {
     let (_, raw_path) = parse_route(&finding.entry_route);
     let path = if raw_path == "/" || raw_path.is_empty() {
-        "/graphql"
+        "/graphql".to_string()
     } else {
-        raw_path
+        substitute_route_params(raw_path)
     };
     let payload = r#"{"query":"{ __schema { types { name } } }"}"#;
     let req = format!(
         "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
         payload.len()
     );
-    let (code, _, body) = send_raw_protocol_probe(port, &req).await?;
+    let (code, _, body) = send_raw_protocol_probe(port, use_tls, &req).await?;
     let (status, evidence) = if (200..300).contains(&code) && body.contains("__schema") {
         (
             VerificationStatus::Proven,
@@ -1118,6 +1145,7 @@ pub async fn verify_graphql_probe(port: u16, finding: &LatticeFinding) -> Result
             format!("GraphQL probe inconclusive at `{path}` (HTTP {code})"),
         )
     };
+    let scheme = if use_tls { "https" } else { "http" };
     Ok(VerifiedFinding {
         finding_id: finding.id.clone(),
         rule_id: finding.rule_id.clone(),
@@ -1125,7 +1153,7 @@ pub async fn verify_graphql_probe(port: u16, finding: &LatticeFinding) -> Result
         status,
         evidence,
         replay_cmd: format!(
-            "curl -i -X POST http://127.0.0.1:{port}{path} -H 'Content-Type: application/json' -d '{payload}'"
+            "curl -i -X POST {scheme}://127.0.0.1:{port}{path} -H 'Content-Type: application/json' -d '{payload}'"
         ),
     })
 }
@@ -1135,12 +1163,24 @@ pub async fn verify_websocket_cswsh_probe(
     port: u16,
     finding: &LatticeFinding,
 ) -> Result<VerifiedFinding> {
+    verify_websocket_cswsh_probe_with_tls(port, finding, false).await
+}
+
+async fn verify_websocket_cswsh_probe_with_tls(
+    port: u16,
+    finding: &LatticeFinding,
+    use_tls: bool,
+) -> Result<VerifiedFinding> {
     let (_, raw_path) = parse_route(&finding.entry_route);
-    let path = if raw_path.is_empty() { "/ws" } else { raw_path };
+    let path = if raw_path.is_empty() {
+        "/ws".to_string()
+    } else {
+        substitute_route_params(raw_path)
+    };
     let req = format!(
         "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nOrigin: https://evil.shellmind.invalid\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
     );
-    let (code, _, _) = send_raw_protocol_probe(port, &req).await?;
+    let (code, _, _) = send_raw_protocol_probe(port, use_tls, &req).await?;
     let (status, evidence) = if code == 101 {
         (
             VerificationStatus::Proven,
@@ -1159,6 +1199,7 @@ pub async fn verify_websocket_cswsh_probe(
             format!("WebSocket CSWSH probe returned HTTP {code} (inconclusive)"),
         )
     };
+    let scheme = if use_tls { "https" } else { "http" };
     Ok(VerifiedFinding {
         finding_id: finding.id.clone(),
         rule_id: finding.rule_id.clone(),
@@ -1166,26 +1207,35 @@ pub async fn verify_websocket_cswsh_probe(
         status,
         evidence,
         replay_cmd: format!(
-            "curl -i -H 'Upgrade: websocket' -H 'Origin: https://evil.shellmind.invalid' http://127.0.0.1:{port}{path}"
+            "curl -i -H 'Upgrade: websocket' -H 'Origin: https://evil.shellmind.invalid' {scheme}://127.0.0.1:{port}{path}"
         ),
     })
 }
 
 /// Signal-gated OAuth2 missing `state`/PKCE & open `redirect_uri` probe (`SMG-OAUTH-*`).
 pub async fn verify_oauth2_probe(port: u16, finding: &LatticeFinding) -> Result<VerifiedFinding> {
+    verify_oauth2_probe_with_tls(port, finding, false).await
+}
+
+async fn verify_oauth2_probe_with_tls(
+    port: u16,
+    finding: &LatticeFinding,
+    use_tls: bool,
+) -> Result<VerifiedFinding> {
     let (_, raw_path) = parse_route(&finding.entry_route);
     let base = if raw_path == "/" || raw_path.is_empty() {
-        "/oauth/authorize"
+        "/oauth/authorize".to_string()
     } else {
-        raw_path
+        substitute_route_params(raw_path)
     };
     let q = concat!(
         "response",
         "_type=code&client_id=smg&redirect_uri=https://evil.shellmind.invalid/cb"
     );
-    let path = format!("{base}?{q}");
+    let sep = if base.contains('?') { '&' } else { '?' };
+    let path = format!("{base}{sep}{q}");
     let req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
-    let (code, head, _) = send_raw_protocol_probe(port, &req).await?;
+    let (code, head, _) = send_raw_protocol_probe(port, use_tls, &req).await?;
     let head_low = head.to_ascii_lowercase();
     let redirects_evil = (300..400).contains(&code)
         && head_low.contains("location:")
@@ -1208,13 +1258,14 @@ pub async fn verify_oauth2_probe(port: u16, finding: &LatticeFinding) -> Result<
             format!("OAuth2 probe inconclusive at `{base}` (HTTP {code})"),
         )
     };
+    let scheme = if use_tls { "https" } else { "http" };
     Ok(VerifiedFinding {
         finding_id: finding.id.clone(),
         rule_id: finding.rule_id.clone(),
         entry_route: finding.entry_route.clone(),
         status,
         evidence,
-        replay_cmd: format!("curl -i 'http://127.0.0.1:{port}{path}'"),
+        replay_cmd: format!("curl -i '{scheme}://127.0.0.1:{port}{path}'"),
     })
 }
 
@@ -1222,6 +1273,14 @@ pub async fn verify_oauth2_probe(port: u16, finding: &LatticeFinding) -> Result<
 pub async fn verify_csrf_origin_probe(
     port: u16,
     finding: &LatticeFinding,
+) -> Result<VerifiedFinding> {
+    verify_csrf_origin_probe_with_tls(port, finding, false).await
+}
+
+async fn verify_csrf_origin_probe_with_tls(
+    port: u16,
+    finding: &LatticeFinding,
+    use_tls: bool,
 ) -> Result<VerifiedFinding> {
     let (method, raw_path) = parse_route(&finding.entry_route);
     let m = if matches!(method, "GET" | "HEAD") {
@@ -1235,7 +1294,7 @@ pub async fn verify_csrf_origin_probe(
         "{m} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: https://evil.shellmind.invalid\r\nCookie: session=smg_csrf_probe\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
-    let (code, _, resp_body) = send_raw_protocol_probe(port, &req).await?;
+    let (code, _, resp_body) = send_raw_protocol_probe(port, use_tls, &req).await?;
     let (status, evidence) = if (200..300).contains(&code) && !is_failure_envelope(code, &resp_body)
     {
         (
@@ -1255,6 +1314,7 @@ pub async fn verify_csrf_origin_probe(
             format!("CSRF probe inconclusive at `{m} {path}` (HTTP {code})"),
         )
     };
+    let scheme = if use_tls { "https" } else { "http" };
     Ok(VerifiedFinding {
         finding_id: finding.id.clone(),
         rule_id: finding.rule_id.clone(),
@@ -1262,7 +1322,7 @@ pub async fn verify_csrf_origin_probe(
         status,
         evidence,
         replay_cmd: format!(
-            "curl -i -X {m} -H 'Origin: https://evil.shellmind.invalid' -H 'Cookie: session=smg_csrf_probe' http://127.0.0.1:{port}{path}"
+            "curl -i -X {m} -H 'Origin: https://evil.shellmind.invalid' -H 'Cookie: session=smg_csrf_probe' {scheme}://127.0.0.1:{port}{path}"
         ),
     })
 }
@@ -1272,6 +1332,14 @@ pub async fn verify_open_redirect_probe(
     port: u16,
     finding: &LatticeFinding,
 ) -> Result<VerifiedFinding> {
+    verify_open_redirect_probe_with_tls(port, finding, false).await
+}
+
+async fn verify_open_redirect_probe_with_tls(
+    port: u16,
+    finding: &LatticeFinding,
+    use_tls: bool,
+) -> Result<VerifiedFinding> {
     let (_, raw_path) = parse_route(&finding.entry_route);
     let base = substitute_route_params(raw_path);
     let sep = if base.contains('?') { '&' } else { '?' };
@@ -1279,7 +1347,7 @@ pub async fn verify_open_redirect_probe(
         "{base}{sep}next=https://evil.shellmind.invalid&redirect=https://evil.shellmind.invalid"
     );
     let req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
-    let (code, head, _) = send_raw_protocol_probe(port, &req).await?;
+    let (code, head, _) = send_raw_protocol_probe(port, use_tls, &req).await?;
     let head_low = head.to_ascii_lowercase();
     let evil_loc = (300..400).contains(&code)
         && head_low.contains("location:")
@@ -1302,13 +1370,14 @@ pub async fn verify_open_redirect_probe(
             format!("Open Redirect probe inconclusive at `{base}` (HTTP {code})"),
         )
     };
+    let scheme = if use_tls { "https" } else { "http" };
     Ok(VerifiedFinding {
         finding_id: finding.id.clone(),
         rule_id: finding.rule_id.clone(),
         entry_route: finding.entry_route.clone(),
         status,
         evidence,
-        replay_cmd: format!("curl -i 'http://127.0.0.1:{port}{path}'"),
+        replay_cmd: format!("curl -i '{scheme}://127.0.0.1:{port}{path}'"),
     })
 }
 
@@ -1322,19 +1391,19 @@ pub async fn verify_finding_with_config(
     let rule = finding.rule_id.as_str();
     let title_low = finding.title.to_ascii_lowercase();
     if rule.starts_with("SMG-OAUTH-") {
-        return verify_oauth2_probe(port, finding).await;
+        return verify_oauth2_probe_with_tls(port, finding, cfg.use_tls).await;
     }
     if rule.starts_with("SMG-CSRF-") {
-        return verify_csrf_origin_probe(port, finding).await;
+        return verify_csrf_origin_probe_with_tls(port, finding, cfg.use_tls).await;
     }
     if rule.starts_with("SMG-REDIRECT-") {
-        return verify_open_redirect_probe(port, finding).await;
+        return verify_open_redirect_probe_with_tls(port, finding, cfg.use_tls).await;
     }
     if rule.starts_with("SMG-API-") && title_low.contains("graphql") {
-        return verify_graphql_probe(port, finding).await;
+        return verify_graphql_probe_with_tls(port, finding, cfg.use_tls).await;
     }
     if rule.starts_with("SMG-API-") && title_low.contains("websocket") {
-        return verify_websocket_cswsh_probe(port, finding).await;
+        return verify_websocket_cswsh_probe_with_tls(port, finding, cfg.use_tls).await;
     }
 
     match finding.missing_guard {
@@ -1974,13 +2043,13 @@ pub async fn verify_route_fuzz_with_config(
 }
 
 /// Promotes or annotates a Last-Byte Sync result with differential DB/Redis mutation frame counts
-/// recorded by `WireDiffProxy`.
+/// recorded by `WireDiffProxy`. Never overwrites an already-`Mitigated` verdict to `Proven`.
 pub fn apply_wire_diff_corroboration(
     mut verified: VerifiedFinding,
     proxy: &crate::wire_oracle::WireDiffProxy,
 ) -> (VerifiedFinding, usize) {
     let writes = proxy.write_mutations();
-    if writes >= 2 {
+    if writes >= 2 && verified.status != VerificationStatus::Mitigated {
         verified.status = VerificationStatus::Proven;
         verified.evidence = format!(
             "{} [WireDiffProxy: {} non-idempotent write mutation frames]",
@@ -2061,7 +2130,7 @@ pub async fn verify_stateful_http_workflow(
         _ => None,
     };
 
-    let Some(res_id) = created_id else {
+    let Some(res_id) = created_id.and_then(|raw| sanitize_path_segment_id(&raw)) else {
         return StatefulWorkflowResult {
             violations,
             steps_executed,

@@ -540,11 +540,14 @@ fn take_fn_call(s: &str, pos: usize) -> Option<(String, Vec<String>, usize)> {
     let mut args: Vec<String> = Vec::new();
     let mut cur = String::new();
     while i < bytes.len() {
-        let ch = bytes[i] as char;
+        let Some(ch) = s[i..].chars().next() else {
+            break;
+        };
+        let step = ch.len_utf8();
         if ch == '"' && (i == 0 || bytes[i - 1] != b'\\') {
             in_quote = !in_quote;
             cur.push(ch);
-            i += 1;
+            i += step;
             continue;
         }
         if !in_quote {
@@ -554,17 +557,17 @@ fn take_fn_call(s: &str, pos: usize) -> Option<(String, Vec<String>, usize)> {
                 depth -= 1;
                 if depth == 0 {
                     args.push(cur.trim().to_string());
-                    return Some((name, args, i + 1));
+                    return Some((name, args, i + step));
                 }
             } else if ch == ',' && depth == 1 {
                 args.push(cur.trim().to_string());
                 cur.clear();
-                i += 1;
+                i += step;
                 continue;
             }
         }
         cur.push(ch);
-        i += 1;
+        i += step;
     }
     None
 }
@@ -641,7 +644,7 @@ fn find_top_level_op(s: &str, op: &str) -> Option<usize> {
     let mut in_quote = false;
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'"' {
+        if bytes[i] == b'"' && (i == 0 || bytes[i - 1] != b'\\') {
             in_quote = !in_quote;
         } else if !in_quote && bytes[i..].starts_with(op_bytes) {
             match op {
@@ -721,7 +724,10 @@ fn eval_dsl_atom(atom: &str, ctx: &DslCtx) -> Option<bool> {
         }
         "starts_with" => Some(src.starts_with(&eval_arg(args.get(1)?, ctx)?)),
         "ends_with" => Some(src.ends_with(&eval_arg(args.get(1)?, ctx)?)),
-        "regex" => Regex::new(&eval_arg(args.get(1)?, ctx)?)
+        "regex" => regex::RegexBuilder::new(&eval_arg(args.get(1)?, ctx)?)
+            .size_limit(256 * 1024)
+            .dfa_size_limit(256 * 1024)
+            .build()
             .ok()
             .map(|re| re.is_match(&src)),
         _ => None,
@@ -775,16 +781,20 @@ pub struct HttpRunners {
 
 impl HttpRunners {
     pub fn build_with_scope(timeout: Duration, allow_remote: bool) -> Result<HttpRunners> {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        crate::idor_audit::ensure_rustls_ring_provider();
         let build = |redirects: bool| -> Result<Client> {
             let policy = if redirects {
                 Policy::custom(move |attempt| {
                     if attempt.previous().len() >= 10 {
                         return attempt.stop();
                     }
-                    if !allow_remote
-                        && !crate::idor_audit::is_lab_or_loopback_url(attempt.url().as_str())
-                            .unwrap_or(false)
+                    // Unconditionally deny redirects to cloud metadata / link-local /
+                    // unspecified hosts even when `allow_remote == true` (Council T5).
+                    if crate::idor_audit::validate_live_target_url(
+                        attempt.url().as_str(),
+                        allow_remote,
+                    )
+                    .is_err()
                     {
                         return attempt.stop();
                     }
@@ -876,8 +886,11 @@ fn send_request(
     body: &str,
     follow_redirects: bool,
 ) -> Result<HttpResponse> {
-    if !runners.allow_remote && !crate::idor_audit::is_lab_or_loopback_url(url)? {
-        bail!("refusing off-scope template URL '{url}' without --allow-remote");
+    // Unconditionally enforce IMDS/link-local denial & lab-scope gate on every
+    // final substituted destination URL (Council T5).
+    let parsed = crate::idor_audit::validate_live_target_url(url, runners.allow_remote)?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        bail!("HTTP template engine only supports http/https URLs");
     }
     let client = if follow_redirects {
         &runners.redirect
@@ -1183,7 +1196,10 @@ pub fn run_extractors(extractors: &[Extractor], resp: &HttpResponse) -> Vec<(Str
         match ex.kind.as_str() {
             "regex" => {
                 for p in ex.regex.as_ref().map(|r| r.to_vec()).unwrap_or_default() {
-                    if let Ok(re) = Regex::new(&p)
+                    if let Ok(re) = regex::RegexBuilder::new(&p)
+                        .size_limit(256 * 1024)
+                        .dfa_size_limit(256 * 1024)
+                        .build()
                         && let Some(cap) = re.captures(&resp.body)
                         && let Some(v) = cap.get(1).or_else(|| cap.get(0))
                     {
@@ -1325,6 +1341,9 @@ pub fn parse_dns_response(buf: &[u8]) -> Option<(u16, Vec<(u16, String)>)> {
     let mut pos = 12usize;
     for _ in 0..qdcount {
         let (_, next) = read_dns_name(buf, pos)?;
+        if next + 4 > buf.len() {
+            return None;
+        }
         pos = next + 4;
     }
     let mut records = Vec::new();
@@ -1386,17 +1405,28 @@ pub fn send_dns_query(
 ) -> Option<Vec<(u16, String)>> {
     let query = build_dns_query(name, qtype, id);
     for server in system_nameservers().into_iter().take(3) {
-        let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
-        sock.set_read_timeout(Some(timeout)).ok()?;
-        sock.set_write_timeout(Some(timeout)).ok()?;
-        if sock.send_to(&query, format!("{server}:53")).is_err() {
+        let Ok(server_ip) = server.parse::<std::net::IpAddr>() else {
+            continue;
+        };
+        let bind_addr = if server_ip.is_ipv6() {
+            "[::]:0"
+        } else {
+            "0.0.0.0:0"
+        };
+        let Ok(sock) = UdpSocket::bind(bind_addr) else {
+            continue;
+        };
+        let _ = sock.set_read_timeout(Some(timeout));
+        let _ = sock.set_write_timeout(Some(timeout));
+        let dest = std::net::SocketAddr::new(server_ip, 53);
+        if sock.send_to(&query, dest).is_err() {
             continue;
         }
         let mut buf = [0u8; 4096];
-        let Ok((n, _)) = sock.recv_from(&mut buf) else {
+        let Ok((n, peer)) = sock.recv_from(&mut buf) else {
             continue;
         };
-        if n < 12 || buf[0..2] != id.to_be_bytes() {
+        if peer.ip() != server_ip || n < 12 || buf[0..2] != id.to_be_bytes() {
             continue;
         }
         if let Some((rcode, records)) = parse_dns_response(&buf[..n])
@@ -1431,8 +1461,9 @@ pub fn execute_dns_block(
             block.qtype.as_deref().unwrap_or("")
         ));
     };
-    let digest = blake3::hash(format!("{template_id}:{name}").as_bytes()).to_hex();
-    let id = u16::from_be_bytes([digest.as_bytes()[0], digest.as_bytes()[1]]);
+    let hash = blake3::hash(format!("{template_id}:{name}").as_bytes());
+    let hb = hash.as_bytes();
+    let id = u16::from_be_bytes([hb[0], hb[1]]);
     match send_dns_query(&name, qtype, id, timeout) {
         Some(records) => DnsOutcome::Records(records),
         None => DnsOutcome::Failed("DNS query failed (no reachable resolver)".into()),
@@ -1569,11 +1600,48 @@ pub fn tls_enabled(v: &Option<serde_yaml_ng::Value>) -> bool {
     }
 }
 
+/// Splits `host[:port]` or `[ipv6][:port]` cleanly without mangling bare IPv6 literals.
+fn parse_host_and_optional_port(raw: &str) -> (String, Option<u16>) {
+    let trimmed = raw.trim();
+    if let Some(rest) = trimmed.strip_prefix('[')
+        && let Some((h, tail)) = rest.split_once(']')
+    {
+        let port = tail.strip_prefix(':').and_then(|p| p.parse::<u16>().ok());
+        return (h.to_string(), port);
+    }
+    if trimmed.matches(':').count() == 1
+        && let Some((h, p)) = trimmed.rsplit_once(':')
+    {
+        return (h.to_string(), p.parse::<u16>().ok());
+    }
+    (trimmed.to_string(), None)
+}
+
+fn build_tls_client_config(allow_insecure: bool) -> rustls::ClientConfig {
+    crate::idor_audit::ensure_rustls_ring_provider();
+    if allow_insecure {
+        rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(InsecureServerVerifier))
+            .with_no_client_auth()
+    } else {
+        let mut roots = rustls::RootCertStore::empty();
+        let loaded = rustls_native_certs::load_native_certs();
+        for cert in loaded.certs {
+            let _ = roots.add(cert);
+        }
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth()
+    }
+}
+
 pub fn execute_network_block(
     block: &NetworkBlock,
     vars: &Vars,
     timeout: Duration,
     extra: &HashMap<String, String>,
+    allow_remote: bool,
 ) -> Result<Vec<HttpResponse>> {
     let hosts = block
         .host
@@ -1587,48 +1655,26 @@ pub fn execute_network_block(
 
     for host_raw in hosts {
         let host = substitute(&host_raw, vars, extra);
-        let (host_name, host_port): (String, Option<u16>) = if !host.contains('[')
-            && let Some((h, p)) = host.rsplit_once(':')
-        {
-            (h.to_string(), p.parse().ok())
-        } else {
-            (host.clone(), None)
-        };
-        let ip: std::net::IpAddr = host_name.parse().map_err(|_| {
-            anyhow::anyhow!(
-                "network host '{host_name}' is not an IP (hostname DNS resolution is outside the network engine scope; use {{Host}} of an IP target)"
-            )
-        })?;
-        if crate::idor_audit::is_forbidden_metadata_or_special_host(&host_name) {
-            bail!(
-                "network engine: refusing cloud metadata / link-local / unspecified host '{host_name}'"
-            );
+        if has_unresolved_vars(&host) {
+            bail!("network host has unresolved template variables");
         }
-        let is_lab_ip = match ip {
-            std::net::IpAddr::V4(v4) => {
-                !v4.is_link_local() && (v4.is_loopback() || v4.is_private())
-            }
-            std::net::IpAddr::V6(v6) => v6.is_loopback(),
-        };
-        if !is_lab_ip {
-            bail!("network engine: refusing non-lab host '{host_name}'");
-        }
+        let (host_name, host_port) = parse_host_and_optional_port(&host);
         let port_list: Vec<u16> = if ports.is_empty() {
             vec![host_port.unwrap_or(80)]
         } else {
             ports.clone()
         };
         for port in port_list {
-            let addr = std::net::SocketAddr::new(ip, port);
+            // Unconditionally deny IMDS/link-local/unspecified & enforce lab scope (Council T5).
+            let addrs =
+                crate::idor_audit::resolve_and_validate_live_addrs(&host_name, port, allow_remote)?;
+            let addr = addrs[0];
             let sock = TcpStream::connect_timeout(&addr, timeout)?;
             sock.set_read_timeout(Some(timeout))?;
             sock.set_write_timeout(Some(timeout))?;
             let mut conn = if tls_enabled(&block.tls) {
-                let _ = rustls::crypto::ring::default_provider().install_default();
-                let cfg = rustls::ClientConfig::builder()
-                    .dangerous()
-                    .with_custom_certificate_verifier(Arc::new(InsecureServerVerifier))
-                    .with_no_client_auth();
+                let is_lab = crate::idor_audit::is_lab_ip(addr.ip());
+                let cfg = build_tls_client_config(is_lab);
                 let server_name = block.sni.clone().unwrap_or_else(|| host_name.clone());
                 let name = rustls::pki_types::ServerName::try_from(server_name)
                     .map_err(|e| anyhow::anyhow!("invalid SNI/server name: {e}"))?;
@@ -1723,6 +1769,7 @@ pub fn execute_ssl_block(
     vars: &Vars,
     extra: &HashMap<String, String>,
     timeout: Duration,
+    allow_remote: bool,
 ) -> Result<Vec<HttpResponse>> {
     let hosts = block
         .host
@@ -1735,34 +1782,18 @@ pub fn execute_ssl_block(
         if has_unresolved_vars(&host) {
             continue;
         }
-        // {{Hostname}} carries host:port (same convention as the network
-        // engine); an explicit block port wins over the target port.
-        let (host_name, target_port): (String, Option<u16>) = if !host.contains('[')
-            && let Some((h, p)) = host.rsplit_once(':')
-        {
-            (h.to_string(), p.parse().ok())
-        } else {
-            (host.clone(), None)
-        };
+        let (host_name, target_port) = parse_host_and_optional_port(&host);
         let port = block.port.or(target_port).unwrap_or(443);
-        if crate::idor_audit::is_forbidden_metadata_or_special_host(&host_name) {
-            bail!(
-                "ssl engine: refusing cloud metadata / link-local / unspecified host '{host_name}'"
-            );
-        }
-        let ssl_check_url = format!("https://{host_name}:{port}");
-        if !crate::idor_audit::is_lab_or_loopback_url(&ssl_check_url).unwrap_or(false) {
-            bail!("ssl engine: refusing non-lab host '{host_name}'");
-        }
-        let mut sock = TcpStream::connect((host_name.as_str(), port))
+        // Unconditionally deny IMDS/link-local/unspecified & enforce lab scope (Council T5).
+        let addrs =
+            crate::idor_audit::resolve_and_validate_live_addrs(&host_name, port, allow_remote)?;
+        let addr = addrs[0];
+        let mut sock = TcpStream::connect_timeout(&addr, timeout)
             .with_context(|| format!("ssl engine: TCP connect to {host_name}:{port}"))?;
         sock.set_read_timeout(Some(timeout))?;
         sock.set_write_timeout(Some(timeout))?;
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let cfg = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(InsecureServerVerifier))
-            .with_no_client_auth();
+        // Certificate-inspection handshake (no application credentials/body sent).
+        let cfg = build_tls_client_config(true);
         let server_name = block.sni.clone().unwrap_or_else(|| host_name.clone());
         let name = rustls::pki_types::ServerName::try_from(server_name)
             .map_err(|e| anyhow::anyhow!("ssl engine: invalid SNI/server name: {e}"))?;
@@ -1824,8 +1855,9 @@ pub fn execute_ws_block(
     vars: &Vars,
     extra: &HashMap<String, String>,
     timeout: Duration,
+    allow_remote: bool,
 ) -> Result<Vec<HttpResponse>> {
-    let raw = block.url.as_deref().unwrap_or("{{base_url}}");
+    let raw = block.url.as_deref().unwrap_or("{{BaseURL}}");
     let mut url = substitute(raw, vars, extra);
     if has_unresolved_vars(&url) {
         bail!("websocket url has unresolved template variables");
@@ -1838,37 +1870,28 @@ pub fn execute_ws_block(
     if !url.starts_with("ws://") && !url.starts_with("wss://") {
         url = format!("ws://{url}");
     }
-    let (mut ws, _resp) = if url.starts_with("wss://") {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let parsed =
-            reqwest::Url::parse(&url).with_context(|| format!("invalid wss:// url '{url}'"))?;
-        let is_lab = parsed
-            .host_str()
-            .map(crate::proxy_mitm::is_lab_host)
-            .unwrap_or(false);
-        let tls_cfg = if is_lab {
-            rustls::ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(InsecureServerVerifier))
-                .with_no_client_auth()
-        } else {
-            let mut roots = rustls::RootCertStore::empty();
-            let loaded = rustls_native_certs::load_native_certs();
-            for cert in loaded.certs {
-                let _ = roots.add(cert);
-            }
-            rustls::ClientConfig::builder()
-                .with_root_certificates(roots)
-                .with_no_client_auth()
-        };
-        let host_str = parsed
-            .host_str()
-            .ok_or_else(|| anyhow::anyhow!("wss:// url missing host: {url}"))?;
-        let port = parsed.port_or_known_default().unwrap_or(443);
-        let tcp = TcpStream::connect((host_str, port))
-            .with_context(|| format!("wss:// TCP connect to {host_str}:{port}"))?;
-        let _ = tcp.set_read_timeout(Some(timeout));
-        let _ = tcp.set_write_timeout(Some(timeout));
+    // Unconditionally enforce IMDS/link-local denial & lab-scope gate on final
+    // substituted WebSocket destination (Council T5).
+    let parsed = crate::idor_audit::validate_live_target_url(&url, allow_remote)?;
+    if !matches!(parsed.scheme(), "ws" | "wss") {
+        bail!("websocket engine requires ws:// or wss:// URL");
+    }
+    let host_str = parsed
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("websocket url missing host: {url}"))?;
+    let port = parsed
+        .port_or_known_default()
+        .unwrap_or(if parsed.scheme() == "wss" { 443 } else { 80 });
+    let addrs = crate::idor_audit::resolve_and_validate_live_addrs(host_str, port, allow_remote)?;
+    let addr = addrs[0];
+    let tcp = TcpStream::connect_timeout(&addr, timeout)
+        .with_context(|| format!("websocket TCP connect to {host_str}:{port}"))?;
+    let _ = tcp.set_read_timeout(Some(timeout));
+    let _ = tcp.set_write_timeout(Some(timeout));
+
+    let (mut ws, _resp) = if parsed.scheme() == "wss" {
+        let is_lab = crate::idor_audit::is_lab_ip(addr.ip());
+        let tls_cfg = build_tls_client_config(is_lab);
         tungstenite::client_tls_with_config(
             &url,
             tcp,
@@ -1877,7 +1900,8 @@ pub fn execute_ws_block(
         )
         .with_context(|| format!("wss:// connect to {url}"))?
     } else {
-        tungstenite::connect(&url).with_context(|| format!("websocket connect to {url}"))?
+        tungstenite::client(&url, tungstenite::stream::MaybeTlsStream::Plain(tcp))
+            .with_context(|| format!("websocket connect to {url}"))?
     };
     set_ws_socket_timeouts(&mut ws, timeout);
     for input in block.inputs.iter().flatten() {
@@ -1927,13 +1951,8 @@ pub fn execute_headless_block(
     vars: &Vars,
     extra: &HashMap<String, String>,
     browser: &mut Option<(crate::cdp_engine::CdpSession, crate::cdp_engine::CdpEngine)>,
+    allow_remote: bool,
 ) -> Result<Vec<HttpResponse>> {
-    if browser.is_none() {
-        let engine = crate::cdp_engine::CdpEngine::launch()?;
-        let session = engine.session()?;
-        *browser = Some((session, engine));
-    }
-    let (session, _engine) = browser.as_mut().expect("headless browser initialized");
     let resolve = |raw: &str| -> String {
         let url = substitute(raw, vars, extra);
         if url.starts_with('/') {
@@ -1942,14 +1961,51 @@ pub fn execute_headless_block(
             url
         }
     };
+    // Pre-validate every navigation target (and default fallback) BEFORE launching
+    // headless Chrome so IMDS/link-local/off-scope URLs fail closed immediately (Council T5).
+    let mut has_navigate_step = false;
+    for step in &block.steps {
+        if step
+            .action
+            .as_deref()
+            .is_some_and(|a| a.eq_ignore_ascii_case("navigate"))
+        {
+            has_navigate_step = true;
+            let url = resolve(step.url.as_deref().unwrap_or("{{BaseURL}}"));
+            if has_unresolved_vars(&url) {
+                bail!("headless navigate url has unresolved template variables");
+            }
+            let parsed = crate::idor_audit::validate_live_target_url(&url, allow_remote)?;
+            if !matches!(parsed.scheme(), "http" | "https") {
+                bail!("headless engine only supports http/https URLs");
+            }
+        }
+    }
+    let fallback_url = resolve("{{BaseURL}}");
+    if !has_navigate_step {
+        let parsed = crate::idor_audit::validate_live_target_url(&fallback_url, allow_remote)?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            bail!("headless engine only supports http/https URLs");
+        }
+    }
+
+    if browser.is_none() {
+        let engine = crate::cdp_engine::CdpEngine::launch()?;
+        let session = engine.session()?;
+        *browser = Some((session, engine));
+    }
+    let (session, _engine) = browser.as_mut().expect("headless browser initialized");
     let mut last_html = String::new();
     let mut navigated = false;
     for step in &block.steps {
         let action = step.action.as_deref().unwrap_or("").to_ascii_lowercase();
         match action.as_str() {
             "navigate" => {
-                let url = resolve(step.url.as_deref().unwrap_or("{{base_url}}"));
-                crate::idor_audit::validate_live_target_url(&url, false)?;
+                let url = resolve(step.url.as_deref().unwrap_or("{{BaseURL}}"));
+                let parsed = crate::idor_audit::validate_live_target_url(&url, allow_remote)?;
+                if !matches!(parsed.scheme(), "http" | "https") {
+                    bail!("headless engine only supports http/https URLs");
+                }
                 let data = session.navigate_and_collect(&url, 800)?;
                 last_html = data.rendered_html;
                 navigated = true;
@@ -1962,7 +2018,7 @@ pub fn execute_headless_block(
         }
     }
     if !navigated {
-        let data = session.navigate_and_collect(&resolve("{{base_url}}"), 800)?;
+        let data = session.navigate_and_collect(&fallback_url, 800)?;
         last_html = data.rendered_html;
     }
     Ok(vec![HttpResponse {
@@ -2136,13 +2192,21 @@ fn collect_yaml_files(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
         return;
     };
     for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if ft.is_symlink() {
+            continue;
+        }
         let p = entry.path();
-        if p.is_dir() {
+        if ft.is_dir() {
             collect_yaml_files(&p, out, depth + 1);
-        } else if matches!(
-            p.extension().and_then(|e| e.to_str()),
-            Some("yaml") | Some("yml")
-        ) {
+        } else if ft.is_file()
+            && matches!(
+                p.extension().and_then(|e| e.to_str()),
+                Some("yaml") | Some("yml")
+            )
+        {
             out.push(p);
         }
     }
@@ -2152,6 +2216,7 @@ fn load_templates_dir(
     dir: &Path,
     max: usize,
 ) -> Result<(Vec<LoadedTemplate>, Vec<SkippedTemplate>, usize)> {
+    const MAX_TEMPLATE_YAML_BYTES: u64 = 512 * 1024;
     if !dir.is_dir() {
         bail!("Templates directory {} does not exist", dir.display());
     }
@@ -2162,7 +2227,21 @@ fn load_templates_dir(
     let mut skipped = Vec::new();
     let mut parse_errors = 0usize;
     for path in yaml_paths.into_iter().take(max) {
-        let Ok(raw) = fs::read_to_string(&path) else {
+        let Ok(file) = fs::File::open(&path) else {
+            parse_errors += 1;
+            continue;
+        };
+        let mut raw_bytes = Vec::new();
+        if file
+            .take(MAX_TEMPLATE_YAML_BYTES + 1)
+            .read_to_end(&mut raw_bytes)
+            .is_err()
+            || raw_bytes.len() > MAX_TEMPLATE_YAML_BYTES as usize
+        {
+            parse_errors += 1;
+            continue;
+        }
+        let Ok(raw) = String::from_utf8(raw_bytes) else {
             parse_errors += 1;
             continue;
         };
@@ -2254,14 +2333,14 @@ fn template_severity(t: &NucleiTemplate) -> String {
 pub fn run_template_audit(cfg: &TemplateRunConfig) -> Result<TemplateRunReport> {
     let target_is_local_path =
         cfg.target.starts_with("file://") || Path::new(cfg.target.as_str()).exists();
-    if !target_is_local_path
-        && !cfg.allow_remote
-        && !crate::idor_audit::is_lab_or_loopback_url(&cfg.target)?
-    {
-        bail!(
-            "Refusing remote target '{}' by default (template scans target loopback/private lab hosts unless `--allow-remote` is explicitly passed for your own staging server).",
-            cfg.target
-        );
+    if !target_is_local_path {
+        let normalized = if cfg.target.contains("://") {
+            cfg.target.clone()
+        } else {
+            format!("http://{}", cfg.target)
+        };
+        // Unconditionally deny IMDS/link-local/unspecified even when `--allow-remote` is set (Council T5).
+        crate::idor_audit::validate_live_target_url(&normalized, cfg.allow_remote)?;
     }
     let started = Instant::now();
     let (templates, mut skipped, parse_errors) =
@@ -2331,6 +2410,13 @@ pub fn run_template_audit(cfg: &TemplateRunConfig) -> Result<TemplateRunReport> 
         // Per-run OOB tokens (blake3(run_nonce || template_id || target)) are
         // injected through the substitution extra-map.
         let mut extra: HashMap<String, String> = HashMap::new();
+        for (k, v) in &tpl.constants {
+            extra.insert(k.clone(), substitute(v, &vars, &HashMap::new()));
+        }
+        for (k, v) in &tpl.variables {
+            let val = substitute(v, &vars, &extra);
+            extra.insert(k.clone(), val);
+        }
         let mut oob_token: Option<String> = None;
         if let Some(oob) = &oob_client {
             let token = oob.token_for_target(&id, &cfg.target);
@@ -2472,7 +2558,13 @@ pub fn run_template_audit(cfg: &TemplateRunConfig) -> Result<TemplateRunReport> 
         }
 
         if !tpl.network.is_empty() {
-            match execute_network_block(&tpl.network[0], &vars, cfg.timeout, &extra) {
+            match execute_network_block(
+                &tpl.network[0],
+                &vars,
+                cfg.timeout,
+                &extra,
+                cfg.allow_remote,
+            ) {
                 Err(e) => block_skips.push(format!("network engine: {e}")),
                 Ok(responses) => {
                     for resp in responses {
@@ -2508,7 +2600,7 @@ pub fn run_template_audit(cfg: &TemplateRunConfig) -> Result<TemplateRunReport> 
 
         // ---- ssl: engine (TLS attribute matching) ----
         if let Some(block) = tpl.ssl.first() {
-            match execute_ssl_block(block, &vars, &extra, cfg.timeout) {
+            match execute_ssl_block(block, &vars, &extra, cfg.timeout, cfg.allow_remote) {
                 Err(e) => block_skips.push(format!("ssl engine: {e}")),
                 Ok(responses) => {
                     for resp in responses {
@@ -2544,7 +2636,7 @@ pub fn run_template_audit(cfg: &TemplateRunConfig) -> Result<TemplateRunReport> 
 
         // ---- websocket: engine (frame round-trip) ----
         for block in &tpl.websocket {
-            match execute_ws_block(block, &vars, &extra, cfg.timeout) {
+            match execute_ws_block(block, &vars, &extra, cfg.timeout, cfg.allow_remote) {
                 Err(e) => block_skips.push(format!("websocket engine: {e}")),
                 Ok(responses) => {
                     for resp in responses {
@@ -2580,7 +2672,13 @@ pub fn run_template_audit(cfg: &TemplateRunConfig) -> Result<TemplateRunReport> 
 
         // ---- headless: engine (rendered-DOM matching via CDP) ----
         if let Some(block) = tpl.headless.first() {
-            match execute_headless_block(block, &vars, &extra, &mut headless_browser) {
+            match execute_headless_block(
+                block,
+                &vars,
+                &extra,
+                &mut headless_browser,
+                cfg.allow_remote,
+            ) {
                 Err(e) => block_skips.push(format!("headless engine: {e}")),
                 Ok(responses) => {
                     for resp in responses {
@@ -3210,5 +3308,68 @@ http:
         .unwrap();
         assert_eq!(report.matched_count, 1);
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn nuclei_all_engines_deny_imds_even_with_allow_remote() {
+        let vars = parse_target("http://127.0.0.1:8080").unwrap();
+        let extra = HashMap::new();
+        let timeout = Duration::from_secs(1);
+
+        // 1. network engine denies IMDS even with allow_remote=true
+        let net_block = NetworkBlock {
+            host: Some(OneOrMany::One("169.254.169.254:80".into())),
+            ..NetworkBlock::default()
+        };
+        assert!(execute_network_block(&net_block, &vars, timeout, &extra, true).is_err());
+
+        // 2. ssl engine denies IPv6 link-local & AWS IPv6 IMDS even with allow_remote=true
+        let ssl_block = SslBlock {
+            host: Some(OneOrMany::One("[fd00:ec2::254]:443".into())),
+            ..SslBlock::default()
+        };
+        assert!(execute_ssl_block(&ssl_block, &vars, &extra, timeout, true).is_err());
+
+        // 3. websocket engine denies IMDS with allow_remote=true AND denies remote without allow_remote
+        let ws_imds = WsBlock {
+            url: Some("ws://169.254.169.254:80/latest".into()),
+            ..WsBlock::default()
+        };
+        assert!(execute_ws_block(&ws_imds, &vars, &extra, timeout, true).is_err());
+        let ws_remote = WsBlock {
+            url: Some("ws://example.com:80/ws".into()),
+            ..WsBlock::default()
+        };
+        assert!(execute_ws_block(&ws_remote, &vars, &extra, timeout, false).is_err());
+
+        // 4. headless engine denies IMDS & file:// BEFORE launching Chrome even with allow_remote=true
+        let mut browser = None;
+        let headless_imds = HeadlessBlock {
+            steps: vec![HeadlessStep {
+                action: Some("navigate".into()),
+                url: Some("http://169.254.169.254/latest/meta-data/".into()),
+                duration: None,
+            }],
+            ..HeadlessBlock::default()
+        };
+        assert!(execute_headless_block(&headless_imds, &vars, &extra, &mut browser, true).is_err());
+        assert!(
+            browser.is_none(),
+            "Chrome must never launch for denied URLs"
+        );
+
+        // 5. HTTP engine denies template-specified IMDS URL even with allow_remote=true
+        let runners = HttpRunners::build_with_scope(timeout, true).unwrap();
+        let http_imds = HttpBlock {
+            method: Some("GET".into()),
+            path: Some(OneOrMany::One(
+                "http://169.254.169.254/latest/meta-data/".into(),
+            )),
+            ..HttpBlock::default()
+        };
+        assert!(matches!(
+            execute_http_block(&runners, &http_imds, &vars, &extra),
+            BlockOutcome::Skipped(_)
+        ));
     }
 }

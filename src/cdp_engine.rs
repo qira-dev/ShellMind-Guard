@@ -33,6 +33,8 @@ const CHROME_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const NAVIGATE_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_DOM_FINDINGS_PER_PAGE: usize = 50;
 const MAX_XHR_ENDPOINTS_PER_PAGE: usize = 200;
+const MAX_PENDING_CDP_RESPONSES: usize = 512;
+const MAX_DEVTOOLS_JSON_BYTES: u64 = 256 * 1024;
 
 /// A DOM source-to-sink flow observed by the injected instrumentation.
 #[derive(Debug, Clone)]
@@ -128,26 +130,32 @@ pub struct CdpEngine {
 
 impl CdpEngine {
     pub fn launch() -> Result<Self> {
+        static PROFILE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let binary = find_chrome_binary()?;
+        let seq = PROFILE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let user_data_dir = std::env::temp_dir().join(format!(
-            "smg-cdp-{}-{}",
+            "smg-cdp-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis())
-                .unwrap_or(0)
+                .unwrap_or(0),
+            seq
         ));
-        std::fs::create_dir_all(&user_data_dir).with_context(|| {
-            format!(
-                "creating private Chrome profile dir at {}",
-                user_data_dir.display()
-            )
-        })?;
-        #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let _ =
-                std::fs::set_permissions(&user_data_dir, std::fs::Permissions::from_mode(0o700));
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            builder.create(&user_data_dir).with_context(|| {
+                format!(
+                    "creating private Chrome profile dir at {}",
+                    user_data_dir.display()
+                )
+            })?;
         }
         let child = Command::new(&binary)
             .arg("--headless=new")
@@ -187,12 +195,15 @@ impl CdpEngine {
 
     /// `PUT /json/new?url=about:blank` (older builds only accept GET).
     fn open_page_target(&self) -> Result<String> {
+        use std::io::Read as _;
+        crate::idor_audit::ensure_rustls_ring_provider();
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
             .build()?;
         let base = format!("http://127.0.0.1:{}/json/new", self.devtools_port);
-        let body = match client.put(format!("{base}?url=about:blank")).send() {
-            Ok(resp) if resp.status().is_success() => resp.text()?,
+        let resp = match client.put(format!("{base}?url=about:blank")).send() {
+            Ok(resp) if resp.status().is_success() => resp,
             _ => {
                 // Older Chrome: GET only.
                 let resp = client
@@ -202,10 +213,14 @@ impl CdpEngine {
                 if !resp.status().is_success() {
                     bail!("CDP /json/new returned {}", resp.status());
                 }
-                resp.text()?
+                resp
             }
         };
-        let parsed: Value = serde_json::from_str(&body).context("parsing /json/new response")?;
+        let mut raw = Vec::new();
+        resp.take(MAX_DEVTOOLS_JSON_BYTES)
+            .read_to_end(&mut raw)
+            .context("reading CDP /json/new response")?;
+        let parsed: Value = serde_json::from_slice(&raw).context("parsing /json/new response")?;
         let entry = if parsed.is_array() {
             parsed
                 .as_array()
@@ -220,6 +235,25 @@ impl CdpEngine {
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("/json/new response missing webSocketDebuggerUrl"))?
             .to_string();
+        let ws_parsed = reqwest::Url::parse(&ws_url)
+            .with_context(|| format!("invalid webSocketDebuggerUrl '{ws_url}'"))?;
+        let is_loopback_ws = ws_parsed.scheme() == "ws"
+            && ws_parsed.port() == Some(self.devtools_port)
+            && ws_parsed
+                .host_str()
+                .map(|h| {
+                    matches!(
+                        h.trim_matches(['[', ']']),
+                        "127.0.0.1" | "::1" | "localhost"
+                    )
+                })
+                .unwrap_or(false);
+        if !is_loopback_ws {
+            bail!(
+                "Refusing unexpected non-loopback or port-mismatched DevTools URL '{ws_url}' (expected port {})",
+                self.devtools_port
+            );
+        }
         Ok(ws_url)
     }
 }
@@ -327,6 +361,9 @@ impl CdpSession {
             return Ok(());
         };
         if let Some(id) = v.get("id").and_then(Value::as_u64) {
+            if self.pending.len() >= MAX_PENDING_CDP_RESPONSES {
+                self.pending.clear();
+            }
             self.pending.insert(id, v);
             return Ok(());
         }
@@ -423,6 +460,12 @@ impl CdpSession {
     /// Navigates to `url`, waits for load + settle, and collects the rendered
     /// DOM, background endpoints, and DOM source-sink findings.
     pub fn navigate_and_collect(&mut self, url: &str, settle_ms: u64) -> Result<CdpPageData> {
+        // Unconditionally deny file://, chrome://, javascript:, IMDS, and link-local
+        // URLs before driving Page.navigate (Council T5).
+        let parsed = crate::idor_audit::validate_live_target_url(url, true)?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            bail!("CDP navigation only permits http:// and https:// URLs");
+        }
         self.load_fired = false;
         self.xhr_urls.clear();
         let id = self.send("Page.navigate", json!({ "url": url }))?;
@@ -488,13 +531,11 @@ const SMG_SOURCE_SINK_JS: &str = r#"(() => {
   if (window.__smgInstalled) return;
   window.__smgInstalled = true;
   const report = [];
-  const srcVals = new Set();
-  let lastSource = 'location';
+  const srcVals = new Map();
   const addSource = (label, value) => {
     const s = value == null ? '' : String(value);
-    if (s.length > 0 && s.length <= 500) {
-      srcVals.add(s);
-      lastSource = label;
+    if (s.length > 0 && s.length <= 500 && srcVals.size < 128) {
+      if (!srcVals.has(s)) srcVals.set(s, label);
     }
   };
   const snapshot = () => {
@@ -523,10 +564,10 @@ const SMG_SOURCE_SINK_JS: &str = r#"(() => {
     if (report.length >= 50 || value == null) return;
     const s = String(value);
     if (s.length < 1) return;
-    for (const v of srcVals) {
+    for (const [v, srcLabel] of srcVals.entries()) {
       const bare = v.replace(/^[?#]/, '');
       if (bare.length >= 4 && s.includes(bare)) {
-        report.push({ source: lastSource, sink, value: s.slice(0, 200) });
+        report.push({ source: srcLabel, sink, value: s.slice(0, 200) });
         return;
       }
     }
@@ -681,6 +722,18 @@ mod tests {
         assert_eq!(data.dom_findings.len(), 1);
         assert_eq!(data.dom_findings[0].source, "location.hash");
         assert_eq!(data.dom_findings[0].sink, "innerHTML");
+
+        // Unconditionally deny IMDS and file:// URLs in navigate_and_collect
+        assert!(
+            session
+                .navigate_and_collect("http://169.254.169.254/latest/meta-data/", 50)
+                .is_err()
+        );
+        assert!(
+            session
+                .navigate_and_collect("file:///etc/passwd", 50)
+                .is_err()
+        );
     }
 
     #[test]

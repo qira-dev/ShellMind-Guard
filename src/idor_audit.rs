@@ -15,9 +15,21 @@ use reqwest::redirect::Policy;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::Path;
+use std::sync::Once;
 use std::time::Duration;
+
+static RUSTLS_PROVIDER_INIT: Once = Once::new();
+
+/// Ensures the `rustls` ring `CryptoProvider` is installed once process-wide
+/// so isolated tests and live-engine invocations never panic with
+/// `No rustls crypto provider is configured`.
+pub(crate) fn ensure_rustls_ring_provider() {
+    RUSTLS_PROVIDER_INIT.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct IdorTestConfig {
@@ -70,29 +82,137 @@ pub struct IdorAuditReport {
     pub outcomes: Vec<IdorCheckOutcome>,
 }
 
+/// Returns true for IP addresses that MUST be unconditionally denied across all
+/// live engines, even when `--allow-remote` is explicitly passed:
+/// - IPv4 link-local (`169.254.0.0/16`, incl. cloud IMDS `169.254.169.254`)
+/// - IPv4 unspecified (`0.0.0.0`)
+/// - IPv6 link-local (`fe80::/10`), unspecified (`::`), AWS IPv6 IMDS (`fd00:ec2::254`),
+///   and IPv4-mapped IPv6 encodings of forbidden IPv4 addresses.
+pub fn is_forbidden_metadata_or_special_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_link_local() || v4.is_unspecified(),
+        IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                mapped.is_link_local() || mapped.is_unspecified()
+            } else {
+                let segs = v6.segments();
+                v6.is_unspecified()
+                    || (segs[0] & 0xffc0) == 0xfe80
+                    || segs == [0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254]
+            }
+        }
+    }
+}
+
+/// Returns true only for loopback or RFC1918 private lab IPs (never link-local/IMDS/unspecified).
+pub fn is_lab_ip(ip: IpAddr) -> bool {
+    if is_forbidden_metadata_or_special_ip(ip) {
+        return false;
+    }
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private(),
+        IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                !mapped.is_link_local()
+                    && !mapped.is_unspecified()
+                    && (mapped.is_loopback() || mapped.is_private())
+            } else {
+                v6.is_loopback()
+            }
+        }
+    }
+}
+
 pub fn is_forbidden_metadata_or_special_host(host: &str) -> bool {
-    let clean = host.trim().trim_matches(['[', ']']).to_ascii_lowercase();
+    let clean = host
+        .trim()
+        .trim_matches(['[', ']'])
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
     if matches!(
         clean.as_str(),
-        "metadata.google.internal" | "metadata.goog" | "metadata.azure.com" | "169.254.169.254"
+        "metadata.google.internal"
+            | "metadata.goog"
+            | "metadata.azure.com"
+            | "169.254.169.254"
+            | "instance-data"
+            | "instance-data.ec2.internal"
+            | "metadata.tencentyun.com"
+            | "metadata.packet.net"
     ) {
         return true;
     }
     if let Ok(ip) = clean.parse::<IpAddr>() {
-        return match ip {
-            IpAddr::V4(v4) => v4.is_link_local() || v4.is_unspecified(),
-            IpAddr::V6(v6) => {
-                if let Some(mapped) = v6.to_ipv4_mapped() {
-                    mapped.is_link_local() || mapped.is_unspecified()
-                } else {
-                    v6.is_unspecified()
-                        || (v6.segments()[0] & 0xffc0) == 0xfe80
-                        || clean == "fd00:ec2::254"
-                }
-            }
-        };
+        return is_forbidden_metadata_or_special_ip(ip);
     }
     false
+}
+
+fn is_local_alias_hostname(host: &str) -> bool {
+    let clean = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    clean == "localhost" || clean.ends_with(".local")
+}
+
+/// Resolves `host:port` and enforces both unconditional IMDS/link-local denial
+/// and lab-scope rules (when `!allow_remote`). Returns the validated socket
+/// addresses so raw TCP engines can connect directly without a second DNS lookup.
+pub fn resolve_and_validate_live_addrs(
+    host: &str,
+    port: u16,
+    allow_remote: bool,
+) -> Result<Vec<SocketAddr>> {
+    let clean = host.trim().trim_matches(['[', ']']);
+    if clean.is_empty() || clean.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        bail!("Invalid or empty target host '{host}'");
+    }
+    if is_forbidden_metadata_or_special_host(clean) {
+        bail!(
+            "Refusing cloud metadata / link-local / unspecified host '{clean}' (unconditionally denied even with --allow-remote)"
+        );
+    }
+    if let Ok(ip) = clean.parse::<IpAddr>() {
+        if is_forbidden_metadata_or_special_ip(ip) {
+            bail!(
+                "Refusing cloud metadata / link-local / unspecified IP '{ip}' (unconditionally denied even with --allow-remote)"
+            );
+        }
+        if !allow_remote && !is_lab_ip(ip) {
+            bail!(
+                "Refusing non-lab remote target '{clean}:{port}' (pass --allow-remote for an explicitly owned staging host)"
+            );
+        }
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+
+    let local_alias = is_local_alias_hostname(clean);
+    if !allow_remote && !local_alias {
+        bail!(
+            "Refusing non-lab remote target '{clean}:{port}' (pass --allow-remote for an explicitly owned staging host)"
+        );
+    }
+
+    let addrs: Vec<SocketAddr> = (clean, port)
+        .to_socket_addrs()
+        .with_context(|| format!("Failed to resolve target host '{clean}:{port}'"))?
+        .collect();
+    if addrs.is_empty() {
+        bail!("Target host '{clean}:{port}' resolved to no addresses");
+    }
+    for addr in &addrs {
+        if is_forbidden_metadata_or_special_ip(addr.ip()) {
+            bail!(
+                "Refusing host '{clean}' resolving to forbidden cloud metadata / link-local / unspecified IP '{}'",
+                addr.ip()
+            );
+        }
+        if !allow_remote && !is_lab_ip(addr.ip()) {
+            bail!(
+                "Refusing local host '{clean}' resolving to non-lab IP '{}'",
+                addr.ip()
+            );
+        }
+    }
+    Ok(addrs)
 }
 
 /// Unified unconditional IMDS / link-local / lab-scope guardrail.
@@ -114,40 +234,47 @@ pub fn validate_live_target_url(raw_url: &str, allow_remote: bool) -> Result<req
             "Refusing cloud metadata / link-local / unspecified host '{host}' (unconditionally denied even with --allow-remote)"
         );
     }
-    if !allow_remote && !is_lab_or_loopback_url(parsed.as_str())? {
+    let clean = host.trim_matches(['[', ']']);
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    if let Ok(ip) = clean.parse::<IpAddr>() {
+        if is_forbidden_metadata_or_special_ip(ip) {
+            bail!(
+                "Refusing cloud metadata / link-local / unspecified IP '{ip}' (unconditionally denied even with --allow-remote)"
+            );
+        }
+        if !allow_remote && !is_lab_ip(ip) {
+            bail!(
+                "Refusing non-lab remote target '{raw_url}' (pass --allow-remote for an explicitly owned staging host)"
+            );
+        }
+        return Ok(parsed);
+    }
+
+    if is_local_alias_hostname(clean) {
+        // Fail closed on DNS failure or forbidden/non-lab resolution for localhost / *.local.
+        let _ = resolve_and_validate_live_addrs(clean, port, allow_remote)?;
+        return Ok(parsed);
+    }
+
+    if !allow_remote {
         bail!(
             "Refusing non-lab remote target '{raw_url}' (pass --allow-remote for an explicitly owned staging host)"
         );
     }
-    Ok(parsed)
-}
 
-pub fn is_lab_or_loopback_url(base_url: &str) -> Result<bool> {
-    let parsed =
-        reqwest::Url::parse(base_url).with_context(|| format!("Invalid base_url '{base_url}'"))?;
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| anyhow::anyhow!("base_url is missing host"))?;
-    if is_forbidden_metadata_or_special_host(host) {
-        return Ok(false);
-    }
-    if host.eq_ignore_ascii_case("localhost") || host.ends_with(".local") {
-        return Ok(true);
-    }
-    if let Ok(ip) = host.trim_matches(['[', ']']).parse::<IpAddr>() {
-        return Ok(match ip {
-            // Explicitly exclude IPv4 link-local (169.254.0.0/16, cloud IMDS 169.254.169.254)
-            IpAddr::V4(v4) => v4.is_loopback() || v4.is_private(),
-            IpAddr::V6(v6) => {
-                if let Some(mapped) = v6.to_ipv4_mapped() {
-                    !mapped.is_link_local() && (mapped.is_loopback() || mapped.is_private())
-                } else {
-                    v6.is_loopback()
-                }
+    // Even when `allow_remote == true`, if DNS resolves the hostname to any
+    // cloud metadata / link-local / unspecified address, unconditionally deny.
+    if let Ok(addrs) = (clean, port).to_socket_addrs() {
+        for addr in addrs {
+            if is_forbidden_metadata_or_special_ip(addr.ip()) {
+                bail!(
+                    "Refusing host '{clean}' resolving to forbidden cloud metadata / link-local / unspecified IP '{}'",
+                    addr.ip()
+                );
             }
-        });
+        }
     }
-    Ok(false)
+    Ok(parsed)
 }
 
 pub fn is_strictly_loopback_url(base_url: &str) -> bool {
@@ -157,13 +284,22 @@ pub fn is_strictly_loopback_url(base_url: &str) -> bool {
     let Some(host) = parsed.host_str() else {
         return false;
     };
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
+    if is_forbidden_metadata_or_special_host(host) {
+        return false;
     }
-    host.trim_matches(['[', ']'])
-        .parse::<IpAddr>()
-        .map(|ip| ip.is_loopback())
-        .unwrap_or(false)
+    let clean = host.trim_matches(['[', ']']);
+    if let Ok(ip) = clean.parse::<IpAddr>() {
+        return ip.is_loopback();
+    }
+    if clean.eq_ignore_ascii_case("localhost") {
+        let port = parsed.port_or_known_default().unwrap_or(80);
+        let Ok(addrs) = (clean, port).to_socket_addrs() else {
+            return false;
+        };
+        let list: Vec<SocketAddr> = addrs.collect();
+        return !list.is_empty() && list.iter().all(|a| a.ip().is_loopback());
+    }
+    false
 }
 
 pub fn run_idor_audit_with_options(
@@ -188,11 +324,9 @@ pub fn run_idor_audit_config_with_options(
     allow_remote: bool,
     allow_mutations: bool,
 ) -> Result<IdorAuditReport> {
-    if !allow_remote && !is_lab_or_loopback_url(&cfg.base_url)? {
-        bail!(
-            "Refusing remote target '{}' by default (IDOR regression checks target loopback/private lab hosts unless `--allow-remote` is explicitly passed for your own staging server).",
-            cfg.base_url
-        );
+    let base_parsed = validate_live_target_url(&cfg.base_url, allow_remote)?;
+    if !matches!(base_parsed.scheme(), "http" | "https") {
+        bail!("IDOR audit requires http:// or https:// base_url");
     }
     if allow_mutations && !is_strictly_loopback_url(&cfg.base_url) {
         bail!(
@@ -200,8 +334,16 @@ pub fn run_idor_audit_config_with_options(
             cfg.base_url
         );
     }
+    if !cfg.checks.is_empty()
+        && !cfg.user_a_headers.is_empty()
+        && cfg.user_a_headers == cfg.user_b_headers
+    {
+        bail!(
+            "IDOR config must define two distinct authenticated test principals (`user_a_headers` and `user_b_headers` are identical)"
+        );
+    }
 
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    ensure_rustls_ring_provider();
     let client = Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(10))
@@ -244,7 +386,19 @@ pub fn run_idor_audit_config_with_options(
             });
             continue;
         }
-        let url = format!("{base}/{}", chk.path.trim_start_matches('/'));
+        let clean_path = chk.path.trim_start_matches('/');
+        let url = format!("{base}/{clean_path}");
+        let parsed_check = validate_live_target_url(&url, allow_remote)?;
+        if parsed_check.scheme() != base_parsed.scheme()
+            || parsed_check.host_str() != base_parsed.host_str()
+            || parsed_check.port_or_known_default() != base_parsed.port_or_known_default()
+        {
+            bail!(
+                "Refusing IDOR check '{}' whose resolved URL '{}' leaves base_url origin",
+                chk.name,
+                parsed_check
+            );
+        }
 
         let (st_a, body_a) = send_with_headers(
             &client,
@@ -263,6 +417,12 @@ pub fn run_idor_audit_config_with_options(
         let (st_u, body_u) =
             send_with_headers(&client, method, &url, &HashMap::new(), chk.body.as_ref())?;
 
+        let owner_marker_present_a = chk
+            .owner_marker
+            .as_deref()
+            .filter(|m| !m.is_empty())
+            .map(|m| body_a.contains(m))
+            .unwrap_or(true);
         let marker_leaked_b = chk
             .owner_marker
             .as_deref()
@@ -300,6 +460,19 @@ pub fn run_idor_audit_config_with_options(
             (
                 "INCONCLUSIVE".to_string(),
                 format!("Owner user_a baseline returned HTTP {st_a} (expected 2xx)"),
+            )
+        } else if !owner_marker_present_a {
+            (
+                "INCONCLUSIVE".to_string(),
+                "Owner user_a 2xx baseline response did not contain configured owner_marker"
+                    .to_string(),
+            )
+        } else if st_b >= 500 || st_u >= 500 {
+            (
+                "INCONCLUSIVE".to_string(),
+                format!(
+                    "Server error during authorization probe (user_b={st_b}, unauth={st_u}); cannot certify PASS"
+                ),
             )
         } else {
             (
@@ -347,7 +520,8 @@ fn send_with_headers(
         .with_context(|| format!("HTTP request failed for {url}"))?;
     let status = resp.status().as_u16();
     let mut buf = Vec::new();
-    let _ = std::io::Read::read_to_end(&mut std::io::Read::take(resp, 2 * 1024 * 1024), &mut buf);
+    std::io::Read::read_to_end(&mut std::io::Read::take(resp, 2 * 1024 * 1024), &mut buf)
+        .with_context(|| format!("Failed reading HTTP response body from {url}"))?;
     let body = String::from_utf8_lossy(&buf).into_owned();
     Ok((status, body))
 }
@@ -445,5 +619,45 @@ mod tests {
             checks: vec![],
         };
         assert!(run_idor_audit_config(&cfg, false).is_err());
+    }
+
+    #[test]
+    fn unconditionally_denies_imds_and_link_local_even_with_allow_remote() {
+        let forbidden = [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://2852039166/latest/meta-data/",
+            "http://[::ffff:169.254.169.254]/latest/meta-data/",
+            "http://[fe80::1]/",
+            "http://[fd00:ec2::254]/latest/meta-data/",
+            "http://[fd00:0ec2:0:0:0:0:0:254]/latest/meta-data/",
+            "http://0.0.0.0/",
+            "http://[::]/",
+            "http://metadata.google.internal/computeMetadata/v1/",
+            "http://metadata.google.internal./computeMetadata/v1/",
+            "https://metadata.azure.com/metadata/instance",
+            "http://user:pass@127.0.0.1:8080/",
+            "file:///etc/passwd",
+        ];
+        for url in forbidden {
+            assert!(
+                validate_live_target_url(url, true).is_err(),
+                "must deny {url} even with allow_remote=true"
+            );
+            assert!(
+                validate_live_target_url(url, false).is_err(),
+                "must deny {url} with allow_remote=false"
+            );
+        }
+        assert!(validate_live_target_url("http://127.0.0.1:8080/api", false).is_ok());
+        assert!(validate_live_target_url("http://[::1]:8080/api", false).is_ok());
+
+        // IDOR audit must also deny IMDS even when allow_remote == true
+        let cfg = IdorTestConfig {
+            base_url: "http://169.254.169.254".into(),
+            user_a_headers: HashMap::new(),
+            user_b_headers: HashMap::new(),
+            checks: vec![],
+        };
+        assert!(run_idor_audit_config(&cfg, true).is_err());
     }
 }

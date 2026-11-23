@@ -766,6 +766,27 @@ fn normalize_response_body(body: &str) -> String {
     serde_json::to_string(&parsed).unwrap_or_else(|_| body.to_string())
 }
 
+/// Token-level Jaccard similarity percentage (0..=100) so same-length
+/// different-content responses (e.g. `{"user":"alice"}` vs `{"error":"none"}`)
+/// are still distinguished cleanly.
+fn token_similarity_pct(a: &str, b: &str) -> usize {
+    use std::collections::HashSet;
+    fn tok(s: &str) -> HashSet<&str> {
+        s.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .filter(|t| !t.is_empty())
+            .take(512)
+            .collect()
+    }
+    let sa = tok(a);
+    let sb = tok(b);
+    let union = sa.union(&sb).count();
+    if union == 0 {
+        return if a == b { 100 } else { 0 };
+    }
+    let inter = sa.intersection(&sb).count();
+    (inter * 100) / union
+}
+
 fn body_close(a: &Response, b: &Response) -> bool {
     if a.status != b.status {
         return false;
@@ -779,7 +800,7 @@ fn body_close(a: &Response, b: &Response) -> bool {
     }
     let max = na.len().max(nb.len()).max(1);
     let delta = (na.len() as i64 - nb.len() as i64).unsigned_abs() as usize;
-    delta * 100 / max <= 2
+    delta * 100 / max <= 2 && token_similarity_pct(&na, &nb) >= 70
 }
 
 fn body_diverges(a: &Response, b: &Response) -> bool {
@@ -795,7 +816,7 @@ fn body_diverges(a: &Response, b: &Response) -> bool {
     }
     let max = na.len().max(nb.len()).max(1);
     let delta = (na.len() as i64 - nb.len() as i64).unsigned_abs() as usize;
-    delta * 100 / max > 5
+    delta * 100 / max > 5 || token_similarity_pct(&na, &nb) < 60
 }
 
 fn median_f64(samples: &mut [f64]) -> f64 {
@@ -871,11 +892,9 @@ fn original_value_of(cfg: &SqliAuditConfig, url: &reqwest::Url, pref: &ParamRef)
 }
 
 pub fn run_sqli_audit(cfg: &SqliAuditConfig) -> Result<SqliAuditReport> {
-    if !cfg.allow_remote && !crate::idor_audit::is_lab_or_loopback_url(&cfg.url)? {
-        bail!(
-            "Refusing remote target '{}' by default (SQLi verification targets loopback/private lab hosts unless `--allow-remote` is explicitly passed for your own staging server).",
-            cfg.url
-        );
+    let url = crate::idor_audit::validate_live_target_url(&cfg.url, cfg.allow_remote)?;
+    if !matches!(url.scheme(), "http" | "https") {
+        bail!("SQLi verification requires an http:// or https:// target URL");
     }
     let method = cfg.method.to_ascii_uppercase();
     if !matches!(method.as_str(), "GET" | "POST") {
@@ -887,7 +906,7 @@ pub fn run_sqli_audit(cfg: &SqliAuditConfig) -> Result<SqliAuditReport> {
         bail!("POST requires a --data body (urlencoded or JSON)");
     }
 
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    crate::idor_audit::ensure_rustls_ring_provider();
     let safe_delay = cfg.delay_secs.clamp(1, 30);
     let client = Client::builder()
         .connect_timeout(Duration::from_secs(5))
@@ -901,7 +920,6 @@ pub fn run_sqli_audit(cfg: &SqliAuditConfig) -> Result<SqliAuditReport> {
         .build()?;
 
     // Determine the parameter set across all testable surfaces.
-    let url = reqwest::Url::parse(cfg.url.trim())?;
     let mut prefs: Vec<ParamRef> = Vec::new();
     let json_value = if body_is_json(cfg) {
         cfg.body
@@ -1031,6 +1049,7 @@ pub fn run_sqli_audit(cfg: &SqliAuditConfig) -> Result<SqliAuditReport> {
         };
 
         let baseline = send_injectable(&client, &inj, &method, &cfg.headers);
+        let mut probes_succeeded = 0usize;
 
         if let Ok(base) = &baseline {
             let orig_value = original_value_of(cfg, &url, pref);
@@ -1042,6 +1061,7 @@ pub fn run_sqli_audit(cfg: &SqliAuditConfig) -> Result<SqliAuditReport> {
             // 1. Error-based
             for payload in ERROR_PROBES {
                 if let Ok(resp) = send_probe(payload) {
+                    probes_succeeded += 1;
                     let haystack = format!("{}\n{}", resp.body, resp.status);
                     if let Some((db, sig)) = scan_error_signatures(&haystack) {
                         result.error_based = Some(TechniqueEvidence {
@@ -1076,6 +1096,7 @@ pub fn run_sqli_audit(cfg: &SqliAuditConfig) -> Result<SqliAuditReport> {
             let t1 = send_probe(&true_payload);
             let f1 = send_probe(&false_payload);
             if let (Ok(t1), Ok(f1)) = (&t1, &f1) {
+                probes_succeeded += 2;
                 let truthy_matches = body_close(t1, base);
                 let falsy_diverges = body_diverges(f1, base) && !body_close(f1, t1);
                 if truthy_matches
@@ -1101,9 +1122,9 @@ pub fn run_sqli_audit(cfg: &SqliAuditConfig) -> Result<SqliAuditReport> {
                 }
             }
 
-            // 3. Time-based (only when quick checks were inconclusive; bounded)
+            // 3. Time-based (only when quick checks were inconclusive; bounded, single-statement only)
             if result.error_based.is_none() && result.boolean_based.is_none() && !cfg.skip_timing {
-                let delay = cfg.delay_secs;
+                let delay = safe_delay;
                 let baseline_median = {
                     let mut samples = Vec::new();
                     for _ in 0..TIME_BASELINE_REPS {
@@ -1113,14 +1134,11 @@ pub fn run_sqli_audit(cfg: &SqliAuditConfig) -> Result<SqliAuditReport> {
                     }
                     median_f64(&mut samples)
                 };
+                // Strictly single-statement timing expressions (never stacked `;` queries).
                 let families: Vec<(&str, String)> = if numeric {
                     vec![
                         ("MySQL/MariaDB", format!("{orig_value} AND sleep({delay})")),
                         ("PostgreSQL", format!("{orig_value} AND pg_sleep({delay})")),
-                        (
-                            "MSSQL",
-                            format!("{orig_value} AND WAITFOR DELAY '0:0:{delay}'"),
-                        ),
                     ]
                 } else {
                     vec![
@@ -1129,10 +1147,6 @@ pub fn run_sqli_audit(cfg: &SqliAuditConfig) -> Result<SqliAuditReport> {
                             format!("{orig_value}' AND sleep({delay})-- "),
                         ),
                         ("PostgreSQL", format!("{orig_value}'||pg_sleep({delay})||'")),
-                        (
-                            "MSSQL",
-                            format!("{orig_value}'; WAITFOR DELAY '0:0:{delay}'-- "),
-                        ),
                     ]
                 };
                 for (db, payload) in &families {
@@ -1140,6 +1154,7 @@ pub fn run_sqli_audit(cfg: &SqliAuditConfig) -> Result<SqliAuditReport> {
                     for _ in 0..TIME_PAYLOAD_REPS {
                         let t0 = Instant::now();
                         if send_probe(payload).is_ok() {
+                            probes_succeeded += 1;
                             samples.push(t0.elapsed().as_secs_f64());
                         }
                     }
@@ -1174,6 +1189,7 @@ pub fn run_sqli_audit(cfg: &SqliAuditConfig) -> Result<SqliAuditReport> {
                 };
                 match send_probe(&payload) {
                     Ok(resp) => {
+                        probes_succeeded += 1;
                         let broke = scan_error_signatures(&resp.body).is_some()
                             || resp.status != base.status
                             || body_diverges(&resp, base);
@@ -1197,7 +1213,7 @@ pub fn run_sqli_audit(cfg: &SqliAuditConfig) -> Result<SqliAuditReport> {
         {
             vulnerable += 1;
             "VULNERABLE".into()
-        } else if baseline.is_ok() {
+        } else if baseline.is_ok() && probes_succeeded > 0 {
             "CLEAN".into()
         } else {
             "INCONCLUSIVE".into()
@@ -1532,6 +1548,25 @@ mod tests {
     fn refuses_remote_host_without_explicit_flag() {
         let err = run_sqli_audit(&cfg_for("https://example.com/item?id=1", |_| {}));
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn refuses_imds_even_with_allow_remote_and_detects_same_length_divergence() {
+        let err = run_sqli_audit(&cfg_for("http://169.254.169.254/latest?id=1", |c| {
+            c.allow_remote = true;
+        }));
+        assert!(err.is_err());
+
+        let a = Response {
+            status: 200,
+            body: r#"{"status":"ok","user":"alice"}"#.into(),
+        };
+        let b = Response {
+            status: 200,
+            body: r#"{"error":"denied","role":"none"}"#.into(),
+        };
+        assert!(!body_close(&a, &b));
+        assert!(body_diverges(&a, &b));
     }
 
     #[test]

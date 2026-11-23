@@ -20,29 +20,51 @@ pub const H2_FRAME_SETTINGS: u8 = 0x04;
 pub const H2_FLAG_END_STREAM: u8 = 0x01;
 pub const H2_FLAG_END_HEADERS: u8 = 0x04;
 
+/// RFC 9113 default maximum HTTP/2 frame payload size (`SETTINGS_MAX_FRAME_SIZE`).
+pub const H2_DEFAULT_MAX_FRAME_SIZE: usize = 16_384;
+
 /// Builds a wire-valid RFC 9113 §4.1 9-byte HTTP/2 frame header + payload.
+/// Payload lengths exceeding 24-bit frame capacity (`0x00FF_FFFF`) are clamped safely.
 pub fn build_h2_frame(frame_type: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
-    let len = payload.len() as u32;
+    let clamped_len = payload.len().min(0x00FF_FFFF);
+    let len = clamped_len as u32;
     let sid = stream_id & 0x7FFF_FFFF;
-    let mut out = Vec::with_capacity(9 + payload.len());
+    let mut out = Vec::with_capacity(9 + clamped_len);
     out.push(((len >> 16) & 0xFF) as u8);
     out.push(((len >> 8) & 0xFF) as u8);
     out.push((len & 0xFF) as u8);
     out.push(frame_type);
     out.push(flags);
     out.extend_from_slice(&sid.to_be_bytes());
-    out.extend_from_slice(payload);
+    out.extend_from_slice(&payload[..clamped_len]);
     out
 }
 
-/// Encodes a minimal literal-without-indexing HPACK header block (`:method`, `:path`, `:scheme`, `:authority`).
+/// Encodes an RFC 7541 §5.1 7-bit prefix non-Huffman string length (`H = 0`) followed by raw bytes.
+fn push_hpack_string(buf: &mut Vec<u8>, s: &str) {
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    if len < 127 {
+        buf.push(len as u8); // H = 0 (bit 7 clear)
+    } else {
+        buf.push(0x7F); // H = 0, 7-bit prefix = 127
+        let mut rem = len - 127;
+        while rem >= 128 {
+            buf.push(((rem & 0x7F) as u8) | 0x80);
+            rem >>= 7;
+        }
+        buf.push(rem as u8);
+    }
+    buf.extend_from_slice(bytes);
+}
+
+/// Encodes a minimal literal-without-indexing HPACK header block (`:method`, `:path`, `:scheme`, `:authority`)
+/// using valid RFC 7541 §5.1 7-bit prefix integers (safe for headers/paths >= 128 bytes).
 pub fn encode_hpack_literal_headers(method: &str, path: &str, authority: &str) -> Vec<u8> {
     fn push_hdr(buf: &mut Vec<u8>, name: &str, val: &str) {
         buf.push(0x00); // Literal Header Field without Indexing — New Name
-        buf.push(name.len() as u8);
-        buf.extend_from_slice(name.as_bytes());
-        buf.push(val.len() as u8);
-        buf.extend_from_slice(val.as_bytes());
+        push_hpack_string(buf, name);
+        push_hpack_string(buf, val);
     }
     let mut block = Vec::new();
     push_hdr(&mut block, ":method", method);
@@ -78,6 +100,18 @@ pub fn build_h2_single_packet_burst(
     let effective_body = if body.is_empty() { b"{}" } else { body };
     let (prefix_body, final_byte) = effective_body.split_at(effective_body.len() - 1);
     let hpack = encode_hpack_literal_headers(method, path, authority);
+    if hpack.len() > H2_DEFAULT_MAX_FRAME_SIZE {
+        bail!(
+            "HTTP/2 HPACK header block ({} bytes) exceeds default SETTINGS_MAX_FRAME_SIZE ({H2_DEFAULT_MAX_FRAME_SIZE})",
+            hpack.len()
+        );
+    }
+    if prefix_body.len() > H2_DEFAULT_MAX_FRAME_SIZE {
+        bail!(
+            "HTTP/2 DATA payload ({} bytes) exceeds default SETTINGS_MAX_FRAME_SIZE ({H2_DEFAULT_MAX_FRAME_SIZE})",
+            prefix_body.len()
+        );
+    }
 
     let mut staged_prefix = Vec::new();
     staged_prefix.extend_from_slice(H2_CLIENT_PREFACE);
@@ -255,6 +289,18 @@ mod tests {
             execute_loopback_h2_single_packet_race(remote, &burst, Duration::from_millis(100))
                 .is_err()
         );
+
+        // RFC 7541 7-bit HPACK integer encoding for paths >= 128 bytes must NOT set Huffman bit 0x80
+        let long_path = format!("/api/{}", "a".repeat(150));
+        let hpack = encode_hpack_literal_headers("GET", &long_path, "127.0.0.1:8080");
+        // After `:method` (1+1+7+1+3=13 bytes), `:path` starts with 0x00, 0x05, ":path", 0x7F, (155-127)=28
+        let path_marker = b":path";
+        let pos = hpack
+            .windows(path_marker.len())
+            .position(|w| w == path_marker)
+            .unwrap();
+        assert_eq!(hpack[pos + 5], 0x7F);
+        assert_eq!(hpack[pos + 6], (long_path.len() - 127) as u8);
     }
 
     #[test]

@@ -18,7 +18,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Sender, channel};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -26,7 +26,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const MAX_HEAD: usize = 64 * 1024;
 const MAX_REQUEST_BODY: usize = 8 * 1024 * 1024;
 const MAX_RESPONSE_CAPTURE: usize = 8 * 1024 * 1024;
+const MAX_PROXY_CONNS: usize = 128;
 pub const DEFAULT_CAPTURE_LIMIT: usize = 256 * 1024;
+
+struct ProxyConnGuard(Arc<AtomicUsize>);
+impl Drop for ProxyConnGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ProxyConfig {
@@ -129,14 +137,26 @@ pub fn start_proxy(cfg: ProxyConfig) -> Result<ProxyHandle> {
     let (log_tx, log_rx) = channel::<Arc<ProxyEntry>>();
     let log_path = cfg.jsonl_log.clone();
     let log_enabled = log_path.is_some();
+    if let Some(ref path) = log_path
+        && let Ok(meta) = std::fs::symlink_metadata(path)
+        && meta.file_type().is_symlink()
+    {
+        bail!(
+            "Refusing to write proxy JSONL log to symlink {}",
+            path.display()
+        );
+    }
     if log_enabled {
         thread::spawn(move || {
             let Some(path) = log_path else { return };
-            let Ok(mut file) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-            else {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.create(true).append(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let Ok(mut file) = opts.open(path) else {
                 return;
             };
             for entry in log_rx.iter() {
@@ -165,6 +185,7 @@ pub fn start_proxy(cfg: ProxyConfig) -> Result<ProxyHandle> {
         log_tx: ctx.log_tx.clone(),
         mitm: ctx.mitm.clone(),
     };
+    let active_conns = Arc::new(AtomicUsize::new(0));
     let listener_thread = thread::spawn(move || {
         loop {
             if stop_flag.load(Ordering::Relaxed) {
@@ -172,13 +193,22 @@ pub fn start_proxy(cfg: ProxyConfig) -> Result<ProxyHandle> {
             }
             match listener.accept() {
                 Ok((mut stream, _peer)) => {
+                    let prev = active_conns.fetch_add(1, Ordering::AcqRel);
+                    if prev >= MAX_PROXY_CONNS {
+                        active_conns.fetch_sub(1, Ordering::AcqRel);
+                        drop(stream);
+                        continue;
+                    }
                     let _ = stream.set_nonblocking(false);
                     let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
                     let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
                     {
                         let mut s = match listener_ctx.summary.lock() {
                             Ok(s) => s,
-                            Err(_) => continue,
+                            Err(_) => {
+                                active_conns.fetch_sub(1, Ordering::AcqRel);
+                                continue;
+                            }
                         };
                         s.connections += 1;
                     }
@@ -190,7 +220,9 @@ pub fn start_proxy(cfg: ProxyConfig) -> Result<ProxyHandle> {
                         log_tx: listener_ctx.log_tx.clone(),
                         mitm: listener_ctx.mitm.clone(),
                     };
+                    let guard = ProxyConnGuard(Arc::clone(&active_conns));
                     thread::spawn(move || {
+                        let _guard = guard;
                         let _ = handle_connection(&mut stream, &conn_ctx);
                     });
                 }
@@ -332,11 +364,36 @@ fn intercept_http<S: Read + Write>(
     opts: InterceptOpts<'_>,
 ) -> Result<()> {
     let headers = parse_headers(head);
-    let content_length = headers
+    let cl_values: Vec<&str> = headers
         .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
-        .and_then(|(_, v)| v.parse::<usize>().ok())
-        .unwrap_or(0);
+        .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+        .map(|(_, v)| v.as_str())
+        .collect();
+    let has_te = headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("transfer-encoding"));
+    if has_te && !cl_values.is_empty() {
+        let _ = stream.write_all(
+            b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        bail!("Refusing ambiguous request carrying both Transfer-Encoding and Content-Length");
+    }
+    let mut parsed_cl: Option<usize> = None;
+    for raw_cl in &cl_values {
+        let v = raw_cl
+            .parse::<usize>()
+            .map_err(|_| anyhow::anyhow!("Invalid Content-Length header '{raw_cl}'"))?;
+        if let Some(prev) = parsed_cl
+            && prev != v
+        {
+            let _ = stream.write_all(
+                b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+            bail!("Refusing conflicting duplicate Content-Length headers ({prev} vs {v})");
+        }
+        parsed_cl = Some(v);
+    }
+    let content_length = parsed_cl.unwrap_or(0);
     let host = headers
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("host"))
@@ -372,6 +429,9 @@ fn intercept_http<S: Read + Write>(
             };
             let parsed = reqwest::Url::parse(&url)?;
             if parsed.scheme().eq_ignore_ascii_case("https") {
+                let _ = stream.write_all(
+                    b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
                 bail!(
                     "Refusing plaintext forwarding for absolute-form https:// request '{}'; use HTTP CONNECT tunneling",
                     parsed.as_str()
@@ -419,13 +479,21 @@ fn intercept_http<S: Read + Write>(
 
     let started = Instant::now();
 
-    // Rebuild origin-form request: strip hop-by-hop headers + compression.
+    // Rebuild origin-form request: strip hop-by-hop headers + compression + proxy creds.
     let mut out_head = format!("{method} {path_and_query} HTTP/1.1\r\n");
     for (k, v) in &headers {
         let kl = k.to_ascii_lowercase();
         if matches!(
             kl.as_str(),
-            "connection" | "proxy-connection" | "keep-alive" | "accept-encoding" | "content-length"
+            "connection"
+                | "proxy-connection"
+                | "proxy-authorization"
+                | "keep-alive"
+                | "te"
+                | "trailers"
+                | "transfer-encoding"
+                | "accept-encoding"
+                | "content-length"
         ) {
             continue;
         }
@@ -442,9 +510,24 @@ fn intercept_http<S: Read + Write>(
     let mut origin: OriginConn = match opts.origin_conn {
         Some(conn) => conn,
         None => {
-            let s = TcpStream::connect((origin_host.as_str(), origin_port)).with_context(|| {
-                format!("proxy could not reach origin {origin_host}:{origin_port}")
-            })?;
+            // Unconditionally deny cloud metadata / link-local / unspecified destinations
+            // even if `--allow-remote-bind` was passed (Council T5).
+            let addrs = match crate::idor_audit::resolve_and_validate_live_addrs(
+                &origin_host,
+                origin_port,
+                true,
+            ) {
+                Ok(a) => a,
+                Err(e) => {
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                    return Err(e);
+                }
+            };
+            let s = TcpStream::connect_timeout(&addrs[0], Duration::from_secs(15)).with_context(
+                || format!("proxy could not reach origin {origin_host}:{origin_port}"),
+            )?;
             s.set_read_timeout(Some(Duration::from_secs(30)))?;
             s.set_write_timeout(Some(Duration::from_secs(30)))?;
             OriginConn::Plain(s)
@@ -511,8 +594,22 @@ fn tunnel(stream: &mut TcpStream, target: &str, ctx: &ConnCtx) -> Result<()> {
     if let Some(mitm) = &ctx.mitm {
         return tunnel_mitm(stream, target, mitm, ctx);
     }
+    let (host, port) = parse_connect_target(target)?;
+    // Unconditionally deny cloud metadata / link-local / unspecified tunnels (Council T5).
+    let addrs = match crate::idor_audit::resolve_and_validate_live_addrs(&host, port, true) {
+        Ok(a) => a,
+        Err(e) => {
+            let _ = stream.write_all(
+                b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+            if let Ok(mut s) = ctx.summary.lock() {
+                s.errors += 1;
+            }
+            return Err(e);
+        }
+    };
     let started = Instant::now();
-    match TcpStream::connect(target) {
+    match TcpStream::connect_timeout(&addrs[0], Duration::from_secs(15)) {
         Ok(mut origin) => {
             stream.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")?;
             stream.flush()?;
@@ -597,6 +694,15 @@ fn parse_connect_target(target: &str) -> Result<(String, u16)> {
 /// tunnel) plus WebSocket upgrade logging (`kind: "ws"`).
 fn tunnel_mitm(stream: &mut TcpStream, target: &str, mitm: &MitmCa, ctx: &ConnCtx) -> Result<()> {
     let (host, port) = parse_connect_target(target)?;
+    // Unconditionally deny IMDS/link-local/unspecified BEFORE confirming 200 Connection established.
+    if let Err(e) = crate::idor_audit::resolve_and_validate_live_addrs(&host, port, true) {
+        let _ = stream
+            .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        if let Ok(mut s) = ctx.summary.lock() {
+            s.errors += 1;
+        }
+        return Err(e);
+    }
     // The tunnel is established first; the TLS handshake happens over it.
     stream.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")?;
     stream.flush()?;
@@ -985,5 +1091,39 @@ mod tests {
         let content = std::fs::read_to_string(&log_path).unwrap_or_default();
         assert!(content.contains("\"kind\":\"http\""), "log: {content}");
         let _ = std::fs::remove_file(&log_path);
+    }
+
+    #[test]
+    fn proxy_unconditionally_denies_imds_http_and_connect() {
+        let handle = start_proxy(test_config(None)).unwrap();
+
+        let http_resp = send_via_proxy(
+            handle.bound_addr,
+            "GET http://169.254.169.254/latest/meta-data/ HTTP/1.1\r\nHost: 169.254.169.254\r\n\r\n",
+        );
+        assert!(
+            http_resp.contains("403 Forbidden"),
+            "IMDS HTTP request must return 403, got: {http_resp}"
+        );
+
+        let connect_resp = send_via_proxy(
+            handle.bound_addr,
+            "CONNECT 169.254.169.254:80 HTTP/1.1\r\nHost: 169.254.169.254:80\r\n\r\n",
+        );
+        assert!(
+            connect_resp.contains("403 Forbidden"),
+            "IMDS CONNECT tunnel must return 403, got: {connect_resp}"
+        );
+
+        let abs_https_resp = send_via_proxy(
+            handle.bound_addr,
+            "GET https://127.0.0.1:443/secret HTTP/1.1\r\nHost: 127.0.0.1:443\r\n\r\n",
+        );
+        assert!(
+            abs_https_resp.contains("502 Bad Gateway"),
+            "absolute-form https:// must return 502 instead of plaintext downgrade, got: {abs_https_resp}"
+        );
+
+        handle.stop.store(true, Ordering::Relaxed);
     }
 }
