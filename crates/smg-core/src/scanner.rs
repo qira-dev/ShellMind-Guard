@@ -128,10 +128,10 @@ impl Language {
                     | "swagger.yaml"
                     | "swagger.yml"
             )
-            || (fname == ".env"
-                || (fname.starts_with(".env.")
+            || (low_fname == ".env"
+                || (low_fname.starts_with(".env.")
                     && !matches!(
-                        fname,
+                        low_fname.as_str(),
                         ".env.example" | ".env.sample" | ".env.template" | ".env.dist"
                     )))
         {
@@ -424,6 +424,7 @@ pub fn scan_repository_with_options(
         })
         .build();
 
+    let mut seen_rel: std::collections::HashSet<String> = std::collections::HashSet::new();
     for entry in walker.flatten() {
         if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
             continue;
@@ -443,9 +444,64 @@ pub fn scan_repository_with_options(
                 skipped.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
-            candidate_paths.push((path.to_path_buf(), rel_norm, lang));
+            if seen_rel.insert(rel_norm.clone()) {
+                candidate_paths.push((path.to_path_buf(), rel_norm, lang));
+            }
         } else {
             skipped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    // Council CASE-001 T1: Bounded sensitive-file discovery pass so `.gitignore`
+    // (including ignored ancestor directories) never blinds working-tree secret scanning
+    // while still honoring built-in hard-prunes (`node_modules`, `venv`, `target`, `.git`).
+    const MAX_EXTRA_SENSITIVE_FILES: usize = 2048;
+    let root_for_sens = canon_root.clone();
+    let ignore_for_sens = ignore_set.clone();
+    let sens_walker = WalkBuilder::new(&canon_root)
+        .hidden(false)
+        .follow_links(false)
+        .require_git(false)
+        .ignore(false)
+        .git_ignore(false)
+        .git_global(false)
+        .git_exclude(false)
+        .threads(1)
+        .filter_entry(move |entry| {
+            should_visit_entry(entry, &root_for_sens, &ignore_for_sens, include_tests)
+        })
+        .build();
+    let mut extra_sens = 0usize;
+    for entry in sens_walker.flatten() {
+        if extra_sens >= MAX_EXTRA_SENSITIVE_FILES {
+            break;
+        }
+        if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+            continue;
+        }
+        let low = entry.file_name().to_string_lossy().to_ascii_lowercase();
+        let is_high_val = low == ".env"
+            || (low.starts_with(".env.")
+                && !matches!(
+                    low.as_str(),
+                    ".env.example" | ".env.sample" | ".env.template" | ".env.dist"
+                ))
+            || low.ends_with(".pem")
+            || low.ends_with(".key")
+            || low.ends_with(".p12")
+            || low.ends_with(".pfx")
+            || low == "id_rsa"
+            || low == "id_ed25519";
+        if !is_high_val {
+            continue;
+        }
+        let path = entry.path();
+        if let Ok(rel) = path.strip_prefix(&canon_root) {
+            let rel_norm = rel.to_string_lossy().replace('\\', "/");
+            if seen_rel.insert(rel_norm.clone()) {
+                candidate_paths.push((path.to_path_buf(), rel_norm, Language::Config));
+                extra_sens += 1;
+            }
         }
     }
 
@@ -517,12 +573,26 @@ pub fn scan_repository_with_options(
                 }
                 let hash = blake3::hash(&bytes).to_hex().to_string();
                 let cached_bytes = if bytes.len() <= 256 * 1024 {
-                    let prev = cached_budget_used.fetch_add(bytes.len(), Ordering::Relaxed);
-                    if prev.saturating_add(bytes.len()) <= MAX_TOTAL_CACHED_BYTES {
-                        Some(bytes)
-                    } else {
-                        None
+                    let mut reserved = false;
+                    let mut cur = cached_budget_used.load(Ordering::Relaxed);
+                    while let Some(next) = cur.checked_add(bytes.len()) {
+                        if next > MAX_TOTAL_CACHED_BYTES {
+                            break;
+                        }
+                        match cached_budget_used.compare_exchange_weak(
+                            cur,
+                            next,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        ) {
+                            Ok(_) => {
+                                reserved = true;
+                                break;
+                            }
+                            Err(actual) => cur = actual,
+                        }
                     }
+                    if reserved { Some(bytes) } else { None }
                 } else {
                     None
                 };

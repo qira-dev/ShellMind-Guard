@@ -254,9 +254,23 @@ pub fn scan_git_history(
     let mut skip_hunk = false;
     let mut cur_line: usize = 0;
 
-    let reader = BufReader::with_capacity(64 * 1024, stdout);
-    for raw_line in reader.lines() {
-        let Ok(line) = raw_line else { break };
+    let mut reader = BufReader::with_capacity(64 * 1024, stdout);
+    let mut raw_buf = Vec::with_capacity(4096);
+    loop {
+        raw_buf.clear();
+        let Ok(n) = reader.read_until(b'\n', &mut raw_buf) else {
+            break;
+        };
+        if n == 0 {
+            break;
+        }
+        if raw_buf.ends_with(b"\n") {
+            raw_buf.pop();
+        }
+        if raw_buf.ends_with(b"\r") {
+            raw_buf.pop();
+        }
+        let line = String::from_utf8_lossy(&raw_buf);
 
         if let Some(rest) = line.strip_prefix("SMG_COMMIT_HDR:") {
             let mut parts = rest.splitn(3, '|');

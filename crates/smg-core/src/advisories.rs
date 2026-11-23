@@ -54,6 +54,23 @@ pub fn canonical_ecosystem(raw: &str) -> Option<&'static str> {
     }
 }
 
+/// Preserves release-stream suffixes for Linux distro ecosystems (`Debian:12`, `Alpine:v3.19`,
+/// `Ubuntu:22.04:LTS`) so cross-release advisories never collide, while normalizing non-distro
+/// ecosystems to canonical OSV names (`npm`, `crates.io`, `Go`, `PyPI`, etc.).
+pub fn canonical_ecosystem_key(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let family = canonical_ecosystem(trimmed)?;
+    if is_distro_ecosystem(Some(family))
+        && let Some((_, rest)) = trimmed.split_once(':')
+    {
+        let suffix = rest.trim();
+        if !suffix.is_empty() {
+            return Some(format!("{family}:{suffix}"));
+        }
+    }
+    Some(family.to_string())
+}
+
 /// Normalizes package identifiers per ecosystem (`PyPI` collapses runs of `-`/`_`/`.` into `-`, PEP 503).
 pub fn normalize_package_name(ecosystem: &str, name: &str) -> String {
     let eco = canonical_ecosystem(ecosystem).unwrap_or(ecosystem);
@@ -340,6 +357,7 @@ pub fn parse_semver_with_prerelease(raw: &str) -> Option<(u64, u64, u64, bool)> 
     Some((k.major, k.minor, k.patch, k.tier >= 1))
 }
 
+#[allow(dead_code)]
 fn is_go_pseudo_version(ver: &str) -> bool {
     let trimmed = ver.trim().trim_start_matches(['v', 'V']);
     trimmed.starts_with("0.0.0-") && trimmed.len() >= 20
@@ -388,15 +406,6 @@ pub fn version_matches_range(
         return true;
     }
 
-    if canon_eco == Some("Go") && is_go_pseudo_version(installed) {
-        let fixed_trimmed = fixed.trim();
-        let last_trimmed = last_affected.trim();
-        let has_pseudo_bound = (!fixed_trimmed.is_empty() && is_go_pseudo_version(fixed_trimmed))
-            || (!last_trimmed.is_empty() && is_go_pseudo_version(last_trimmed));
-        if !has_pseudo_bound {
-            return false;
-        }
-    }
     let Some(inst) = parse_semver_key(installed) else {
         return false;
     };
@@ -455,7 +464,10 @@ pub fn advisories_db_stamp() -> String {
             .unwrap_or(0);
         format!("{}:{}", m.len(), mtime_ns)
     };
-    let wal_path = path.with_extension("db-wal");
+    let wal_path = path
+        .file_name()
+        .map(|n| path.with_file_name(format!("{}-wal", n.to_string_lossy())))
+        .unwrap_or_else(|| path.with_extension("db-wal"));
     let wal_part = fs::metadata(&wal_path)
         .ok()
         .map(|wm| meta_stamp(&wm))
@@ -528,7 +540,9 @@ impl AdvisoryStore {
         if records.is_empty() {
             return Ok(0);
         }
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let mut upserted = 0usize;
         {
             let mut stmt = tx.prepare_cached(
@@ -543,14 +557,15 @@ impl AdvisoryStore {
                      updated_at = excluded.updated_at",
             )?;
             for rec in records {
-                let eco = canonical_ecosystem(&rec.ecosystem).unwrap_or(&rec.ecosystem);
-                let pkg = normalize_package_name(eco, &rec.package);
+                let eco_key = canonical_ecosystem_key(&rec.ecosystem)
+                    .unwrap_or_else(|| rec.ecosystem.trim().to_string());
+                let pkg = normalize_package_name(&eco_key, &rec.package);
                 if rec.id.trim().is_empty() || pkg.is_empty() {
                     continue;
                 }
                 stmt.execute(params![
                     rec.id.trim(),
-                    eco,
+                    eco_key,
                     pkg,
                     rec.introduced.trim(),
                     rec.fixed.trim(),
@@ -578,7 +593,9 @@ impl AdvisoryStore {
         if packages.is_empty() {
             return Ok(out);
         }
-        let eco = canonical_ecosystem(ecosystem).unwrap_or(ecosystem);
+        let eco_key =
+            canonical_ecosystem_key(ecosystem).unwrap_or_else(|| ecosystem.trim().to_string());
+        let eco = eco_key.as_str();
         let normalized: Vec<String> = packages
             .iter()
             .map(|p| normalize_package_name(eco, p))
@@ -677,6 +694,9 @@ fn extract_osv_severity(vuln: &Value) -> &'static str {
 
 fn cvss_vector_to_severity(vector: &str) -> Option<&'static str> {
     if let Ok(num) = vector.trim().parse::<f64>() {
+        if !num.is_finite() || !(0.0..=10.0).contains(&num) {
+            return None;
+        }
         return Some(if num >= 9.0 {
             "CRITICAL"
         } else if num >= 7.0 {
@@ -871,6 +891,21 @@ pub fn parse_osv_value_into_records(val: &Value, timestamp: i64) -> Result<Vec<A
                                 updated_at: timestamp,
                             });
                             extracted_any_range = true;
+                        } else if let Some(limit) = ev.get("limit").and_then(Value::as_str) {
+                            let intro = pending_intro.take().unwrap_or_else(|| "0".into());
+                            out.push(AdvisoryRecord {
+                                id: id.to_string(),
+                                ecosystem: eco.to_string(),
+                                package: pkg.clone(),
+                                introduced: intro,
+                                fixed: limit.to_string(),
+                                last_affected: String::new(),
+                                severity: severity.clone(),
+                                summary: summary.clone(),
+                                source: "osv".into(),
+                                updated_at: timestamp,
+                            });
+                            extracted_any_range = true;
                         } else if let Some(last) = ev.get("last_affected").and_then(Value::as_str) {
                             let intro = pending_intro.take().unwrap_or_else(|| "0".into());
                             out.push(AdvisoryRecord {
@@ -998,13 +1033,27 @@ mod tests {
         assert!(!version_matches_range(
             "PyPI", "2.2.1", "1.26.0", "1.26.18", ""
         ));
-        assert!(!version_matches_range(
+        // Go v0.0.0-<ts>-<hash> form-1 pseudo-version is < 0.17.0 and MUST match the advisory range
+        assert!(version_matches_range(
             "Go",
             "v0.0.0-20230101120000-abcdef123456",
             "0",
             "0.17.0",
             ""
         ));
+        // Distro release streams must remain isolated (Debian:11 != Debian:12)
+        assert_eq!(
+            canonical_ecosystem_key("Debian:11").as_deref(),
+            Some("Debian:11")
+        );
+        assert_eq!(
+            canonical_ecosystem_key("Debian:12").as_deref(),
+            Some("Debian:12")
+        );
+        assert_ne!(
+            canonical_ecosystem_key("Debian:11"),
+            canonical_ecosystem_key("Debian:12")
+        );
         // Pre-release ordering within same (major, minor, patch)
         assert!(version_matches_range(
             "npm",

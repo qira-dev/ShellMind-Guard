@@ -65,7 +65,23 @@ impl TrivyIgnore {
             return false;
         }
         let up = text_or_id.to_ascii_uppercase();
-        self.ignored_ids.iter().any(|id| up.contains(id))
+        let bytes = up.as_bytes();
+        self.ignored_ids.iter().any(|id| {
+            let mut search_from = 0usize;
+            while let Some(rel) = up[search_from..].find(id.as_str()) {
+                let start = search_from + rel;
+                let end = start + id.len();
+                let left_ok = start == 0
+                    || !matches!(bytes[start - 1], b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_');
+                let right_ok = end == bytes.len()
+                    || !matches!(bytes[end], b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_');
+                if left_ok && right_ok {
+                    return true;
+                }
+                search_from = start + 1;
+            }
+            false
+        })
     }
 }
 
@@ -456,8 +472,20 @@ pub fn scan_oci_image(
     let mut raw_collected: Vec<(ResolvedDependency, String)> = Vec::new();
 
     if target.is_file() {
-        let bytes = fs::read(target)
+        use std::io::Read as _;
+        const MAX_OCI_TAR_BYTES: u64 = 256 * 1024 * 1024;
+        let file = fs::File::open(target)
+            .with_context(|| format!("Failed opening OCI tar archive {}", target.display()))?;
+        let mut bytes = Vec::new();
+        file.take(MAX_OCI_TAR_BYTES + 1)
+            .read_to_end(&mut bytes)
             .with_context(|| format!("Failed reading OCI tar archive {}", target.display()))?;
+        if bytes.len() as u64 > MAX_OCI_TAR_BYTES {
+            bail!(
+                "OCI tar archive {} exceeds {MAX_OCI_TAR_BYTES} byte safety cap",
+                target.display()
+            );
+        }
         let label = target
             .file_name()
             .and_then(|n| n.to_str())

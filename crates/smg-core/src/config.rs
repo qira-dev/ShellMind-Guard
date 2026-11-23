@@ -156,21 +156,27 @@ impl SandboxConfig {
             "Refusing userinfo in sandbox.base_url `{}`",
             raw
         );
-        let (host, port_str) = if let Some(after_bracket) = authority.strip_prefix("[::1]") {
-            match after_bracket.strip_prefix(':') {
-                Some(p) => ("::1", p),
-                None if after_bracket.is_empty() => ("::1", ""),
-                None => anyhow::bail!("Malformed IPv6 authority in sandbox.base_url `{}`", raw),
-            }
-        } else if let Some((h, p)) = authority.rsplit_once(':') {
-            (h, p)
+        let (host, port_str, is_bracketed_v6) =
+            if let Some(after_bracket) = authority.strip_prefix("[::1]") {
+                match after_bracket.strip_prefix(':') {
+                    Some(p) => ("::1", p, true),
+                    None if after_bracket.is_empty() => ("::1", "", true),
+                    None => anyhow::bail!("Malformed IPv6 authority in sandbox.base_url `{}`", raw),
+                }
+            } else if let Some((h, p)) = authority.rsplit_once(':') {
+                (h, p, false)
+            } else {
+                (authority, "", false)
+            };
+        let host_ok = if is_bracketed_v6 {
+            true
         } else {
-            (authority, "")
+            matches!(
+                host.to_ascii_lowercase().as_str(),
+                "127.0.0.1" | "localhost"
+            )
         };
-        if !matches!(
-            host.to_ascii_lowercase().as_str(),
-            "127.0.0.1" | "localhost" | "::1"
-        ) {
+        if !host_ok {
             anyhow::bail!(
                 "Refusing non-loopback sandbox.base_url `{}` (only 127.0.0.1, localhost, or [::1] allowed)",
                 raw
@@ -385,11 +391,19 @@ impl ShellMindGuardConfig {
         force: bool,
     ) -> Result<(Vec<String>, std::path::PathBuf)> {
         let out_path = root.join(".shellmind-guard.toml");
-        if out_path.exists() && !force {
-            anyhow::bail!(
-                "Refusing to overwrite existing {} (pass force=true to overwrite)",
-                out_path.display()
-            );
+        if let Ok(meta) = fs::symlink_metadata(&out_path) {
+            if meta.file_type().is_symlink() {
+                anyhow::bail!(
+                    "Refusing to write through symlinked config path {}",
+                    out_path.display()
+                );
+            }
+            if !force {
+                anyhow::bail!(
+                    "Refusing to overwrite existing {} (pass force=true to overwrite)",
+                    out_path.display()
+                );
+            }
         }
         let mut detected = Vec::new();
         if root.join("package.json").exists() {

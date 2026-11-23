@@ -2080,16 +2080,17 @@ fn parse_yarn_pkg_header(line: &str) -> Option<String> {
 fn parse_pnpm_pkg_key(trimmed: &str) -> Option<(String, String)> {
     let key = trimmed.strip_suffix(':')?.trim().trim_matches(['"', '\'']);
     let key = key.strip_prefix('/').unwrap_or(key);
-    // Strip peer-dep suffix like `(react@18.2.0)` or `_react@18.2.0`
-    let key_no_peer = key.split('(').next().unwrap_or(key);
-    let key_no_peer = key_no_peer.split('_').next().unwrap_or(key_no_peer);
-    let at_pos = if let Some(rest) = key_no_peer.strip_prefix('@') {
+    let key_no_paren = key.split('(').next().unwrap_or(key);
+    // Split package name vs version at `@` BEFORE stripping `_peer@ver` from the version segment
+    // so package names containing `_` (e.g. `lodash_es@4.17.21`) are preserved intact.
+    let at_pos = if let Some(rest) = key_no_paren.strip_prefix('@') {
         rest.find('@').map(|i| i + 1)
     } else {
-        key_no_peer.find('@')
+        key_no_paren.find('@')
     }?;
-    let name = key_no_peer[..at_pos].trim();
-    let ver = key_no_peer[at_pos + 1..].trim();
+    let name = key_no_paren[..at_pos].trim();
+    let ver_raw = key_no_paren[at_pos + 1..].trim();
+    let ver = ver_raw.split('_').next().unwrap_or(ver_raw).trim();
     if !name.is_empty() && ver.chars().next().is_some_and(|c| c.is_ascii_digit()) {
         Some((name.to_string(), ver.to_string()))
     } else {

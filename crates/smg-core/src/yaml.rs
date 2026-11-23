@@ -197,12 +197,19 @@ pub fn parse_structural_yaml_entries(doc: &str) -> Vec<YamlEntry> {
 }
 
 pub fn parse_structural_yaml_entries_with_offset(doc: &str, start_line: usize) -> Vec<YamlEntry> {
+    const MAX_YAML_ENTRIES: usize = 65_536;
+    const MAX_ANCHORS: usize = 512;
+    const MAX_MERGE_ALIASES_PER_LINE: usize = 32;
+
     let mut entries = Vec::new();
     let mut anchors: HashMap<String, Vec<(String, String)>> = HashMap::new();
     let mut scalar_anchors: HashMap<String, String> = HashMap::new();
     let mut current_anchor: Option<(String, usize)> = None;
 
     for (idx, raw_line) in doc.lines().enumerate() {
+        if entries.len() >= MAX_YAML_ENTRIES {
+            break;
+        }
         let ln = start_line + idx;
         let line = strip_yaml_comment_quoted(raw_line);
         if line.trim().is_empty() {
@@ -268,11 +275,15 @@ pub fn parse_structural_yaml_entries_with_offset(doc: &str, start_line: usize) -
                     Vec::new()
                 };
                 if !alias_names.is_empty() {
-                    for alias in alias_names {
+                    for alias in alias_names.into_iter().take(MAX_MERGE_ALIASES_PER_LINE) {
                         if let Some(merged) = anchors.get(&alias).cloned() {
                             for (mk, mv) in merged {
+                                if entries.len() >= MAX_YAML_ENTRIES {
+                                    break;
+                                }
                                 if let Some((ref aname, a_indent)) = current_anchor
                                     && indent > a_indent
+                                    && (anchors.contains_key(aname) || anchors.len() < MAX_ANCHORS)
                                 {
                                     let slot = anchors.entry(aname.clone()).or_default();
                                     if slot.len() < MAX_ANCHOR_ENTRIES {
