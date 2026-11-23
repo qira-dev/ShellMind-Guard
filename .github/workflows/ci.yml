@@ -8,8 +8,13 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   check-and-test:
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -17,6 +22,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           components: rustfmt, clippy
@@ -27,7 +34,7 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo check -p shellmind-guard --all-targets --no-default-features --locked
       - name: Run Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Run Workspace Tests
         env:
           SMG_ENFORCE_PRECISION_GATE: "1"

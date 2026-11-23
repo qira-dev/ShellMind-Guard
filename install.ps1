@@ -5,7 +5,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # ShellMind Guard — 1-Command Windows Installer
 $Repo = "qira-dev/ShellMind-Guard"
@@ -24,12 +24,11 @@ function Install-FromSource {
             Write-Host "[ShellMind Guard] Building from local source..."
             cargo install --path $PSScriptRoot --root $CargoRoot --locked
         } else {
-            Write-Host "[ShellMind Guard] Building from GitHub repository via cargo..."
-            if ($Version -ne "latest") {
-                cargo install --git "https://github.com/$Repo.git" --tag $Version --root $CargoRoot --locked
-            } else {
-                cargo install --git "https://github.com/$Repo.git" --root $CargoRoot --locked
+            if ($Version -eq "latest") {
+                throw "Building from GitHub requires an explicit release tag (-Version vX.Y.Z); refusing unpinned HEAD."
             }
+            Write-Host "[ShellMind Guard] Building from GitHub repository tag $Version via cargo..."
+            cargo install --git "https://github.com/$Repo.git" --tag $Version --root $CargoRoot --locked
         }
         if ($LASTEXITCODE -ne 0) {
             throw "cargo install exited with code $LASTEXITCODE"
@@ -67,6 +66,11 @@ if (-not $FromSource) {
             throw [System.Security.SecurityException]"Checksum for $Asset not found in SHA256SUMS.txt"
         }
         $ExpectedHash = ($ExpectedLine -split "\s+")[0].ToUpperInvariant()
+        if ($ExpectedHash -notmatch '^[0-9A-F]{64}
+Write-Host "[ShellMind Guard] Installed 'smg' (and 'shellmind-guard' alias). Run 'smg' for TUI, 'smg scan .', or 'smg mcp'."
+) {
+            throw [System.Security.SecurityException]"Malformed SHA256 digest in SHA256SUMS.txt for $Asset"
+        }
         $ActualHash = (Get-FileHash -Path $ZipPath -Algorithm SHA256).Hash.ToUpperInvariant()
         if ($ExpectedHash -ne $ActualHash) {
             throw [System.Security.SecurityException]"SHA256 checksum mismatch for $Asset! Expected $ExpectedHash, got $ActualHash"
@@ -74,18 +78,20 @@ if (-not $FromSource) {
         $ExtractDir = Join-Path $TmpDir "extract"
         New-Item -ItemType Directory -Force -Path $ExtractDir | Out-Null
         Expand-Archive -Path $ZipPath -DestinationPath $ExtractDir -Force
+        $ExtractedAny = $false
         foreach ($BinName in @("smg.exe", "shellmind-guard.exe")) {
             $Candidate = Join-Path $ExtractDir $BinName
             if (Test-Path $Candidate) {
                 Copy-Item -Path $Candidate -Destination (Join-Path $InstallDir $BinName) -Force
+                $ExtractedAny = $true
             }
         }
-    } catch [System.Security.SecurityException] {
-        Write-Error $_.Exception.Message
-        exit 1
+        if (-not $ExtractedAny) {
+            throw [System.Security.SecurityException]"Archive $Asset did not contain smg.exe or shellmind-guard.exe"
+        }
     } catch {
-        Write-Warning "Prebuilt release verification failed ($_); falling back to source build."
-        Install-FromSource
+        Write-Error "Prebuilt release verification failed ($($_.Exception.Message)). Aborting (pass -FromSource -Version vX.Y.Z to build from a pinned tag)."
+        exit 1
     } finally {
         Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
     }
@@ -107,9 +113,9 @@ $LegacyExePath = Join-Path $InstallDir "shellmind-guard.exe"
 if (-not (Test-Path $SmgExePath) -and (Test-Path $LegacyExePath)) {
     Copy-Item -Path $LegacyExePath -Destination $SmgExePath -Force
 }
-if (Test-Path $SmgExePath) {
-    & $SmgExePath --version
-} else {
-    smg --version
+if (-not (Test-Path $SmgExePath)) {
+    Write-Error "Expected installed binary not found at $SmgExePath"
+    exit 1
 }
+& $SmgExePath --version
 Write-Host "[ShellMind Guard] Installed 'smg' (and 'shellmind-guard' alias). Run 'smg' for TUI, 'smg scan .', or 'smg mcp'."

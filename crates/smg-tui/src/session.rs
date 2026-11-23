@@ -53,8 +53,18 @@ impl TuiSessionPrefs {
     }
 }
 
+fn is_symlink_path(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
 pub fn load_session_prefs(root: &Path) -> TuiSessionPrefs {
+    let dir = root.join(".shellmind-guard");
     let path = root.join(SESSION_REL_PATH);
+    if is_symlink_path(&dir) || is_symlink_path(&path) {
+        return TuiSessionPrefs::default();
+    }
     fs::read_to_string(path)
         .ok()
         .and_then(|raw| serde_json::from_str::<TuiSessionPrefs>(&raw).ok())
@@ -63,10 +73,14 @@ pub fn load_session_prefs(root: &Path) -> TuiSessionPrefs {
 
 pub fn save_session_prefs(root: &Path, prefs: &TuiSessionPrefs) {
     let dir = root.join(".shellmind-guard");
+    let path = root.join(SESSION_REL_PATH);
+    if is_symlink_path(&dir) || is_symlink_path(&path) {
+        return;
+    }
     if fs::create_dir_all(&dir).is_ok()
         && let Ok(json) = serde_json::to_string_pretty(prefs)
     {
-        let _ = fs::write(root.join(SESSION_REL_PATH), json);
+        let _ = fs::write(path, json);
     }
 }
 
@@ -99,7 +113,11 @@ pub fn finding_baseline_key(f: &LatticeFinding) -> BaselineEntry {
 }
 
 pub fn load_baseline_keys(root: &Path) -> HashSet<BaselineEntry> {
+    let dir = root.join(".shellmind-guard");
     let path = root.join(BASELINE_REL_PATH);
+    if is_symlink_path(&dir) || is_symlink_path(&path) {
+        return HashSet::new();
+    }
     fs::read_to_string(path)
         .ok()
         .and_then(|raw| serde_json::from_str::<BaselineFile>(&raw).ok())
@@ -108,6 +126,14 @@ pub fn load_baseline_keys(root: &Path) -> HashSet<BaselineEntry> {
 }
 
 pub fn write_baseline_file(root: &Path, findings: &[LatticeFinding]) -> io::Result<usize> {
+    let dir = root.join(".shellmind-guard");
+    let path = root.join(BASELINE_REL_PATH);
+    if is_symlink_path(&dir) || is_symlink_path(&path) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Refusing to write baseline through symlinked path",
+        ));
+    }
     let mut entries: Vec<BaselineEntry> = findings.iter().map(finding_baseline_key).collect();
     entries.sort();
     entries.dedup();
@@ -116,9 +142,9 @@ pub fn write_baseline_file(root: &Path, findings: &[LatticeFinding]) -> io::Resu
         version: 1,
         entries,
     };
-    fs::create_dir_all(root.join(".shellmind-guard"))?;
+    fs::create_dir_all(&dir)?;
     let json = serde_json::to_string_pretty(&file).map_err(io::Error::other)?;
-    fs::write(root.join(BASELINE_REL_PATH), json)?;
+    fs::write(path, json)?;
     Ok(count)
 }
 
@@ -146,9 +172,19 @@ pub fn encode_base64(input: &[u8]) -> String {
     out
 }
 
-/// Copies via OSC 52 (works over SSH/tmux) plus optional native clipboard helper fallback (`wl-copy`/`xclip`/`pbcopy`).
+/// Copies via OSC 52 (works over SSH/tmux, capped at 64 KiB) plus optional native clipboard helper fallback (`wl-copy`/`xclip`/`pbcopy`).
 pub fn copy_clipboard(text: &str) -> io::Result<&'static str> {
-    let b64 = encode_base64(text.as_bytes());
+    const MAX_OSC52_RAW_BYTES: usize = 65_536;
+    let osc_slice = if text.len() > MAX_OSC52_RAW_BYTES {
+        let mut cut = MAX_OSC52_RAW_BYTES;
+        while cut > 0 && !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        &text[..cut]
+    } else {
+        text
+    };
+    let b64 = encode_base64(osc_slice.as_bytes());
     let mut stdout = io::stdout();
     write!(stdout, "\x1b]52;c;{}\x07", b64)?;
     stdout.flush()?;

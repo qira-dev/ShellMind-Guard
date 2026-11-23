@@ -44,6 +44,7 @@ install_from_source() {
   fi
   local cargo_root
   cargo_root="$(mktemp -d)"
+  trap 'rm -rf "${cargo_root}"' EXIT
   local script_dir=""
   if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
     script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
@@ -52,12 +53,12 @@ install_from_source() {
     echo "[ShellMind Guard] Building from local source..."
     cargo install --path "${script_dir}" --root "${cargo_root}" --locked
   else
-    echo "[ShellMind Guard] Building from GitHub repository..."
-    if [[ "${VERSION}" != "latest" ]]; then
-      cargo install --git "https://github.com/${REPO}.git" --tag "${VERSION}" --root "${cargo_root}" --locked
-    else
-      cargo install --git "https://github.com/${REPO}.git" --root "${cargo_root}" --locked
+    if [[ "${VERSION}" == "latest" ]]; then
+      echo "[ShellMind Guard] Error: --from-source from GitHub requires an explicit release tag (--version vX.Y.Z); refusing unpinned HEAD." >&2
+      exit 1
     fi
+    echo "[ShellMind Guard] Building from GitHub repository tag ${VERSION}..."
+    cargo install --git "https://github.com/${REPO}.git" --tag "${VERSION}" --root "${cargo_root}" --locked
   fi
   install -m 0755 "${cargo_root}/bin/${BIN_NAME}" "${INSTALL_DIR}/${BIN_NAME}"
   if [[ -f "${cargo_root}/bin/smg" ]]; then
@@ -65,7 +66,6 @@ install_from_source() {
   else
     ln -sf "${INSTALL_DIR}/${BIN_NAME}" "${INSTALL_DIR}/smg"
   fi
-  rm -rf "${cargo_root}"
 }
 
 if [[ "${FROM_SOURCE}" -eq 0 ]] && asset="$(detect_asset)"; then
@@ -78,31 +78,34 @@ if [[ "${FROM_SOURCE}" -eq 0 ]] && asset="$(detect_asset)"; then
   trap 'rm -rf "${tmp_dir}"' EXIT
 
   echo "[ShellMind Guard] Downloading ${asset} (${VERSION})..."
-  if curl --proto "=https" --tlsv1.2 -fsSL "${base_url}/${asset}" -o "${tmp_dir}/${asset}" && curl --proto "=https" --tlsv1.2 -fsSL "${base_url}/SHA256SUMS.txt" -o "${tmp_dir}/SHA256SUMS.txt"; then
-    expected="$(awk -v a="${asset}" 'NF>=2 && $2==a {print $1; exit}' "${tmp_dir}/SHA256SUMS.txt" || true)"
-    if [[ -z "${expected}" ]]; then
-      echo "[ShellMind Guard] Missing SHA256 entry for ${asset} in SHA256SUMS.txt! Aborting." >&2
-      exit 1
-    fi
-    if command -v sha256sum >/dev/null 2>&1; then
-      actual="$(sha256sum "${tmp_dir}/${asset}" | awk '{print $1}')"
-    else
-      actual="$(shasum -a 256 "${tmp_dir}/${asset}" | awk '{print $1}')"
-    fi
-    if [[ "${expected}" != "${actual}" ]]; then
-      echo "[ShellMind Guard] Checksum mismatch! Aborting." >&2
-      exit 1
-    fi
-    tar --no-same-owner -xzf "${tmp_dir}/${asset}" -C "${tmp_dir}"
-    install -m 0755 "${tmp_dir}/${BIN_NAME}" "${INSTALL_DIR}/${BIN_NAME}"
-    if [[ -f "${tmp_dir}/smg" ]]; then
-      install -m 0755 "${tmp_dir}/smg" "${INSTALL_DIR}/smg"
-    else
-      ln -sf "${INSTALL_DIR}/${BIN_NAME}" "${INSTALL_DIR}/smg"
-    fi
+  if ! curl --proto "=https" --tlsv1.2 -fsSL "${base_url}/${asset}" -o "${tmp_dir}/${asset}" || ! curl --proto "=https" --tlsv1.2 -fsSL "${base_url}/SHA256SUMS.txt" -o "${tmp_dir}/SHA256SUMS.txt"; then
+    echo "[ShellMind Guard] Error: failed to download prebuilt release or SHA256SUMS.txt for ${VERSION}. Aborting (pass --from-source --version vX.Y.Z to build from a pinned tag)." >&2
+    exit 1
+  fi
+  expected="$(awk -v a="${asset}" 'NF>=2 && $2==a {print $1; exit}' "${tmp_dir}/SHA256SUMS.txt" || true)"
+  if [[ ! "${expected}" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    echo "[ShellMind Guard] Missing or malformed SHA256 entry for ${asset} in SHA256SUMS.txt! Aborting." >&2
+    exit 1
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual="$(sha256sum "${tmp_dir}/${asset}" | awk '{print $1}')"
   else
-    echo "[ShellMind Guard] Prebuilt release unavailable, falling back to source build..."
-    install_from_source
+    actual="$(shasum -a 256 "${tmp_dir}/${asset}" | awk '{print $1}')"
+  fi
+  if [[ "${expected,,}" != "${actual,,}" ]]; then
+    echo "[ShellMind Guard] Checksum mismatch! Aborting." >&2
+    exit 1
+  fi
+  tar --no-same-owner -xzf "${tmp_dir}/${asset}" -C "${tmp_dir}"
+  if [[ ! -f "${tmp_dir}/${BIN_NAME}" ]]; then
+    echo "[ShellMind Guard] Error: archive did not contain ${BIN_NAME}! Aborting." >&2
+    exit 1
+  fi
+  install -m 0755 "${tmp_dir}/${BIN_NAME}" "${INSTALL_DIR}/${BIN_NAME}"
+  if [[ -f "${tmp_dir}/smg" ]]; then
+    install -m 0755 "${tmp_dir}/smg" "${INSTALL_DIR}/smg"
+  else
+    ln -sf "${INSTALL_DIR}/${BIN_NAME}" "${INSTALL_DIR}/smg"
   fi
 else
   install_from_source
@@ -112,9 +115,5 @@ if ! echo ":${PATH}:" | grep -q ":${INSTALL_DIR}:"; then
   echo "[ShellMind Guard] Add to PATH: export PATH=\"${INSTALL_DIR}:\$PATH\""
 fi
 
-if command -v smg >/dev/null 2>&1; then
-  smg --version
-else
-  "${INSTALL_DIR}/smg" --version
-fi
+"${INSTALL_DIR}/smg" --version
 echo "[ShellMind Guard] Installed 'smg' (and '${BIN_NAME}' alias). Run 'smg' for TUI, 'smg scan .', or 'smg mcp'."

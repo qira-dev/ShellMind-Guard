@@ -10,6 +10,27 @@ use std::path::{Component, Path, PathBuf};
 const PROTOCOL_VERSION: &str = "2024-11-05";
 const MAX_MCP_LINE_BYTES: u64 = 4 * 1024 * 1024;
 
+fn drain_to_newline<R: BufRead>(reader: &mut R) {
+    let mut buf = [0u8; 8192];
+    loop {
+        match reader.fill_buf() {
+            Ok([]) => break,
+            Ok(avail) => {
+                if let Some(pos) = avail.iter().position(|&b| b == b'\n') {
+                    let consume = pos + 1;
+                    reader.consume(consume);
+                    break;
+                }
+                let n = avail.len().min(buf.len());
+                buf[..n].copy_from_slice(&avail[..n]);
+                reader.consume(n);
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+}
+
 /// Runs ShellMind Guard's stdio JSON-RPC 2.0 MCP server loop.
 /// Reads newline-delimited requests from `stdin` and writes single-line responses exclusively to `stdout`.
 pub fn run_stdio_server() -> Result<()> {
@@ -21,16 +42,25 @@ pub fn run_stdio_server() -> Result<()> {
 
     loop {
         line.clear();
-        let n = (&mut reader)
-            .take(MAX_MCP_LINE_BYTES)
-            .read_line(&mut line)?;
+        let n = match (&mut reader).take(MAX_MCP_LINE_BYTES).read_line(&mut line) {
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                drain_to_newline(&mut reader);
+                let err_resp = json_error(Value::Null, -32700, "Parse error: invalid UTF-8 input");
+                let encoded = serde_json::to_string(&err_resp)?;
+                writer.write_all(encoded.as_bytes())?;
+                writer.write_all(b"\n")?;
+                writer.flush()?;
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
         if n == 0 {
             break;
         }
         if n as u64 == MAX_MCP_LINE_BYTES && !line.ends_with('\n') {
-            // Drain remaining bytes up to newline or EOF so the stream does not split into two frames
-            let mut discard = Vec::new();
-            let _ = reader.read_until(b'\n', &mut discard);
+            // Drain remaining bytes in a fixed stack buffer up to newline or EOF (no OOM).
+            drain_to_newline(&mut reader);
             let err_resp = json_error(
                 Value::Null,
                 -32600,
@@ -79,6 +109,13 @@ pub fn handle_jsonrpc_line(raw: &str) -> Option<Value> {
     };
 
     let id_opt = obj.get("id").cloned();
+    if obj.get("jsonrpc").and_then(|v| v.as_str()) != Some("2.0") {
+        return Some(json_error(
+            id_opt.unwrap_or(Value::Null),
+            -32600,
+            "Invalid Request: jsonrpc must be \"2.0\"",
+        ));
+    }
     let Some(method) = obj.get("method").and_then(|m| m.as_str()) else {
         return id_opt.map(|id| json_error(id, -32600, "Invalid Request: missing method"));
     };
@@ -263,7 +300,6 @@ fn normalize_and_resolve_path(base_cwd: &Path, raw_path: &Path) -> PathBuf {
 fn validate_mcp_target_path(raw_path: &str) -> Result<PathBuf> {
     let cwd = std::fs::canonicalize(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
         .unwrap_or_else(|_| PathBuf::from("."));
-    let tmp = std::fs::canonicalize(std::env::temp_dir()).unwrap_or_else(|_| std::env::temp_dir());
     let canon = normalize_and_resolve_path(&cwd, Path::new(raw_path));
 
     let env_root = std::env::var("SHELLMIND_GUARD_ROOT")
@@ -271,12 +307,14 @@ fn validate_mcp_target_path(raw_path: &str) -> Result<PathBuf> {
         .filter(|s| !s.trim().is_empty())
         .map(|s| normalize_and_resolve_path(&cwd, Path::new(s.trim())));
 
-    // Block sensitive credential/system dot-directories
+    // Block sensitive credential/system dot-directories (case-insensitive for macOS/Windows).
     let has_sensitive_component = canon.components().any(|c| {
-        matches!(
-            c.as_os_str().to_str(),
-            Some(".ssh" | ".gnupg" | ".aws" | ".kube" | ".docker" | ".netrc")
-        )
+        c.as_os_str().to_str().is_some_and(|s| {
+            matches!(
+                s.to_ascii_lowercase().as_str(),
+                ".ssh" | ".gnupg" | ".aws" | ".kube" | ".docker" | ".netrc"
+            )
+        })
     });
     if has_sensitive_component {
         anyhow::bail!(
@@ -285,13 +323,18 @@ fn validate_mcp_target_path(raw_path: &str) -> Result<PathBuf> {
         );
     }
 
+    let in_tmp_for_tests = cfg!(test) && {
+        let tmp =
+            std::fs::canonicalize(std::env::temp_dir()).unwrap_or_else(|_| std::env::temp_dir());
+        canon.starts_with(&tmp)
+    };
     let in_allowed = canon.starts_with(&cwd)
-        || canon.starts_with(&tmp)
+        || in_tmp_for_tests
         || env_root.as_ref().is_some_and(|r| canon.starts_with(r));
 
     if !in_allowed {
         anyhow::bail!(
-            "Refusing MCP access outside workspace root ({}) or temp dir: {}",
+            "Refusing MCP access outside workspace root ({}) or SHELLMIND_GUARD_ROOT: {}",
             cwd.display(),
             canon.display()
         );
@@ -401,7 +444,7 @@ fn handle_tool_call(params: &Value) -> Result<Value> {
                 .ok_or_else(|| anyhow::anyhow!("Missing required argument `finding_id`"))?;
             let root =
                 validate_mcp_target_path(args.get("path").and_then(|v| v.as_str()).unwrap_or("."))?;
-            let cfg = ShellMindGuardConfig::load_from_dir(&root)?;
+            let cfg = ShellMindGuardConfig::load_trusted_from_dir(&root, false)?;
             let summary = scan_repository(&root, &cfg)?;
             let mut store = StateStore::open(&root)?;
             let _ = store.sync_files(&summary.files)?;
@@ -504,16 +547,24 @@ fn handle_tool_call(params: &Value) -> Result<Value> {
     let mut text = serde_json::to_string(&payload)?;
     const MAX_MCP_ENVELOPE_BYTES: usize = 32 * 1024;
     if text.len() > MAX_MCP_ENVELOPE_BYTES {
-        let mut cut = (MAX_MCP_ENVELOPE_BYTES - 128).min(text.len());
-        while cut > 0 && !text.is_char_boundary(cut) {
-            cut -= 1;
+        let mut preview_cap = (MAX_MCP_ENVELOPE_BYTES / 2).min(text.len());
+        loop {
+            let mut cut = preview_cap.min(text.len());
+            while cut > 0 && !text.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            let wrapped = serde_json::to_string(&json!({
+                "ok": true,
+                "truncated": true,
+                "budget_bytes": MAX_MCP_ENVELOPE_BYTES,
+                "preview": &text[..cut],
+            }))?;
+            if wrapped.len() <= MAX_MCP_ENVELOPE_BYTES || preview_cap == 0 {
+                text = wrapped;
+                break;
+            }
+            preview_cap = preview_cap.saturating_sub(1024);
         }
-        text = serde_json::to_string(&json!({
-            "ok": true,
-            "truncated": true,
-            "budget_bytes": MAX_MCP_ENVELOPE_BYTES,
-            "preview": &text[..cut],
-        }))?;
     }
 
     Ok(json!({

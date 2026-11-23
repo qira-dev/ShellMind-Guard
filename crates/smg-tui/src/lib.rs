@@ -299,15 +299,24 @@ struct TerminalGuard {
 }
 
 static TUI_PANIC_HOOK_INIT: std::sync::Once = std::sync::Once::new();
+static TUI_UI_THREAD_ID: std::sync::OnceLock<std::thread::ThreadId> = std::sync::OnceLock::new();
 const MAX_CACHED_FILES: usize = 64;
 
 impl TerminalGuard {
     fn init() -> Result<Self> {
+        let _ = TUI_UI_THREAD_ID.set(std::thread::current().id());
         TUI_PANIC_HOOK_INIT.call_once(|| {
             let orig_hook = std::panic::take_hook();
             std::panic::set_hook(Box::new(move |info| {
-                let _ = disable_raw_mode();
-                let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+                // Only tear down raw mode / alternate screen if the panic occurs on the UI thread;
+                // caught panics inside background worker threads must not corrupt the active TUI.
+                if TUI_UI_THREAD_ID
+                    .get()
+                    .is_some_and(|id| *id == std::thread::current().id())
+                {
+                    let _ = disable_raw_mode();
+                    let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+                }
                 orig_hook(info);
             }));
         });
@@ -2306,7 +2315,11 @@ fn export_report(state: &mut TuiState, fmt: &str) {
             );
             match fs::create_dir_all(&dir).and_then(|_| fs::write(&out, html)) {
                 Ok(_) => {
-                    let _ = open_path_in_browser(&out);
+                    if let Ok(mut child) = open_path_in_browser(&out) {
+                        std::thread::spawn(move || {
+                            let _ = child.wait();
+                        });
+                    }
                     state.push_log(format!("Opened HTML graph -> {}", out.display()));
                 }
                 Err(e) => state.push_log(format!("HTML export error: {}", e)),
