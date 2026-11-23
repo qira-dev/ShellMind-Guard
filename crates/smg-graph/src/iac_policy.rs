@@ -1,9 +1,9 @@
-//! Declarative, data-driven Cloud/IaC Policy Engine (Checkov 95% parity).
+//! Declarative, data-driven Cloud/IaC Policy Engine (Checkov-class parity).
 //!
-//! Evaluates 50+ high-signal AWS, GCP, and Azure Terraform/HCL policies using a
+//! Evaluates 60 unique high-signal AWS, GCP, and Azure Terraform/HCL policies using a
 //! compact declarative matcher (`PolicyCheck`) against resolved HCL resource attributes
 //! and nested blocks — zero giant hardcoded `if/else` chains, zero regex guessing.
-//! Also supports loading custom user policy packs from JSON/TOML.
+//! Also provides a library parser (`parse_custom_policy_pack_json`) for JSON policy packs.
 
 use crate::ast::{Confidence, GuardKind, LocalStaticFinding, SinkKind};
 use serde::Deserialize;
@@ -46,6 +46,10 @@ pub enum PolicyCheck {
         expected_values: Vec<String>,
         fire_if_block_missing: bool,
     },
+    /// Fires when ALL sub-checks match (logical AND).
+    AllOf { checks: Vec<PolicyCheck> },
+    /// Fires when ANY sub-check matches (logical OR).
+    AnyOf { checks: Vec<PolicyCheck> },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -100,6 +104,10 @@ fn check_matches(check: &PolicyCheck, res: &HclResourceView<'_>) -> bool {
                 Some(v) => !expected_values.contains(&clean_val(v)),
             }),
         },
+        PolicyCheck::AllOf { checks } => {
+            !checks.is_empty() && checks.iter().all(|c| check_matches(c, res))
+        }
+        PolicyCheck::AnyOf { checks } => checks.iter().any(|c| check_matches(c, res)),
     }
 }
 
@@ -271,9 +279,16 @@ pub fn builtin_iac_policies() -> &'static [IacPolicySpec] {
             "aws_sqs_queue",
             "AWS SQS queue lacks KMS encryption (`kms_master_key_id` or `sqs_managed_sse_enabled`)",
             "Set `kms_master_key_id` or `sqs_managed_sse_enabled = true` on `aws_sqs_queue`.",
-            PolicyCheck::AttrEquals {
-                key: "sqs_managed_sse_enabled".into(),
-                bad_values: vec!["false".into()],
+            PolicyCheck::AllOf {
+                checks: vec![
+                    PolicyCheck::AttrMissing {
+                        key: "kms_master_key_id".into(),
+                    },
+                    PolicyCheck::AttrMissingOrNotIn {
+                        key: "sqs_managed_sse_enabled".into(),
+                        expected_values: vec!["true".into()],
+                    },
+                ],
             },
         );
         add(
@@ -372,7 +387,7 @@ pub fn builtin_iac_policies() -> &'static [IacPolicySpec] {
                 block: "vpc_config".into(),
                 key: "endpoint_public_access".into(),
                 expected_values: vec!["false".into()],
-                fire_if_block_missing: false,
+                fire_if_block_missing: true,
             },
         );
         add(
@@ -618,9 +633,17 @@ pub fn builtin_iac_policies() -> &'static [IacPolicySpec] {
             "azurerm_storage_account",
             "Azure Storage Account does not enforce HTTPS-only traffic (`enable_https_traffic_only = false`)",
             "Set `enable_https_traffic_only = true` (or `https_traffic_only_enabled = true`) on `azurerm_storage_account`.",
-            PolicyCheck::AttrEquals {
-                key: "enable_https_traffic_only".into(),
-                bad_values: vec!["false".into()],
+            PolicyCheck::AnyOf {
+                checks: vec![
+                    PolicyCheck::AttrEquals {
+                        key: "enable_https_traffic_only".into(),
+                        bad_values: vec!["false".into()],
+                    },
+                    PolicyCheck::AttrEquals {
+                        key: "https_traffic_only_enabled".into(),
+                        bad_values: vec!["false".into()],
+                    },
+                ],
             },
         );
         add(
@@ -768,33 +791,103 @@ pub fn builtin_iac_policies() -> &'static [IacPolicySpec] {
             },
         );
 
-        // ==================== Phase 36 Checkov Expansion (+26 policies -> 78 total) ====================
-        add("CKV_AWS_7", "SMG-CFG-IAC-CRYPTO", "MEDIUM", "aws_kms_key", "AWS KMS key does not enable automatic annual key rotation", "Set `enable_key_rotation = true` on `aws_kms_key`.", PolicyCheck::AttrMissingOrNotIn { key: "enable_key_rotation".into(), expected_values: vec!["true".into()] });
-        add("CKV_AWS_35", "SMG-CFG-IAC-CRYPTO", "HIGH", "aws_cloudtrail", "AWS CloudTrail logs are not encrypted with KMS (`kms_key_id` missing)", "Configure `kms_key_id` on `aws_cloudtrail`.", PolicyCheck::AttrMissing { key: "kms_key_id".into() });
-        add("CKV_AWS_36", "SMG-CFG-IAC-LOG", "MEDIUM", "aws_cloudtrail", "AWS CloudTrail does not enable log file integrity validation", "Set `enable_log_file_validation = true` on `aws_cloudtrail`.", PolicyCheck::AttrMissingOrNotIn { key: "enable_log_file_validation".into(), expected_values: vec!["true".into()] });
-        add("CKV_AWS_67", "SMG-CFG-IAC-LOG", "MEDIUM", "aws_cloudtrail", "AWS CloudTrail is not multi-region (`is_multi_region_trail`)", "Set `is_multi_region_trail = true` on `aws_cloudtrail`.", PolicyCheck::AttrMissingOrNotIn { key: "is_multi_region_trail".into(), expected_values: vec!["true".into()] });
-        add("CKV_AWS_238", "SMG-CFG-IAC-LOG", "HIGH", "aws_guardduty_detector", "AWS GuardDuty detector is disabled (`enable = false`)", "Set `enable = true` on `aws_guardduty_detector`.", PolicyCheck::AttrEquals { key: "enable".into(), bad_values: vec!["false".into()] });
-        add("CKV_AWS_161", "SMG-CFG-IAC-IAM", "MEDIUM", "aws_db_instance", "AWS RDS instance does not enable IAM database authentication", "Set `iam_database_authentication_enabled = true` on `aws_db_instance`.", PolicyCheck::AttrMissingOrNotIn { key: "iam_database_authentication_enabled".into(), expected_values: vec!["true".into()] });
-        add("CKV_AWS_293", "SMG-CFG-IAC-PUBLIC", "MEDIUM", "aws_db_instance", "AWS RDS instance lacks deletion protection (`deletion_protection`)", "Set `deletion_protection = true` on production `aws_db_instance`.", PolicyCheck::AttrMissingOrNotIn { key: "deletion_protection".into(), expected_values: vec!["true".into()] });
-        add("CKV_AWS_133", "SMG-CFG-IAC-LOG", "MEDIUM", "aws_db_instance", "AWS RDS instance disables automated backups (`backup_retention_period = 0`)", "Set `backup_retention_period` >= 7 on `aws_db_instance`.", PolicyCheck::AttrEquals { key: "backup_retention_period".into(), bad_values: vec!["0".into()] });
-        add("CKV_AWS_50", "SMG-CFG-IAC-LOG", "LOW", "aws_lambda_function", "AWS Lambda function does not enable X-Ray tracing (`tracing_config`)", "Add `tracing_config { mode = \"Active\" }` on `aws_lambda_function`.", PolicyCheck::NestedBlockMissing { block: "tracing_config".into() });
-        add("CKV_AWS_173", "SMG-CFG-IAC-CRYPTO", "MEDIUM", "aws_lambda_function", "AWS Lambda environment variables are not encrypted with CMK (`kms_key_arn`)", "Set `kms_key_arn` on `aws_lambda_function`.", PolicyCheck::AttrMissing { key: "kms_key_arn".into() });
-        add("CKV_AWS_27", "SMG-CFG-IAC-CRYPTO", "HIGH", "aws_sqs_queue", "AWS SQS queue lacks KMS encryption (`kms_master_key_id`)", "Set `kms_master_key_id` on `aws_sqs_queue`.", PolicyCheck::AttrMissing { key: "kms_master_key_id".into() });
-        add("CKV_AWS_26", "SMG-CFG-IAC-CRYPTO", "HIGH", "aws_sns_topic", "AWS SNS topic lacks KMS encryption (`kms_master_key_id`)", "Set `kms_master_key_id` on `aws_sns_topic`.", PolicyCheck::AttrMissing { key: "kms_master_key_id".into() });
-        add("CKV_AWS_28", "SMG-CFG-IAC-LOG", "MEDIUM", "aws_dynamodb_table", "AWS DynamoDB table lacks Point-in-Time Recovery (`point_in_time_recovery`)", "Enable `point_in_time_recovery { enabled = true }` on `aws_dynamodb_table`.", PolicyCheck::NestedAttrBadOrMissing { block: "point_in_time_recovery".into(), key: "enabled".into(), expected_values: vec!["true".into()], fire_if_block_missing: true });
-        add("CKV_AWS_119", "SMG-CFG-IAC-CRYPTO", "HIGH", "aws_dynamodb_table", "AWS DynamoDB table lacks server-side KMS encryption (`server_side_encryption`)", "Enable `server_side_encryption { enabled = true }` on `aws_dynamodb_table`.", PolicyCheck::NestedAttrBadOrMissing { block: "server_side_encryption".into(), key: "enabled".into(), expected_values: vec!["true".into()], fire_if_block_missing: true });
-        add("CKV_AWS_163", "SMG-CFG-IAC-LOG", "MEDIUM", "aws_ecr_repository", "AWS ECR repository does not enable image scan on push", "Set `image_scanning_configuration { scan_on_push = true }` on `aws_ecr_repository`.", PolicyCheck::NestedAttrBadOrMissing { block: "image_scanning_configuration".into(), key: "scan_on_push".into(), expected_values: vec!["true".into()], fire_if_block_missing: true });
-        add("CKV_AWS_51", "SMG-CFG-IAC-PUBLIC", "MEDIUM", "aws_ecr_repository", "AWS ECR image tags are mutable (`image_tag_mutability != IMMUTABLE`)", "Set `image_tag_mutability = \"IMMUTABLE\"` on `aws_ecr_repository`.", PolicyCheck::AttrMissingOrNotIn { key: "image_tag_mutability".into(), expected_values: vec!["immutable".into()] });
-        add("CKV_AWS_131", "SMG-CFG-IAC-NET", "MEDIUM", "aws_lb", "AWS ALB does not drop invalid HTTP header fields (`drop_invalid_header_fields`)", "Set `drop_invalid_header_fields = true` on `aws_lb`.", PolicyCheck::AttrMissingOrNotIn { key: "drop_invalid_header_fields".into(), expected_values: vec!["true".into()] });
-        add("CKV_AWS_149", "SMG-CFG-IAC-CRYPTO", "MEDIUM", "aws_secretsmanager_secret", "AWS Secrets Manager secret is not encrypted with customer-managed KMS key", "Set `kms_key_id` on `aws_secretsmanager_secret`.", PolicyCheck::AttrMissing { key: "kms_key_id".into() });
-        add("CKV_GCP_14", "SMG-CFG-IAC-LOG", "MEDIUM", "google_sql_database_instance", "GCP Cloud SQL instance disables automated backups (`backup_configuration`)", "Enable `backup_configuration { enabled = true }` on `google_sql_database_instance`.", PolicyCheck::NestedAttrBadOrMissing { block: "backup_configuration".into(), key: "enabled".into(), expected_values: vec!["true".into()], fire_if_block_missing: false });
-        add("CKV_GCP_39", "SMG-CFG-IAC-NET", "MEDIUM", "google_compute_instance", "GCP Compute instance disables Shielded VM vTPM (`enable_vtpm = false`)", "Set `shielded_instance_config { enable_vtpm = true }` on `google_compute_instance`.", PolicyCheck::NestedAttrBadOrMissing { block: "shielded_instance_config".into(), key: "enable_vtpm".into(), expected_values: vec!["true".into()], fire_if_block_missing: false });
-        add("CKV_GCP_43", "SMG-CFG-IAC-CRYPTO", "MEDIUM", "google_kms_crypto_key", "GCP KMS CryptoKey lacks rotation period (`rotation_period` missing)", "Configure `rotation_period` (<= 90 days) on `google_kms_crypto_key`.", PolicyCheck::AttrMissing { key: "rotation_period".into() });
-        add("CKV_GCP_26", "SMG-CFG-IAC-LOG", "MEDIUM", "google_compute_subnetwork", "GCP VPC subnetwork does not enable flow logs (`log_config` missing)", "Add `log_config` block on `google_compute_subnetwork`.", PolicyCheck::NestedBlockMissing { block: "log_config".into() });
-        add("CKV_AZURE_110", "SMG-CFG-IAC-PUBLIC", "HIGH", "azurerm_key_vault", "Azure Key Vault does not enable purge protection (`purge_protection_enabled`)", "Set `purge_protection_enabled = true` on `azurerm_key_vault`.", PolicyCheck::AttrMissingOrNotIn { key: "purge_protection_enabled".into(), expected_values: vec!["true".into()] });
-        add("CKV_AZURE_42", "SMG-CFG-IAC-LOG", "MEDIUM", "azurerm_key_vault", "Azure Key Vault disables soft delete (`soft_delete_retention_days`)", "Set `soft_delete_retention_days` >= 7 on `azurerm_key_vault`.", PolicyCheck::AttrMissing { key: "soft_delete_retention_days".into() });
-        add("CKV_AZURE_3", "SMG-CFG-IAC-CRYPTO", "HIGH", "azurerm_storage_account", "Azure Storage Account does not enforce HTTPS traffic only", "Set `enable_https_traffic_only = true` on `azurerm_storage_account`.", PolicyCheck::AttrEquals { key: "enable_https_traffic_only".into(), bad_values: vec!["false".into()] });
-        add("CKV_AZURE_44", "SMG-CFG-IAC-CRYPTO", "HIGH", "azurerm_storage_account", "Azure Storage Account allows TLS version below 1.2 (`min_tls_version`)", "Set `min_tls_version = \"TLS1_2\"` on `azurerm_storage_account`.", PolicyCheck::AttrMissingOrNotIn { key: "min_tls_version".into(), expected_values: vec!["tls1_2".into(), "tls1_3".into()] });
+        // ==================== Phase 36 Checkov Expansion (unique additional policies -> 60 total) ====================
+        add(
+            "CKV_AWS_35",
+            "SMG-CFG-IAC-CRYPTO",
+            "HIGH",
+            "aws_cloudtrail",
+            "AWS CloudTrail logs are not encrypted with KMS (`kms_key_id` missing)",
+            "Configure `kms_key_id` on `aws_cloudtrail`.",
+            PolicyCheck::AttrMissing {
+                key: "kms_key_id".into(),
+            },
+        );
+        add(
+            "CKV_AWS_238",
+            "SMG-CFG-IAC-LOG",
+            "HIGH",
+            "aws_guardduty_detector",
+            "AWS GuardDuty detector is disabled (`enable = false`)",
+            "Set `enable = true` on `aws_guardduty_detector`.",
+            PolicyCheck::AttrEquals {
+                key: "enable".into(),
+                bad_values: vec!["false".into()],
+            },
+        );
+        add(
+            "CKV_AWS_161",
+            "SMG-CFG-IAC-IAM",
+            "MEDIUM",
+            "aws_db_instance",
+            "AWS RDS instance does not enable IAM database authentication",
+            "Set `iam_database_authentication_enabled = true` on `aws_db_instance`.",
+            PolicyCheck::AttrMissingOrNotIn {
+                key: "iam_database_authentication_enabled".into(),
+                expected_values: vec!["true".into()],
+            },
+        );
+        add(
+            "CKV_AWS_50",
+            "SMG-CFG-IAC-LOG",
+            "LOW",
+            "aws_lambda_function",
+            "AWS Lambda function does not enable X-Ray tracing (`tracing_config`)",
+            "Add `tracing_config { mode = \"Active\" }` on `aws_lambda_function`.",
+            PolicyCheck::NestedBlockMissing {
+                block: "tracing_config".into(),
+            },
+        );
+        add(
+            "CKV_AWS_173",
+            "SMG-CFG-IAC-CRYPTO",
+            "MEDIUM",
+            "aws_lambda_function",
+            "AWS Lambda environment variables are not encrypted with CMK (`kms_key_arn`)",
+            "Set `kms_key_arn` on `aws_lambda_function`.",
+            PolicyCheck::AttrMissing {
+                key: "kms_key_arn".into(),
+            },
+        );
+        add(
+            "CKV_GCP_14",
+            "SMG-CFG-IAC-LOG",
+            "MEDIUM",
+            "google_sql_database_instance",
+            "GCP Cloud SQL instance disables automated backups (`backup_configuration`)",
+            "Enable `backup_configuration { enabled = true }` on `google_sql_database_instance`.",
+            PolicyCheck::NestedAttrBadOrMissing {
+                block: "backup_configuration".into(),
+                key: "enabled".into(),
+                expected_values: vec!["true".into()],
+                fire_if_block_missing: false,
+            },
+        );
+        add(
+            "CKV_GCP_38",
+            "SMG-CFG-IAC-NET",
+            "MEDIUM",
+            "google_compute_instance",
+            "GCP Compute instance disables Shielded VM vTPM (`enable_vtpm = false`)",
+            "Set `shielded_instance_config { enable_vtpm = true }` on `google_compute_instance`.",
+            PolicyCheck::NestedAttrBadOrMissing {
+                block: "shielded_instance_config".into(),
+                key: "enable_vtpm".into(),
+                expected_values: vec!["true".into()],
+                fire_if_block_missing: false,
+            },
+        );
+        add(
+            "CKV_AZURE_42",
+            "SMG-CFG-IAC-LOG",
+            "MEDIUM",
+            "azurerm_key_vault",
+            "Azure Key Vault disables soft delete (`soft_delete_retention_days`)",
+            "Set `soft_delete_retention_days` >= 7 on `azurerm_key_vault`.",
+            PolicyCheck::AttrMissing {
+                key: "soft_delete_retention_days".into(),
+            },
+        );
 
         p
     })
@@ -893,7 +986,70 @@ mod tests {
         assert!(az_hits.iter().any(|h| h.title.contains("CKV_AZURE_44")));
         assert!(az_hits.iter().any(|h| h.title.contains("CKV_AZURE_190")));
 
-        // 4. Built-in pack size >= 50
-        assert!(builtin_iac_policies().len() >= 50);
+        // 4. Built-in pack size >= 50 and strictly unique Checkov IDs
+        let policies = builtin_iac_policies();
+        assert!(policies.len() >= 50);
+        let mut seen_ckv = std::collections::HashSet::new();
+        for pol in policies {
+            assert!(
+                seen_ckv.insert(pol.checkov_id.as_str()),
+                "Duplicate Checkov ID in builtin_iac_policies: {}",
+                pol.checkov_id
+            );
+        }
+
+        // 5. CKV_AWS_27 accepts either sqs_managed_sse_enabled = true OR kms_master_key_id
+        let mut sqs_sse = HashMap::new();
+        sqs_sse.insert("sqs_managed_sse_enabled".into(), "true".into());
+        assert!(
+            evaluate_hcl_resource_policies(&HclResourceView {
+                rel_path: "infra/sqs.tf",
+                res_type: "aws_sqs_queue",
+                res_name: "q_sse",
+                line: 1,
+                attrs: &sqs_sse,
+                nested: &empty_nested,
+            })
+            .is_empty()
+        );
+        let mut sqs_kms = HashMap::new();
+        sqs_kms.insert("kms_master_key_id".into(), "\"alias/aws/sqs\"".into());
+        assert!(
+            evaluate_hcl_resource_policies(&HclResourceView {
+                rel_path: "infra/sqs.tf",
+                res_type: "aws_sqs_queue",
+                res_name: "q_kms",
+                line: 5,
+                attrs: &sqs_kms,
+                nested: &empty_nested,
+            })
+            .is_empty()
+        );
+        let mut sqs_off = HashMap::new();
+        sqs_off.insert("sqs_managed_sse_enabled".into(), "false".into());
+        assert!(
+            evaluate_hcl_resource_policies(&HclResourceView {
+                rel_path: "infra/sqs.tf",
+                res_type: "aws_sqs_queue",
+                res_name: "q_off",
+                line: 10,
+                attrs: &sqs_off,
+                nested: &empty_nested,
+            })
+            .iter()
+            .any(|h| h.title.contains("CKV_AWS_27"))
+        );
+
+        // 6. CKV_AWS_39 fires when vpc_config block is missing on aws_eks_cluster
+        let eks_empty = HashMap::new();
+        let eks_hits = evaluate_hcl_resource_policies(&HclResourceView {
+            rel_path: "infra/eks.tf",
+            res_type: "aws_eks_cluster",
+            res_name: "prod",
+            line: 1,
+            attrs: &eks_empty,
+            nested: &empty_nested,
+        });
+        assert!(eks_hits.iter().any(|h| h.title.contains("CKV_AWS_39")));
     }
 }

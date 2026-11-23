@@ -33,8 +33,44 @@ fn stack_buf_re() -> &'static Regex {
 fn malloc_buf_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:\([^)]+\)\s*)?(?:malloc|calloc)\s*\(\s*(\d+)\s*\)").expect("valid malloc re")
+        Regex::new(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:\([^)]+\)\s*)?(?:malloc\s*\(\s*(\d+)\s*\)|calloc\s*\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\))").expect("valid malloc re")
     })
+}
+
+/// Counts `{` and `}` on a single line outside string (`"..."`) and char (`'...'`) literals.
+fn count_code_braces(line: &str) -> (i32, i32) {
+    let bytes = line.as_bytes();
+    let mut opens = 0i32;
+    let mut closes = 0i32;
+    let mut in_quote: Option<u8> = None;
+    let mut esc = false;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if esc {
+            esc = false;
+            i += 1;
+            continue;
+        }
+        if let Some(q) = in_quote {
+            if b == b'\\' {
+                esc = true;
+            } else if b == q {
+                in_quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'/' if bytes.get(i + 1) == Some(&b'/') => break,
+            b'"' | b'\'' => in_quote = Some(b),
+            b'{' => opens += 1,
+            b'}' => closes += 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    (opens, closes)
 }
 
 fn memcpy_const_re() -> &'static Regex {
@@ -126,27 +162,22 @@ fn line_reassigns_ptr(line: &str, var: &str) -> bool {
 /// Audits C/C++ source code for Use-After-Free, Double-Free, and provable constant
 /// buffer-length overflows (`malloc(N)` / `char buf[N]` -> `memcpy(buf, src, M)` where `M > N`).
 pub fn analyze_c_cpp_memory_typestate(rel_path: &str, source: &str) -> Vec<LocalStaticFinding> {
+    let cleaned = crate::ast::strip_comments(source);
     let mut findings = Vec::new();
     let mut ptr_states: HashMap<String, PtrState> = HashMap::new();
-    let mut buf_sizes: HashMap<String, usize> = HashMap::new();
+    let mut buf_sizes: HashMap<String, (usize, i32)> = HashMap::new();
     let mut brace_depth: i32 = 0;
 
-    for (idx, raw_line) in source.lines().enumerate() {
+    for (idx, raw_line) in cleaned.lines().enumerate() {
         let ln = idx + 1;
-        let line = raw_line.split("//").next().unwrap_or(raw_line).trim();
-        if line.is_empty()
-            || line.starts_with("/*")
-            || line.starts_with('*')
-            || line.starts_with('#')
-        {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
             continue;
         }
 
         // Reset function-local state when exiting top-level function body,
-        // and clear conditional-branch `Freed` states when exiting an inner `{ ... }` block
-        // or entering an `else` / `case` / `default:` / goto-label branch.
-        let opens = line.chars().filter(|&c| c == '{').count() as i32;
-        let closes = line.chars().filter(|&c| c == '}').count() as i32;
+        // and clear conditional-branch `Freed` states & inner-scope buffers on block exit.
+        let (opens, closes) = count_code_braces(line);
         if brace_depth == 0 && opens > 0 {
             ptr_states.clear();
             buf_sizes.clear();
@@ -166,6 +197,7 @@ pub fn analyze_c_cpp_memory_typestate(rel_path: &str, source: &str) -> Vec<Local
             || (line.ends_with(':') && !line.contains(' ') && !line.contains('('))
         {
             ptr_states.retain(|_, st| !matches!(st, PtrState::Freed(_, d) if *d > brace_depth));
+            buf_sizes.retain(|_, (_, d)| *d <= brace_depth);
             if line.starts_with("else")
                 || line.starts_with("} else")
                 || line.starts_with("case ")
@@ -176,27 +208,40 @@ pub fn analyze_c_cpp_memory_typestate(rel_path: &str, source: &str) -> Vec<Local
             }
         }
 
-        // 1. Track stack & heap constant buffer capacities
+        // 1. Track stack & heap constant buffer capacities (with lexical brace depth)
         if let Some(c) = stack_buf_re().captures(line)
             && let (Some(v), Some(sz)) = (c.get(1), c.get(2))
             && let Ok(n) = sz.as_str().parse::<usize>()
         {
-            buf_sizes.insert(v.as_str().to_string(), n);
+            buf_sizes.insert(v.as_str().to_string(), (n, brace_depth));
             ptr_states.insert(v.as_str().to_string(), PtrState::Live);
         }
         if let Some(c) = malloc_buf_re().captures(line)
-            && let (Some(v), Some(sz)) = (c.get(1), c.get(2))
-            && let Ok(n) = sz.as_str().parse::<usize>()
+            && let Some(v) = c.get(1)
         {
-            buf_sizes.insert(v.as_str().to_string(), n);
-            ptr_states.insert(v.as_str().to_string(), PtrState::Live);
+            let cap_opt = if let Some(m_sz) = c.get(2) {
+                m_sz.as_str().parse::<usize>().ok()
+            } else if let Some(c1) = c.get(3) {
+                let n1 = c1.as_str().parse::<usize>().ok();
+                let n2 = c
+                    .get(4)
+                    .map(|m| m.as_str().parse::<usize>().ok())
+                    .unwrap_or(Some(1));
+                n1.zip(n2).and_then(|(a, b)| a.checked_mul(b))
+            } else {
+                None
+            };
+            if let Some(n) = cap_opt {
+                buf_sizes.insert(v.as_str().to_string(), (n, brace_depth));
+                ptr_states.insert(v.as_str().to_string(), PtrState::Live);
+            }
         }
 
         // 2. Check symbolic constant buffer-length overflow (`memcpy(buf, src, M)` where M > N)
         if let Some(c) = memcpy_const_re().captures(line)
             && let (Some(v), Some(len_m)) = (c.get(1), c.get(2))
             && let Ok(write_len) = len_m.as_str().parse::<usize>()
-            && let Some(&cap) = buf_sizes.get(v.as_str())
+            && let Some(&(cap, _)) = buf_sizes.get(v.as_str())
             && write_len > cap
         {
             findings.push(LocalStaticFinding {
@@ -315,34 +360,80 @@ pub fn analyze_rust_async_mutex_across_await(
     if !rel_path.ends_with(".rs") || !source.contains("async fn") || !source.contains(".await") {
         return Vec::new();
     }
-    let uses_std_sync = source.contains("std::sync::Mutex")
-        || source.contains("std::sync::RwLock")
-        || source.contains("parking_lot::Mutex");
-    if !uses_std_sync {
+    let uses_std_mutex =
+        source.contains("std::sync::Mutex") || source.contains("parking_lot::Mutex");
+    let uses_std_rwlock =
+        source.contains("std::sync::RwLock") || source.contains("parking_lot::RwLock");
+    if !uses_std_mutex && !uses_std_rwlock {
         return Vec::new();
     }
 
-    static GUARD_RE: OnceLock<Regex> = OnceLock::new();
-    let guard_re = GUARD_RE.get_or_init(|| {
+    static LOCK_GUARD_RE: OnceLock<Regex> = OnceLock::new();
+    static RW_GUARD_RE: OnceLock<Regex> = OnceLock::new();
+    let lock_guard_re = LOCK_GUARD_RE.get_or_init(|| {
+        Regex::new(r"\blet\s+(?:mut\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*[^;]+\.lock\(\)")
+            .expect("valid lock guard re")
+    });
+    let rw_guard_re = RW_GUARD_RE.get_or_init(|| {
         Regex::new(
             r"\blet\s+(?:mut\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*[^;]+\.(?:lock|read|write)\(\)",
         )
-        .expect("valid guard re")
+        .expect("valid rw guard re")
     });
+    let guard_re = if uses_std_rwlock {
+        rw_guard_re
+    } else {
+        lock_guard_re
+    };
 
+    let cleaned = crate::ast::strip_comments(source);
     let mut findings = Vec::new();
     let mut in_async = false;
     let mut async_depth: i32 = 0;
     let mut active_guards: Vec<(String, usize, i32)> = Vec::new(); // (name, line, scope_depth)
-    let mut in_cfg_test = false;
+    let mut cfg_test_pending = false;
+    let mut cfg_test_in_block = false;
+    let mut cfg_test_depth: i32 = 0;
 
-    for (idx, raw_line) in source.lines().enumerate() {
+    for (idx, raw_line) in cleaned.lines().enumerate() {
         let ln = idx + 1;
-        let line = raw_line.split("//").next().unwrap_or(raw_line).trim();
-        if line.starts_with("#[cfg(test)]") {
-            in_cfg_test = true;
+        let line = raw_line.trim();
+        let (opens, closes) = count_code_braces(line);
+
+        if !cfg_test_in_block && !cfg_test_pending && line.starts_with("#[cfg(test)]") {
+            cfg_test_pending = true;
+            if opens > 0 {
+                cfg_test_in_block = true;
+                cfg_test_pending = false;
+                cfg_test_depth = opens - closes;
+                if cfg_test_depth <= 0 {
+                    cfg_test_in_block = false;
+                    cfg_test_depth = 0;
+                }
+            } else if line.contains(';') {
+                cfg_test_pending = false;
+            }
+            continue;
         }
-        if in_cfg_test || line.is_empty() {
+        if cfg_test_pending || cfg_test_in_block {
+            if opens > 0 {
+                cfg_test_in_block = true;
+                cfg_test_pending = false;
+            }
+            if cfg_test_in_block {
+                cfg_test_depth += opens - closes;
+                if cfg_test_depth <= 0 {
+                    cfg_test_in_block = false;
+                    cfg_test_pending = false;
+                    cfg_test_depth = 0;
+                }
+            } else if line.contains(';') {
+                cfg_test_pending = false;
+            }
+            continue;
+        }
+
+        if line.is_empty() {
             continue;
         }
 
@@ -354,9 +445,6 @@ pub fn analyze_rust_async_mutex_across_await(
         if !in_async {
             continue;
         }
-
-        let opens = line.chars().filter(|&c| c == '{').count() as i32;
-        let closes = line.chars().filter(|&c| c == '}').count() as i32;
 
         if let Some(c) = guard_re.captures(line)
             && let Some(gname) = c.get(1)

@@ -107,7 +107,9 @@ pub fn detect_domain_hints(
     let is_mobile_cfg = matches!(
         fname,
         "AndroidManifest.xml" | "network_security_config.xml" | "Info.plist" | "Podfile"
-    ) || (fname == "pubspec.yaml" && low_src.contains("flutter"));
+    ) || (fname == "pubspec.yaml" && low_src.contains("flutter"))
+        || (matches!(fname, "build.gradle" | "build.gradle.kts")
+            && (low_src.contains("com.android.") || low_src.contains("android {")));
 
     let mobile_signal = is_mobile_cfg
         || low_path.contains("/android/app/")
@@ -122,7 +124,9 @@ pub fn detect_domain_hints(
         || low_src.contains("encryptedsharedpreferences")
         || low_src.contains("userdefaults")
         || low_src.contains("secitemadd")
-        || low_src.contains("badcertificatecallback");
+        || low_src.contains("badcertificatecallback")
+        || low_src.contains("react-native")
+        || low_src.contains("asyncstorage");
 
     let system_engine = matches!(lang, Language::C | Language::Cpp | Language::Rust)
         || [
@@ -216,16 +220,28 @@ pub fn analyze_ast_phase9(
                     rel_path, src_str,
                 ));
             } else if matches!(lang, Language::Rust) {
-                static_findings.extend(mem_typestate::analyze_rust_async_mutex_across_await(
-                    rel_path, src_str,
-                ));
+                for hit in mem_typestate::analyze_rust_async_mutex_across_await(rel_path, src_str) {
+                    let already_reported = static_findings.iter().any(|e| {
+                        e.rel_path == hit.rel_path
+                            && e.line == hit.line
+                            && (e.rule_id == "SMG-ENG-DEADLOCK" || e.rule_id == hit.rule_id)
+                    });
+                    if !already_reported {
+                        static_findings.push(hit);
+                    }
+                }
             }
         }
     }
 
     if matches!(
         lang,
-        Language::Kotlin | Language::Java | Language::Swift | Language::Dart
+        Language::Kotlin
+            | Language::Java
+            | Language::Swift
+            | Language::Dart
+            | Language::JavaScript
+            | Language::TypeScript
     ) {
         mobile::analyze_mobile_ast(root, src, rel_path, lang, static_findings);
     }

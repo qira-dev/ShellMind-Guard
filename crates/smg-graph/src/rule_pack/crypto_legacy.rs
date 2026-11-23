@@ -55,7 +55,7 @@ pub(super) const RULES: &[(&str, PackRuleSpec)] = &[
         },
     ),
     (
-        r#"(?i)(?:modulusLength\s*:\s*(?:512|1024)\b|\brsa\.GenerateKey\s*\([^,]+,\s*(?:512|1024)\s*\)|\.initialize\s*\(\s*(?:512|1024)\s*\)|RSACryptoServiceProvider\s*\(\s*(?:512|1024)\s*\))"#,
+        r#"(?i)(?:modulusLength\s*:\s*(?:512|1024)\b|\brsa\.GenerateKey\s*\([^,]+,\s*(?:512|1024)\s*\)|(?:keypairgenerator|kpg|rsa|dsa)[^\n]*\.initialize\s*\(\s*(?:512|1024)\s*\)|RSACryptoServiceProvider\s*\(\s*(?:512|1024)\s*\))"#,
         PackRuleSpec {
             rule_id: "SMG-CRYPTO-001",
             severity: "HIGH",
@@ -178,7 +178,7 @@ pub(super) const RULES: &[(&str, PackRuleSpec)] = &[
         },
     ),
     (
-        r"\bAesGcm\s*\(\s*key\s*\)\s*;|\bnew\s+RSACryptoServiceProvider\s*\(\s*\)",
+        r"\bnew\s+RSACryptoServiceProvider\s*\(\s*\)",
         PackRuleSpec {
             rule_id: "SMG-CRYPTO-001",
             severity: "LOW",
@@ -188,7 +188,7 @@ pub(super) const RULES: &[(&str, PackRuleSpec)] = &[
             confidence: Confidence::Heuristic,
             remediation: "Use `RSA.Create(3072)` or `ECDsa.Create(ECCurve.NamedCurves.nistP256)`.",
             langs: CSHARP_ONLY,
-            line_exempt_any: &["aesgcm"],
+            line_exempt_any: &[],
             file_exempt_any: &[],
             path_require_any: &[],
             symbol: "dotnet_legacy_rsa",

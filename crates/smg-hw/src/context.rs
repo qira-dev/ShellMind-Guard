@@ -133,50 +133,222 @@ pub fn parse_hex_or_dec_u64(raw: &str) -> Option<u64> {
     }
 }
 
-/// Evaluates GNU linker constant expressions such as `128K - 4K` or `0x08000000 + 64K`.
+/// Evaluates GNU linker constant expressions such as `128K - 4K`, `0x08000000 + 2 * 64K`,
+/// or `(128K - 16K) / 2` using full recursive-descent operator precedence.
 pub fn eval_linker_expr(raw: &str) -> Option<u64> {
-    let mut s = raw.trim().trim_end_matches([';', ',', '}']).trim();
-    while s.starts_with('(') && s.ends_with(')') && s.len() >= 2 {
-        let inner = &s[1..s.len() - 1];
-        if inner.chars().fold(0i32, |acc, c| match c {
-            '(' => acc + 1,
-            ')' => acc - 1,
-            _ => acc,
-        }) == 0
-        {
-            s = inner.trim();
-        } else {
-            break;
-        }
+    let stripped = smg_graph::taint::strip_comments_simple(raw);
+    let s = stripped.trim().trim_end_matches([';', ',', '}']).trim();
+    if s.is_empty() {
+        return None;
     }
     if let Some(v) = parse_hex_or_dec_u64(s) {
         return Some(v);
     }
-    let mut acc: Option<u64> = None;
-    let mut op = '+';
-    let mut cur = String::new();
-    for ch in s.chars() {
-        if ch == '+' || ch == '-' {
-            let term = parse_hex_or_dec_u64(&cur)?;
-            acc = Some(match (acc, op) {
-                (None, _) => term,
-                (Some(prev), '+') => prev.saturating_add(term),
-                (Some(prev), '-') => prev.saturating_sub(term),
-                (Some(prev), _) => prev,
-            });
-            op = ch;
-            cur.clear();
-        } else if ch != '(' && ch != ')' {
-            cur.push(ch);
+
+    #[derive(Clone, Debug)]
+    enum LTok {
+        Num(i128),
+        LParen,
+        RParen,
+        Plus,
+        Minus,
+        Star,
+        Slash,
+        Shl,
+        Shr,
+        BitOr,
+        BitAnd,
+        BitNot,
+    }
+
+    let bytes = s.as_bytes();
+    let mut toks = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        match b {
+            b'(' => {
+                toks.push(LTok::LParen);
+                i += 1;
+            }
+            b')' => {
+                toks.push(LTok::RParen);
+                i += 1;
+            }
+            b'+' => {
+                toks.push(LTok::Plus);
+                i += 1;
+            }
+            b'-' => {
+                toks.push(LTok::Minus);
+                i += 1;
+            }
+            b'*' => {
+                toks.push(LTok::Star);
+                i += 1;
+            }
+            b'/' => {
+                toks.push(LTok::Slash);
+                i += 1;
+            }
+            b'~' => {
+                toks.push(LTok::BitNot);
+                i += 1;
+            }
+            b'|' if bytes.get(i + 1) != Some(&b'|') => {
+                toks.push(LTok::BitOr);
+                i += 1;
+            }
+            b'&' if bytes.get(i + 1) != Some(&b'&') => {
+                toks.push(LTok::BitAnd);
+                i += 1;
+            }
+            b'<' if bytes.get(i + 1) == Some(&b'<') => {
+                toks.push(LTok::Shl);
+                i += 2;
+            }
+            b'>' if bytes.get(i + 1) == Some(&b'>') => {
+                toks.push(LTok::Shr);
+                i += 2;
+            }
+            b'0'..=b'9' => {
+                let start = i;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                let word = s[start..i].replace('_', "");
+                let val = parse_hex_or_dec_u64(&word)?;
+                toks.push(LTok::Num(val as i128));
+            }
+            _ => return None,
         }
     }
-    let last_term = parse_hex_or_dec_u64(&cur)?;
-    Some(match (acc, op) {
-        (None, _) => last_term,
-        (Some(prev), '+') => prev.saturating_add(last_term),
-        (Some(prev), '-') => prev.saturating_sub(last_term),
-        (Some(prev), _) => prev,
-    })
+    if toks.is_empty() {
+        return None;
+    }
+
+    fn p_bitor(toks: &[LTok], pos: &mut usize) -> Option<i128> {
+        let mut lhs = p_bitand(toks, pos)?;
+        while matches!(toks.get(*pos), Some(LTok::BitOr)) {
+            *pos += 1;
+            lhs |= p_bitand(toks, pos)?;
+        }
+        Some(lhs)
+    }
+    fn p_bitand(toks: &[LTok], pos: &mut usize) -> Option<i128> {
+        let mut lhs = p_shift(toks, pos)?;
+        while matches!(toks.get(*pos), Some(LTok::BitAnd)) {
+            *pos += 1;
+            lhs &= p_shift(toks, pos)?;
+        }
+        Some(lhs)
+    }
+    fn p_shift(toks: &[LTok], pos: &mut usize) -> Option<i128> {
+        let mut lhs = p_add(toks, pos)?;
+        while let Some(op) = toks.get(*pos) {
+            match op {
+                LTok::Shl => {
+                    *pos += 1;
+                    let r = p_add(toks, pos)?;
+                    if !(0..64).contains(&r) {
+                        return None;
+                    }
+                    lhs = lhs.checked_shl(r as u32)?;
+                }
+                LTok::Shr => {
+                    *pos += 1;
+                    let r = p_add(toks, pos)?;
+                    if !(0..64).contains(&r) {
+                        return None;
+                    }
+                    lhs = lhs.checked_shr(r as u32)?;
+                }
+                _ => break,
+            }
+        }
+        Some(lhs)
+    }
+    fn p_add(toks: &[LTok], pos: &mut usize) -> Option<i128> {
+        let mut lhs = p_mul(toks, pos)?;
+        while let Some(op) = toks.get(*pos) {
+            match op {
+                LTok::Plus => {
+                    *pos += 1;
+                    lhs = lhs.checked_add(p_mul(toks, pos)?)?;
+                }
+                LTok::Minus => {
+                    *pos += 1;
+                    lhs = lhs.checked_sub(p_mul(toks, pos)?)?;
+                }
+                _ => break,
+            }
+        }
+        Some(lhs)
+    }
+    fn p_mul(toks: &[LTok], pos: &mut usize) -> Option<i128> {
+        let mut lhs = p_atom(toks, pos)?;
+        while let Some(op) = toks.get(*pos) {
+            match op {
+                LTok::Star => {
+                    *pos += 1;
+                    lhs = lhs.checked_mul(p_atom(toks, pos)?)?;
+                }
+                LTok::Slash => {
+                    *pos += 1;
+                    let r = p_atom(toks, pos)?;
+                    if r == 0 {
+                        return None;
+                    }
+                    lhs = lhs.checked_div(r)?;
+                }
+                _ => break,
+            }
+        }
+        Some(lhs)
+    }
+    fn p_atom(toks: &[LTok], pos: &mut usize) -> Option<i128> {
+        match toks.get(*pos)? {
+            LTok::Num(n) => {
+                let v = *n;
+                *pos += 1;
+                Some(v)
+            }
+            LTok::Plus => {
+                *pos += 1;
+                p_atom(toks, pos)
+            }
+            LTok::Minus => {
+                *pos += 1;
+                p_atom(toks, pos)?.checked_neg()
+            }
+            LTok::BitNot => {
+                *pos += 1;
+                Some((!(p_atom(toks, pos)? as u64)) as i128)
+            }
+            LTok::LParen => {
+                *pos += 1;
+                let v = p_bitor(toks, pos)?;
+                if !matches!(toks.get(*pos), Some(LTok::RParen)) {
+                    return None;
+                }
+                *pos += 1;
+                Some(v)
+            }
+            _ => None,
+        }
+    }
+
+    let mut pos = 0;
+    let val = p_bitor(&toks, &mut pos)?;
+    if pos == toks.len() {
+        u64::try_from(val).ok()
+    } else {
+        None
+    }
 }
 
 fn parse_ld_writable(name: &str, attrs_opt: Option<&str>) -> bool {
@@ -297,6 +469,7 @@ fn eval_define_expr(raw: &str, env: &HashMap<String, i64>) -> Option<i64> {
         Shr,
         BitOr,
         BitAnd,
+        BitNot,
     }
 
     let bytes = no_comment.as_bytes();
@@ -331,6 +504,10 @@ fn eval_define_expr(raw: &str, env: &HashMap<String, i64>) -> Option<i64> {
             }
             b'/' => {
                 toks.push(Tok::Slash);
+                i += 1;
+            }
+            b'~' => {
+                toks.push(Tok::BitNot);
                 i += 1;
             }
             b'|' => {
@@ -468,9 +645,17 @@ fn eval_define_expr(raw: &str, env: &HashMap<String, i64>) -> Option<i64> {
                 *pos += 1;
                 Some(v)
             }
+            Tok::Plus => {
+                *pos += 1;
+                parse_atom(toks, pos)
+            }
             Tok::Minus => {
                 *pos += 1;
                 parse_atom(toks, pos)?.checked_neg()
+            }
+            Tok::BitNot => {
+                *pos += 1;
+                Some(!parse_atom(toks, pos)?)
             }
             Tok::LParen => {
                 *pos += 1;
@@ -1024,5 +1209,25 @@ MEMORY
             .find(|r| r.name == "DMA0")
             .expect("DMA0 peripheral region expected");
         assert_eq!(periph.size, 0x10 + 64);
+    }
+
+    #[test]
+    fn define_and_linker_expr_support_unary_bitnot_and_full_precedence() {
+        let hdr = r#"
+#define POS_VAL   (+42)
+#define MASK_LOW  (~0x0F)
+#define BIT_CLR   (~(1 << 3))
+"#;
+        let ctx = ingest_firmware_context(Path::new("/nonexistent"), &[("fw/masks.h".into(), hdr)]);
+        assert_eq!(ctx.global_defines.get("POS_VAL"), Some(&42));
+        assert_eq!(ctx.global_defines.get("MASK_LOW"), Some(&(!0x0Fi64)));
+        assert_eq!(ctx.global_defines.get("BIT_CLR"), Some(&(!(1i64 << 3))));
+
+        assert_eq!(eval_linker_expr("64K - 4K"), Some(60 * 1024));
+        assert_eq!(eval_linker_expr("(128K - 16K) / 2"), Some(56 * 1024));
+        assert_eq!(
+            eval_linker_expr("0x20000000 + 2 * 32K"),
+            Some(0x2000_0000 + 64 * 1024)
+        );
     }
 }

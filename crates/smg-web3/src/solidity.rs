@@ -77,7 +77,9 @@ pub struct ParsedContract {
     pub packed_slots: Vec<EvmSlotEntry>,
     pub custom_auth_modifiers: HashSet<String>,
     pub custom_lock_modifiers: HashSet<String>,
+    pub local_enums: HashSet<String>,
     pub functions: Vec<ParsedFunction>,
+    pub has_erc7201_struct: bool,
     pub has_erc7201_namespace: bool,
 }
 
@@ -627,35 +629,62 @@ pub fn parse_solidity_file_with_bases(
 
     // Linearize inherited base contracts' state variables, auth modifiers, and lock modifiers
     // (merging both same-file bases and cross-file workspace bases via bounded transitive walk).
-    let mut by_name: HashMap<String, ParsedContract> = workspace_bases.cloned().unwrap_or_default();
-    for c in &contracts {
-        by_name.insert(c.name.clone(), c.clone());
+    let local_by_name: HashMap<String, ParsedContract> = contracts
+        .iter()
+        .map(|c| (c.name.clone(), c.clone()))
+        .collect();
+    let lookup_base = |bname: &str| -> Option<&ParsedContract> {
+        local_by_name
+            .get(bname)
+            .or_else(|| workspace_bases.and_then(|wb| wb.get(bname)))
+    };
+
+    // Post-order DFS linearization: most-base-like ancestors first (slot 0 -> derived)
+    fn linearize_bases_postorder<'a>(
+        base_names: &[String],
+        lookup: &dyn Fn(&str) -> Option<&'a ParsedContract>,
+        depth: usize,
+        visiting: &mut HashSet<String>,
+        visited: &mut HashSet<String>,
+        out: &mut Vec<String>,
+    ) {
+        if depth >= 8 {
+            return;
+        }
+        for bname in base_names {
+            if visited.contains(bname) || !visiting.insert(bname.clone()) {
+                continue;
+            }
+            if let Some(bc) = lookup(bname) {
+                linearize_bases_postorder(&bc.bases, lookup, depth + 1, visiting, visited, out);
+            }
+            visiting.remove(bname);
+            if visited.insert(bname.clone()) {
+                out.push(bname.clone());
+            }
+        }
     }
 
     for (idx, c) in contracts.iter_mut().enumerate() {
         if c.bases.is_empty() {
             continue;
         }
-        // Bounded C3-style transitive base order (depth <= 8)
         let mut ordered_bases: Vec<String> = Vec::new();
-        let mut queue: std::collections::VecDeque<(String, usize)> =
-            c.bases.iter().cloned().map(|b| (b, 0)).collect();
-        while let Some((bname, depth)) = queue.pop_front() {
-            if depth >= 8 || ordered_bases.contains(&bname) {
-                continue;
-            }
-            ordered_bases.push(bname.clone());
-            if let Some(bc) = by_name.get(&bname) {
-                for parent in &bc.bases {
-                    if !ordered_bases.contains(parent) {
-                        queue.push_back((parent.clone(), depth + 1));
-                    }
-                }
-            }
-        }
+        let mut visiting = HashSet::new();
+        let mut visited = HashSet::new();
+        linearize_bases_postorder(
+            &c.bases,
+            &lookup_base,
+            0,
+            &mut visiting,
+            &mut visited,
+            &mut ordered_bases,
+        );
         let mut linearized_vars = Vec::new();
+        let mut merged_enums = file_enums.clone();
+        merged_enums.extend(c.local_enums.iter().cloned());
         for base_name in &ordered_bases {
-            if let Some(base_c) = by_name.get(base_name) {
+            if let Some(base_c) = lookup_base(base_name) {
                 for sv in &base_c.state_vars {
                     if !linearized_vars
                         .iter()
@@ -668,6 +697,7 @@ pub fn parse_solidity_file_with_bases(
                     .extend(base_c.custom_auth_modifiers.iter().cloned());
                 c.custom_lock_modifiers
                     .extend(base_c.custom_lock_modifiers.iter().cloned());
+                merged_enums.extend(base_c.local_enums.iter().cloned());
             }
         }
         for sv in &c.state_vars {
@@ -678,12 +708,13 @@ pub fn parse_solidity_file_with_bases(
         let inherited_state_names: HashSet<String> =
             linearized_vars.iter().map(|v| v.name.clone()).collect();
         c.state_vars = linearized_vars;
+        c.local_enums = merged_enums;
         c.packed_slots = pack_storage_vars_with_defs(
             &c.name,
             rel_path,
             &c.state_vars,
             0,
-            &file_enums,
+            &c.local_enums,
             &file_contract_types,
         );
         // Re-extract child functions with inherited base state_vars so CEI/view reentrancy catches inherited storage writes
@@ -692,7 +723,7 @@ pub fn parse_solidity_file_with_bases(
             src,
             rel_path,
             c.kind,
-            &file_enums,
+            &c.local_enums,
             &file_contract_types,
             Some(&inherited_state_names),
         );
@@ -986,7 +1017,9 @@ fn extract_contract(
         packed_slots,
         custom_auth_modifiers,
         custom_lock_modifiers,
+        local_enums,
         functions,
+        has_erc7201_struct,
         has_erc7201_namespace,
     }
 }
@@ -1061,8 +1094,9 @@ pub fn analyze_solidity_file_with_bases(
         if matches!(c.kind, ContractKind::Interface) {
             continue;
         }
-        // ERC-7201 slot-0 check: proxy using `@custom:storage-location erc7201:...` with raw slot-0 vars
-        if c.has_erc7201_namespace
+        // ERC-7201 slot-0 check: proxy using `@custom:storage-location erc7201:...`
+        // that also declares raw slot-0 storage variables risks storage collisions on upgrade/proxy
+        if c.has_erc7201_struct
             && c.is_proxy_like
             && !c.packed_slots.is_empty()
             && matches!(c.kind, ContractKind::Contract)

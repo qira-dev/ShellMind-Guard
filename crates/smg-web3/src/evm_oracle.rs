@@ -237,16 +237,19 @@ fn build_forwarding_reentrant_attacker(max_calls: u8, reenter_calldata: &[u8]) -
         0x60, 0x01, 0x01, 0x60, 0x00, 0x55, // slot[0] += 1
     ]);
 
-    // Store reenter_calldata words into memory at 0..
-    for (chunk_idx, chunk) in reenter_calldata.chunks(32).enumerate() {
+    // Store reenter_calldata words into memory at 0.. using PUSH2 16-bit offsets (capped at 4 KiB)
+    let bounded_cd = &reenter_calldata[..reenter_calldata.len().min(4096)];
+    for (chunk_idx, chunk) in bounded_cd.chunks(32).enumerate() {
         let mut word = [0u8; 32];
         word[..chunk.len()].copy_from_slice(chunk);
         code.push(0x7f); // PUSH32
         code.extend_from_slice(&word);
-        let mem_off = (chunk_idx * 32) as u8;
-        code.extend_from_slice(&[0x60, mem_off, 0x52]); // PUSH1 off, MSTORE
+        let mem_off = (chunk_idx * 32) as u16;
+        code.push(0x61); // PUSH2
+        code.extend_from_slice(&mem_off.to_be_bytes());
+        code.push(0x52); // MSTORE
     }
-    let cd_len = reenter_calldata.len() as u16;
+    let cd_len = bounded_cd.len() as u16;
     code.extend_from_slice(&[0x60, 0x00, 0x60, 0x00]); // retSize=0, retOff=0
     code.push(0x61);
     code.extend_from_slice(&cd_len.to_be_bytes()); // argSize
@@ -337,16 +340,19 @@ pub fn build_callback_reentrant_attacker(
     let ret_jump_idx = code.len() + 1;
     code.extend_from_slice(&[0x61, 0x00, 0x00, 0x57]); // PUSH2 ret_pc, JUMPI
 
-    // Copy reenter_calldata into memory and CALL VICTIM_ADDR
-    for (chunk_idx, chunk) in reenter_calldata.chunks(32).enumerate() {
+    // Copy reenter_calldata into memory using PUSH2 16-bit offsets (capped at 4 KiB) and CALL VICTIM_ADDR
+    let bounded_cd = &reenter_calldata[..reenter_calldata.len().min(4096)];
+    for (chunk_idx, chunk) in bounded_cd.chunks(32).enumerate() {
         let mut word = [0u8; 32];
         word[..chunk.len()].copy_from_slice(chunk);
         code.push(0x7f);
         code.extend_from_slice(&word);
-        let mem_off = (chunk_idx * 32) as u8;
-        code.extend_from_slice(&[0x60, mem_off, 0x52]);
+        let mem_off = (chunk_idx * 32) as u16;
+        code.push(0x61); // PUSH2
+        code.extend_from_slice(&mem_off.to_be_bytes());
+        code.push(0x52); // MSTORE
     }
-    let cd_len = reenter_calldata.len() as u16;
+    let cd_len = bounded_cd.len() as u16;
     code.extend_from_slice(&[0x60, 0x00, 0x60, 0x00]);
     code.push(0x61);
     code.extend_from_slice(&cd_len.to_be_bytes());
@@ -393,16 +399,24 @@ pub fn probe_view_reentrancy_in_revm(
     attacker.extend_from_slice(&[0x61, 0x00, 0x00, 0x57]); // PUSH2 fwd_pc, JUMPI
 
     // Both CALLDATASIZE==0 (mid-callback) and CALLDATASIZE==1 (post-tx) run STATICCALL VICTIM_ADDR(view_calldata)
-    for (chunk_idx, chunk) in view_calldata.chunks(32).enumerate() {
+    let bounded_view = &view_calldata[..view_calldata.len().min(4096)];
+    for (chunk_idx, chunk) in bounded_view.chunks(32).enumerate() {
         let mut word = [0u8; 32];
         word[..chunk.len()].copy_from_slice(chunk);
         attacker.push(0x7f);
         attacker.extend_from_slice(&word);
-        let mem_off = (chunk_idx * 32) as u8;
-        attacker.extend_from_slice(&[0x60, mem_off, 0x52]);
+        let mem_off = (chunk_idx * 32) as u16;
+        attacker.push(0x61); // PUSH2
+        attacker.extend_from_slice(&mem_off.to_be_bytes());
+        attacker.push(0x52); // MSTORE
     }
-    let vlen = view_calldata.len() as u16;
-    attacker.extend_from_slice(&[0x60, 0x20, 0x60, 0x40]); // retSize=32, retOff=0x40
+    let vlen = bounded_view.len() as u16;
+    // Place return buffer strictly past padded view_calldata so >64-byte view calldata never collides
+    let ret_off: u16 = ((bounded_view.len().div_ceil(32) * 32) as u16).max(0x40);
+    attacker.push(0x60);
+    attacker.push(0x20); // retSize=32
+    attacker.push(0x61);
+    attacker.extend_from_slice(&ret_off.to_be_bytes()); // retOff
     attacker.push(0x61);
     attacker.extend_from_slice(&vlen.to_be_bytes()); // argSize
     attacker.extend_from_slice(&[0x60, 0x00, 0x61, 0x20, 0x00]); // argOff=0, VICTIM_ADDR
@@ -411,12 +425,17 @@ pub fn probe_view_reentrancy_in_revm(
     attacker.extend_from_slice(&[0x36, 0x60, 0x01, 0x14]); // CALLDATASIZE == 1
     let post_jump_idx = attacker.len() + 1;
     attacker.extend_from_slice(&[0x61, 0x00, 0x00, 0x57]); // PUSH2 post_pc, JUMPI
-    attacker.extend_from_slice(&[0x60, 0x40, 0x51, 0x60, 0x01, 0x55]); // MLOAD(0x40), SSTORE(1)
+    attacker.push(0x61);
+    attacker.extend_from_slice(&ret_off.to_be_bytes());
+    attacker.extend_from_slice(&[0x51, 0x60, 0x01, 0x55]); // MLOAD(ret_off), SSTORE(1)
     attacker.extend_from_slice(&[0x60, 0x01, 0x60, 0x02, 0x55, 0x00]); // SSTORE(2, 1), STOP
 
     let post_pc = attacker.len() as u16;
     attacker[post_jump_idx..post_jump_idx + 2].copy_from_slice(&post_pc.to_be_bytes());
-    attacker.extend_from_slice(&[0x5b, 0x60, 0x40, 0x51, 0x60, 0x03, 0x55, 0x00]); // JUMPDEST, MLOAD(0x40), SSTORE(3), STOP
+    attacker.push(0x5b); // JUMPDEST
+    attacker.push(0x61);
+    attacker.extend_from_slice(&ret_off.to_be_bytes());
+    attacker.extend_from_slice(&[0x51, 0x60, 0x03, 0x55, 0x00]); // MLOAD(ret_off), SSTORE(3), STOP
 
     let fwd_pc = attacker.len() as u16;
     attacker[fwd_jump_idx..fwd_jump_idx + 2].copy_from_slice(&fwd_pc.to_be_bytes());
@@ -821,18 +840,24 @@ fn replay_invariant_sequence(
 
     let mut evm = Context::mainnet().with_db(db).build_mainnet();
     let mut cumulative_deposits = U256::ZERO;
+    let mut nonces: std::collections::HashMap<Address, u64> = std::collections::HashMap::new();
 
     for (step_idx, step) in trace.iter().enumerate() {
+        let cur_nonce = *nonces.entry(step.caller).or_insert(0);
         let tx = TxEnv {
             caller: step.caller,
             kind: TxKind::Call(target),
             gas_limit: 2_000_000,
             value: step.value_wei,
             data: Bytes::from(step.calldata.clone()),
+            nonce: cur_nonce,
             ..Default::default()
         };
-        if let Ok(ExecutionResult::Success { .. }) = evm.transact_commit(tx) {
-            cumulative_deposits = cumulative_deposits.saturating_add(step.value_wei);
+        if let Ok(exec_res) = evm.transact_commit(tx) {
+            *nonces.entry(step.caller).or_insert(0) = cur_nonce.saturating_add(1);
+            if matches!(exec_res, ExecutionResult::Success { .. }) {
+                cumulative_deposits = cumulative_deposits.saturating_add(step.value_wei);
+            }
         }
 
         let db_ref = &evm.ctx.journaled_state.database;
@@ -907,6 +932,14 @@ pub fn run_stateful_revm_invariant_campaign(
     let mut rng = cfg.seed;
     let mut txs_executed = 0usize;
 
+    let value_samples = [
+        U256::ZERO,
+        U256::ZERO,
+        U256::from(1u64),
+        U256::from(100_000_000_000_000_000u128),   // 0.1 ETH
+        U256::from(1_000_000_000_000_000_000u128), // 1 ETH
+    ];
+
     for seq_idx in 0..cfg.sequences {
         let step_count = cfg.max_steps.clamp(1, 64);
         let mut trace = Vec::with_capacity(step_count);
@@ -919,22 +952,25 @@ pub fn run_stateful_revm_invariant_campaign(
             let mut word = [0u8; 32];
             word[31] = arg_word;
             calldata.extend_from_slice(&word);
+            let value_wei = value_samples[(xorshift64(&mut rng) as usize) % value_samples.len()];
             trace.push(InvariantTxStep {
                 caller: actor,
                 selector: sel,
-                value_wei: U256::ZERO,
+                value_wei,
                 calldata,
             });
         }
         txs_executed += trace.len();
 
         if let Some(reason) = replay_invariant_sequence(deployed_bytecode, cfg, &trace) {
-            // Delta-debugging shrinker: iteratively drop unnecessary steps while preserving failure
+            // Bounded delta-debugging shrinker: drop unnecessary steps while preserving failure
             let mut shrunk = trace;
             let mut i = 0usize;
-            while i < shrunk.len() && shrunk.len() > 1 {
+            let mut shrink_replays = 0usize;
+            while i < shrunk.len() && shrunk.len() > 1 && shrink_replays < 64 {
                 let mut cand = shrunk.clone();
                 cand.remove(i);
+                shrink_replays += 1;
                 if replay_invariant_sequence(deployed_bytecode, cfg, &cand).is_some() {
                     shrunk = cand;
                 } else {

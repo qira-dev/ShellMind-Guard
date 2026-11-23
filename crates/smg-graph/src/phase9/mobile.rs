@@ -19,9 +19,74 @@ fn sensitive_key_re() -> &'static Regex {
 fn manifest_tag_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r#"(?is)<(activity|service|receiver|provider|application)\b([^>]*)>"#)
-            .expect("valid android manifest regex")
+        Regex::new(
+            r#"(?is)<(activity-alias|activity|service|receiver|provider|application)\b([^>]*)>"#,
+        )
+        .expect("valid android manifest regex")
     })
+}
+
+fn xml_attr_eq_ci(attrs_low: &str, key: &str, expected: &str) -> bool {
+    let mut rest = attrs_low;
+    while let Some(pos) = rest.find(key) {
+        let left_ok = pos == 0
+            || !rest.as_bytes()[pos - 1].is_ascii_alphanumeric()
+                && rest.as_bytes()[pos - 1] != b'_'
+                && rest.as_bytes()[pos - 1] != b'-';
+        let after = &rest[pos + key.len()..];
+        if left_ok {
+            let trimmed = after.trim_start();
+            if let Some(after_eq) = trimmed.strip_prefix('=') {
+                let val_part = after_eq.trim_start();
+                for q in ['"', '\''] {
+                    if let Some(after_q) = val_part.strip_prefix(q)
+                        && let Some(end_q) = after_q.find(q)
+                    {
+                        if after_q[..end_q].trim() == expected {
+                            return true;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        rest = after;
+    }
+    false
+}
+
+fn xml_has_attr(attrs_low: &str, key: &str) -> bool {
+    let mut rest = attrs_low;
+    while let Some(pos) = rest.find(key) {
+        let left_ok = pos == 0
+            || !rest.as_bytes()[pos - 1].is_ascii_alphanumeric()
+                && rest.as_bytes()[pos - 1] != b'_'
+                && rest.as_bytes()[pos - 1] != b'-';
+        let after = &rest[pos + key.len()..];
+        if left_ok && after.trim_start().starts_with('=') {
+            return true;
+        }
+        rest = after;
+    }
+    false
+}
+
+/// Returns true if `s` contains Kotlin/Dart string interpolation (`$ident` or `${...}`),
+/// excluding currency literals like `$100`.
+fn has_dollar_var_interpolation(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    for i in 0..bytes.len().saturating_sub(1) {
+        if bytes[i] == b'$' {
+            if i > 0 && bytes[i - 1] == b'\\' {
+                continue;
+            }
+            let next = bytes[i + 1];
+            if next == b'{' || next.is_ascii_alphabetic() || next == b'_' {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Scans Android/iOS mobile manifests and network security XML/plist files.
@@ -56,19 +121,36 @@ pub fn scan_mobile_config(rel_path: &str, source: &str) -> Vec<LocalStaticFindin
 }
 
 fn scan_android_gradle(rel_path: &str, source: &str, out: &mut Vec<LocalStaticFinding>) {
-    let mut in_release_block = false;
+    let mut release_depth: Option<i32> = None;
     for (idx, line) in source.lines().enumerate() {
-        let low = line.trim().to_ascii_lowercase();
-        if low.starts_with("//") {
+        let code = line.split("//").next().unwrap_or(line);
+        let low = code.trim().to_ascii_lowercase();
+        if low.is_empty() {
             continue;
         }
-        if low.contains("release") && low.contains('{') {
-            in_release_block = true;
-        } else if in_release_block && low == "}" {
-            in_release_block = false;
+        let opens = low.bytes().filter(|&b| b == b'{').count() as i32;
+        let closes = low.bytes().filter(|&b| b == b'}').count() as i32;
+        if release_depth.is_none()
+            && (low.starts_with("release ")
+                || low.starts_with("release{")
+                || low.contains("getbyname(\"release\")")
+                || low.contains("create(\"release\")")
+                || low.contains("named(\"release\")"))
+            && opens > 0
+        {
+            release_depth = Some(opens - closes);
+            if release_depth == Some(0) {
+                release_depth = None;
+            }
+        } else if let Some(d) = release_depth {
+            let next_d = d + opens - closes;
+            release_depth = if next_d <= 0 { None } else { Some(next_d) };
         }
+        let in_release_block = release_depth.is_some();
         if in_release_block
-            && (low.contains("minifyenabled false") || low.contains("isminifyenabled = false"))
+            && (low.contains("minifyenabled false")
+                || low.contains("minifyenabled = false")
+                || low.contains("isminifyenabled = false"))
         {
             out.push(make_phase9_finding(
                 "SMG-MOB-STORAGE",
@@ -84,7 +166,9 @@ fn scan_android_gradle(rel_path: &str, source: &str, out: &mut Vec<LocalStaticFi
             ));
         }
         if in_release_block
-            && (low.contains("debuggable true") || low.contains("isdebuggable = true"))
+            && (low.contains("debuggable true")
+                || low.contains("debuggable = true")
+                || low.contains("isdebuggable = true"))
         {
             out.push(make_phase9_finding(
                 "SMG-MOB-IPC",
@@ -174,6 +258,11 @@ fn blank_xml_comments(src: &str) -> String {
             }
             rest = &rest[start + 4 + end_rel + 3..];
         } else {
+            // Unclosed XML comment: blank to EOF without duplicating prefix
+            for ch in rest[start..].chars() {
+                out.push(if ch == '\n' { '\n' } else { ' ' });
+            }
+            rest = "";
             break;
         }
     }
@@ -218,10 +307,10 @@ fn scan_android_manifest(rel_path: &str, raw_source: &str, out: &mut Vec<LocalSt
         };
 
         if tag == "application" {
-            if attrs_low.contains("android:permission=") {
+            if xml_has_attr(&attrs_low, "android:permission") {
                 app_has_permission = true;
             }
-            if attrs_low.contains("android:usescleartexttraffic=\"true\"") {
+            if xml_attr_eq_ci(&attrs_low, "android:usescleartexttraffic", "true") {
                 out.push(make_phase9_finding(
                     "SMG-MOB-TLS",
                     "HIGH",
@@ -235,7 +324,7 @@ fn scan_android_manifest(rel_path: &str, raw_source: &str, out: &mut Vec<LocalSt
                     "Set `android:usesCleartextTraffic=\"false\"` and enforce HTTPS via `network_security_config.xml`.",
                 ));
             }
-            if attrs_low.contains("android:allowbackup=\"true\"") {
+            if xml_attr_eq_ci(&attrs_low, "android:allowbackup", "true") {
                 out.push(make_phase9_finding(
                     "SMG-MOB-STORAGE",
                     "MEDIUM",
@@ -249,7 +338,7 @@ fn scan_android_manifest(rel_path: &str, raw_source: &str, out: &mut Vec<LocalSt
                     "Set `android:allowBackup=\"false\"` or configure strict `fullBackupContent`/`dataExtractionRules` exclusions.",
                 ));
             }
-            if attrs_low.contains("android:debuggable=\"true\"") {
+            if xml_attr_eq_ci(&attrs_low, "android:debuggable", "true") {
                 out.push(make_phase9_finding(
                     "SMG-MOB-IPC",
                     "HIGH",
@@ -266,20 +355,20 @@ fn scan_android_manifest(rel_path: &str, raw_source: &str, out: &mut Vec<LocalSt
             continue;
         }
 
-        let is_launcher = tag == "activity"
+        let is_launcher = matches!(tag.as_str(), "activity" | "activity-alias")
             && body_low.contains("android.intent.action.main")
             && body_low.contains("android.intent.category.launcher");
         if is_launcher {
             continue;
         }
 
-        let explicitly_exported = attrs_low.contains("android:exported=\"true\"");
-        let explicitly_disabled = attrs_low.contains("android:exported=\"false\"");
+        let explicitly_exported = xml_attr_eq_ci(&attrs_low, "android:exported", "true");
+        let explicitly_disabled = xml_attr_eq_ci(&attrs_low, "android:exported", "false");
         let has_intent_filter = body_low.contains("<intent-filter");
         let has_permission = app_has_permission
-            || attrs_low.contains("android:permission=")
-            || attrs_low.contains("android:readpermission=")
-            || attrs_low.contains("android:writepermission=");
+            || xml_has_attr(&attrs_low, "android:permission")
+            || xml_has_attr(&attrs_low, "android:readpermission")
+            || xml_has_attr(&attrs_low, "android:writepermission");
 
         if (explicitly_exported || (has_intent_filter && !explicitly_disabled)) && !has_permission {
             out.push(make_phase9_finding(
@@ -559,6 +648,7 @@ fn scan_android_code(
         }
 
         if low.contains("setallowfileaccessfromfileurls(true)")
+            || low.contains("setallowuniversalaccessfromfileurls(true)")
             || low.contains("allowfileaccessfromfileurls = true")
             || low.contains("allowuniversalaccessfromfileurls = true")
             || low.contains("setallowfileaccess(true)")
@@ -723,22 +813,6 @@ fn scan_android_code(
                 "Generate a fresh cryptographically random IV via `SecureRandom` for every encryption operation.",
             ));
         }
-        if low.contains("setallowfileaccessfromfileurls(true)")
-            || low.contains("setallowuniversalaccessfromfileurls(true)")
-        {
-            out.push(make_phase9_finding(
-                "SMG-MOB-IPC",
-                "HIGH",
-                "Android WebView enables cross-origin `file://` URL access (local file exfiltration risk)".into(),
-                rel_path,
-                ln,
-                "WebSettings",
-                SinkKind::MobileSecurity,
-                GuardKind::MobilePolicy,
-                Confidence::Confirmed,
-                "Set `setAllowFileAccessFromFileURLs(false)` and `setAllowUniversalAccessFromFileURLs(false)`.",
-            ));
-        }
         if low.contains("setwebcontentsdebuggingenabled(true)") {
             out.push(make_phase9_finding(
                 "SMG-MOB-IPC",
@@ -788,7 +862,7 @@ fn scan_android_code(
             ));
         }
         if (low.contains(".rawquery(") || low.contains(".execsql("))
-            && (trimmed.contains(" + ") || trimmed.contains("\"$") || trimmed.contains("${"))
+            && (trimmed.contains(" + ") || has_dollar_var_interpolation(trimmed))
         {
             out.push(make_phase9_finding(
                 "SMG-MOB-STORAGE",
@@ -823,11 +897,9 @@ fn scan_android_code(
 fn scan_swift_mobile(
     rel_path: &str,
     lines: &[&str],
-    full_low: &str,
+    _full_low: &str,
     out: &mut Vec<LocalStaticFinding>,
 ) {
-    let uses_keychain = full_low.contains("secitemadd") || full_low.contains("keychain");
-
     for (idx, line) in lines.iter().enumerate() {
         let ln = idx + 1;
         let trimmed = line.trim();
@@ -836,24 +908,30 @@ fn scan_swift_mobile(
         // 1. SMG-MOB-STORAGE: UserDefaults storing secrets/tokens (skip nil/bool deletes & check kSecAttrAccessibleAlways)
         let is_ud_delete_or_bool =
             low.contains(".set(nil,") || low.contains(".set(true,") || low.contains(".set(false,");
-        if !uses_keychain
-            && low.contains("userdefaults")
+        if low.contains("userdefaults")
             && low.contains(".set(")
             && !is_ud_delete_or_bool
             && sensitive_key_re().is_match(trimmed)
         {
-            out.push(make_phase9_finding(
-                "SMG-MOB-STORAGE",
-                "HIGH",
-                "Sensitive token/secret stored in unencrypted iOS `UserDefaults`".into(),
-                rel_path,
-                ln,
-                "UserDefaults",
-                SinkKind::MobileSecurity,
-                GuardKind::MobilePolicy,
-                Confidence::Confirmed,
-                "Store tokens, keys, and passwords in iOS Keychain (`SecItemAdd` with `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`).",
-            ));
+            let local_win = lines[idx.saturating_sub(10)..(idx + 5).min(lines.len())]
+                .join("\n")
+                .to_ascii_lowercase();
+            let local_uses_keychain =
+                local_win.contains("secitemadd") || local_win.contains("keychain");
+            if !local_uses_keychain {
+                out.push(make_phase9_finding(
+                    "SMG-MOB-STORAGE",
+                    "HIGH",
+                    "Sensitive token/secret stored in unencrypted iOS `UserDefaults`".into(),
+                    rel_path,
+                    ln,
+                    "UserDefaults",
+                    SinkKind::MobileSecurity,
+                    GuardKind::MobilePolicy,
+                    Confidence::Confirmed,
+                    "Store tokens, keys, and passwords in iOS Keychain (`SecItemAdd` with `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`).",
+                ));
+            }
         }
         if trimmed.contains("kSecAttrAccessibleAlways") {
             out.push(make_phase9_finding(
@@ -1003,11 +1081,9 @@ fn scan_swift_mobile(
 fn scan_dart_mobile(
     rel_path: &str,
     lines: &[&str],
-    full_low: &str,
+    _full_low: &str,
     out: &mut Vec<LocalStaticFinding>,
 ) {
-    let uses_secure_storage = full_low.contains("fluttersecurestorage");
-
     for (idx, line) in lines.iter().enumerate() {
         let ln = idx + 1;
         let trimmed = line.trim();
@@ -1015,41 +1091,48 @@ fn scan_dart_mobile(
 
         // 1. SMG-MOB-STORAGE: SharedPreferences / GetStorage / unencrypted Hive storing sensitive tokens/secrets
         let is_prefs_receiver = low.contains("sharedpreferences") || low.contains("prefs.");
-        if !uses_secure_storage
-            && is_prefs_receiver
-            && low.contains(".setstring(")
-            && sensitive_key_re().is_match(trimmed)
+        if is_prefs_receiver && low.contains(".setstring(") && sensitive_key_re().is_match(trimmed)
         {
-            out.push(make_phase9_finding(
-                "SMG-MOB-STORAGE",
-                "HIGH",
-                "Sensitive credential/token saved in plaintext Flutter `SharedPreferences`".into(),
-                rel_path,
-                ln,
-                "SharedPreferences",
-                SinkKind::MobileSecurity,
-                GuardKind::MobilePolicy,
-                Confidence::Confirmed,
-                "Use `FlutterSecureStorage` (Keychain/EncryptedSharedPreferences) instead of `SharedPreferences` for tokens and secrets.",
-            ));
+            let local_win = lines[idx.saturating_sub(10)..(idx + 5).min(lines.len())]
+                .join("\n")
+                .to_ascii_lowercase();
+            if !local_win.contains("fluttersecurestorage") {
+                out.push(make_phase9_finding(
+                    "SMG-MOB-STORAGE",
+                    "HIGH",
+                    "Sensitive credential/token saved in plaintext Flutter `SharedPreferences`"
+                        .into(),
+                    rel_path,
+                    ln,
+                    "SharedPreferences",
+                    SinkKind::MobileSecurity,
+                    GuardKind::MobilePolicy,
+                    Confidence::Confirmed,
+                    "Use `FlutterSecureStorage` (Keychain/EncryptedSharedPreferences) instead of `SharedPreferences` for tokens and secrets.",
+                ));
+            }
         }
-        if !uses_secure_storage
-            && (low.contains("getstorage().write(")
-                || (low.contains("hive.openbox") && !low.contains("encryptioncipher")))
+        if (low.contains("getstorage().write(")
+            || (low.contains("hive.openbox") && !low.contains("encryptioncipher")))
             && sensitive_key_re().is_match(trimmed)
         {
-            out.push(make_phase9_finding(
-                "SMG-MOB-STORAGE",
-                "HIGH",
-                "Sensitive secret written to unencrypted Flutter local box (`GetStorage` / `Hive` without encryptionCipher)".into(),
-                rel_path,
-                ln,
-                "Hive/GetStorage",
-                SinkKind::MobileSecurity,
-                GuardKind::MobilePolicy,
-                Confidence::Confirmed,
-                "Store sensitive tokens in `FlutterSecureStorage` or encrypt Hive boxes with `HiveAesCipher`.",
-            ));
+            let local_win = lines[idx.saturating_sub(10)..(idx + 5).min(lines.len())]
+                .join("\n")
+                .to_ascii_lowercase();
+            if !local_win.contains("fluttersecurestorage") {
+                out.push(make_phase9_finding(
+                    "SMG-MOB-STORAGE",
+                    "HIGH",
+                    "Sensitive secret written to unencrypted Flutter local box (`GetStorage` / `Hive` without encryptionCipher)".into(),
+                    rel_path,
+                    ln,
+                    "Hive/GetStorage",
+                    SinkKind::MobileSecurity,
+                    GuardKind::MobilePolicy,
+                    Confidence::Confirmed,
+                    "Store sensitive tokens in `FlutterSecureStorage` or encrypt Hive boxes with `HiveAesCipher`.",
+                ));
+            }
         }
 
         // 2. SMG-MOB-TLS: HttpClient.badCertificateCallback = (...) => true & InAppWebView proceed
@@ -1090,7 +1173,7 @@ fn scan_dart_mobile(
             || low.contains(".rawinsert(")
             || low.contains(".rawdelete(")
             || low.contains(".rawupdate("))
-            && (trimmed.contains('\x24') || trimmed.contains(" + "))
+            && (has_dollar_var_interpolation(trimmed) || trimmed.contains(" + "))
         {
             out.push(make_phase9_finding(
                 "SMG-MOB-STORAGE",
@@ -1112,32 +1195,34 @@ fn scan_dart_mobile(
 fn scan_react_native_mobile(
     rel_path: &str,
     lines: &[&str],
-    full_low: &str,
+    _full_low: &str,
     out: &mut Vec<LocalStaticFinding>,
 ) {
-    let uses_secure = full_low.contains("react-native-keychain")
-        || full_low.contains("expo-secure-store")
-        || full_low.contains("encrypted-storage");
     for (idx, line) in lines.iter().enumerate() {
         let ln = idx + 1;
         let trimmed = line.trim();
         let low = trimmed.to_ascii_lowercase();
-        if !uses_secure
-            && low.contains("asyncstorage.setitem(")
-            && sensitive_key_re().is_match(trimmed)
-        {
-            out.push(make_phase9_finding(
-                "SMG-MOB-STORAGE",
-                "HIGH",
-                "React Native `AsyncStorage.setItem` stores sensitive token/secret in unencrypted storage".into(),
-                rel_path,
-                ln,
-                "AsyncStorage",
-                SinkKind::MobileSecurity,
-                GuardKind::MobilePolicy,
-                Confidence::Confirmed,
-                "Store credentials in `react-native-keychain` or `expo-secure-store` instead of `AsyncStorage`.",
-            ));
+        if low.contains("asyncstorage.setitem(") && sensitive_key_re().is_match(trimmed) {
+            let local_win = lines[idx.saturating_sub(10)..(idx + 5).min(lines.len())]
+                .join("\n")
+                .to_ascii_lowercase();
+            let local_uses_secure = local_win.contains("react-native-keychain")
+                || local_win.contains("expo-secure-store")
+                || local_win.contains("encrypted-storage");
+            if !local_uses_secure {
+                out.push(make_phase9_finding(
+                    "SMG-MOB-STORAGE",
+                    "HIGH",
+                    "React Native `AsyncStorage.setItem` stores sensitive token/secret in unencrypted storage".into(),
+                    rel_path,
+                    ln,
+                    "AsyncStorage",
+                    SinkKind::MobileSecurity,
+                    GuardKind::MobilePolicy,
+                    Confidence::Confirmed,
+                    "Store credentials in `react-native-keychain` or `expo-secure-store` instead of `AsyncStorage`.",
+                ));
+            }
         }
     }
 }

@@ -243,7 +243,10 @@ fn is_control_kw(name: &str) -> bool {
     )
 }
 
-fn collect_functions(node: Node, src: &[u8], lang: Language, out: &mut Vec<FnSpan>) {
+fn collect_functions(node: Node, src: &[u8], lang: Language, out: &mut Vec<FnSpan>, depth: usize) {
+    if depth >= crate::taint::MAX_AST_WALK_DEPTH {
+        return;
+    }
     let k = node.kind();
     if lang == Language::Rust
         && matches!(k, "mod_item" | "function_item")
@@ -285,7 +288,7 @@ fn collect_functions(node: Node, src: &[u8], lang: Language, out: &mut Vec<FnSpa
 
     let mut c = node.walk();
     for ch in node.children(&mut c) {
-        collect_functions(ch, src, lang, out);
+        collect_functions(ch, src, lang, out, depth + 1);
     }
 }
 
@@ -319,7 +322,7 @@ pub fn analyze_concurrency_and_leaks(
     let file_uses_rwlock = full_src.contains("RwLock");
 
     let mut spans = Vec::new();
-    collect_functions(root, src, lang, &mut spans);
+    collect_functions(root, src, lang, &mut spans, 0);
 
     for f in spans {
         let sym_idx = find_symbol_index_for_span(symbols, f.line_start, f.line_end);
@@ -802,6 +805,14 @@ pub fn solve_cross_function_deadlocks(
     let mut findings = Vec::new();
     let mut seen_pairs: HashSet<(String, String)> = HashSet::new();
     let mut seen_triples: HashSet<(String, String, String)> = HashSet::new();
+    let mut outgoing: HashMap<&str, Vec<(&str, &EdgeWitness)>> = HashMap::new();
+    for ((from, to), witness) in &order_edges {
+        outgoing
+            .entry(from.as_str())
+            .or_default()
+            .push((to.as_str(), witness));
+    }
+
     for ((a, b), raw_ab) in &order_edges {
         if let Some(raw_ba) = order_edges.get(&(b.clone(), a.clone())) {
             let (lock_a, lock_b, edge_ab, edge_ba) = if a <= b {
@@ -854,54 +865,61 @@ pub fn solve_cross_function_deadlocks(
                 proof_reasons: vec!["LockOrderInversionCycle".into(), "U32SymbolArena".into()],
             });
         }
-        for ((b2, c), raw_bc) in &order_edges {
-            if b2 != b || c == a || c == b {
-                continue;
-            }
-            if let Some(raw_ca) = order_edges.get(&(c.clone(), a.clone())) {
-                if !scopes_compatible(raw_ab, raw_bc, a, b)
-                    || !scopes_compatible(raw_bc, raw_ca, b, c)
-                {
+        if let Some(next_edges) = outgoing.get(b.as_str()) {
+            for &(c_str, raw_bc) in next_edges {
+                if c_str == a.as_str() || c_str == b.as_str() {
                     continue;
                 }
-                let mut triple = [a.clone(), b.clone(), c.clone()];
-                triple.sort();
-                if !seen_triples.insert((triple[0].clone(), triple[1].clone(), triple[2].clone())) {
-                    continue;
-                }
-                let first_hop = raw_ab.hops.first().cloned().unwrap_or(TraceHop {
-                    file: raw_ab.file.clone(),
-                    symbol: "unknown".into(),
-                    line: 1,
-                });
-                let mut witness = raw_ab.hops.clone();
-                for h in raw_bc.hops.iter().chain(raw_ca.hops.iter()) {
-                    if !witness
-                        .iter()
-                        .any(|w| w.file == h.file && w.symbol == h.symbol && w.line == h.line)
+                let c = c_str.to_string();
+                if let Some(raw_ca) = order_edges.get(&(c.clone(), a.clone())) {
+                    if !scopes_compatible(raw_ab, raw_bc, a, b)
+                        || !scopes_compatible(raw_bc, raw_ca, b, &c)
                     {
-                        witness.push(h.clone());
+                        continue;
                     }
+                    let mut triple = [a.clone(), b.clone(), c.clone()];
+                    triple.sort();
+                    if !seen_triples.insert((
+                        triple[0].clone(),
+                        triple[1].clone(),
+                        triple[2].clone(),
+                    )) {
+                        continue;
+                    }
+                    let first_hop = raw_ab.hops.first().cloned().unwrap_or(TraceHop {
+                        file: raw_ab.file.clone(),
+                        symbol: "unknown".into(),
+                        line: 1,
+                    });
+                    let mut witness = raw_ab.hops.clone();
+                    for h in raw_bc.hops.iter().chain(raw_ca.hops.iter()) {
+                        if !witness
+                            .iter()
+                            .any(|w| w.file == h.file && w.symbol == h.symbol && w.line == h.line)
+                        {
+                            witness.push(h.clone());
+                        }
+                    }
+                    findings.push(LatticeFinding {
+                        id: String::new(),
+                        rule_id: "SMG-ENG-DEADLOCK".into(),
+                        severity: "CRITICAL".into(),
+                        title: format!(
+                            "3-way lock-order cycle deadlock: `{}` -> `{}` -> `{}` -> `{}`",
+                            a, b, c, a
+                        ),
+                        file: first_hop.file.clone(),
+                        line: first_hop.line,
+                        status: "SUSPECT_UNGUARDED".into(),
+                        confidence: Confidence::Confirmed,
+                        entry_route: format!("LOCK {}->{}->{}", a, b, c),
+                        sink_kind: SinkKind::ConcurrencyHazard,
+                        missing_guard: GuardKind::LockOrdering,
+                        witness_path: witness,
+                        remediation: "Enforce a single canonical lock acquisition hierarchy (`std::scoped_lock`, consistent global ordering) across all call paths.".into(),
+                        proof_reasons: vec!["LockOrder3Cycle".into(), "U32SymbolArena".into()],
+                    });
                 }
-                findings.push(LatticeFinding {
-                    id: String::new(),
-                    rule_id: "SMG-ENG-DEADLOCK".into(),
-                    severity: "CRITICAL".into(),
-                    title: format!(
-                        "3-way lock-order cycle deadlock: `{}` -> `{}` -> `{}` -> `{}`",
-                        a, b, c, a
-                    ),
-                    file: first_hop.file.clone(),
-                    line: first_hop.line,
-                    status: "SUSPECT_UNGUARDED".into(),
-                    confidence: Confidence::Confirmed,
-                    entry_route: format!("LOCK {}->{}->{}", a, b, c),
-                    sink_kind: SinkKind::ConcurrencyHazard,
-                    missing_guard: GuardKind::LockOrdering,
-                    witness_path: witness,
-                    remediation: "Enforce a single canonical lock acquisition hierarchy (`std::scoped_lock`, consistent global ordering) across all call paths.".into(),
-                    proof_reasons: vec!["LockOrder3Cycle".into(), "U32SymbolArena".into()],
-                });
             }
         }
     }

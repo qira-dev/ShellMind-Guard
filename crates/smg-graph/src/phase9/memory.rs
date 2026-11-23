@@ -59,16 +59,25 @@ pub fn analyze_memory_and_overflows(
 ) {
     match lang {
         Language::C | Language::Cpp => {
-            walk_c_cpp_functions(root, src, rel_path, static_findings);
+            walk_c_cpp_functions(root, src, rel_path, static_findings, 0);
         }
         Language::Rust => {
-            walk_rust_unsafe(root, src, rel_path, static_findings);
+            walk_rust_unsafe(root, src, rel_path, static_findings, 0);
         }
         _ => {}
     }
 }
 
-fn walk_c_cpp_functions(node: Node, src: &[u8], rel_path: &str, out: &mut Vec<LocalStaticFinding>) {
+fn walk_c_cpp_functions(
+    node: Node,
+    src: &[u8],
+    rel_path: &str,
+    out: &mut Vec<LocalStaticFinding>,
+    depth: usize,
+) {
+    if depth >= crate::taint::MAX_AST_WALK_DEPTH {
+        return;
+    }
     if node.kind() == "function_definition" {
         let name = node
             .child_by_field_name("declarator")
@@ -93,7 +102,7 @@ fn walk_c_cpp_functions(node: Node, src: &[u8], rel_path: &str, out: &mut Vec<Lo
 
     let mut c = node.walk();
     for ch in node.children(&mut c) {
-        walk_c_cpp_functions(ch, src, rel_path, out);
+        walk_c_cpp_functions(ch, src, rel_path, out, depth + 1);
     }
 }
 
@@ -596,11 +605,14 @@ fn strip_comments_and_strings(node: Node, src: &[u8]) -> String {
     let base = node.start_byte();
     let end = node.end_byte().min(src.len());
     let mut bytes = src[base..end].to_vec();
-    blank_trivia_nodes(node, base, &mut bytes);
+    blank_trivia_nodes(node, base, &mut bytes, 0);
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
-fn blank_trivia_nodes(node: Node, base: usize, out: &mut [u8]) {
+fn blank_trivia_nodes(node: Node, base: usize, out: &mut [u8], depth: usize) {
+    if depth >= crate::taint::MAX_AST_WALK_DEPTH {
+        return;
+    }
     let k = node.kind();
     if matches!(
         k,
@@ -622,11 +634,20 @@ fn blank_trivia_nodes(node: Node, base: usize, out: &mut [u8]) {
     }
     let mut c = node.walk();
     for ch in node.children(&mut c) {
-        blank_trivia_nodes(ch, base, out);
+        blank_trivia_nodes(ch, base, out, depth + 1);
     }
 }
 
-fn walk_rust_unsafe(node: Node, src: &[u8], rel_path: &str, out: &mut Vec<LocalStaticFinding>) {
+fn walk_rust_unsafe(
+    node: Node,
+    src: &[u8],
+    rel_path: &str,
+    out: &mut Vec<LocalStaticFinding>,
+    depth: usize,
+) {
+    if depth >= crate::taint::MAX_AST_WALK_DEPTH {
+        return;
+    }
     let k = node.kind();
     if matches!(k, "mod_item" | "function_item") && is_rust_test_subtree(node, src) {
         return;
@@ -638,6 +659,7 @@ fn walk_rust_unsafe(node: Node, src: &[u8], rel_path: &str, out: &mut Vec<LocalS
             .map(|n| node_text(n, src).trim().to_string())
             .unwrap_or_else(|| "rust_fn".to_string());
         let fn_code = strip_comments_and_strings(node, src);
+        let fn_start_ln = node.start_position().row + 1;
         let fn_low = fn_code.to_ascii_lowercase();
 
         let is_unsafe_fn = fn_low.starts_with("unsafe fn ")
@@ -660,7 +682,7 @@ fn walk_rust_unsafe(node: Node, src: &[u8], rel_path: &str, out: &mut Vec<LocalS
                             name
                         ),
                         rel_path,
-                        node.start_position().row + 1 + idx,
+                        fn_start_ln + idx,
                         &name,
                         SinkKind::IntegerOverflow,
                         GuardKind::MemoryBounds,
@@ -674,7 +696,8 @@ fn walk_rust_unsafe(node: Node, src: &[u8], rel_path: &str, out: &mut Vec<LocalS
         if is_unsafe_fn {
             walk_rust_unsafe_block_lines(
                 &fn_code,
-                node.start_position().row + 1,
+                fn_start_ln,
+                fn_start_ln,
                 rel_path,
                 &name,
                 &fn_code,
@@ -685,31 +708,36 @@ fn walk_rust_unsafe(node: Node, src: &[u8], rel_path: &str, out: &mut Vec<LocalS
 
         let mut c = node.walk();
         for ch in node.children(&mut c) {
-            walk_rust_unsafe_in_fn(ch, src, rel_path, &name, &fn_code, out);
+            walk_rust_unsafe_in_fn(
+                ch,
+                src,
+                rel_path,
+                &name,
+                fn_start_ln,
+                &fn_code,
+                out,
+                depth + 1,
+            );
         }
         return;
     }
 
     let mut c = node.walk();
     for ch in node.children(&mut c) {
-        walk_rust_unsafe(ch, src, rel_path, out);
+        walk_rust_unsafe(ch, src, rel_path, out, depth + 1);
     }
 }
 
 fn walk_rust_unsafe_block_lines(
     block_code: &str,
     start_ln: usize,
+    fn_start_ln: usize,
     rel_path: &str,
     fn_name: &str,
     enclosing_fn_code: &str,
     out: &mut Vec<LocalStaticFinding>,
 ) {
-    let has_bounds_guard = enclosing_fn_code.contains(".len()")
-        && (enclosing_fn_code.contains('<')
-            || enclosing_fn_code.contains("<=")
-            || enclosing_fn_code.contains("assert!")
-            || enclosing_fn_code.contains("assert_eq!")
-            || enclosing_fn_code.contains(".min("));
+    let fn_lines: Vec<&str> = enclosing_fn_code.lines().collect();
     let has_checked_arith = enclosing_fn_code.contains("checked_mul")
         || enclosing_fn_code.contains("checked_add")
         || enclosing_fn_code.contains("saturating_");
@@ -717,6 +745,19 @@ fn walk_rust_unsafe_block_lines(
     for (idx, raw_line) in block_code.lines().enumerate() {
         let ln = start_ln + idx;
         let trimmed = raw_line.trim();
+        // Only count bounds checks that appear BEFORE (or on) the current unsafe line,
+        // never post-sink lines!
+        let prefix_count = ln
+            .saturating_sub(fn_start_ln)
+            .saturating_add(1)
+            .min(fn_lines.len());
+        let pre_code = fn_lines[..prefix_count].join("\n");
+        let has_bounds_guard = pre_code.contains(".len()")
+            && (pre_code.contains('<')
+                || pre_code.contains("<=")
+                || pre_code.contains("assert!")
+                || pre_code.contains("assert_eq!")
+                || pre_code.contains(".min("));
 
         let mut is_uninit_ub = trimmed.contains("mem::uninitialized(")
             || (trimmed.contains("MaybeUninit::uninit().assume_init(")
@@ -824,20 +865,27 @@ fn walk_rust_unsafe_block_lines(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn walk_rust_unsafe_in_fn(
     node: Node,
     src: &[u8],
     rel_path: &str,
     fn_name: &str,
+    fn_start_ln: usize,
     enclosing_fn_code: &str,
     out: &mut Vec<LocalStaticFinding>,
+    depth: usize,
 ) {
+    if depth >= crate::taint::MAX_AST_WALK_DEPTH {
+        return;
+    }
     if node.kind() == "unsafe_block" {
         let block_code = strip_comments_and_strings(node, src);
         let start_ln = node.start_position().row + 1;
         walk_rust_unsafe_block_lines(
             &block_code,
             start_ln,
+            fn_start_ln,
             rel_path,
             fn_name,
             enclosing_fn_code,
@@ -848,6 +896,15 @@ fn walk_rust_unsafe_in_fn(
 
     let mut c = node.walk();
     for ch in node.children(&mut c) {
-        walk_rust_unsafe_in_fn(ch, src, rel_path, fn_name, enclosing_fn_code, out);
+        walk_rust_unsafe_in_fn(
+            ch,
+            src,
+            rel_path,
+            fn_name,
+            fn_start_ln,
+            enclosing_fn_code,
+            out,
+            depth + 1,
+        );
     }
 }

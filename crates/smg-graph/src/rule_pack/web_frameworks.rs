@@ -607,7 +607,7 @@ pub(super) const RULES: &[(&str, PackRuleSpec)] = &[
         },
     ),
     (
-        r"\bparams\.permit!\b|\bparams\.to_unsafe_h\b",
+        r"\bparams\.permit!(?:[^\w]|$)|\bparams\.to_unsafe_h\b",
         PackRuleSpec {
             rule_id: "SMG-SQLI-MASS",
             severity: "HIGH",

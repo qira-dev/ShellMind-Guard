@@ -57,11 +57,11 @@ pub fn is_solana_rust_source(source: &str) -> bool {
 #[derive(Default, Clone)]
 pub struct SolanaFileContext {
     /// Per `Context<StructName>` fields verified with `.is_signer` inside instructions using that `StructName`
-    struct_signers: HashMap<String, HashSet<String>>,
+    pub(crate) struct_signers: HashMap<String, HashSet<String>>,
     /// Per `Context<StructName>` fields verified with `.owner ==` inside instructions using that `StructName`
-    struct_owners: HashMap<String, HashSet<String>>,
+    pub(crate) struct_owners: HashMap<String, HashSet<String>>,
     /// `#[derive(Accounts)]` structs that validate a program account via `Program<'info, ...>` or `address = ...`
-    structs_with_validated_program: HashSet<String>,
+    pub(crate) structs_with_validated_program: HashSet<String>,
 }
 
 /// Workspace-wide Solana/Anchor context hoisted across split instruction & account files (`Phase 13B P13-04`).
@@ -148,8 +148,20 @@ fn collect_solana_file_context(node: Node, src: &[u8], sctx: &mut SolanaFileCont
         let ctx_struct =
             extract_ctx_struct_name(fn_txt).unwrap_or_else(|| "__native__".to_string());
         for line in fn_txt.lines() {
-            let low = line.to_ascii_lowercase();
-            if low.contains(".is_signer")
+            let trimmed = line.trim();
+            let low = trimmed.to_ascii_lowercase();
+            // Require `.is_signer` inside an actual guard/check statement (never a bare `msg!` log or `let _ =`)
+            let is_guard_stmt = (low.starts_with("if ")
+                || low.contains("require!")
+                || low.contains("assert!")
+                || low.contains("assert_eq!")
+                || low.contains("ensure!")
+                || low.contains("if !")
+                || low.contains("if ("))
+                && !low.starts_with("msg!(")
+                && !low.starts_with("let _ =");
+            if is_guard_stmt
+                && low.contains(".is_signer")
                 && let Some(ident) = line.split(".is_signer").next()
                 && let Some(word) = ident
                     .split(|c: char| !c.is_alphanumeric() && c != '_')
@@ -389,7 +401,24 @@ fn inspect_solana_instruction_fn(
             .is_some_and(|st| sctx.structs_with_validated_program.contains(&st));
 
     let body_low = body.to_ascii_lowercase();
-    let has_lamport_zero = body_low.contains("try_borrow_mut_lamports") && body_low.contains("= 0");
+    // Distinguish actual lamport assignment (`= 0`) from equality check (`== 0`, `!= 0`, `<= 0`, `>= 0`)
+    let has_zero_assign = body_low.lines().any(|l| {
+        let bytes = l.as_bytes();
+        for (i, w) in bytes.windows(3).enumerate() {
+            if w == b"= 0"
+                && (i == 0 || !matches!(bytes[i - 1], b'=' | b'!' | b'<' | b'>'))
+                && !bytes.get(i + 3).is_some_and(|b| b.is_ascii_digit())
+            {
+                return true;
+            }
+        }
+        l.contains("=0;")
+            && !l.contains("==0")
+            && !l.contains("!=0")
+            && !l.contains("<=0")
+            && !l.contains(">=0")
+    });
+    let has_lamport_zero = body_low.contains("try_borrow_mut_lamports") && has_zero_assign;
     if has_lamport_zero
         && !body_low.contains(".fill(0)")
         && !body_low.contains("closed_account_discriminator")
@@ -497,18 +526,97 @@ fn has_move_capability_param(params: &str) -> bool {
     false
 }
 
+/// Updates brace depth across a single Move line while ignoring string literals (`"..."`, `b"..."`).
+pub(crate) fn update_move_brace_depth(line: &str, depth: &mut i32, started: &mut bool) {
+    let bytes = line.as_bytes();
+    let mut i = 0usize;
+    let mut in_str = false;
+    let mut esc = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if esc {
+            esc = false;
+            i += 1;
+            continue;
+        }
+        if b == b'\\' && in_str {
+            esc = true;
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            in_str = !in_str;
+            i += 1;
+            continue;
+        }
+        if !in_str {
+            if b == b'{' {
+                *depth += 1;
+                *started = true;
+            } else if b == b'}' {
+                *depth -= 1;
+            }
+        }
+        i += 1;
+    }
+}
+
+/// Returns true only when `#[test_only]` annotates the entire `module` declaration itself.
+pub(crate) fn is_test_only_move_module(lines: &[&str]) -> bool {
+    let mut saw_test_only = false;
+    for raw in lines {
+        let t = raw.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if t.starts_with("#[test_only]") {
+            saw_test_only = true;
+            continue;
+        }
+        if t.starts_with("#[") {
+            continue;
+        }
+        return saw_test_only && t.starts_with("module ");
+    }
+    false
+}
+
 /// Analyzes Sui / Aptos Move source modules cleanly above VM linear resource guarantees.
 pub fn analyze_move_file(rel_path: &str, source: &str) -> Vec<LocalStaticFinding> {
-    if smg_core::is_test_source_path(rel_path) || source.contains("#[test_only]") {
+    if smg_core::is_test_source_path(rel_path) {
         return Vec::new();
     }
     let stripped = smg_graph::taint::strip_comments_simple(source);
-    let mut findings = Vec::new();
     let lines: Vec<&str> = stripped.lines().collect();
+    if is_test_only_move_module(&lines) {
+        return Vec::new();
+    }
+    let mut findings = Vec::new();
 
     // Phase 13B (`P13-04`): Parse Move `struct <Name> has <abilities>` for hot-potato & capability invariants
+    // (skipping individual `#[test_only]` items without skipping the rest of the module)
+    let mut skip_next_test_item = false;
+    let mut skip_item_depth: i32 = 0;
+    let mut skip_item_started = false;
     for (idx, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
+        if skip_next_test_item {
+            update_move_brace_depth(trimmed, &mut skip_item_depth, &mut skip_item_started);
+            if (skip_item_started && skip_item_depth <= 0)
+                || (!skip_item_started && !trimmed.starts_with("#[") && trimmed.ends_with(';'))
+            {
+                skip_next_test_item = false;
+                skip_item_depth = 0;
+                skip_item_started = false;
+            }
+            continue;
+        }
+        if trimmed.starts_with("#[test_only]") || trimmed.starts_with("#[test") {
+            skip_next_test_item = true;
+            skip_item_depth = 0;
+            skip_item_started = false;
+            continue;
+        }
         let after_struct = trimmed
             .strip_prefix("public struct ")
             .or_else(|| trimmed.strip_prefix("struct "));
@@ -579,7 +687,21 @@ pub fn analyze_move_file(rel_path: &str, source: &str) -> Vec<LocalStaticFinding
                 && (lines[i - 2].contains("#[test") || lines[i - 2].contains("#[test_only]")))
             || trimmed.starts_with("#[test");
         if is_test_fn {
-            i += 1;
+            // Skip the entire annotated test/test_only item body
+            let mut td: i32 = 0;
+            let mut t_started = false;
+            let mut m = i;
+            while m < lines.len() {
+                let lt = lines[m].trim();
+                update_move_brace_depth(lt, &mut td, &mut t_started);
+                if (t_started && td <= 0)
+                    || (!t_started && !lt.starts_with("#[") && lt.ends_with(';'))
+                {
+                    break;
+                }
+                m += 1;
+            }
+            i = m.saturating_add(1).max(i + 1);
             continue;
         }
 
@@ -625,14 +747,7 @@ pub fn analyze_move_file(rel_path: &str, source: &str) -> Vec<LocalStaticFinding
         let mut k = i;
         let mut started = false;
         while k < lines.len() {
-            for ch in lines[k].chars() {
-                if ch == '{' {
-                    depth += 1;
-                    started = true;
-                } else if ch == '}' {
-                    depth -= 1;
-                }
-            }
+            update_move_brace_depth(lines[k], &mut depth, &mut started);
             body.push_str(lines[k]);
             body.push('\n');
             if started && depth <= 0 {

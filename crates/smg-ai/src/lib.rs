@@ -4,7 +4,8 @@ pub mod semantic_patcher;
 use anyhow::{Context, Result, bail};
 pub use codemods::{
     CegisOutcome, GeneratedRegressionTest, export_regression_tests, generate_regression_test,
-    run_cegis_patch_loop, synthesize_deterministic_codemod_diff, verify_diff_syntax_before_sandbox,
+    run_cegis_patch_loop, run_cegis_patch_loop_with_probe_cfg,
+    synthesize_deterministic_codemod_diff, verify_diff_syntax_before_sandbox,
 };
 pub use semantic_patcher::{
     VerifyFixOutcome, apply_patch_and_verify_fix, synthesize_16lang_multi_hunk_patch,
@@ -50,6 +51,17 @@ pub fn build_minimal_patch_prompt(
     finding: &LatticeFinding,
     verified: Option<&VerifiedFinding>,
 ) -> Result<String> {
+    build_minimal_patch_prompt_with_feedback(project_root, finding, verified, None)
+}
+
+/// Same as `build_minimal_patch_prompt`, optionally appending bounded prior-attempt CEGIS
+/// counterexample feedback (syntax/verification error) within the 2048 B prompt budget.
+pub fn build_minimal_patch_prompt_with_feedback(
+    project_root: &Path,
+    finding: &LatticeFinding,
+    verified: Option<&VerifiedFinding>,
+    prior_feedback: Option<&str>,
+) -> Result<String> {
     let canon_root = fs::canonicalize(project_root)?;
     let status_label = match verified.map(|v| &v.status) {
         Some(VerificationStatus::Proven) => "PROVEN",
@@ -68,6 +80,13 @@ pub fn build_minimal_patch_prompt(
     }
     if !finding.remediation.is_empty() {
         prompt.push_str(&format!("Remediation: {}\n", finding.remediation));
+    }
+    if let Some(fb) = prior_feedback.map(str::trim).filter(|s| !s.is_empty()) {
+        let fb_clean: String = fb.replace(['\r', '\n'], " ").chars().take(300).collect();
+        prompt.push_str(&format!(
+            "Prior Attempt Feedback (fix this error in the new diff): {}\n",
+            fb_clean
+        ));
     }
 
     prompt.push_str("\nRelevant Witness Hops:\n");
@@ -146,19 +165,61 @@ fn ensure_rustls_provider() {
     });
 }
 
-fn is_loopback_host(host: &str) -> bool {
-    let trimmed = host.trim().trim_start_matches('[').trim_end_matches(']');
-    if trimmed.eq_ignore_ascii_case("localhost") {
+fn is_imds_or_link_local_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            (v6.segments()[0] & 0xffc0) == 0xfe80
+                || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_link_local())
+        }
+    }
+}
+
+fn is_imds_or_link_local_host(host: &str) -> bool {
+    let trimmed = host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.');
+    let low = trimmed.to_ascii_lowercase();
+    if matches!(
+        low.as_str(),
+        "metadata.google.internal" | "metadata.goog" | "metadata" | "instance-data"
+    ) {
         return true;
     }
     trimmed
         .parse::<IpAddr>()
-        .map(|ip| ip.is_loopback())
+        .is_ok_and(is_imds_or_link_local_ip)
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let trimmed = host.trim().trim_start_matches('[').trim_end_matches(']');
+    if trimmed.eq_ignore_ascii_case("localhost") {
+        use std::net::ToSocketAddrs;
+        if let Ok(addrs) = (trimmed, 80).to_socket_addrs() {
+            let mut saw_any = false;
+            for sa in addrs {
+                saw_any = true;
+                if !sa.ip().is_loopback() {
+                    return false;
+                }
+            }
+            return saw_any;
+        }
+        return false;
+    }
+    trimmed
+        .parse::<IpAddr>()
+        .map(|ip| {
+            ip.is_loopback()
+                || matches!(ip, IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()))
+        })
         .unwrap_or(false)
 }
 
 /// Validates AI provider endpoint URLs so local code snippets never leak over
-/// cleartext HTTP or unintended remote Ollama hosts.
+/// cleartext HTTP, cloud IMDS/link-local addresses, or unintended remote Ollama hosts.
 pub fn validate_provider_endpoint(provider: &AiProvider) -> Result<reqwest::Url> {
     match provider {
         AiProvider::Disabled => bail!("AI provider is disabled"),
@@ -171,6 +232,12 @@ pub fn validate_provider_endpoint(provider: &AiProvider) -> Result<reqwest::Url>
             let host = url
                 .host_str()
                 .ok_or_else(|| anyhow::anyhow!("Ollama endpoint URL missing host"))?;
+            if is_imds_or_link_local_host(host) {
+                bail!(
+                    "Ollama endpoint host '{}' targets denied link-local/IMDS address",
+                    host
+                );
+            }
             if !matches!(url.scheme(), "http" | "https") {
                 bail!("Ollama endpoint must use http:// or https://");
             }
@@ -191,6 +258,12 @@ pub fn validate_provider_endpoint(provider: &AiProvider) -> Result<reqwest::Url>
             let host = url
                 .host_str()
                 .ok_or_else(|| anyhow::anyhow!("OpenAiCompatible endpoint URL missing host"))?;
+            if is_imds_or_link_local_host(host) {
+                bail!(
+                    "OpenAiCompatible endpoint host '{}' targets denied link-local/IMDS address",
+                    host
+                );
+            }
             match url.scheme() {
                 "https" => Ok(url),
                 "http" if is_loopback_host(host) => Ok(url),
@@ -228,9 +301,28 @@ pub fn generate_patch_plan(
     finding: &LatticeFinding,
     verified: Option<&VerifiedFinding>,
 ) -> Result<Option<String>> {
-    generate_patch_plan_with_env(provider, project_root, finding, verified, |name| {
-        std::env::var(name).map_err(|_| anyhow::anyhow!("Environment variable '{}' is unset", name))
-    })
+    generate_patch_plan_with_feedback(provider, project_root, finding, verified, None)
+}
+
+/// Calls an explicitly opted-in AI provider with optional CEGIS counterexample feedback.
+pub fn generate_patch_plan_with_feedback(
+    provider: &AiProvider,
+    project_root: &Path,
+    finding: &LatticeFinding,
+    verified: Option<&VerifiedFinding>,
+    prior_feedback: Option<&str>,
+) -> Result<Option<String>> {
+    generate_patch_plan_with_env(
+        provider,
+        project_root,
+        finding,
+        verified,
+        prior_feedback,
+        |name| {
+            std::env::var(name)
+                .map_err(|_| anyhow::anyhow!("Environment variable '{}' is unset", name))
+        },
+    )
 }
 
 fn generate_patch_plan_with_env<F>(
@@ -238,6 +330,7 @@ fn generate_patch_plan_with_env<F>(
     project_root: &Path,
     finding: &LatticeFinding,
     verified: Option<&VerifiedFinding>,
+    prior_feedback: Option<&str>,
     env_lookup: F,
 ) -> Result<Option<String>>
 where
@@ -250,7 +343,12 @@ where
             if model.trim().is_empty() {
                 bail!("Ollama model name must not be empty");
             }
-            let prompt = build_minimal_patch_prompt(project_root, finding, verified)?;
+            let prompt = build_minimal_patch_prompt_with_feedback(
+                project_root,
+                finding,
+                verified,
+                prior_feedback,
+            )?;
             if url.path().trim_end_matches('/').is_empty() {
                 url.set_path("/api/generate");
             }
@@ -311,7 +409,12 @@ where
             if api_key.is_empty() {
                 bail!("API key environment variable '{}' is empty", api_key_env);
             }
-            let prompt = build_minimal_patch_prompt(project_root, finding, verified)?;
+            let prompt = build_minimal_patch_prompt_with_feedback(
+                project_root,
+                finding,
+                verified,
+                prior_feedback,
+            )?;
             let trimmed_path = url.path().trim_end_matches('/');
             if trimmed_path.is_empty() || trimmed_path == "/v1" {
                 url.set_path("/v1/chat/completions");
@@ -697,6 +800,7 @@ fn apply_hunks_to_text(
     allow_create: bool,
     hunks: &[DiffHunk],
 ) -> Result<String> {
+    let uses_crlf = original.contains("\r\n");
     let had_trailing_nl = original.ends_with('\n');
     let norm = original.replace("\r\n", "\n");
     let old_lines: Vec<String> = if norm.is_empty() {
@@ -712,6 +816,14 @@ fn apply_hunks_to_text(
 
     for hunk in hunks {
         let base_idx = hunk.old_start.saturating_sub(1);
+        if base_idx < cursor {
+            bail!(
+                "Out-of-order or overlapping hunk at line {} (cursor already at line {}) in '{}'",
+                hunk.old_start,
+                cursor + 1,
+                rel_display
+            );
+        }
         let has_old_anchors = hunk
             .lines
             .iter()
@@ -781,7 +893,8 @@ fn apply_hunks_to_text(
     if out_lines.is_empty() {
         return Ok(String::new());
     }
-    let mut rendered = out_lines.join("\n");
+    let line_ending = if uses_crlf { "\r\n" } else { "\n" };
+    let mut rendered = out_lines.join(line_ending);
     let emit_nl = if force_no_trailing_nl {
         false
     } else if allow_create {
@@ -790,7 +903,7 @@ fn apply_hunks_to_text(
         had_trailing_nl || original.is_empty()
     };
     if emit_nl {
-        rendered.push('\n');
+        rendered.push_str(line_ending);
     }
     Ok(rendered)
 }
@@ -898,13 +1011,20 @@ pub fn copy_workspace_filtered(src_root: &Path, dst_root: &Path) -> Result<()> {
 }
 
 #[cfg(unix)]
-pub(crate) fn set_private_dir_mode(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+pub(crate) fn create_private_dir(path: &Path) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)?;
+    Ok(())
 }
 
 #[cfg(not(unix))]
-pub(crate) fn set_private_dir_mode(_path: &Path) {}
+pub(crate) fn create_private_dir(path: &Path) -> Result<()> {
+    fs::create_dir_all(path)?;
+    Ok(())
+}
 
 fn copy_dir_recursive_filtered(src: &Path, dst: &Path, canonical_dst_root: &Path) -> Result<()> {
     for entry in fs::read_dir(src)? {
@@ -913,11 +1033,24 @@ fn copy_dir_recursive_filtered(src: &Path, dst: &Path, canonical_dst_root: &Path
         let name_str = name.to_string_lossy();
         let low = name_str.to_ascii_lowercase();
         if matches!(
-            name_str.as_ref(),
-            ".git" | "target" | ".shellmind-guard" | ".veriforge" | ".npmrc" | ".env"
+            low.as_str(),
+            ".git"
+                | "target"
+                | ".shellmind-guard"
+                | ".veriforge"
+                | ".npmrc"
+                | ".env"
+                | "id_rsa"
+                | "id_ed25519"
+                | "id_ecdsa"
+                | "id_dsa"
         ) || low.starts_with(".env.")
             || low.ends_with(".pem")
             || low.ends_with(".key")
+            || low.ends_with(".p12")
+            || low.ends_with(".pfx")
+            || low.ends_with(".jks")
+            || low.ends_with(".keystore")
         {
             continue;
         }
@@ -932,8 +1065,7 @@ fn copy_dir_recursive_filtered(src: &Path, dst: &Path, canonical_dst_root: &Path
         }
         let dst_path = dst.join(&name);
         if ft.is_dir() {
-            fs::create_dir_all(&dst_path)?;
-            set_private_dir_mode(&dst_path);
+            create_private_dir(&dst_path)?;
             copy_dir_recursive_filtered(&src_path, &dst_path, canonical_dst_root)?;
         } else if ft.is_file() {
             fs::copy(&src_path, &dst_path)?;
@@ -971,8 +1103,7 @@ pub fn verify_patch_in_isolated_copy(params: &ApplyCheckParams<'_>) -> Result<Ap
         nanos,
         seq
     ));
-    fs::create_dir_all(&temp_root)?;
-    set_private_dir_mode(&temp_root);
+    create_private_dir(&temp_root)?;
     let _cleanup = TempDirCleanup(temp_root.clone());
 
     copy_workspace_filtered(params.project_root, &temp_root)?;
@@ -1206,7 +1337,7 @@ mod tests {
             api_key_env: "SMG_AI_MOCK_KEY".into(),
         };
         let oai_out =
-            generate_patch_plan_with_env(&oai_provider, &fixture_root, &finding, None, |k| {
+            generate_patch_plan_with_env(&oai_provider, &fixture_root, &finding, None, None, |k| {
                 assert_eq!(k, "SMG_AI_MOCK_KEY");
                 Ok("sk-mock-secret".into())
             })

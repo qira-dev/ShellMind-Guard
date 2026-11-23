@@ -147,6 +147,36 @@ pub struct WrappedInterval {
 }
 
 impl WrappedInterval {
+    #[inline]
+    pub const fn sign_bit_for_width(width_bits: u32) -> u64 {
+        if width_bits == 0 || width_bits >= 64 {
+            1u64 << 63
+        } else {
+            1u64 << (width_bits - 1)
+        }
+    }
+
+    #[inline]
+    pub const fn signed_limits(width_bits: u32) -> (i128, i128) {
+        if width_bits == 0 || width_bits >= 64 {
+            (i64::MIN as i128, i64::MAX as i128)
+        } else {
+            let half = 1i128 << (width_bits - 1);
+            (-half, half - 1)
+        }
+    }
+
+    #[inline]
+    pub const fn sign_extend(val: u64, width_bits: u32) -> i64 {
+        let w = if width_bits == 0 || width_bits >= 64 {
+            64
+        } else {
+            width_bits
+        };
+        let shift = 64 - w;
+        ((val << shift) as i64) >> shift
+    }
+
     pub fn join(self, other: Self) -> Self {
         let width_bits = self.width_bits.max(other.width_bits);
         let mut out = Self {
@@ -163,12 +193,8 @@ impl WrappedInterval {
     }
 
     pub fn constant_signed(val: i64, width_bits: u32) -> Self {
-        let (sval, uval) = if width_bits == 32 {
-            let v32 = val as i32;
-            (v32 as i64, (v32 as u32) as u64)
-        } else {
-            (val, val as u64 & Tnum::width_mask(width_bits))
-        };
+        let uval = (val as u64) & Tnum::width_mask(width_bits);
+        let sval = Self::sign_extend(uval, width_bits);
         Self {
             smin: sval,
             smax: sval,
@@ -186,10 +212,9 @@ impl WrappedInterval {
         } else {
             (smax, smin)
         };
-        if width_bits == 32 {
-            smin = smin.clamp(i32::MIN as i64, i32::MAX as i64);
-            smax = smax.clamp(i32::MIN as i64, i32::MAX as i64);
-        }
+        let (lim_min, lim_max) = Self::signed_limits(width_bits);
+        smin = smin.clamp(lim_min as i64, lim_max as i64);
+        smax = smax.clamp(lim_min as i64, lim_max as i64);
         let max_w = Tnum::width_mask(width_bits);
         let mut out = if smin >= 0 {
             let umin = (smin as u64) & max_w;
@@ -204,15 +229,9 @@ impl WrappedInterval {
                 width_bits,
             }
         } else {
-            let min_neg_u = if width_bits == 32 {
-                (smin as i32 as u32) as u64
-            } else {
-                (smin as u64) & max_w
-            };
+            let min_neg_u = (smin as u64) & max_w;
             let umax = if smax >= 0 {
                 max_w
-            } else if width_bits == 32 {
-                (smax as i32 as u32) as u64
             } else {
                 (smax as u64) & max_w
             };
@@ -238,25 +257,17 @@ impl WrappedInterval {
         let wmask = Tnum::width_mask(width_bits);
         let umin = umin & wmask;
         let umax = (umax & wmask).max(umin);
-        let sign_bit = if width_bits == 32 {
-            1u64 << 31
-        } else if width_bits > 0 && width_bits < 64 {
-            1u64 << (width_bits - 1)
-        } else {
-            1u64 << 63
-        };
+        let sign_bit = Self::sign_bit_for_width(width_bits);
         let (smin, smax) = if umax < sign_bit {
             (umin as i64, umax as i64)
         } else if umin >= sign_bit {
-            if width_bits == 32 {
-                ((umin as u32 as i32) as i64, (umax as u32 as i32) as i64)
-            } else {
-                (umin as i64, umax as i64)
-            }
-        } else if width_bits == 32 {
-            (i32::MIN as i64, i32::MAX as i64)
+            (
+                Self::sign_extend(umin, width_bits),
+                Self::sign_extend(umax, width_bits),
+            )
         } else {
-            (i64::MIN, i64::MAX)
+            let (lim_min, lim_max) = Self::signed_limits(width_bits);
+            (lim_min as i64, lim_max as i64)
         };
         let mut s = Self {
             smin,
@@ -272,15 +283,18 @@ impl WrappedInterval {
     }
 
     /// Reduced-product refinement `I_w ⋈ T_w` until fixed point.
-    pub fn reduce(&mut self) {
+    /// Returns `false` if the interval and tnum constraints are contradictory (empty / bottom),
+    /// without fabricating a bogus singleton witness.
+    pub fn reduce_checked(&mut self) -> bool {
         let wmask = Tnum::width_mask(self.width_bits);
         self.tnum = self.tnum.masked(self.width_bits);
         self.umin &= wmask;
         self.umax &= wmask;
         if self.umin > self.umax {
-            // Normalize inverted/empty interval (e.g. conflicting guard tightening or width-mask wrap)
-            // so `clamp(self.umin, self.umax)` can never panic.
+            // Normalize inverted/empty interval so `umin <= umax` holds without panicking.
             self.umax = self.umin;
+            self.tnum = Tnum::from_range(self.umin, self.umax).masked(self.width_bits);
+            return false;
         }
 
         for _ in 0..4 {
@@ -288,12 +302,10 @@ impl WrappedInterval {
             let tmin = self.tnum.min_u64();
             let tmax = self.tnum.max_u64();
             if tmin > self.umax || tmax < self.umin {
-                // Disjoint interval and tnum: clamp to single witness point to preserve `umin <= umax`.
-                let witness = tmin.clamp(self.umin, self.umax);
-                self.umin = witness;
-                self.umax = witness;
-                self.tnum = Tnum::constant(witness).masked(self.width_bits);
-                break;
+                // Disjoint interval and tnum: report bottom (`false`) and keep the interval bounds
+                // consistent with its prefix tnum rather than fabricating a fake singleton point.
+                self.tnum = Tnum::from_range(self.umin, self.umax).masked(self.width_bits);
+                return false;
             }
             self.umin = self.umin.max(tmin);
             self.umax = self.umax.min(tmax);
@@ -304,7 +316,7 @@ impl WrappedInterval {
                 if conflict != 0 {
                     // Known bits conflict between interval prefix and tnum; preserve valid range prefix.
                     self.tnum = prefix_tnum;
-                    break;
+                    return false;
                 }
                 let combined_mask = self.tnum.mask & prefix_tnum.mask;
                 let combined_val = (self.tnum.value | prefix_tnum.value) & !combined_mask;
@@ -318,24 +330,22 @@ impl WrappedInterval {
                 break;
             }
         }
+        true
+    }
+
+    /// Reduced-product refinement `I_w ⋈ T_w` until fixed point.
+    pub fn reduce(&mut self) {
+        let _ = self.reduce_checked();
     }
 
     pub fn can_wrap_negative_to_large_size(&self) -> bool {
-        let high_bit_threshold = if self.width_bits == 32 {
-            1u64 << 31
-        } else {
-            1u64 << 63
-        };
+        let high_bit_threshold = Self::sign_bit_for_width(self.width_bits);
         self.smin < 0 && self.umax >= high_bit_threshold
     }
 
     pub fn signed_add(self, rhs: Self) -> Self {
         let width_bits = self.width_bits;
-        let (min_limit, max_limit) = if width_bits == 32 {
-            (i32::MIN as i128, i32::MAX as i128)
-        } else {
-            (i64::MIN as i128, i64::MAX as i128)
-        };
+        let (min_limit, max_limit) = Self::signed_limits(width_bits);
         let lo = self.smin as i128 + rhs.smin as i128;
         let hi = self.smax as i128 + rhs.smax as i128;
         let wrapped = lo < min_limit || hi > max_limit;
@@ -605,7 +615,50 @@ mod tests {
             signed_wrap: false,
             width_bits: 32,
         };
-        s.reduce();
+        assert!(!s.reduce_checked());
         assert!(s.umin <= s.umax);
+    }
+
+    #[test]
+    fn narrow_8bit_and_16bit_sign_extension_wrap_and_disjoint_reduce() {
+        // 8-bit sign extension & negative wrap
+        let i8_neg = WrappedInterval::constant_signed(-1, 8);
+        assert_eq!(i8_neg.smin, -1);
+        assert_eq!(i8_neg.umin, 0xFF);
+        assert!(i8_neg.can_wrap_negative_to_large_size());
+
+        let u8_high = WrappedInterval::from_u64_bounds(0x80, 0xFF, 8);
+        assert_eq!(u8_high.smin, -128);
+        assert_eq!(u8_high.smax, -1);
+        assert!(u8_high.can_wrap_negative_to_large_size());
+
+        let i8_max = WrappedInterval::constant_signed(127, 8);
+        let i8_one = WrappedInterval::constant_signed(1, 8);
+        let i8_ov = i8_max.signed_add(i8_one);
+        assert!(i8_ov.signed_wrap);
+        assert_eq!(i8_ov.smin, -128);
+        assert_eq!(i8_ov.smax, 127);
+
+        // 16-bit sign extension & wrap
+        let i16_max = WrappedInterval::constant_signed(32767, 16);
+        let i16_one = WrappedInterval::constant_signed(1, 16);
+        let i16_ov = i16_max.signed_add(i16_one);
+        assert!(i16_ov.signed_wrap);
+        assert_eq!(i16_ov.smin, -32768);
+        assert_eq!(i16_ov.smax, 32767);
+
+        // Disjoint interval and tnum must return false and NOT fabricate a singleton
+        let mut disjoint = WrappedInterval {
+            smin: 10,
+            smax: 20,
+            umin: 10,
+            umax: 20,
+            tnum: Tnum::constant(0),
+            signed_wrap: false,
+            width_bits: 32,
+        };
+        assert!(!disjoint.reduce_checked());
+        assert_eq!(disjoint.umin, 10);
+        assert_eq!(disjoint.umax, 20);
     }
 }

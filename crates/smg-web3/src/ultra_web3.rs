@@ -5,9 +5,54 @@
 //! - Move (Aptos/Sui) capability/ability (`copy`/`drop` on Coin/Vault), public entry missing signer/cap
 
 use crate::context::abi_selector;
-use crate::solidity::ParsedContract;
+use crate::solidity::{ContractKind, ParsedContract};
+use crate::svm_move::SolanaWorkspaceContext;
 use smg_graph::{Confidence, GuardKind, LocalStaticFinding, SinkKind};
 use std::collections::HashMap;
+
+/// Extracts canonical Solidity ABI signature `"name(type1,type2)"` from parsed function metadata,
+/// stripping parameter names, `memory`/`calldata`/`storage`/`payable` qualifiers, and normalizing
+/// `uint`->`uint256`, `int`->`int256`.
+pub(crate) fn canonical_abi_signature(fn_name: &str, params_text: &str) -> String {
+    let mut param_types = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (i, ch) in params_text.char_indices() {
+        match ch {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                if let Some(t) = extract_canonical_param_type(&params_text[start..i]) {
+                    param_types.push(t);
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if start < params_text.len()
+        && let Some(t) = extract_canonical_param_type(&params_text[start..])
+    {
+        param_types.push(t);
+    }
+    format!("{}({})", fn_name.trim(), param_types.join(","))
+}
+
+fn extract_canonical_param_type(param: &str) -> Option<String> {
+    let tokens: Vec<&str> = param.split_whitespace().collect();
+    let raw_ty = *tokens.first()?;
+    if raw_ty.is_empty() {
+        return None;
+    }
+    let norm = match raw_ty {
+        "uint" => "uint256".to_string(),
+        "int" => "int256".to_string(),
+        other if other.starts_with("uint[") => other.replacen("uint[", "uint256[", 1),
+        other if other.starts_with("int[") => other.replacen("int[", "int256[", 1),
+        other => other.to_string(),
+    };
+    Some(norm)
+}
 
 #[allow(clippy::too_many_arguments)]
 fn mk_web3_finding(
@@ -98,7 +143,16 @@ pub fn analyze_solidity_ultra_depth(
     let mut findings = Vec::new();
 
     // 1. UUPS / Initializable implementation missing `_disableInitializers()` in constructor
-    let is_upgradeable = stripped.contains("UUPSUpgradeable") || stripped.contains("Initializable");
+    let has_concrete_sol_contract = if !contracts.is_empty() {
+        contracts.iter().any(|c| c.kind == ContractKind::Contract)
+    } else {
+        lines.iter().any(|l| {
+            let t = l.trim();
+            t.starts_with("contract ")
+        })
+    };
+    let is_upgradeable = has_concrete_sol_contract
+        && (stripped.contains("UUPSUpgradeable") || stripped.contains("Initializable"));
     if is_upgradeable
         && !stripped.contains("_disableInitializers()")
         && !stripped.contains("VersionedInitializable")
@@ -260,11 +314,13 @@ pub fn analyze_solidity_ultra_depth(
     }
 
     // 6. ERC-4626 First-Depositor Share Inflation Attack
-    // Skip pure interface files (no `contract ` definition) and abstract extensions
+    // Skip pure interface files (no concrete `contract` definition) and abstract extensions
     // without a concrete `deposit(` implementation.
-    let has_concrete_contract = (stripped.contains("contract ")
-        && !stripped.contains("abstract contract "))
-        || (stripped.contains("contract ") && stripped.contains("function deposit("));
+    let has_concrete_contract = if !contracts.is_empty() {
+        contracts.iter().any(|c| c.kind == ContractKind::Contract)
+    } else {
+        lines.iter().any(|l| l.trim().starts_with("contract "))
+    };
     let is_erc4626 = has_concrete_contract
         && (stripped.contains("ERC4626")
             || (stripped.contains("convertToShares") && stripped.contains("totalAssets")));
@@ -273,7 +329,11 @@ pub fn analyze_solidity_ultra_depth(
             || stripped.contains("MINIMUM_LIQUIDITY")
             || stripped.contains("DEAD_SHARES")
             || stripped.contains("virtualShares")
-            || stripped.contains("+ 1");
+            || stripped.contains("virtualAssets")
+            || stripped.contains("totalSupply() + 1")
+            || stripped.contains("totalSupply + 1")
+            || stripped.contains("totalAssets() + 1")
+            || stripped.contains("totalAssets + 1");
         if !has_mitigation {
             let line = lines
                 .iter()
@@ -295,21 +355,24 @@ pub fn analyze_solidity_ultra_depth(
         }
     }
 
-    // 7. Diamond Facet Selector Collisions within single file
+    // 7. Diamond Facet Selector Collisions within single file (per-contract parsed functions + canonical ABI types)
     let mut facet_sigs: Vec<(String, String, usize, String)> = Vec::new();
+    let is_diamond_file = stripped.contains("IDiamondCut") || stripped.contains("diamondCut");
     for c in contracts {
-        if c.name.contains("Facet")
-            || stripped.contains("IDiamondCut")
-            || stripped.contains("diamondCut")
-        {
-            for (idx, line) in lines.iter().enumerate() {
-                if let Some(rest) = line.trim().strip_prefix("function ")
-                    && (line.contains("external") || line.contains("public"))
-                    && let Some(paren_end) = rest.find(')')
+        if c.kind != ContractKind::Contract {
+            continue;
+        }
+        if c.name.contains("Facet") || is_diamond_file {
+            for f in &c.functions {
+                if f.is_constructor
+                    || f.name == "fallback"
+                    || f.name == "receive"
+                    || !matches!(f.visibility.as_str(), "external" | "public")
                 {
-                    let sig = rest[..=paren_end].replace(' ', "");
-                    facet_sigs.push((c.name.clone(), rel_path.to_string(), idx + 1, sig));
+                    continue;
                 }
+                let sig = canonical_abi_signature(&f.name, &f.params_text);
+                facet_sigs.push((c.name.clone(), rel_path.to_string(), f.start_line, sig));
             }
         }
     }
@@ -320,6 +383,15 @@ pub fn analyze_solidity_ultra_depth(
 
 /// Deep Solana Anchor / Native PDA & CPI security checks.
 pub fn analyze_solana_pda_depth(rel_path: &str, source: &str) -> Vec<LocalStaticFinding> {
+    analyze_solana_pda_depth_with_ctx(rel_path, source, None)
+}
+
+/// Deep Solana Anchor / Native PDA & CPI security checks with workspace-wide Anchor context.
+pub fn analyze_solana_pda_depth_with_ctx(
+    rel_path: &str,
+    source: &str,
+    ws_ctx: Option<&SolanaWorkspaceContext>,
+) -> Vec<LocalStaticFinding> {
     // Only scan before `#[cfg(test)]` so inline Rust unit test fixtures never false-positive
     let prod_src = source.split("#[cfg(test)]").next().unwrap_or(source);
     if !prod_src.contains("use anchor_lang")
@@ -332,6 +404,11 @@ pub fn analyze_solana_pda_depth(rel_path: &str, source: &str) -> Vec<LocalStatic
     let stripped = smg_graph::taint::strip_comments_simple(prod_src);
     let lines: Vec<&str> = stripped.lines().collect();
     let mut findings = Vec::new();
+
+    let file_has_validated_program = stripped.contains("Program<'info,")
+        || stripped.contains("Program< 'info,")
+        || stripped.contains("Interface<'info,")
+        || ws_ctx.is_some_and(|w| !w.structs_with_validated_program.is_empty());
 
     for (idx, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
@@ -364,21 +441,24 @@ pub fn analyze_solana_pda_depth(rel_path: &str, source: &str) -> Vec<LocalStatic
         }
 
         // 2. Non-canonical PDA derivation via `create_program_address`
-        if trimmed.contains("create_program_address(")
-            && !stripped.contains("find_program_address(")
-        {
-            findings.push(mk_web3_finding(
-                "SMG-SOL-PDA-NONCANONICAL",
-                "HIGH",
-                "Solana `create_program_address()` used without canonical bump from `find_program_address()` (PDA bump-seed spoofing)".into(),
-                rel_path,
-                idx + 1,
-                "create_program_address",
-                SinkKind::AuthMutation,
-                GuardKind::Auth,
-                Confidence::Confirmed,
-                "Derive canonical PDA bumps with `Pubkey::find_program_address()` or Anchor `seeds = [...], bump`.",
-            ));
+        if trimmed.contains("create_program_address(") {
+            let win_start = idx.saturating_sub(15);
+            let win_end = (idx + 5).min(lines.len());
+            let local_win = lines[win_start..win_end].join("\n");
+            if !local_win.contains("find_program_address(") {
+                findings.push(mk_web3_finding(
+                    "SMG-SOL-PDA-NONCANONICAL",
+                    "HIGH",
+                    "Solana `create_program_address()` used without canonical bump from `find_program_address()` (PDA bump-seed spoofing)".into(),
+                    rel_path,
+                    idx + 1,
+                    "create_program_address",
+                    SinkKind::AuthMutation,
+                    GuardKind::Auth,
+                    Confidence::Confirmed,
+                    "Derive canonical PDA bumps with `Pubkey::find_program_address()` or Anchor `seeds = [...], bump`.",
+                ));
+            }
         }
 
         // 3. Arbitrary CPI via `invoke` / `invoke_signed` without verifying target program_id
@@ -387,11 +467,14 @@ pub fn analyze_solana_pda_depth(rel_path: &str, source: &str) -> Vec<LocalStatic
         {
             let win_start = idx.saturating_sub(15);
             let window = lines[win_start..=idx].join("\n");
-            let checks_program = window.contains("program_id ==")
+            let checks_program = file_has_validated_program
+                || window.contains("program_id ==")
                 || window.contains("key == &spl_token")
                 || window.contains("key == &system_program")
                 || window.contains("Program<'info,")
-                || window.contains("check_program_account");
+                || window.contains("check_program_account")
+                || window.contains("::ID")
+                || window.contains("::id()");
             if !checks_program {
                 findings.push(mk_web3_finding(
                     "SMG-SOL-ARBITRARY-CPI",
@@ -416,10 +499,33 @@ pub fn analyze_solana_pda_depth(rel_path: &str, source: &str) -> Vec<LocalStatic
 pub fn analyze_move_ultra_depth(rel_path: &str, source: &str) -> Vec<LocalStaticFinding> {
     let stripped = smg_graph::taint::strip_comments_simple(source);
     let lines: Vec<&str> = stripped.lines().collect();
+    if crate::svm_move::is_test_only_move_module(&lines) {
+        return Vec::new();
+    }
     let mut findings = Vec::new();
+    let mut skip_test_item = false;
+    let mut skip_depth: i32 = 0;
+    let mut skip_started = false;
 
     for (idx, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
+        if skip_test_item {
+            crate::svm_move::update_move_brace_depth(trimmed, &mut skip_depth, &mut skip_started);
+            if (skip_started && skip_depth <= 0)
+                || (!skip_started && !trimmed.starts_with("#[") && trimmed.ends_with(';'))
+            {
+                skip_test_item = false;
+                skip_depth = 0;
+                skip_started = false;
+            }
+            continue;
+        }
+        if trimmed.starts_with("#[test_only]") || trimmed.starts_with("#[test") {
+            skip_test_item = true;
+            skip_depth = 0;
+            skip_started = false;
+            continue;
+        }
 
         // 1. Asset/Vault/Cap struct mistakenly granted `copy` or `drop` ability
         if trimmed.starts_with("struct ") || trimmed.starts_with("public struct ") {
@@ -481,10 +587,25 @@ pub fn analyze_move_ultra_depth(rel_path: &str, source: &str) -> Vec<LocalStatic
                 || low.contains("burn")
                 || low.contains("set_fee")
                 || low.contains("upgrade");
-            let has_auth_param = trimmed.contains("&signer")
-                || trimmed.contains("Cap")
-                || trimmed.contains("Admin")
-                || trimmed.contains("Owner");
+            let params_str = trimmed
+                .split_once('(')
+                .and_then(|(_, r)| r.split_once(')'))
+                .map(|(p, _)| p)
+                .unwrap_or("");
+            let has_auth_param = params_str.split(',').any(|part| {
+                let Some((_, raw_ty)) = part.split_once(':') else {
+                    return false;
+                };
+                let ty = raw_ty.trim();
+                let ty_low = ty.to_ascii_lowercase();
+                ty_low.contains("signer")
+                    || ty_low.contains("capability")
+                    || ty_low.contains("admin_cap")
+                    || ty_low.contains("owner_cap")
+                    || ty_low.contains("treasury_cap")
+                    || ty.ends_with("Cap")
+                    || ty.contains("Cap<")
+            });
             if mutates_treasury && !has_auth_param {
                 findings.push(mk_web3_finding(
                     "SMG-MOVE-ENTRY-NO-AUTH",

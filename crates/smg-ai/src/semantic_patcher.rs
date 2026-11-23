@@ -84,9 +84,75 @@ fn lang_semantic_guard_snippet(
     }
 }
 
+fn import_insert_index(lang: Language, lines: &[String]) -> usize {
+    let mut idx = 0usize;
+    while idx < lines.len() {
+        let trimmed = lines[idx].trim();
+        if idx == 0 && trimmed.starts_with("#!") {
+            idx += 1;
+            continue;
+        }
+        match lang {
+            Language::Python => {
+                if trimmed.starts_with("# -*-")
+                    || trimmed.starts_with("# coding")
+                    || trimmed.starts_with("from __future__ import ")
+                {
+                    idx += 1;
+                    continue;
+                }
+                if trimmed.starts_with("\"\"\"") || trimmed.starts_with("'''") {
+                    let delim = if trimmed.starts_with("\"\"\"") {
+                        "\"\"\""
+                    } else {
+                        "'''"
+                    };
+                    if trimmed.len() >= 6 && trimmed[3..].contains(delim) {
+                        idx += 1;
+                        continue;
+                    }
+                    idx += 1;
+                    while idx < lines.len() {
+                        let closing = lines[idx].contains(delim);
+                        idx += 1;
+                        if closing {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+            }
+            Language::TypeScript | Language::JavaScript => {
+                if matches!(
+                    trimmed,
+                    "'use client'"
+                        | "\"use client\""
+                        | "'use client';"
+                        | "\"use client\";"
+                        | "'use server'"
+                        | "\"use server\""
+                        | "'use server';"
+                        | "\"use server\";"
+                        | "'use strict'"
+                        | "\"use strict\""
+                        | "'use strict';"
+                        | "\"use strict\";"
+                ) {
+                    idx += 1;
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        break;
+    }
+    idx
+}
+
 /// Synthesizes a multi-hunk unified diff AND the resulting patched source for any of the 16
-/// supported languages: Hunk 1 inserts a required import at line 1 (if absent), and Hunk 2 inserts
-/// the semantic guard directly before `sink_line_1based` matching the sink line's indentation.
+/// supported languages: Hunk 1 inserts a required import after leading directives/shebangs (if
+/// absent), and Hunk 2 inserts or wraps the semantic guard around `sink_line_1based` matching
+/// the sink line's indentation.
 pub fn synthesize_16lang_multi_hunk_patch(
     lang: Language,
     guard: GuardKind,
@@ -106,7 +172,6 @@ pub fn synthesize_16lang_multi_hunk_patch(
         .chars()
         .take_while(|c| *c == ' ' || *c == '\t')
         .collect();
-    let guarded_line = format!("{indent}{guard_stmt}");
 
     let mut hunks: Vec<(usize, Vec<String>, Vec<String>)> = Vec::new();
     let mut new_lines = lines.clone();
@@ -114,20 +179,54 @@ pub fn synthesize_16lang_multi_hunk_patch(
 
     if let Some(import_stmt) = opt_import
         && !source.contains(import_stmt)
-        && sink_line_1based > 1
     {
-        let first = lines[0].clone();
-        hunks.push((1, vec![first.clone()], vec![import_stmt.to_string(), first]));
-        new_lines.insert(0, import_stmt.to_string());
-        line_shift = 1;
+        let ins_idx = import_insert_index(lang, &lines);
+        if ins_idx < sink_idx {
+            let anchor = lines[ins_idx].clone();
+            hunks.push((
+                ins_idx + 1,
+                vec![anchor.clone()],
+                vec![import_stmt.to_string(), anchor],
+            ));
+            new_lines.insert(ins_idx, import_stmt.to_string());
+            line_shift = 1;
+        }
     }
+
+    let replacement_lines: Vec<String> = match (lang, guard) {
+        (Language::Python, GuardKind::TxLock) => {
+            // Indent sink line inside `with db.begin():` so Python indentation stays valid
+            vec![
+                format!("{indent}{guard_stmt}"),
+                format!("{indent}    {}", sink_line.trim_start()),
+            ]
+        }
+        (Language::TypeScript | Language::JavaScript, GuardKind::TxLock) => {
+            let trimmed = sink_line.trim();
+            if let Some(ret_expr) = trimmed.strip_prefix("return ") {
+                vec![
+                    format!("{indent}return await db.transaction(async (_tx) => {{"),
+                    format!("{indent}  return {ret_expr}"),
+                    format!("{indent}}});"),
+                ]
+            } else {
+                vec![
+                    format!("{indent}await db.transaction(async (_tx) => {{"),
+                    format!("{indent}  {trimmed}"),
+                    format!("{indent}}});"),
+                ]
+            }
+        }
+        _ => vec![format!("{indent}{guard_stmt}"), sink_line.clone()],
+    };
 
     hunks.push((
         sink_line_1based,
         vec![sink_line.clone()],
-        vec![guarded_line.clone(), sink_line.clone()],
+        replacement_lines.clone(),
     ));
-    new_lines.insert(sink_idx + line_shift, guarded_line);
+    let target_pos = sink_idx + line_shift;
+    new_lines.splice(target_pos..=target_pos, replacement_lines);
 
     let udiff = format_multi_hunk_udiff(rel_path, &hunks);
     let mut patched = new_lines.join("\n");

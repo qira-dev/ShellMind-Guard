@@ -32,6 +32,7 @@ pub fn scan_pqc_repo(
     let (mut findings, assets) = analyze_pqc_inventory(files, min_pq_category);
     let mut certificates = Vec::new();
     let mut seen_rel: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let current_year = x509::current_utc_year();
     for f in files {
         let low = f.rel_path.to_ascii_lowercase();
         if low.ends_with(".pem") || low.ends_with(".crt") || low.ends_with(".cer") {
@@ -49,24 +50,31 @@ pub fn scan_pqc_repo(
             }
         } else if low.ends_with(".der") {
             seen_rel.insert(f.rel_path.clone());
-            let bytes_opt = f
-                .cached_bytes
-                .clone()
-                .or_else(|| std::fs::read(&f.abs_path).ok());
+            let bytes_opt = f.cached_bytes.clone().or_else(|| {
+                use std::io::Read;
+                let file = std::fs::File::open(&f.abs_path).ok()?;
+                let mut buf = Vec::new();
+                file.take(1024 * 1024).read_to_end(&mut buf).ok()?;
+                Some(buf)
+            });
             if let Some(der) = bytes_opt {
                 let (_audit, der_hits) =
-                    x509_starttls_elf::inspect_x509_der(&f.rel_path, &der, 2026);
+                    x509_starttls_elf::inspect_x509_der(&f.rel_path, &der, current_year);
                 findings.extend(der_hits);
             }
         } else if low.ends_with(".so") || low.ends_with(".elf") {
             seen_rel.insert(f.rel_path.clone());
-            let bytes_opt = f
-                .cached_bytes
-                .clone()
-                .or_else(|| std::fs::read(&f.abs_path).ok());
-            if let Some(elf_bytes) = bytes_opt {
+            if let Some(elf_bytes) = f.cached_bytes.as_deref() {
                 let (_audit, elf_hits) =
-                    x509_starttls_elf::scan_elf_crypto_symbols(&f.rel_path, &elf_bytes);
+                    x509_starttls_elf::scan_elf_crypto_symbols(&f.rel_path, elf_bytes);
+                findings.extend(elf_hits);
+            } else if let Ok(mut file) = std::fs::File::open(&f.abs_path)
+                && let Ok((_audit, elf_hits)) = x509_starttls_elf::scan_elf_crypto_symbols_reader(
+                    &f.rel_path,
+                    &mut file,
+                    32 * 1024 * 1024,
+                )
+            {
                 findings.extend(elf_hits);
             }
         }
@@ -76,6 +84,7 @@ pub fn scan_pqc_repo(
         root: &Path,
         dir: &Path,
         depth: usize,
+        current_year: u32,
         seen: &mut std::collections::HashSet<String>,
         out: &mut Vec<LocalStaticFinding>,
     ) {
@@ -86,17 +95,23 @@ pub fn scan_pqc_repo(
             return;
         };
         for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if ft.is_symlink() {
+                continue;
+            }
             let path = entry.path();
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            if path.is_dir() {
+            if ft.is_dir() {
                 if matches!(
                     name_str.as_ref(),
                     ".git" | "target" | "node_modules" | ".venv" | "dist" | "build"
                 ) {
                     continue;
                 }
-                walk_pqc_binaries(root, &path, depth + 1, seen, out);
+                walk_pqc_binaries(root, &path, depth + 1, current_year, seen, out);
                 continue;
             }
             let rel = path
@@ -109,24 +124,35 @@ pub fn scan_pqc_repo(
             }
             let low = name_str.to_ascii_lowercase();
             if low.ends_with(".der") {
-                if let Ok(der) = std::fs::read(&path) {
-                    let (_a, hits) = x509_starttls_elf::inspect_x509_der(&rel, &der, 2026);
-                    out.extend(hits);
+                use std::io::Read;
+                if let Ok(file) = std::fs::File::open(&path) {
+                    let mut der = Vec::new();
+                    if file.take(1024 * 1024).read_to_end(&mut der).is_ok() {
+                        let (_a, hits) =
+                            x509_starttls_elf::inspect_x509_der(&rel, &der, current_year);
+                        out.extend(hits);
+                    }
                 }
             } else if (low.ends_with(".elf") || low.ends_with(".so"))
                 && let Ok(mut f) = std::fs::File::open(&path)
+                && let Ok((_a, hits)) = x509_starttls_elf::scan_elf_crypto_symbols_reader(
+                    &rel,
+                    &mut f,
+                    32 * 1024 * 1024,
+                )
             {
-                use std::io::Read;
-                let mut buf = vec![0u8; 512 * 1024];
-                if let Ok(n) = f.read(&mut buf) {
-                    buf.truncate(n);
-                    let (_a, hits) = x509_starttls_elf::scan_elf_crypto_symbols(&rel, &buf);
-                    out.extend(hits);
-                }
+                out.extend(hits);
             }
         }
     }
-    walk_pqc_binaries(project_root, project_root, 0, &mut seen_rel, &mut findings);
+    walk_pqc_binaries(
+        project_root,
+        project_root,
+        0,
+        current_year,
+        &mut seen_rel,
+        &mut findings,
+    );
     let cbom_json = build_static_cbom_cyclonedx(project_root, &assets, &certificates);
     PqcScanResult {
         findings,
@@ -390,6 +416,15 @@ pub fn bad_tls() {
             res.cbom_json.contains("\"assetType\": \"certificate\""),
             "CBOM must include X.509 certificate components"
         );
+
+        // Verify Falcon/HQC/BLAKE3 assets are not silently filtered out by FAST_STEMS
+        let asset_algos: Vec<&str> = res.assets.iter().map(|a| a.algorithm.as_str()).collect();
+        assert!(
+            asset_algos.contains(&"HQC-192") && asset_algos.contains(&"BLAKE3"),
+            "HQC-192 and BLAKE3 must appear in PQC inventory assets: {asset_algos:?}"
+        );
+        assert!(res.cbom_json.contains("HQC-192"));
+        assert!(res.cbom_json.contains("BLAKE3"));
 
         // Safe modern PQC + multi-line HMAC SHA-256 + separate functions -> 0 FP!
         let safe_hits: Vec<_> = res

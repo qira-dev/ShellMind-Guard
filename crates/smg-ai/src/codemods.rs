@@ -1,6 +1,6 @@
 use crate::{
     AiProvider, ApplyCheckParams, apply_unified_diff_safely, copy_workspace_filtered,
-    generate_patch_plan, verify_patch_in_isolated_copy,
+    generate_patch_plan_with_feedback, verify_patch_in_isolated_copy,
 };
 use anyhow::{Result, bail};
 use smg_core::{Language, ShellMindGuardConfig};
@@ -23,6 +23,47 @@ pub struct GeneratedRegressionTest {
     pub file_name: String,
     pub framework: &'static str,
     pub code: String,
+}
+
+fn find_matching_close_paren(s: &str, open_paren_byte_idx: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if bytes.get(open_paren_byte_idx) != Some(&b'(') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut in_quote: Option<u8> = None;
+    let mut esc = false;
+    let mut i = open_paren_byte_idx;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if esc {
+            esc = false;
+            i += 1;
+            continue;
+        }
+        if let Some(q) = in_quote {
+            if b == b'\\' {
+                esc = true;
+            } else if b == q {
+                in_quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\'' | b'"' | b'`' => in_quote = Some(b),
+            b'(' => depth += 1,
+            b')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 fn format_single_line_udiff(
@@ -160,7 +201,7 @@ pub fn synthesize_deterministic_codemod_diff(
                     && !expr.contains("DOMPurify.sanitize")
                 {
                     Some(format!(
-                        "{before} DOMPurify.sanitize({}) }}{tail}",
+                        "{before} DOMPurify.sanitize({}) }}}}{tail}",
                         expr.trim()
                     ))
                 } else {
@@ -194,9 +235,9 @@ pub fn synthesize_deterministic_codemod_diff(
         }
         "SMG-PATH-001" => {
             if let Some(pos) = raw_line.find("os.path.join(")
-                && let Some(end) = raw_line[pos..].find(')')
+                && let Some(end) = find_matching_close_paren(raw_line, pos + "os.path.join".len())
             {
-                let inner = &raw_line[pos + "os.path.join(".len()..pos + end];
+                let inner = &raw_line[pos + "os.path.join(".len()..end];
                 if let Some((base, user_part)) = inner.rsplit_once(',')
                     && !user_part.contains("basename")
                 {
@@ -207,15 +248,15 @@ pub fn synthesize_deterministic_codemod_diff(
                         base.trim(),
                         user_part.trim()
                     ));
-                    out.push_str(&raw_line[pos + end + 1..]);
+                    out.push_str(&raw_line[end + 1..]);
                     Some(out)
                 } else {
                     None
                 }
             } else if let Some(pos) = raw_line.find("path.join(")
-                && let Some(end) = raw_line[pos..].find(')')
+                && let Some(end) = find_matching_close_paren(raw_line, pos + "path.join".len())
             {
-                let inner = &raw_line[pos + "path.join(".len()..pos + end];
+                let inner = &raw_line[pos + "path.join(".len()..end];
                 if let Some((base, user_part)) = inner.rsplit_once(',')
                     && !user_part.contains("basename")
                 {
@@ -226,7 +267,7 @@ pub fn synthesize_deterministic_codemod_diff(
                         base.trim(),
                         user_part.trim()
                     ));
-                    out.push_str(&raw_line[pos + end + 1..]);
+                    out.push_str(&raw_line[end + 1..]);
                     Some(out)
                 } else {
                     None
@@ -353,8 +394,7 @@ pub fn verify_diff_syntax_before_sandbox(
             .unwrap_or_default()
             .as_nanos()
     ));
-    fs::create_dir_all(&temp_root)?;
-    crate::set_private_dir_mode(&temp_root);
+    crate::create_private_dir(&temp_root)?;
     let _cleanup = SyntaxTempCleanup(temp_root.clone());
     copy_workspace_filtered(project_root, &temp_root)?;
     let applied = apply_unified_diff_safely(&temp_root, raw_diff)?;
@@ -368,7 +408,8 @@ pub fn verify_diff_syntax_before_sandbox(
 }
 
 /// Bounded 3-iteration Counterexample-Guided Inductive Synthesis (CEGIS) patch loop (`82.33%`):
-/// 1) tries deterministic AST codemod first, 2) falls back to AI provider when enabled,
+/// 1) tries deterministic AST codemod first, 2) falls back to AI provider when enabled (feeding
+///    prior syntax/verification counterexample feedback into subsequent iterations),
 /// 3) enforces pre-sandbox Tree-sitter syntax validation + isolated `--apply-check` verification.
 #[allow(clippy::too_many_arguments)]
 pub fn run_cegis_patch_loop(
@@ -382,24 +423,68 @@ pub fn run_cegis_patch_loop(
     sync_race: usize,
     unsafe_host_fallback: bool,
 ) -> Result<CegisOutcome> {
-    const MAX_ITERS: usize = 3;
     let probe_cfg = smg_sandbox::SandboxProbeConfig::from_sandbox_config(&cfg.sandbox);
+    run_cegis_patch_loop_with_probe_cfg(
+        project_root,
+        finding,
+        verified,
+        cfg,
+        provider,
+        boot_cmd,
+        port,
+        sync_race,
+        unsafe_host_fallback,
+        &probe_cfg,
+        None,
+    )
+}
+
+/// CEGIS loop accepting caller-supplied `SandboxProbeConfig` (CLI overrides) and an optional
+/// pre-generated candidate diff to avoid duplicate LLM invocations.
+#[allow(clippy::too_many_arguments)]
+pub fn run_cegis_patch_loop_with_probe_cfg(
+    project_root: &Path,
+    finding: &LatticeFinding,
+    verified: Option<&VerifiedFinding>,
+    cfg: &ShellMindGuardConfig,
+    provider: &AiProvider,
+    boot_cmd: Option<&str>,
+    port: u16,
+    sync_race: usize,
+    unsafe_host_fallback: bool,
+    probe_cfg: &smg_sandbox::SandboxProbeConfig,
+    initial_ai_diff: Option<&str>,
+) -> Result<CegisOutcome> {
+    const MAX_ITERS: usize = 3;
     let mut last_feedback = String::new();
     let mut best_diff = String::new();
+    let mut attempts = 0usize;
+    let mut unused_initial = initial_ai_diff.map(str::to_string);
 
     for iter in 1..=MAX_ITERS {
         let (candidate, tag) = if iter == 1
             && let Some(det) = synthesize_deterministic_codemod_diff(project_root, finding)
         {
             (det, "deterministic_ast_codemod")
+        } else if let Some(pre) = unused_initial.take() {
+            (pre, "ai_cegis_patch")
         } else if !matches!(provider, AiProvider::Disabled) {
-            match generate_patch_plan(provider, project_root, finding, verified) {
+            let fb_opt = (!last_feedback.is_empty()).then_some(last_feedback.as_str());
+            match generate_patch_plan_with_feedback(
+                provider,
+                project_root,
+                finding,
+                verified,
+                fb_opt,
+            ) {
                 Ok(Some(d)) => (d, "ai_cegis_patch"),
                 Ok(None) => {
+                    attempts += 1;
                     last_feedback = "AI provider disabled or returned empty reply".into();
                     continue;
                 }
                 Err(e) => {
+                    attempts += 1;
                     last_feedback = e.to_string();
                     continue;
                 }
@@ -408,6 +493,7 @@ pub fn run_cegis_patch_loop(
             break;
         };
 
+        attempts += 1;
         best_diff = candidate.clone();
         if let Err(syntax_err) = verify_diff_syntax_before_sandbox(project_root, &candidate) {
             last_feedback = format!("Syntax error on iter {}: {}", iter, syntax_err);
@@ -423,13 +509,13 @@ pub fn run_cegis_patch_loop(
             port,
             sync_race,
             unsafe_host_fallback,
-            probe_cfg: &probe_cfg,
+            probe_cfg,
         });
         match check {
             Ok(outcome) if outcome.mitigated => {
                 return Ok(CegisOutcome {
                     mitigated: true,
-                    iterations_used: iter,
+                    iterations_used: attempts,
                     diff: candidate,
                     summary: outcome.summary,
                     source_tag: tag,
@@ -453,7 +539,7 @@ pub fn run_cegis_patch_loop(
 
     Ok(CegisOutcome {
         mitigated: false,
-        iterations_used: MAX_ITERS.min(usize::from(!best_diff.is_empty()).max(1)),
+        iterations_used: attempts.max(usize::from(!best_diff.is_empty())),
         diff: best_diff,
         summary: if last_feedback.is_empty() {
             "CEGIS exhausted budget without passing mitigation check".into()

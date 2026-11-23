@@ -52,8 +52,27 @@ fn decode_base64(input: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Computes the current UTC calendar year from `SystemTime::now()` using Howard Hinnant's
+/// civil-from-days algorithm (falling back to 2026 only if the system clock predates the Unix epoch).
+pub fn current_utc_year() -> u32 {
+    let Ok(dur) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
+        return 2026;
+    };
+    let days = (dur.as_secs() / 86_400) as i64;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = y + i64::from(m <= 2);
+    u32::try_from(year).unwrap_or(2026)
+}
+
 /// Parses a single ASN.1 DER TLV header, returning `(tag, content_slice, remaining_slice)`.
-fn read_der_tlv(data: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+pub(crate) fn read_der_tlv(data: &[u8]) -> Option<(u8, &[u8], &[u8])> {
     let &tag = data.first()?;
     let &len_byte = data.get(1)?;
     let (len, hdr_len) = if (len_byte & 0x80) == 0 {
@@ -77,19 +96,45 @@ fn read_der_tlv(data: &[u8]) -> Option<(u8, &[u8], &[u8])> {
 }
 
 /// Decodes an ASN.1 OBJECT IDENTIFIER content slice into dotted-decimal form (`"1.2.840..."`).
-fn decode_oid(bytes: &[u8]) -> Option<String> {
-    let &first = bytes.first()?;
-    let arc0 = first / 40;
-    let arc1 = first % 40;
+/// Correctly handles arc-2 subidentifiers (`first >= 80`), overflow checks, and rejects
+/// truncated trailing VLQ continuation bytes.
+pub(crate) fn decode_oid(bytes: &[u8]) -> Option<String> {
+    if bytes.is_empty() {
+        return None;
+    }
+    // Parse first base-128 subidentifier (encodes 40 * arc0 + arc1)
+    let mut idx = 0usize;
+    let mut first_val: u64 = 0;
+    loop {
+        let &b = bytes.get(idx)?;
+        idx += 1;
+        first_val = first_val.checked_mul(128)? | ((b & 0x7f) as u64);
+        if (b & 0x80) == 0 {
+            break;
+        }
+    }
+    let (arc0, arc1) = if first_val < 40 {
+        (0u64, first_val)
+    } else if first_val < 80 {
+        (1u64, first_val - 40)
+    } else {
+        (2u64, first_val - 80)
+    };
     let mut out = format!("{arc0}.{arc1}");
     let mut cur: u64 = 0;
-    for &b in &bytes[1..] {
-        cur = (cur << 7) | ((b & 0x7f) as u64);
+    let mut in_subid = false;
+    for &b in &bytes[idx..] {
+        cur = cur.checked_mul(128)? | ((b & 0x7f) as u64);
+        in_subid = true;
         if (b & 0x80) == 0 {
             out.push('.');
             out.push_str(&cur.to_string());
             cur = 0;
+            in_subid = false;
         }
+    }
+    if in_subid {
+        return None;
     }
     Some(out)
 }
@@ -186,16 +231,43 @@ pub fn parse_x509_der(rel_path: &str, chain_index: usize, der: &[u8]) -> Option<
         not_after_year = parse_asn1_time_year(na_tag, na_bytes);
     }
 
-    // Detect BasicConstraints CA:TRUE (`2.5.29.19` OID `55 1d 13` followed by `01 01 ff`) in remaining TBS bytes
-    let is_ca = after_validity.windows(3).any(|w| w == [0x55, 0x1d, 0x13])
-        && after_validity.windows(3).any(|w| w == [0x01, 0x01, 0xff]);
+    // Walk remaining TBSCertificate elements (subject, spki, optional [1]/[2], optional [3] extensions)
+    // and check BasicConstraints (`2.5.29.19`, OID bytes `55 1d 13`) `cA` BOOLEAN strictly inside its
+    // `extnValue` OCTET STRING (never confusing `critical = TRUE` on a leaf cert with `cA = TRUE`).
+    let mut is_ca = false;
+    let mut rem = after_validity;
+    while let Some((tag, body, next)) = read_der_tlv(rem) {
+        if tag == 0xa3 {
+            // [3] EXPLICIT Extensions ::= SEQUENCE OF Extension
+            if let Some((0x30, mut exts, _)) = read_der_tlv(body) {
+                while let Some((ext_tag, ext_body, ext_next)) = read_der_tlv(exts) {
+                    if ext_tag == 0x30
+                        && let Some((0x06, oid_bytes, mut ext_rest)) = read_der_tlv(ext_body)
+                        && oid_bytes == [0x55, 0x1d, 0x13]
+                    {
+                        // Optional `critical BOOLEAN DEFAULT FALSE`
+                        if let Some((0x01, _, after_crit)) = read_der_tlv(ext_rest) {
+                            ext_rest = after_crit;
+                        }
+                        // `extnValue OCTET STRING` containing `BasicConstraints ::= SEQUENCE { cA BOOLEAN DEFAULT FALSE, ... }`
+                        if let Some((0x04, octets, _)) = read_der_tlv(ext_rest)
+                            && let Some((0x30, bc_body, _)) = read_der_tlv(octets)
+                            && let Some((0x01, bool_bytes, _)) = read_der_tlv(bc_body)
+                            && bool_bytes.first().is_some_and(|&b| b != 0)
+                        {
+                            is_ca = true;
+                        }
+                    }
+                    exts = ext_next;
+                }
+            }
+            break;
+        }
+        rem = next;
+    }
 
     let (sig_alg, sig_shor) = classify_x509_oid(&sig_oid);
-    let current_year = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| 1970u32.saturating_add((d.as_secs() / 31_557_600) as u32))
-        .unwrap_or(2026u32)
-        .max(2026u32);
+    let current_year = current_utc_year();
     let remaining_years = not_after_year.map(|y| y.saturating_sub(current_year));
 
     Some(X509CertRecord {
@@ -296,4 +368,108 @@ pub fn audit_x509_chain(certs: &[X509CertRecord]) -> Vec<LocalStaticFinding> {
     }
 
     findings
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn der_tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        if content.len() < 128 {
+            out.push(content.len() as u8);
+        } else {
+            out.push(0x82);
+            out.extend_from_slice(&(content.len() as u16).to_be_bytes());
+        }
+        out.extend_from_slice(content);
+        out
+    }
+
+    fn build_v3_cert_with_basic_constraints(critical: bool, ca_true: bool) -> Vec<u8> {
+        let ver = der_tlv(0xa0, &der_tlv(0x02, &[0x02])); // v3
+        let serial = der_tlv(0x02, &[0x01]);
+        let sig_alg = der_tlv(
+            0x30,
+            &der_tlv(
+                0x06,
+                &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b],
+            ),
+        );
+        let issuer = der_tlv(0x30, &[]);
+        let validity = der_tlv(
+            0x30,
+            &[
+                der_tlv(0x17, b"260101000000Z"),
+                der_tlv(0x17, b"350101000000Z"),
+            ]
+            .concat(),
+        );
+        let subject = der_tlv(0x30, &[]);
+        let spki = der_tlv(0x30, &[]);
+
+        // BasicConstraints ext: OID 2.5.29.19, optional critical BOOLEAN, OCTET STRING { SEQUENCE { optional cA BOOLEAN } }
+        let mut ext_inner = der_tlv(0x06, &[0x55, 0x1d, 0x13]);
+        if critical {
+            ext_inner.extend_from_slice(&der_tlv(0x01, &[0xff]));
+        }
+        let bc_seq = if ca_true {
+            der_tlv(0x30, &der_tlv(0x01, &[0xff]))
+        } else {
+            der_tlv(0x30, &[])
+        };
+        ext_inner.extend_from_slice(&der_tlv(0x04, &bc_seq));
+        let ext = der_tlv(0x30, &ext_inner);
+        let exts = der_tlv(0xa3, &der_tlv(0x30, &ext));
+
+        let tbs = der_tlv(
+            0x30,
+            &[
+                ver,
+                serial,
+                sig_alg.clone(),
+                issuer,
+                validity,
+                subject,
+                spki,
+                exts,
+            ]
+            .concat(),
+        );
+        der_tlv(0x30, &[tbs, sig_alg, der_tlv(0x03, &[0x00, 0xaa])].concat())
+    }
+
+    #[test]
+    fn basic_constraints_critical_leaf_is_not_misclassified_as_ca() {
+        let leaf_der = build_v3_cert_with_basic_constraints(true, false);
+        let leaf = parse_x509_der("leaf.der", 0, &leaf_der).expect("valid leaf DER");
+        assert!(
+            !leaf.is_ca,
+            "leaf cert with critical=TRUE and cA=FALSE must NOT be marked is_ca=true"
+        );
+
+        let ca_der = build_v3_cert_with_basic_constraints(true, true);
+        let ca = parse_x509_der("ca.der", 0, &ca_der).expect("valid CA DER");
+        assert!(ca.is_ca, "CA cert with cA=TRUE must be marked is_ca=true");
+    }
+
+    #[test]
+    fn decode_oid_handles_arc2_and_rejects_truncation_or_overflow() {
+        // 2.999.3: 40*2 + 999 = 1079 = (8 << 7) | 55 => 0x88, 0x37
+        assert_eq!(decode_oid(&[0x88, 0x37, 0x03]).as_deref(), Some("2.999.3"));
+        // 2.16.840.1.101.3.4.3.18 (ML-DSA-65): 40*2 + 16 = 96 = 0x60
+        assert_eq!(
+            decode_oid(&[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x12]).as_deref(),
+            Some("2.16.840.1.101.3.4.3.18")
+        );
+        // Truncated continuation byte must fail
+        assert_eq!(decode_oid(&[0x60, 0x86]), None);
+        // Shift overflow (> 9 continuation bytes) must fail cleanly without panic
+        assert_eq!(
+            decode_oid(&[
+                0x60, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x01
+            ]),
+            None
+        );
+    }
 }

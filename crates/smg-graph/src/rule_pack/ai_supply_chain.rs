@@ -180,11 +180,11 @@ pub(super) const RULES: &[(&str, PackRuleSpec)] = &[
         },
     ),
     (
-        r#"(?i)"disabled"\s*:\s*false[^\n]*"alwaysAllow"\s*:\s*\["#,
+        r#"(?i)"alwaysAllow"\s*:\s*\[\s*['"]"#,
         PackRuleSpec {
             rule_id: "SMG-AI-001",
             severity: "MEDIUM",
-            title: "MCP server config defines broad `alwaysAllow` tool bypass list",
+            title: "MCP server config defines non-empty `alwaysAllow` tool bypass list",
             sink_kind: SinkKind::Misconfiguration,
             missing_guard: GuardKind::InputValidation,
             confidence: Confidence::Heuristic,

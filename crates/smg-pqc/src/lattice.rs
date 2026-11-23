@@ -309,13 +309,37 @@ pub fn evaluate_pq_strength(algo_token: &str) -> Option<PqSecurityStrength> {
             nist_category: 0,
         });
     }
-    if low.contains("rs256")
-        || low.contains("rs384")
-        || low.contains("rs512")
-        || low.contains("rsa-pss")
-        || low.contains("rsa_pss")
-        || low.contains("rsa_sign")
-    {
+    if low.contains("rsa-pss") || low.contains("rsa_pss") {
+        return Some(PqSecurityStrength {
+            algorithm: "RSA-PSS",
+            oid: "1.2.840.113549.1.1.10",
+            family: CryptoFamily::AsymmetricSig,
+            classical_bits: 112,
+            quantum_bits: 0,
+            nist_category: 0,
+        });
+    }
+    if low.contains("rs384") {
+        return Some(PqSecurityStrength {
+            algorithm: "RS384",
+            oid: "1.2.840.113549.1.1.12",
+            family: CryptoFamily::AsymmetricSig,
+            classical_bits: 112,
+            quantum_bits: 0,
+            nist_category: 0,
+        });
+    }
+    if low.contains("rs512") {
+        return Some(PqSecurityStrength {
+            algorithm: "RS512",
+            oid: "1.2.840.113549.1.1.13",
+            family: CryptoFamily::AsymmetricSig,
+            classical_bits: 112,
+            quantum_bits: 0,
+            nist_category: 0,
+        });
+    }
+    if low.contains("rs256") || low.contains("rsa_sign") {
         return Some(PqSecurityStrength {
             algorithm: "RS256",
             oid: "1.2.840.113549.1.1.11",

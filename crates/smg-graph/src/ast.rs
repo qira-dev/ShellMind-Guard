@@ -462,10 +462,19 @@ pub fn parse_file_ast_with_hash(
             source,
         ));
         for pf in crate::rule_pack::scan_rule_pack(&file.rel_path, file.language, source) {
-            if !static_findings
-                .iter()
-                .any(|x| x.rule_id == pf.rule_id && x.line == pf.line)
-            {
+            let already_covered = static_findings.iter().any(|x| {
+                x.line == pf.line
+                    && (x.rule_id == pf.rule_id
+                        || (x.rule_id.starts_with("SMG-AI-")
+                            && matches!(
+                                pf.symbol.as_str(),
+                                "torch.load"
+                                    | "ml_pickle_load"
+                                    | "np_allow_pickle"
+                                    | "hf_trust_remote_code"
+                            )))
+            });
+            if !already_covered {
                 static_findings.push(pf);
             }
         }
@@ -476,7 +485,7 @@ pub fn parse_file_ast_with_hash(
     if matches!(file.language, Language::Sql) {
         static_findings.extend(crate::deep_stack::scan_sql_file(&file.rel_path, source));
     }
-    if matches!(file.language, Language::Config) {
+    if matches!(file.language, Language::Config | Language::Manifest) {
         static_findings.extend(crate::phase9::scan_mobile_config(&file.rel_path, source));
     }
 

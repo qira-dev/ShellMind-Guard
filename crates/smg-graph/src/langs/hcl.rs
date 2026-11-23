@@ -8,6 +8,7 @@ use tree_sitter::Node;
 use super::{ExtractContext, strip_quotes};
 
 const SENSITIVE_PORTS: &[u16] = &[22, 23, 445, 1433, 3306, 3389, 5432, 6379, 9200, 27017];
+const MAX_HCL_NESTED_DEPTH: usize = 16;
 
 #[derive(Default)]
 struct HclFileGraph {
@@ -19,11 +20,14 @@ struct HclFileGraph {
 
 pub(crate) fn extract(root: Node, ctx: &mut ExtractContext<'_>) {
     let mut graph = HclFileGraph::default();
-    collect_hcl_file_graph(root, ctx.src, &mut graph);
-    walk_hcl_blocks(root, ctx, &graph);
+    collect_hcl_file_graph(root, ctx.src, &mut graph, 0);
+    walk_hcl_blocks(root, ctx, &graph, 0);
 }
 
-fn collect_hcl_file_graph(node: Node, src: &[u8], graph: &mut HclFileGraph) {
+fn collect_hcl_file_graph(node: Node, src: &[u8], graph: &mut HclFileGraph, depth: usize) {
+    if depth >= crate::taint::MAX_AST_WALK_DEPTH {
+        return;
+    }
     if node.kind() == "block" {
         let (btype, labels) = block_header(node, src);
         if let Some(body) = find_block_body(node) {
@@ -43,14 +47,18 @@ fn collect_hcl_file_graph(node: Node, src: &[u8], graph: &mut HclFileGraph) {
             } else if btype == "resource"
                 && labels.first().map(String::as_str) == Some("aws_s3_bucket_public_access_block")
             {
-                let all_four_true = [
-                    "block_public_acls",
-                    "block_public_policy",
-                    "ignore_public_acls",
-                    "restrict_public_buckets",
-                ]
-                .iter()
-                .all(|k| attr_is_bool(&raw_attrs, k, true));
+                let disabled_by_count = raw_attrs
+                    .get("count")
+                    .is_some_and(|c| strip_quotes(c).trim() == "0");
+                let all_four_true = !disabled_by_count
+                    && [
+                        "block_public_acls",
+                        "block_public_policy",
+                        "ignore_public_acls",
+                        "restrict_public_buckets",
+                    ]
+                    .iter()
+                    .all(|k| attr_is_bool(&raw_attrs, k, true));
                 if all_four_true && let Some(bkt_ref) = raw_attrs.get("bucket") {
                     // Extract `my_bkt` from `aws_s3_bucket.my_bkt.id` or `"my_bkt"`
                     let clean = strip_quotes(bkt_ref);
@@ -68,18 +76,21 @@ fn collect_hcl_file_graph(node: Node, src: &[u8], graph: &mut HclFileGraph) {
     }
     let mut c = node.walk();
     for ch in node.children(&mut c) {
-        collect_hcl_file_graph(ch, src, graph);
+        collect_hcl_file_graph(ch, src, graph, depth + 1);
     }
 }
 
-fn walk_hcl_blocks(node: Node, ctx: &mut ExtractContext<'_>, graph: &HclFileGraph) {
+fn walk_hcl_blocks(node: Node, ctx: &mut ExtractContext<'_>, graph: &HclFileGraph, depth: usize) {
+    if depth >= crate::taint::MAX_AST_WALK_DEPTH {
+        return;
+    }
     if node.kind() == "block" {
         analyze_top_block(node, ctx, graph);
         return;
     }
     let mut c = node.walk();
     for ch in node.children(&mut c) {
-        walk_hcl_blocks(ch, ctx, graph);
+        walk_hcl_blocks(ch, ctx, graph, depth + 1);
     }
 }
 
@@ -140,6 +151,28 @@ fn collect_body_attrs(body: Node, src: &[u8]) -> HashMap<String, String> {
     map
 }
 
+fn collect_resolved_body_attrs(
+    body: Node,
+    src: &[u8],
+    var_defaults: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut attrs = collect_body_attrs(body, src);
+    for val in attrs.values_mut() {
+        for _ in 0..4 {
+            let key_low = val.trim().to_ascii_lowercase();
+            if let Some(resolved) = var_defaults.get(&key_low) {
+                if resolved == val {
+                    break;
+                }
+                *val = resolved.clone();
+            } else {
+                break;
+            }
+        }
+    }
+    attrs
+}
+
 fn find_block_body(block: Node) -> Option<Node> {
     block.child_by_field_name("body").or_else(|| {
         let mut c = block.walk();
@@ -148,13 +181,20 @@ fn find_block_body(block: Node) -> Option<Node> {
 }
 
 fn collect_nested_blocks(body: Node) -> Vec<Node> {
+    collect_nested_blocks_depth(body, 0)
+}
+
+fn collect_nested_blocks_depth(body: Node, depth: usize) -> Vec<Node> {
+    if depth >= MAX_HCL_NESTED_DEPTH {
+        return Vec::new();
+    }
     let mut out = Vec::new();
     let mut c = body.walk();
     for ch in body.children(&mut c) {
         if ch.kind() == "block" {
             out.push(ch);
         } else if ch.kind() == "body" {
-            out.extend(collect_nested_blocks(ch));
+            out.extend(collect_nested_blocks_depth(ch, depth + 1));
         }
     }
     out
@@ -165,14 +205,7 @@ fn analyze_top_block(block: Node, ctx: &mut ExtractContext<'_>, graph: &HclFileG
     let Some(body) = find_block_body(block) else {
         return;
     };
-    let mut attrs = collect_body_attrs(body, ctx.src);
-    // Resolve `var.<name>` and `local.<name>` references in attribute values
-    for val in attrs.values_mut() {
-        let key_low = val.trim().to_ascii_lowercase();
-        if let Some(resolved) = graph.var_defaults.get(&key_low) {
-            *val = resolved.clone();
-        }
-    }
+    let attrs = collect_resolved_body_attrs(body, ctx.src, &graph.var_defaults);
     let line = block.start_position().row + 1;
     let end_line = block.end_position().row + 1;
 
@@ -256,18 +289,18 @@ fn analyze_top_block(block: Node, ctx: &mut ExtractContext<'_>, graph: &HclFileG
     );
 
     // 2. Public Network Ingress (`SMG-CFG-IAC-NET`)
-    check_network_exposure(ctx, &res_type, &sym_name, line, body, &attrs);
+    check_network_exposure(ctx, &res_type, &sym_name, line, body, &attrs, graph);
 
     // 3. Encryption & TLS Posture (`SMG-CFG-IAC-CRYPTO`)
-    check_crypto_posture(ctx, &res_type, &sym_name, line, body, &attrs);
+    check_crypto_posture(ctx, &res_type, &sym_name, line, body, &attrs, graph);
 
     // 4. Over-permissive IAM Policies (`SMG-CFG-IAC-IAM`)
-    check_iam_wildcards(ctx, &res_type, &sym_name, line, body, &attrs);
+    check_iam_wildcards(ctx, &res_type, &sym_name, line, body, &attrs, graph);
 
-    // 5. Phase 23: Declarative Checkov-class Cloud/IaC Policy Pack (52+ AWS/GCP/Azure policies)
+    // 5. Phase 23: Declarative Checkov-class Cloud/IaC Policy Pack (60 unique AWS/GCP/Azure policies)
     if block_type == "resource" {
         let mut nested_map: HashMap<String, Vec<HashMap<String, String>>> = HashMap::new();
-        collect_nested_block_attrs(body, ctx.src, &graph.var_defaults, &mut nested_map);
+        collect_nested_block_attrs(body, ctx.src, &graph.var_defaults, &mut nested_map, 0);
         let view = crate::iac_policy::HclResourceView {
             rel_path: ctx.rel_path,
             res_type: &res_type,
@@ -293,22 +326,20 @@ fn collect_nested_block_attrs(
     src: &[u8],
     var_defaults: &HashMap<String, String>,
     out: &mut HashMap<String, Vec<HashMap<String, String>>>,
+    depth: usize,
 ) {
+    if depth >= MAX_HCL_NESTED_DEPTH {
+        return;
+    }
     for nb in collect_nested_blocks(body) {
         let (nb_type, _) = block_header(nb, src);
         if let Some(nb_body) = find_block_body(nb) {
-            let mut nb_attrs = collect_body_attrs(nb_body, src);
-            for val in nb_attrs.values_mut() {
-                let key_low = val.trim().to_ascii_lowercase();
-                if let Some(resolved) = var_defaults.get(&key_low) {
-                    *val = resolved.clone();
-                }
-            }
+            let nb_attrs = collect_resolved_body_attrs(nb_body, src, var_defaults);
             out.entry(nb_type.to_ascii_lowercase())
                 .or_default()
                 .push(nb_attrs);
-            // Recurse one level deeper (e.g., `settings { ip_configuration { ... } }`)
-            collect_nested_block_attrs(nb_body, src, var_defaults, out);
+            // Bounded recursion for nested blocks (e.g., `settings { ip_configuration { ... } }`)
+            collect_nested_block_attrs(nb_body, src, var_defaults, out, depth + 1);
         }
     }
 }
@@ -391,16 +422,15 @@ fn check_public_exposure(
         );
     }
 
-    if matches!(
-        res_type,
-        "aws_instance" | "aws_launch_template" | "aws_launch_configuration"
-    ) {
+    // `aws_instance` and `aws_launch_template` are checked by `iac_policy` (CKV_AWS_79 / CKV_AWS_8);
+    // keep manual check for `aws_launch_configuration`.
+    if res_type == "aws_launch_configuration" {
         for nested in collect_nested_blocks(body) {
             let (nt, _) = block_header(nested, ctx.src);
             if nt == "metadata_options"
                 && let Some(nb) = find_block_body(nested)
             {
-                let nattrs = collect_body_attrs(nb, ctx.src);
+                let nattrs = collect_resolved_body_attrs(nb, ctx.src, &graph.var_defaults);
                 if nattrs
                     .get("http_tokens")
                     .is_some_and(|v| strip_quotes(v).eq_ignore_ascii_case("optional"))
@@ -434,7 +464,8 @@ fn check_public_exposure(
                             if block_header(auth_net, ctx.src).0 == "authorized_networks"
                                 && let Some(ab) = find_block_body(auth_net)
                             {
-                                let aattrs = collect_body_attrs(ab, ctx.src);
+                                let aattrs =
+                                    collect_resolved_body_attrs(ab, ctx.src, &graph.var_defaults);
                                 if aattrs
                                     .get("value")
                                     .is_some_and(|v| v.contains("0.0.0.0/0") || v.contains("::/0"))
@@ -470,13 +501,18 @@ fn check_public_exposure(
             .filter(|c| !c.is_whitespace())
             .collect::<String>()
             .to_ascii_lowercase();
-        let has_wildcard_principal = compact.contains("\"principal\":\"*\"")
-            || compact.contains("\"principal\":{\"aws\":\"*\"}")
-            || compact.contains("\"principal\":{\"aws\":[\"*\"]}");
-        if has_wildcard_principal
-            && !compact.contains("\"condition\"")
-            && !compact.contains("\"effect\":\"deny\"")
-        {
+        let has_unrestricted_public_stmt =
+            split_json_statement_objects(&compact)
+                .into_iter()
+                .any(|stmt| {
+                    let has_wildcard_principal = stmt.contains("\"principal\":\"*\"")
+                        || stmt.contains("\"principal\":{\"aws\":\"*\"}")
+                        || stmt.contains("\"principal\":{\"aws\":[\"*\"]}");
+                    has_wildcard_principal
+                        && !stmt.contains("\"condition\"")
+                        && !stmt.contains("\"effect\":\"deny\"")
+                });
+        if has_unrestricted_public_stmt {
             push_iac_finding(
                 ctx,
                 "SMG-CFG-IAC-PUBLIC",
@@ -558,8 +594,7 @@ fn check_public_exposure(
 
     if (res_type.contains("db_instance")
         || res_type.contains("rds_cluster")
-        || res_type.contains("sql_database_instance")
-        || res_type.contains("mssql_server"))
+        || res_type.contains("sql_database_instance"))
         && (attr_is_bool(attrs, "publicly_accessible", true)
             || attr_is_bool(attrs, "public_network_access_enabled", true))
     {
@@ -581,6 +616,7 @@ fn check_network_exposure(
     block_line: usize,
     body: Node,
     top_attrs: &HashMap<String, String>,
+    graph: &HclFileGraph,
 ) {
     if res_type == "aws_security_group" {
         for nested in collect_nested_blocks(body) {
@@ -588,7 +624,7 @@ fn check_network_exposure(
             if nt == "ingress"
                 && let Some(nb) = find_block_body(nested)
             {
-                let nattrs = collect_body_attrs(nb, ctx.src);
+                let nattrs = collect_resolved_body_attrs(nb, ctx.src, &graph.var_defaults);
                 check_ingress_attrs(ctx, sym_name, nested.start_position().row + 1, &nattrs);
             }
         }
@@ -634,7 +670,7 @@ fn check_network_exposure(
                     && let Some(nb) = find_block_body(nested)
                 {
                     has_allow_block = true;
-                    let nattrs = collect_body_attrs(nb, ctx.src);
+                    let nattrs = collect_resolved_body_attrs(nb, ctx.src, &graph.var_defaults);
                     let only_http_ports = nattrs.get("ports").is_some_and(|ports| {
                         let inner: Vec<String> = ports
                             .trim_matches(['[', ']', ' ', '\n', '\r', '\t'])
@@ -766,11 +802,11 @@ fn check_crypto_posture(
     line: usize,
     body: Node,
     attrs: &HashMap<String, String>,
+    graph: &HclFileGraph,
 ) {
-    if matches!(
-        res_type,
-        "aws_db_instance" | "aws_rds_cluster" | "aws_ebs_volume"
-    ) && !attrs.contains_key("storage_encrypted")
+    // `aws_ebs_volume` missing encryption is covered by CKV_AWS_3; keep default-off heuristic for RDS.
+    if matches!(res_type, "aws_db_instance" | "aws_rds_cluster")
+        && !attrs.contains_key("storage_encrypted")
         && !attrs.contains_key("encrypted")
         && !attrs.contains_key("kms_key_id")
         && !attrs.contains_key("replicate_source_db")
@@ -800,7 +836,7 @@ fn check_crypto_posture(
             if block_header(nested, ctx.src).0 == "default_action"
                 && let Some(nb) = find_block_body(nested)
             {
-                let nattrs = collect_body_attrs(nb, ctx.src);
+                let nattrs = collect_resolved_body_attrs(nb, ctx.src, &graph.var_defaults);
                 if nattrs
                     .get("type")
                     .is_some_and(|t| strip_quotes(t).eq_ignore_ascii_case("redirect"))
@@ -823,9 +859,15 @@ fn check_crypto_posture(
             );
         }
     }
-    if attr_is_bool(attrs, "storage_encrypted", false)
-        || attr_is_bool(attrs, "encrypted", false)
-        || attr_is_bool(attrs, "encryption_at_rest_enabled", false)
+    // Avoid duplicating resources with explicit declarative Checkov encryption rules
+    let covered_by_iac_encryption = matches!(
+        res_type,
+        "aws_db_instance" | "aws_ebs_volume" | "aws_redshift_cluster" | "aws_efs_file_system"
+    );
+    if !covered_by_iac_encryption
+        && (attr_is_bool(attrs, "storage_encrypted", false)
+            || attr_is_bool(attrs, "encrypted", false)
+            || attr_is_bool(attrs, "encryption_at_rest_enabled", false))
     {
         push_iac_finding(
             ctx,
@@ -837,8 +879,9 @@ fn check_crypto_posture(
         );
     }
 
-    if attr_is_bool(attrs, "enable_https_traffic_only", false)
-        || attr_is_bool(attrs, "https_traffic_only_enabled", false)
+    if res_type != "azurerm_storage_account"
+        && (attr_is_bool(attrs, "enable_https_traffic_only", false)
+            || attr_is_bool(attrs, "https_traffic_only_enabled", false))
     {
         push_iac_finding(
             ctx,
@@ -852,10 +895,7 @@ fn check_crypto_posture(
 
     if matches!(
         res_type,
-        "aws_lb_listener"
-            | "aws_alb_listener"
-            | "aws_api_gateway_domain_name"
-            | "azurerm_storage_account"
+        "aws_lb_listener" | "aws_alb_listener" | "aws_api_gateway_domain_name"
     ) {
         for key in [
             "ssl_policy",
@@ -899,6 +939,7 @@ fn check_iam_wildcards(
     block_line: usize,
     body: Node,
     top_attrs: &HashMap<String, String>,
+    graph: &HclFileGraph,
 ) {
     // Pattern A: `data "aws_iam_policy_document"` nested `statement { actions = ["*"] resources = ["*"] }`
     for nested in collect_nested_blocks(body) {
@@ -906,7 +947,7 @@ fn check_iam_wildcards(
         if nt == "statement"
             && let Some(nb) = find_block_body(nested)
         {
-            let nattrs = collect_body_attrs(nb, ctx.src);
+            let nattrs = collect_resolved_body_attrs(nb, ctx.src, &graph.var_defaults);
             let is_deny = nattrs
                 .get("effect")
                 .is_some_and(|e| strip_quotes(e).eq_ignore_ascii_case("Deny"));

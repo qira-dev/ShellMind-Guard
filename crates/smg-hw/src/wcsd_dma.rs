@@ -21,23 +21,36 @@ pub struct MemoryRegion {
     pub line: usize,
 }
 
-fn parse_ld_size(raw: &str) -> Option<u64> {
-    let s = raw.trim().to_ascii_uppercase();
-    let (num_part, mult) = if let Some(n) = s.strip_suffix("K") {
-        (n, 1024u64)
-    } else if let Some(n) = s.strip_suffix("M") {
-        (n, 1024u64 * 1024)
-    } else if let Some(n) = s.strip_suffix("G") {
-        (n, 1024u64 * 1024 * 1024)
-    } else {
-        (s.as_str(), 1u64)
-    };
-    let base = if let Some(hex) = num_part.strip_prefix("0X") {
-        u64::from_str_radix(hex.trim(), 16).ok()?
-    } else {
-        num_part.trim().parse::<u64>().ok()?
-    };
-    base.checked_mul(mult)
+fn strip_ld_comments_preserve_lines(content: &str) -> String {
+    let bytes = content.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            out.push(b' ');
+            out.push(b' ');
+            i += 2;
+            while i < bytes.len() {
+                if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                    out.push(b' ');
+                    out.push(b' ');
+                    i += 2;
+                    break;
+                }
+                out.push(if bytes[i] == b'\n' { b'\n' } else { b' ' });
+                i += 1;
+            }
+        } else if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                out.push(b' ');
+                i += 1;
+            }
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Audits a GNU `.ld` / `.lds` linker script for overlapping memory regions,
@@ -49,27 +62,27 @@ pub fn audit_linker_script(
     static REGION_RE: OnceLock<Regex> = OnceLock::new();
     let region_re = REGION_RE.get_or_init(|| {
         Regex::new(
-            r"(?i)^\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?:\(([^)]*)\))?\s*:\s*ORIGIN\s*=\s*(0x[0-9a-fA-F]+|\d+[KMG]?)\s*,\s*LENGTH\s*=\s*(0x[0-9a-fA-F]+|\d+[KMG]?)",
+            r"(?i)^\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?:\(([^)]*)\))?\s*:\s*(?:ORIGIN|org|o)\s*=\s*([^,\r\n]+?)\s*,\s*(?:LENGTH|len|l)\s*=\s*([^\r\n;}]+)",
         )
         .expect("valid ld region re")
     });
     static STACK_SYM_RE: OnceLock<Regex> = OnceLock::new();
     let stack_sym_re = STACK_SYM_RE.get_or_init(|| {
-        Regex::new(r"(?i)_Min_Stack_Size\s*=\s*(0x[0-9a-fA-F]+|\d+[KMG]?)\s*;")
-            .expect("valid stack sym re")
+        Regex::new(r"(?i)_Min_Stack_Size\s*=\s*([^;\r\n]+)\s*;").expect("valid stack sym re")
     });
 
+    let clean = strip_ld_comments_preserve_lines(content);
     let mut regions = Vec::new();
     let mut min_stack_size = None;
     let mut findings = Vec::new();
 
-    for (idx, line) in content.lines().enumerate() {
+    for (idx, line) in clean.lines().enumerate() {
         let ln = idx + 1;
         if let Some(c) = region_re.captures(line)
             && let (Some(name), Some(orig_m), Some(len_m)) = (c.get(1), c.get(3), c.get(4))
             && let (Some(origin), Some(length)) = (
-                parse_ld_size(orig_m.as_str()),
-                parse_ld_size(len_m.as_str()),
+                crate::context::eval_linker_expr(orig_m.as_str()),
+                crate::context::eval_linker_expr(len_m.as_str()),
             )
         {
             let attrs = c
@@ -85,7 +98,9 @@ pub fn audit_linker_script(
             });
         }
         if let Some(c) = stack_sym_re.captures(line)
-            && let Some(sz) = c.get(1).and_then(|m| parse_ld_size(m.as_str()))
+            && let Some(sz) = c
+                .get(1)
+                .and_then(|m| crate::context::eval_linker_expr(m.as_str()))
         {
             min_stack_size = Some(sz);
         }
@@ -302,54 +317,98 @@ pub fn analyze_dma_cache_coherency(rel_path: &str, source: &str) -> Vec<LocalSta
     if !source.contains("DMA") && !source.contains("dma_") {
         return Vec::new();
     }
-    let has_clean = source.contains("SCB_CleanDCache")
-        || source.contains("SCB_CleanInvalidateDCache")
-        || source.contains("dma_sync_single_for_device")
-        || source.contains("dcache_clean");
-    let has_invalidate = source.contains("SCB_InvalidateDCache")
-        || source.contains("SCB_CleanInvalidateDCache")
-        || source.contains("dma_sync_single_for_cpu")
-        || source.contains("dcache_invalidate");
+    let clean_source = smg_graph::taint::strip_comments_simple(source);
+    let lines: Vec<&str> = clean_source.lines().collect();
+
+    let is_clean_line = |l: &str| {
+        l.contains("SCB_CleanDCache")
+            || l.contains("SCB_CleanInvalidateDCache")
+            || l.contains("dma_sync_single_for_device")
+            || l.contains("dcache_clean")
+    };
+    let is_invalidate_line = |l: &str| {
+        l.contains("SCB_InvalidateDCache")
+            || l.contains("SCB_CleanInvalidateDCache")
+            || l.contains("dma_sync_single_for_cpu")
+            || l.contains("dcache_invalidate")
+    };
+
+    // Check if the file has a DMA RX completion callback that performs D-Cache invalidation
+    let has_rx_callback_invalidate = lines.iter().enumerate().any(|(i, l)| {
+        if l.contains("RxCpltCallback") || l.contains("RxHalfCpltCallback") {
+            let end = (i + 30).min(lines.len());
+            lines[i..end].iter().any(|cl| is_invalidate_line(cl))
+        } else {
+            false
+        }
+    });
 
     let mut findings = Vec::new();
-    for (idx, line) in source.lines().enumerate() {
+    for (idx, line) in lines.iter().enumerate() {
         let ln = idx + 1;
         let t = line.trim();
-        if (t.contains("HAL_DMA_Start")
+        if t.contains("HAL_DMA_Start")
             || t.contains("HAL_SPI_Transmit_DMA")
-            || t.contains("HAL_UART_Transmit_DMA"))
-            && !has_clean
+            || t.contains("HAL_UART_Transmit_DMA")
         {
-            findings.push(LocalStaticFinding {
-                rule_id: "SMG-HW-DMA".into(),
-                severity: "HIGH".into(),
-                title: "DMA TX started without D-Cache clean (`SCB_CleanDCache` / `dma_sync_single_for_device`) — stale memory hazard".into(),
-                rel_path: rel_path.to_string(),
-                line: ln,
-                symbol: "dma_tx".into(),
-                sink_kind: SinkKind::MemorySafety,
-                missing_guard: GuardKind::MemoryBounds,
-                confidence: Confidence::Confirmed,
-                remediation: "Call `SCB_CleanDCache_by_Addr()` before starting DMA TX, or place the buffer in non-cacheable MPU/DTCM SRAM.".into(),
-            });
-            break;
+            // Look backwards within the current function/local window (up to 25 lines,
+            // stopping at a top-level closing brace `}` of a preceding function).
+            let mut has_local_clean = false;
+            let start = idx.saturating_sub(25);
+            for back in (start..=idx).rev() {
+                let bl = lines[back];
+                if back < idx && bl.starts_with('}') {
+                    break;
+                }
+                if is_clean_line(bl) {
+                    has_local_clean = true;
+                    break;
+                }
+            }
+            if !has_local_clean {
+                findings.push(LocalStaticFinding {
+                    rule_id: "SMG-HW-DMA".into(),
+                    severity: "HIGH".into(),
+                    title: "DMA TX started without D-Cache clean (`SCB_CleanDCache` / `dma_sync_single_for_device`) — stale memory hazard".into(),
+                    rel_path: rel_path.to_string(),
+                    line: ln,
+                    symbol: "dma_tx".into(),
+                    sink_kind: SinkKind::MemorySafety,
+                    missing_guard: GuardKind::MemoryBounds,
+                    confidence: Confidence::Confirmed,
+                    remediation: "Call `SCB_CleanDCache_by_Addr()` before starting DMA TX, or place the buffer in non-cacheable MPU/DTCM SRAM.".into(),
+                });
+            }
         }
-        if (t.contains("HAL_SPI_Receive_DMA") || t.contains("HAL_UART_Receive_DMA"))
-            && !has_invalidate
-        {
-            findings.push(LocalStaticFinding {
-                rule_id: "SMG-HW-DMA".into(),
-                severity: "HIGH".into(),
-                title: "DMA RX configured without D-Cache invalidate (`SCB_InvalidateDCache` / `dma_sync_single_for_cpu`) — stale CPU read hazard".into(),
-                rel_path: rel_path.to_string(),
-                line: ln,
-                symbol: "dma_rx".into(),
-                sink_kind: SinkKind::MemorySafety,
-                missing_guard: GuardKind::MemoryBounds,
-                confidence: Confidence::Confirmed,
-                remediation: "Call `SCB_InvalidateDCache_by_Addr()` after DMA RX completion before CPU reads the buffer.".into(),
-            });
-            break;
+        if t.contains("HAL_SPI_Receive_DMA") || t.contains("HAL_UART_Receive_DMA") {
+            let start = idx.saturating_sub(5);
+            let end = (idx + 25).min(lines.len());
+            let mut has_local_invalidate = has_rx_callback_invalidate;
+            if !has_local_invalidate {
+                for (cur, cl) in lines.iter().enumerate().take(end).skip(start) {
+                    if cur > idx && cl.starts_with('}') {
+                        break;
+                    }
+                    if is_invalidate_line(cl) {
+                        has_local_invalidate = true;
+                        break;
+                    }
+                }
+            }
+            if !has_local_invalidate {
+                findings.push(LocalStaticFinding {
+                    rule_id: "SMG-HW-DMA".into(),
+                    severity: "HIGH".into(),
+                    title: "DMA RX configured without D-Cache invalidate (`SCB_InvalidateDCache` / `dma_sync_single_for_cpu`) — stale CPU read hazard".into(),
+                    rel_path: rel_path.to_string(),
+                    line: ln,
+                    symbol: "dma_rx".into(),
+                    sink_kind: SinkKind::MemorySafety,
+                    missing_guard: GuardKind::MemoryBounds,
+                    confidence: Confidence::Confirmed,
+                    remediation: "Call `SCB_InvalidateDCache_by_Addr()` after DMA RX completion before CPU reads the buffer.".into(),
+                });
+            }
         }
     }
     findings
@@ -421,5 +480,39 @@ _Min_Stack_Size = 128K;
 
         let good = "void send() { tx_buf[0] = 1; SCB_CleanDCache_by_Addr(tx_buf, 64); HAL_SPI_Transmit_DMA(&hspi1, tx_buf, 64); }";
         assert!(analyze_dma_cache_coherency("src/spi.c", good).is_empty());
+
+        // Comment mentioning SCB_CleanDCache must NOT mask an unguarded DMA TX,
+        // and a clean in fn_a must NOT mask an unguarded DMA TX in fn_b.
+        let multi = r#"
+void fn_a(void) {
+    SCB_CleanDCache_by_Addr(a, 64);
+    HAL_SPI_Transmit_DMA(&hspi1, a, 64);
+}
+void fn_b(void) {
+    /* TODO: call SCB_CleanDCache_by_Addr */
+    HAL_UART_Transmit_DMA(&huart1, b, 64);
+    HAL_UART_Receive_DMA(&huart1, c, 64);
+}
+"#;
+        let hits = analyze_dma_cache_coherency("src/multi.c", multi);
+        assert_eq!(
+            hits.len(),
+            2,
+            "expected both unguarded TX and RX: {hits:#?}"
+        );
+
+        // Linker script comments, org/len aliases, and arithmetic LENGTH expressions
+        let ld_expr = r#"
+MEMORY {
+  /* RAM (rwx) : ORIGIN = 0x20000000, LENGTH = 1M */
+  FLASH (rx) : org = 0x08000000, len = 256K
+  RAM (rwx)  : o = 0x20000000, l = (64K - 4K)
+  DMA (rw)   : ORIGIN = 0x20008000, LENGTH = 32K
+}
+"#;
+        let (regions, _stack, ld_hits) = audit_linker_script("expr.ld", ld_expr);
+        assert_eq!(regions.len(), 3);
+        assert_eq!(regions[1].length, 60 * 1024);
+        assert!(ld_hits.iter().any(|h| h.title.contains("overlap")));
     }
 }

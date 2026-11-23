@@ -214,15 +214,17 @@ fn scan_cicd_workflow(rel_path: &str, content: &str, out: &mut Vec<LocalStaticFi
             in_jobs_block = trimmed == "jobs:";
             if !in_jobs_block {
                 saw_unsafe_checkout = false;
+                tainted_workflow_envs.clear();
             }
         } else if in_jobs_block
             && indent == 2
             && trimmed.ends_with(':')
             && !trimmed.starts_with('-')
         {
-            // Entering a new job under `jobs:` resets per-job unsafe checkout taint
+            // Entering a new job under `jobs:` resets per-job unsafe checkout & env taint
             saw_unsafe_checkout = false;
             in_run_block_indent = None;
+            tainted_workflow_envs.clear();
         }
 
         // Track `ENV_NAME: ${{ github.event.* }}` bindings for workflow-to-shell taint correlation
@@ -342,19 +344,23 @@ fn scan_cicd_workflow(rel_path: &str, content: &str, out: &mut Vec<LocalStaticFi
         if let Some(run_indent) = in_run_block_indent {
             if indent <= run_indent {
                 in_run_block_indent = None;
-            } else if ((has_pr_target
-                || trimmed.contains("GITHUB_ENV")
-                || trimmed.contains("GITHUB_PATH"))
-                && untrusted_gha_expr_re().is_match(code))
-                || line_sinks_tainted_env(code)
-            {
+            } else if untrusted_gha_expr_re().is_match(code) || line_sinks_tainted_env(code) {
+                let sev = if has_pr_target
+                    || trimmed.contains("GITHUB_ENV")
+                    || trimmed.contains("GITHUB_PATH")
+                    || line_sinks_tainted_env(code)
+                {
+                    "CRITICAL"
+                } else {
+                    "HIGH"
+                };
                 out.push(mk_finding(
                     "SMG-CICD-001",
-                    "CRITICAL",
-                    "GitHub Actions evaluates untrusted `${{ github.event.* }}` directly inside `run:` / `GITHUB_ENV` (Pwn-Request RCE)".into(),
+                    sev,
+                    "GitHub Actions evaluates untrusted `${{ github.event.* }}` directly inside `run:` / `GITHUB_ENV` (shell expression injection)".into(),
                     rel_path,
                     ln,
-                    "pull_request_target",
+                    if has_pr_target { "pull_request_target" } else { "workflow_run" },
                     SinkKind::Misconfiguration,
                     GuardKind::ConfigPolicy,
                     "Bind `${{ github.event.* }}` via `env:` variables and reference safely as quoted `\"$VAR\"` inside shell scripts, or downgrade trigger to `pull_request`.",
@@ -392,19 +398,23 @@ fn scan_cicd_workflow(rel_path: &str, content: &str, out: &mut Vec<LocalStaticFi
             }
             if rest.starts_with('|') || rest.starts_with('>') {
                 in_run_block_indent = Some(indent);
-            } else if ((has_pr_target
-                || rest.contains("GITHUB_ENV")
-                || rest.contains("GITHUB_PATH"))
-                && untrusted_gha_expr_re().is_match(rest))
-                || line_sinks_tainted_env(rest)
-            {
+            } else if untrusted_gha_expr_re().is_match(rest) || line_sinks_tainted_env(rest) {
+                let sev = if has_pr_target
+                    || rest.contains("GITHUB_ENV")
+                    || rest.contains("GITHUB_PATH")
+                    || line_sinks_tainted_env(rest)
+                {
+                    "CRITICAL"
+                } else {
+                    "HIGH"
+                };
                 out.push(mk_finding(
                     "SMG-CICD-001",
-                    "CRITICAL",
-                    "GitHub Actions interpolates untrusted `${{ github.event.* }}` inside `run:` / `GITHUB_ENV` command (Pwn-Request RCE)".into(),
+                    sev,
+                    "GitHub Actions interpolates untrusted `${{ github.event.* }}` inside `run:` / `GITHUB_ENV` command (shell expression injection)".into(),
                     rel_path,
                     ln,
-                    "pull_request_target",
+                    if has_pr_target { "pull_request_target" } else { "workflow_run" },
                     SinkKind::Misconfiguration,
                     GuardKind::ConfigPolicy,
                     "Pass untrusted GitHub event context through `env:` instead of inline `${{ ... }}` shell interpolation.",
@@ -414,10 +424,11 @@ fn scan_cicd_workflow(rel_path: &str, content: &str, out: &mut Vec<LocalStaticFi
             let rest = after_script.trim();
             if rest.starts_with('|') || rest.starts_with('>') {
                 in_run_block_indent = Some(indent);
-            } else if has_pr_target && untrusted_gha_expr_re().is_match(rest) {
+            } else if untrusted_gha_expr_re().is_match(rest) {
+                let sev = if has_pr_target { "CRITICAL" } else { "HIGH" };
                 out.push(mk_finding(
                     "SMG-CICD-001",
-                    "CRITICAL",
+                    sev,
                     "GitHub Actions `github-script` interpolates untrusted `${{ github.event.* }}` directly inside JS script".into(),
                     rel_path,
                     ln,
@@ -788,21 +799,23 @@ fn scan_redos_patterns(rel_path: &str, content: &str, out: &mut Vec<LocalStaticF
                 ));
             }
         }
-        // JS inline regex literal heuristic when assignment contains `=/.../` with nested `)+` or `)*`
-        if (trimmed.contains("= /") || trimmed.contains("new RegExp"))
-            && let Some(start) = trimmed.find("= /")
-        {
-            let rest = &trimmed[start + 3..];
-            if let Some(end) = rest.find('/') {
+        // JS inline regex literal heuristic when assignment contains `=/.../` or `= /.../` with nested `)+` or `)*`
+        let regex_lit_start = trimmed
+            .find("= /")
+            .map(|p| p + 3)
+            .or_else(|| trimmed.find("=/").map(|p| p + 2));
+        if let Some(start) = regex_lit_start {
+            let rest = &trimmed[start..];
+            // Skip `//` line comments mistakenly matched after `=`
+            if !rest.starts_with('/')
+                && let Some(end) = find_unescaped_js_regex_end(rest)
+            {
                 let lit = &rest[..end];
                 if !lit.is_empty() && has_nested_quantifier_redos(lit) {
                     out.push(mk_finding_conf(
                         "SMG-DOS-001",
                         "HIGH",
-                        format!(
-                            "Catastrophic backtracking ReDoS literal `/{}/`",
-                            lit
-                        ),
+                        format!("Catastrophic backtracking ReDoS literal `/{}/`", lit),
                         rel_path,
                         idx + 1,
                         "regex_literal",
@@ -817,14 +830,35 @@ fn scan_redos_patterns(rel_path: &str, content: &str, out: &mut Vec<LocalStaticF
     }
 }
 
+fn find_unescaped_js_regex_end(rest: &str) -> Option<usize> {
+    let bytes = rest.as_bytes();
+    let mut i = 0usize;
+    let mut in_char_class = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                i += 2;
+                continue;
+            }
+            b'[' if !in_char_class => in_char_class = true,
+            b']' if in_char_class => in_char_class = false,
+            b'/' if !in_char_class => return Some(i),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 fn scan_zipslip_patterns(
     rel_path: &str,
     language: Language,
     content: &str,
     out: &mut Vec<LocalStaticFinding>,
 ) {
-    let low_all = content.to_ascii_lowercase();
-    let lines: Vec<&str> = content.lines().collect();
+    let cleaned = crate::taint::strip_comments_simple(content);
+    let low_all = cleaned.to_ascii_lowercase();
+    let lines: Vec<&str> = cleaned.lines().collect();
     let has_local_path_containment = |win_low: &str| -> bool {
         win_low.contains("commonpath")
             || win_low.contains("commonprefix")
@@ -856,11 +890,11 @@ fn scan_zipslip_patterns(
 
     for (idx, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
-        if trimmed.starts_with("//") || trimmed.starts_with('#') {
+        if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with('#') {
             continue;
         }
         let low = trimmed.to_ascii_lowercase();
-        let local_win = lines[idx.saturating_sub(15)..(idx + 15).min(lines.len())]
+        let local_win = lines[idx.saturating_sub(15)..=idx]
             .join("\n")
             .to_ascii_lowercase();
         if has_local_path_containment(&local_win) {
@@ -1032,17 +1066,13 @@ fn timing_cmp_confidence(rhs: &str) -> Confidence {
 }
 
 fn scan_crypto_math_patterns(rel_path: &str, content: &str, out: &mut Vec<LocalStaticFinding>) {
-    let low_all = content.to_ascii_lowercase();
-    let has_const_time_api = low_all.contains("timingsafeequal")
-        || low_all.contains("compare_digest")
-        || low_all.contains("hmac.equal")
-        || low_all.contains("ct_eq")
-        || low_all.contains("constanttimeeq")
-        || low_all.contains("messagedigest.isequal");
+    let cleaned = crate::taint::strip_comments_simple(content);
+    let lines: Vec<&str> = cleaned.lines().collect();
 
-    for (idx, line) in content.lines().enumerate() {
+    for (idx, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
-        if trimmed.starts_with("//")
+        if trimmed.is_empty()
+            || trimmed.starts_with("//")
             || trimmed.starts_with('#')
             || trimmed.starts_with('*')
             || crate::taint::is_pattern_matcher_or_doc_line(line)
@@ -1061,8 +1091,7 @@ fn scan_crypto_math_patterns(rel_path: &str, content: &str, out: &mut Vec<LocalS
                 GuardKind::ConfigPolicy,
                 "Switch to authenticated encryption (`AES-256-GCM` or `ChaCha20-Poly1305`) with a fresh CSPRNG nonce per encryption.",
             ));
-        } else if !has_const_time_api
-            && let Some(cap) = secret_timing_cmp_re().captures(line)
+        } else if let Some(cap) = secret_timing_cmp_re().captures(line)
             && !line.contains("null")
             && !line.contains("None")
             && !line.contains("nil")
@@ -1072,18 +1101,29 @@ fn scan_crypto_math_patterns(rel_path: &str, content: &str, out: &mut Vec<LocalS
             && !line.contains("len(")
             && !is_benign_timing_cmp(&cap[1], &cap[2])
         {
-            out.push(mk_finding_conf(
-                "SMG-CRYPTO-001",
-                "HIGH",
-                "Non-constant-time (`===` / `==`) comparison of cryptographic HMAC/signature enables timing side-channel".into(),
-                rel_path,
-                idx + 1,
-                "signature_compare",
-                SinkKind::Misconfiguration,
-                GuardKind::ConfigPolicy,
-                timing_cmp_confidence(&cap[2]),
-                "Use constant-time comparison (`crypto.timingSafeEqual`, `hmac.compare_digest`, `hmac.Equal`, or `subtle::ConstantTimeEq`).",
-            ));
+            let local_win = lines[idx.saturating_sub(4)..(idx + 3).min(lines.len())]
+                .join("\n")
+                .to_ascii_lowercase();
+            let has_local_const_time_api = local_win.contains("timingsafeequal")
+                || local_win.contains("compare_digest")
+                || local_win.contains("hmac.equal")
+                || local_win.contains("ct_eq")
+                || local_win.contains("constanttimeeq")
+                || local_win.contains("messagedigest.isequal");
+            if !has_local_const_time_api {
+                out.push(mk_finding_conf(
+                    "SMG-CRYPTO-001",
+                    "HIGH",
+                    "Non-constant-time (`===` / `==`) comparison of cryptographic HMAC/signature enables timing side-channel".into(),
+                    rel_path,
+                    idx + 1,
+                    "signature_compare",
+                    SinkKind::Misconfiguration,
+                    GuardKind::ConfigPolicy,
+                    timing_cmp_confidence(&cap[2]),
+                    "Use constant-time comparison (`crypto.timingSafeEqual`, `hmac.compare_digest`, `hmac.Equal`, or `subtle::ConstantTimeEq`).",
+                ));
+            }
         }
     }
 }

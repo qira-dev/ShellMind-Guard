@@ -73,6 +73,17 @@ pub fn scan_protocols_ai_and_workflow(
     language: Language,
     content: &str,
 ) -> Vec<LocalStaticFinding> {
+    if language == Language::Config {
+        let mut out = Vec::new();
+        for hit in crate::ai_mcp_model::analyze_mcp_tool_poisoning(rel_path, content) {
+            push_unique(&mut out, hit);
+        }
+        for hit in crate::ai_mcp_model::analyze_model_deserialization_and_ssti(rel_path, content) {
+            push_unique(&mut out, hit);
+        }
+        return out;
+    }
+
     if !matches!(
         language,
         Language::TypeScript
@@ -181,7 +192,7 @@ fn scan_graphql_ws_grpc(
         || low_full.contains("createyoga(")
         || low_full.contains("graphqlhttp(")
         || low_full.contains("buildschema(")
-        || low_full.contains("makexecutable");
+        || low_full.contains("makeexecutableschema");
 
     if is_gql_server {
         for (idx, line) in lines.iter().enumerate() {
@@ -374,8 +385,8 @@ fn scan_ai_prompt_and_agent_tools(
         let trimmed = line.trim();
         let low = trimmed.to_ascii_lowercase();
 
-        // Scope reset at top-level function / method boundaries so sibling functions never leak AI taint
-        if (low.starts_with("function ")
+        // Scope reset at function / class method boundaries so sibling methods never leak AI taint
+        if low.starts_with("function ")
             || low.starts_with("async function ")
             || low.starts_with("export function ")
             || low.starts_with("export async function ")
@@ -383,9 +394,9 @@ fn scan_ai_prompt_and_agent_tools(
             || low.starts_with("async def ")
             || low.starts_with("func ")
             || low.starts_with("pub fn ")
-            || low.starts_with("fn "))
-            && !line.starts_with("    ")
-            && !line.starts_with('\t')
+            || low.starts_with("pub async fn ")
+            || low.starts_with("async fn ")
+            || low.starts_with("fn ")
         {
             ai_vars.clear();
         }

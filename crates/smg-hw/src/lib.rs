@@ -81,13 +81,17 @@ pub fn repo_has_hw_indicators(project_root: &Path, files: &[IndexedFile]) -> boo
         if let Some(bytes) = f.cached_bytes.as_deref()
             && let Ok(text) = std::str::from_utf8(bytes)
         {
-            let stripped = smg_graph::taint::strip_comments_simple(text);
-            if HW_TOKENS.iter().any(|t| stripped.contains(t)) {
-                return true;
+            // Fast raw pre-check avoids comment-stripping allocation on pure Web/CLI Rust/C files.
+            if HW_TOKENS.iter().any(|t| text.contains(t)) {
+                let stripped = smg_graph::taint::strip_comments_simple(text);
+                if HW_TOKENS.iter().any(|t| stripped.contains(t)) {
+                    return true;
+                }
             }
         }
         if f.cached_bytes.is_none()
             && let Ok(text) = fs::read_to_string(&f.abs_path)
+            && HW_TOKENS.iter().any(|t| text.contains(t))
         {
             let stripped = smg_graph::taint::strip_comments_simple(&text);
             if HW_TOKENS.iter().any(|t| stripped.contains(t)) {
@@ -126,20 +130,16 @@ pub fn scan_hardware_repo(
         sources.push((f.rel_path.clone(), f.language, text));
     }
 
-    if sources.is_empty() {
-        return Vec::new();
-    }
-
-    let c_refs: Vec<(String, &str)> = sources
-        .iter()
-        .map(|(r, _, s)| (r.clone(), s.as_str()))
-        .collect();
-    let ctx = ingest_firmware_context(project_root, &c_refs);
-
     let mut raw_findings = Vec::new();
     let mut lock_summaries: Vec<HardwareFunctionLockSummary> = Vec::new();
 
-    {
+    if !sources.is_empty() {
+        let c_refs: Vec<(String, &str)> = sources
+            .iter()
+            .map(|(r, _, s)| (r.clone(), s.as_str()))
+            .collect();
+        let ctx = ingest_firmware_context(project_root, &c_refs);
+
         use rayon::prelude::*;
         let per_file: Vec<(Vec<LocalStaticFinding>, Vec<HardwareFunctionLockSummary>)> = sources
             .par_iter()
@@ -165,6 +165,8 @@ pub fn scan_hardware_repo(
             lock_summaries.extend(ll);
         }
     }
+
+    let mut seen_ld_rel_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
     for f in files {
         let low = f.rel_path.to_ascii_lowercase();
         if (low.ends_with(".ld") || low.ends_with(".lds"))
@@ -174,25 +176,38 @@ pub fn scan_hardware_repo(
                 fs::read_to_string(&f.abs_path)
             }
         {
-            let (_regions, _stack, ld_findings) = wcsd_dma::audit_linker_script(&f.rel_path, &text);
-            raw_findings.extend(ld_findings);
+            let norm = f
+                .rel_path
+                .replace('\\', "/")
+                .trim_start_matches("./")
+                .to_string();
+            if seen_ld_rel_paths.insert(norm) {
+                let (_regions, _stack, ld_findings) =
+                    wcsd_dma::audit_linker_script(&f.rel_path, &text);
+                raw_findings.extend(ld_findings);
+            }
         }
     }
     for spec_path in collect_hw_spec_files(project_root, 5, 64) {
         let low = spec_path.to_string_lossy().to_ascii_lowercase();
-        if (low.ends_with(".ld") || low.ends_with(".lds"))
-            && let Ok(text) = fs::read_to_string(&spec_path)
-        {
+        if low.ends_with(".ld") || low.ends_with(".lds") {
             let rel = spec_path
                 .strip_prefix(project_root)
                 .unwrap_or(&spec_path)
                 .to_string_lossy()
                 .replace('\\', "/");
-            let (_regions, _stack, ld_findings) = wcsd_dma::audit_linker_script(&rel, &text);
-            raw_findings.extend(ld_findings);
+            let norm = rel.trim_start_matches("./").to_string();
+            if seen_ld_rel_paths.insert(norm)
+                && let Ok(text) = fs::read_to_string(&spec_path)
+            {
+                let (_regions, _stack, ld_findings) = wcsd_dma::audit_linker_script(&rel, &text);
+                raw_findings.extend(ld_findings);
+            }
         }
     }
-    raw_findings.extend(check_cross_fn_irq_deadlocks(&lock_summaries));
+    if !lock_summaries.is_empty() {
+        raw_findings.extend(check_cross_fn_irq_deadlocks(&lock_summaries));
+    }
 
     // Deduplicate on `(rule_id, rel_path, line)` while keeping highest severity
     let mut best_by_key: HashMap<(String, String, usize), usize> = HashMap::new();

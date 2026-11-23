@@ -382,6 +382,21 @@ fn collect_hw_functions<'a>(node: Node<'a>, src: &[u8], out: &mut Vec<(String, N
     }
 }
 
+fn is_isr_function(fn_name: &str, fn_header_low: &str, lines: &[&str], fn_start: usize) -> bool {
+    let fn_name_low = fn_name.to_ascii_lowercase();
+    let fn_slice_start = fn_start.saturating_sub(2);
+    let attr_ctx = if lines.is_empty() {
+        String::new()
+    } else {
+        lines[fn_slice_start.saturating_sub(1)..fn_start.min(lines.len())].join("\n")
+    };
+    fn_name_low.contains("irqhandler")
+        || fn_name_low.ends_with("_isr")
+        || fn_header_low.contains("__attribute__((interrupt))")
+        || attr_ctx.contains("#[interrupt]")
+        || attr_ctx.contains("ISR(")
+}
+
 fn extract_function_lock_summary(
     fn_name: &str,
     rel_path: &str,
@@ -390,25 +405,16 @@ fn extract_function_lock_summary(
     lines: &[&str],
     fn_body: &str,
 ) -> Option<HardwareFunctionLockSummary> {
-    let fn_low = fn_body.to_ascii_lowercase();
     let fn_header_low = fn_body
         .split('{')
         .next()
         .unwrap_or(fn_body)
         .to_ascii_lowercase();
-    let fn_name_low = fn_name.to_ascii_lowercase();
-    let fn_slice_start = fn_start.saturating_sub(2);
-    let attr_ctx = lines[fn_slice_start.saturating_sub(1)..fn_start.min(lines.len())].join("\n");
-    let is_isr = fn_name_low.contains("irqhandler")
-        || fn_name_low.ends_with("_isr")
-        || fn_header_low.contains("__attribute__((interrupt))")
-        || attr_ctx.contains("#[interrupt]")
-        || attr_ctx.contains("ISR(");
+    let is_isr = is_isr_function(fn_name, &fn_header_low, lines, fn_start);
 
-    let mut global_irq_disabled = fn_low.contains("disable_irq")
-        || fn_low.contains("critical_section")
-        || fn_low.contains("taskenter_critical")
-        || fn_low.contains("cpsid");
+    // Track interrupt-disabled state sequentially line-by-line (never pre-seed from the
+    // whole body, otherwise a late `disable_irq()` would mask an earlier unguarded `spin_lock`).
+    let mut global_irq_disabled = false;
 
     let mut acquired: Vec<String> = Vec::new();
     let mut currently_held: Vec<String> = Vec::new();
@@ -501,6 +507,9 @@ fn extract_function_lock_summary(
             || low.contains("taskenter_critical")
             || low.contains("cpsid")
             || low.contains("critical_section::with")
+            || low.contains("local_irq_save")
+            || low.contains("local_irq_disable")
+            || low.contains("spin_lock_irq(")
         {
             global_irq_disabled = true;
         }
@@ -539,7 +548,13 @@ fn extract_function_lock_summary(
             }
         }
 
-        if low.contains("enable_irq") || low.contains("taskexit_critical") {
+        if low.contains("enable_irq")
+            || low.contains("taskexit_critical")
+            || low.contains("cpsie")
+            || low.contains("local_irq_restore")
+            || low.contains("local_irq_enable")
+            || low.contains("spin_unlock_irq(")
+        {
             global_irq_disabled = false;
         }
 
@@ -787,21 +802,29 @@ fn resolve_bound_token(
 }
 
 fn line_derefs_ptr(trimmed: &str, ptr: &str) -> bool {
+    if ptr.is_empty() {
+        return false;
+    }
     let bytes = trimmed.as_bytes();
     let arrow = format!("{}->", ptr);
     let mut off = 0usize;
-    while let Some(rel) = trimmed[off..].find(&arrow) {
+    while off < trimmed.len()
+        && let Some(rel) = trimmed[off..].find(&arrow)
+    {
         let pos = off + rel;
         let prev_ok =
             pos == 0 || (!bytes[pos - 1].is_ascii_alphanumeric() && bytes[pos - 1] != b'_');
         if prev_ok {
             return true;
         }
-        off = pos + 1;
+        let step = trimmed[pos..].chars().next().map_or(1, char::len_utf8);
+        off = pos + step;
     }
     let star = format!("*{}", ptr);
     let mut soff = 0usize;
-    while let Some(rel) = trimmed[soff..].find(&star) {
+    while soff < trimmed.len()
+        && let Some(rel) = trimmed[soff..].find(&star)
+    {
         let pos = soff + rel;
         let end = pos + star.len();
         let prev_is_expr_operand = pos > 0
@@ -815,7 +838,8 @@ fn line_derefs_ptr(trimmed: &str, ptr: &str) -> bool {
         if !prev_is_expr_operand && next_ok {
             return true;
         }
-        soff = pos + 1;
+        let step = trimmed[pos..].chars().next().map_or(1, char::len_utf8);
+        soff = pos + step;
     }
     false
 }
@@ -1037,10 +1061,7 @@ fn analyze_single_hw_function(
         .next()
         .unwrap_or(fn_body)
         .to_ascii_lowercase();
-    let fn_name_low_self = fn_name.to_ascii_lowercase();
-    let fn_is_isr = fn_name_low_self.contains("irqhandler")
-        || fn_name_low_self.ends_with("_isr")
-        || fn_hdr_low.contains("__attribute__((interrupt))");
+    let fn_is_isr = is_isr_function(fn_name, &fn_hdr_low, all_lines, fn_start);
     if fn_is_isr {
         for &(ln, raw) in &fn_lines {
             let l = strip_string_literals_line(raw).to_ascii_lowercase();
@@ -2299,18 +2320,37 @@ pub fn check_cross_fn_irq_deadlocks(
 ) -> Vec<LocalStaticFinding> {
     const MAX_HW_SUMMARY_HOPS: usize = 4;
 
-    // Clone into working table and build unique function name index for sound inter-procedural resolution
+    // Clone into working table and build same-file + unique global function name indices
+    // so same-named C `static` helpers in different translation units resolve locally instead of dropping.
     let mut work: Vec<HardwareFunctionLockSummary> = summaries.to_vec();
     let mut name_counts: HashMap<&str, usize> = HashMap::new();
+    let mut file_name_counts: HashMap<(&str, &str), usize> = HashMap::new();
     for s in summaries {
         *name_counts.entry(s.fn_name.as_str()).or_insert(0) += 1;
+        *file_name_counts
+            .entry((s.rel_path.as_str(), s.fn_name.as_str()))
+            .or_insert(0) += 1;
     }
+    let mut same_file_idx: HashMap<(String, String), usize> = HashMap::new();
     let mut unique_name_idx: HashMap<String, usize> = HashMap::new();
     for (idx, s) in summaries.iter().enumerate() {
+        if file_name_counts
+            .get(&(s.rel_path.as_str(), s.fn_name.as_str()))
+            .copied()
+            == Some(1)
+        {
+            same_file_idx.insert((s.rel_path.clone(), s.fn_name.clone()), idx);
+        }
         if name_counts.get(s.fn_name.as_str()).copied() == Some(1) {
             unique_name_idx.insert(s.fn_name.clone(), idx);
         }
     }
+    let resolve_callee = |caller_path: &str, callee_name: &str| -> Option<usize> {
+        same_file_idx
+            .get(&(caller_path.to_string(), callee_name.to_string()))
+            .copied()
+            .or_else(|| unique_name_idx.get(callee_name).copied())
+    };
 
     // Bounded <= 4-hop fixed-point propagation of locks, lock pairs, and sleeping-alloc effects
     for _hop in 0..MAX_HW_SUMMARY_HOPS {
@@ -2318,7 +2358,7 @@ pub fn check_cross_fn_irq_deadlocks(
         let snapshot = work.clone();
         for caller in &mut work {
             for callee_name in &caller.callees {
-                let Some(&ci) = unique_name_idx.get(callee_name) else {
+                let Some(ci) = resolve_callee(&caller.rel_path, callee_name) else {
                     continue;
                 };
                 let callee = &snapshot[ci];
@@ -2365,7 +2405,7 @@ pub fn check_cross_fn_irq_deadlocks(
     let mut called_from_non_isr: HashSet<usize> = HashSet::new();
     for s in &work {
         for cname in &s.callees {
-            if let Some(&ci) = unique_name_idx.get(cname) {
+            if let Some(ci) = resolve_callee(&s.rel_path, cname) {
                 if s.is_isr {
                     called_from_isr.insert(ci);
                 } else {
@@ -2380,7 +2420,7 @@ pub fn check_cross_fn_irq_deadlocks(
         let cur: Vec<usize> = called_from_isr.iter().copied().collect();
         for ci in cur {
             for cname in &work[ci].callees {
-                if let Some(&sub) = unique_name_idx.get(cname)
+                if let Some(sub) = resolve_callee(&work[ci].rel_path, cname)
                     && called_from_isr.insert(sub)
                 {
                     added = true;

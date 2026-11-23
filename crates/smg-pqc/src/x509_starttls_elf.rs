@@ -2,9 +2,9 @@
 //! and ELF Binary Crypto Symbol Scanner.
 
 use smg_graph::{Confidence, GuardKind, LocalStaticFinding, SinkKind};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Summary of an inspected X.509 DER certificate.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,7 +59,13 @@ pub fn inspect_x509_der(
         contains_subslice(der, OID_SHA1_RSA) || contains_subslice(der, OID_SHA1_ECDSA);
     let has_md5_sig = contains_subslice(der, OID_MD5_RSA);
     let has_san_extension = contains_subslice(der, OID_SAN);
-    let has_wildcard_san = has_san_extension && contains_subslice(der, b"*.");
+    let parsed_san_dns = extract_san_dns_tlv(der);
+    let has_wildcard_san = if let Some(ref dns_entries) = parsed_san_dns {
+        dns_entries.iter().any(|s| s.starts_with("*."))
+    } else {
+        // Fallback for partial/synthetic non-DER fragments that carry OID_SAN without full OCTET STRING wrapper
+        has_san_extension && contains_subslice(der, b"*.")
+    };
     let has_ct_sct_extension = contains_subslice(der, OID_CT_SCT);
     let has_ocsp_must_staple = contains_subslice(der, OID_OCSP_MUST_STAPLE);
 
@@ -181,31 +187,64 @@ pub fn inspect_x509_der(
     (audit, findings)
 }
 
+/// Parses RFC 5280 SAN extension (`OID 2.5.29.17`) via proper ASN.1 DER TLVs:
+/// `OID_SAN`, optional `critical BOOLEAN (0x01)`, `extnValue OCTET STRING (0x04)`,
+/// `GeneralNames SEQUENCE (0x30)`, returning only `[2] dNSName (0x82)` entries inside it.
+fn extract_san_dns_tlv(der: &[u8]) -> Option<Vec<String>> {
+    const OID_SAN: &[u8] = &[0x06, 0x03, 0x55, 0x1D, 0x11];
+    let pos = der.windows(OID_SAN.len()).position(|w| w == OID_SAN)?;
+    let mut rest = &der[pos + OID_SAN.len()..];
+    // Optional `critical BOOLEAN`
+    if let Some((0x01, _, after_crit)) = crate::x509::read_der_tlv(rest) {
+        rest = after_crit;
+    }
+    // `extnValue OCTET STRING`
+    let (0x04, octets, _) = crate::x509::read_der_tlv(rest)? else {
+        return None;
+    };
+    // `GeneralNames SEQUENCE`
+    let (0x30, mut gen_names, _) = crate::x509::read_der_tlv(octets)? else {
+        return None;
+    };
+    let mut sans = Vec::new();
+    while let Some((tag, val, next)) = crate::x509::read_der_tlv(gen_names) {
+        if tag == 0x82
+            && !val.is_empty()
+            && val.iter().all(|b| b.is_ascii_graphic())
+            && let Ok(s) = std::str::from_utf8(val)
+        {
+            sans.push(s.to_string());
+        }
+        gen_names = next;
+    }
+    Some(sans)
+}
+
 /// Extracts the Subject CN and all dNSName SAN entries from a DER certificate
 /// (`ssl:` template matching needs the actual values, not just presence).
-/// Substring-scan style consistent with `inspect_x509_der` — the Subject RDN
-/// comes after the Issuer RDN in DER, so the LAST CN OID occurrence is the
-/// subject's; dNSName entries are `82 LL <ascii>` TLVs after the SAN OID.
+/// Prefers strict ASN.1 DER TLV traversal for the SAN extension so unrelated
+/// extensions or signature bytes (`0x82`) are never misread as dNSNames.
 pub fn extract_cn_and_san_dns(der: &[u8]) -> (Option<String>, Vec<String>) {
     // Common Name: 2.5.4.3 encoded as `06 03 55 04 03`.
     const OID_CN: &[u8] = &[0x06, 0x03, 0x55, 0x04, 0x03];
     let mut cn = None;
     if let Some(pos) = der.windows(OID_CN.len()).rposition(|w| w == OID_CN) {
         let rest = &der[pos + OID_CN.len()..];
-        if rest.len() >= 2 {
-            let tag = rest[0];
-            let len = rest[1] as usize;
-            if matches!(tag, 0x0C | 0x13 | 0x16)
-                && len > 0
-                && 2 + len <= rest.len()
-                && let Ok(s) = std::str::from_utf8(&rest[2..2 + len])
-            {
-                cn = Some(s.to_string());
-            }
+        if let Some((tag, val, _)) = crate::x509::read_der_tlv(rest)
+            && matches!(tag, 0x0C | 0x13 | 0x16)
+            && !val.is_empty()
+            && let Ok(s) = std::str::from_utf8(val)
+        {
+            cn = Some(s.to_string());
         }
     }
 
-    // Subject Alternative Name: 2.5.29.17; GeneralNames dNSName = [2] (0x82).
+    // Subject Alternative Name: prefer strict ASN.1 DER TLV parse first.
+    if let Some(sans) = extract_san_dns_tlv(der) {
+        return (cn, sans);
+    }
+
+    // Fallback for partial/synthetic non-DER byte fragments in unit harnesses.
     const OID_SAN: &[u8] = &[0x06, 0x03, 0x55, 0x1D, 0x11];
     let mut sans = Vec::new();
     if let Some(pos) = der.windows(OID_SAN.len()).position(|w| w == OID_SAN) {
@@ -242,6 +281,66 @@ pub enum StartTlsProtocol {
     Ftp,
 }
 
+const MAX_STARTTLS_LINE_BYTES: usize = 8192;
+
+/// Reads a single `\n`-terminated plaintext protocol line directly from `stream` without
+/// `BufReader` lookahead over-reading (so zero subsequent TLS handshake bytes are ever lost),
+/// strictly bounded by `MAX_STARTTLS_LINE_BYTES` and a total handshake `deadline`.
+fn read_line_bounded(stream: &mut TcpStream, deadline: Instant) -> std::io::Result<String> {
+    let mut buf = Vec::with_capacity(128);
+    let mut byte = [0u8; 1];
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "STARTTLS handshake deadline exceeded",
+            ));
+        };
+        stream.set_read_timeout(Some(remaining.max(Duration::from_millis(1))))?;
+        match stream.read(&mut byte)? {
+            0 => break,
+            _ => {
+                buf.push(byte[0]);
+                if byte[0] == b'\n' {
+                    break;
+                }
+                if buf.len() >= MAX_STARTTLS_LINE_BYTES {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "STARTTLS banner line exceeded 8 KiB cap",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Drains a possibly multi-line SMTP/FTP reply with status code `code` (e.g. `"220"`),
+/// returning `true` if the final non-continuation line begins with `"{code} "` or equals `code`.
+fn read_multiline_reply(
+    stream: &mut TcpStream,
+    code: &str,
+    deadline: Instant,
+) -> std::io::Result<bool> {
+    let cont_prefix = format!("{code}-");
+    let final_prefix = format!("{code} ");
+    for _ in 0..32 {
+        let line = read_line_bounded(stream, deadline)?;
+        if line.is_empty() {
+            return Ok(false);
+        }
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.starts_with(&final_prefix) || trimmed == code {
+            return Ok(true);
+        }
+        if !trimmed.starts_with(&cont_prefix) {
+            return Ok(false);
+        }
+    }
+    Ok(false)
+}
+
 /// Performs a pure-Rust plaintext STARTTLS upgrade handshake on an open `TcpStream`
 /// so a subsequent TLS handshake can audit SMTP (25/587), IMAP (143), or FTP (21).
 pub fn negotiate_starttls(
@@ -249,16 +348,14 @@ pub fn negotiate_starttls(
     proto: StartTlsProtocol,
     timeout: Duration,
 ) -> std::io::Result<bool> {
+    let deadline = Instant::now() + timeout;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
-    let mut reader = BufReader::new(stream.try_clone()?);
-    let mut line = String::new();
 
     match proto {
         StartTlsProtocol::Smtp => {
-            // Read 220 banner
-            reader.read_line(&mut line)?;
-            if !line.starts_with("220") {
+            // Drain single- or multi-line 220 banner
+            if !read_multiline_reply(stream, "220", deadline)? {
                 return Ok(false);
             }
             stream.write_all(b"EHLO smg-tls-audit.local\r\n")?;
@@ -266,14 +363,14 @@ pub fn negotiate_starttls(
             // Drain multi-line 250- responses until 250<space>
             let mut supports_starttls = false;
             for _ in 0..32 {
-                line.clear();
-                if reader.read_line(&mut line)? == 0 {
+                let line = read_line_bounded(stream, deadline)?;
+                if line.is_empty() {
                     break;
                 }
                 if line.to_ascii_uppercase().contains("STARTTLS") {
                     supports_starttls = true;
                 }
-                if line.starts_with("250 ") {
+                if line.starts_with("250 ") || line.trim_end_matches(['\r', '\n']) == "250" {
                     break;
                 }
             }
@@ -282,31 +379,37 @@ pub fn negotiate_starttls(
             }
             stream.write_all(b"STARTTLS\r\n")?;
             stream.flush()?;
-            line.clear();
-            reader.read_line(&mut line)?;
-            Ok(line.starts_with("220"))
+            read_multiline_reply(stream, "220", deadline)
         }
         StartTlsProtocol::Imap => {
-            reader.read_line(&mut line)?;
-            if !line.starts_with("* OK") {
+            let banner = read_line_bounded(stream, deadline)?;
+            if !banner.starts_with("* OK") {
                 return Ok(false);
             }
             stream.write_all(b"a001 STARTTLS\r\n")?;
             stream.flush()?;
-            line.clear();
-            reader.read_line(&mut line)?;
-            Ok(line.to_ascii_uppercase().contains("A001 OK"))
+            for _ in 0..16 {
+                let resp = read_line_bounded(stream, deadline)?;
+                if resp.is_empty() {
+                    return Ok(false);
+                }
+                let up = resp.to_ascii_uppercase();
+                if up.starts_with("A001 OK") {
+                    return Ok(true);
+                }
+                if up.starts_with("A001 NO") || up.starts_with("A001 BAD") {
+                    return Ok(false);
+                }
+            }
+            Ok(false)
         }
         StartTlsProtocol::Ftp => {
-            reader.read_line(&mut line)?;
-            if !line.starts_with("220") {
+            if !read_multiline_reply(stream, "220", deadline)? {
                 return Ok(false);
             }
             stream.write_all(b"AUTH TLS\r\n")?;
             stream.flush()?;
-            line.clear();
-            reader.read_line(&mut line)?;
-            Ok(line.starts_with("234"))
+            read_multiline_reply(stream, "234", deadline)
         }
     }
 }
@@ -320,61 +423,32 @@ pub struct ElfCryptoAudit {
     pub pqc_symbols: Vec<String>,
 }
 
-/// Scans an ELF (`\x7fELF`) binary's symbol/string sections for broken legacy crypto
-/// (MD5/SHA-1/DES/RC4), quantum-vulnerable public-key crypto (RSA/ECDSA/DH), and PQC readiness.
-pub fn scan_elf_crypto_symbols(
-    rel_path: &str,
-    bytes: &[u8],
-) -> (ElfCryptoAudit, Vec<LocalStaticFinding>) {
-    if bytes.len() < 16 || &bytes[0..4] != b"\x7fELF" {
-        return (ElfCryptoAudit::default(), Vec::new());
-    }
+const ELF_BROKEN_SYMS: &[&str] = &[
+    "EVP_md5",
+    "MD5_Init",
+    "EVP_sha1",
+    "SHA1_Init",
+    "DES_ecb_encrypt",
+    "RC4_set_key",
+    "EVP_rc4",
+];
+const ELF_QUANTUM_VULN_SYMS: &[&str] = &[
+    "RSA_generate_key",
+    "RSA_public_encrypt",
+    "EC_KEY_new",
+    "ECDSA_sign",
+    "DH_generate_key",
+];
+const ELF_PQC_SYMS: &[&str] = &[
+    "OQS_KEM_",
+    "OQS_SIG_",
+    "EVP_PKEY_ML_KEM",
+    "EVP_PKEY_ML_DSA",
+    "MLKEM768",
+    "MLDSA65",
+];
 
-    const BROKEN_SYMS: &[&str] = &[
-        "EVP_md5",
-        "MD5_Init",
-        "EVP_sha1",
-        "SHA1_Init",
-        "DES_ecb_encrypt",
-        "RC4_set_key",
-        "EVP_rc4",
-    ];
-    const QUANTUM_VULN_SYMS: &[&str] = &[
-        "RSA_generate_key",
-        "RSA_public_encrypt",
-        "EC_KEY_new",
-        "ECDSA_sign",
-        "DH_generate_key",
-    ];
-    const PQC_SYMS: &[&str] = &[
-        "OQS_KEM_",
-        "OQS_SIG_",
-        "EVP_PKEY_ML_KEM",
-        "EVP_PKEY_ML_DSA",
-        "MLKEM768",
-        "MLDSA65",
-    ];
-
-    let mut audit = ElfCryptoAudit {
-        is_elf: true,
-        ..Default::default()
-    };
-    for sym in BROKEN_SYMS {
-        if contains_subslice(bytes, sym.as_bytes()) {
-            audit.broken_symbols.push((*sym).to_string());
-        }
-    }
-    for sym in QUANTUM_VULN_SYMS {
-        if contains_subslice(bytes, sym.as_bytes()) {
-            audit.quantum_vulnerable_symbols.push((*sym).to_string());
-        }
-    }
-    for sym in PQC_SYMS {
-        if contains_subslice(bytes, sym.as_bytes()) {
-            audit.pqc_symbols.push((*sym).to_string());
-        }
-    }
-
+fn finalize_elf_findings(rel_path: &str, audit: &ElfCryptoAudit) -> Vec<LocalStaticFinding> {
     let mut findings = Vec::new();
     if !audit.broken_symbols.is_empty() {
         findings.push(LocalStaticFinding {
@@ -410,7 +484,94 @@ pub fn scan_elf_crypto_symbols(
             remediation: "Adopt hybrid PQC KEM/signatures (ML-KEM-768 / ML-DSA-65) to mitigate Harvest-Now-Decrypt-Later exposure.".into(),
         });
     }
+    findings
+}
 
+fn scan_elf_chunk_into_audit(chunk: &[u8], audit: &mut ElfCryptoAudit) {
+    for sym in ELF_BROKEN_SYMS {
+        if !audit.broken_symbols.iter().any(|s| s == sym)
+            && contains_subslice(chunk, sym.as_bytes())
+        {
+            audit.broken_symbols.push((*sym).to_string());
+        }
+    }
+    for sym in ELF_QUANTUM_VULN_SYMS {
+        if !audit.quantum_vulnerable_symbols.iter().any(|s| s == sym)
+            && contains_subslice(chunk, sym.as_bytes())
+        {
+            audit.quantum_vulnerable_symbols.push((*sym).to_string());
+        }
+    }
+    for sym in ELF_PQC_SYMS {
+        if !audit.pqc_symbols.iter().any(|s| s == sym) && contains_subslice(chunk, sym.as_bytes()) {
+            audit.pqc_symbols.push((*sym).to_string());
+        }
+    }
+}
+
+/// Streams an ELF (`\x7fELF`) binary in bounded 64 KiB overlapping chunks (up to `max_bytes`)
+/// so symbol tables located near EOF (well past 512 KiB) are discovered without unbounded RAM.
+pub fn scan_elf_crypto_symbols_reader<R: Read>(
+    rel_path: &str,
+    reader: &mut R,
+    max_bytes: u64,
+) -> std::io::Result<(ElfCryptoAudit, Vec<LocalStaticFinding>)> {
+    const CHUNK_SIZE: usize = 64 * 1024;
+    const OVERLAP: usize = 64;
+    let mut header = [0u8; 16];
+    let mut header_read = 0usize;
+    while header_read < header.len() {
+        let n = reader.read(&mut header[header_read..])?;
+        if n == 0 {
+            break;
+        }
+        header_read += n;
+    }
+    if header_read < 16 || &header[0..4] != b"\x7fELF" {
+        return Ok((ElfCryptoAudit::default(), Vec::new()));
+    }
+
+    let mut audit = ElfCryptoAudit {
+        is_elf: true,
+        ..Default::default()
+    };
+    let mut total_read = header_read as u64;
+    let mut buf = vec![0u8; OVERLAP + CHUNK_SIZE];
+    let mut carry = 0usize;
+
+    while total_read < max_bytes {
+        let to_read = (max_bytes - total_read).min(CHUNK_SIZE as u64) as usize;
+        let n = reader.read(&mut buf[carry..carry + to_read])?;
+        if n == 0 {
+            break;
+        }
+        total_read += n as u64;
+        let valid_len = carry + n;
+        scan_elf_chunk_into_audit(&buf[..valid_len], &mut audit);
+        let keep = valid_len.min(OVERLAP);
+        buf.copy_within(valid_len - keep..valid_len, 0);
+        carry = keep;
+    }
+
+    let findings = finalize_elf_findings(rel_path, &audit);
+    Ok((audit, findings))
+}
+
+/// Scans an ELF (`\x7fELF`) binary's symbol/string sections for broken legacy crypto
+/// (MD5/SHA-1/DES/RC4), quantum-vulnerable public-key crypto (RSA/ECDSA/DH), and PQC readiness.
+pub fn scan_elf_crypto_symbols(
+    rel_path: &str,
+    bytes: &[u8],
+) -> (ElfCryptoAudit, Vec<LocalStaticFinding>) {
+    if bytes.len() < 16 || &bytes[0..4] != b"\x7fELF" {
+        return (ElfCryptoAudit::default(), Vec::new());
+    }
+    let mut audit = ElfCryptoAudit {
+        is_elf: true,
+        ..Default::default()
+    };
+    scan_elf_chunk_into_audit(bytes, &mut audit);
+    let findings = finalize_elf_findings(rel_path, &audit);
     (audit, findings)
 }
 
@@ -496,5 +657,45 @@ mod tests {
         let (cn, sans) = extract_cn_and_san_dns(b"\x30\x00");
         assert!(cn.is_none());
         assert!(sans.is_empty());
+
+        // Proper ASN.1 DER SAN extension must isolate SAN entries from unrelated `*.` in CN
+        // and from trailing `0x82` bytes in signature data.
+        let mut real_der = Vec::new();
+        // Subject CN containing `*.unrelated.cn`
+        real_der.extend_from_slice(&[0x06, 0x03, 0x55, 0x04, 0x03, 0x0C, 0x0E]);
+        real_der.extend_from_slice(b"*.unrelated.cn");
+        // Valid SAN ext: OID 2.5.29.17 + OCTET STRING { SEQUENCE { [2] "api.example.com" } }
+        let dns = b"api.example.com";
+        let mut seq = vec![0x30, (dns.len() + 2) as u8, 0x82, dns.len() as u8];
+        seq.extend_from_slice(dns);
+        real_der.extend_from_slice(&[0x06, 0x03, 0x55, 0x1D, 0x11, 0x04, seq.len() as u8]);
+        real_der.extend_from_slice(&seq);
+        // Trailing signature bytes mimicking `0x82 0x04 "fake"`
+        real_der.extend_from_slice(&[0x82, 0x04, b'f', b'a', b'k', b'e']);
+
+        let (cn2, sans2) = extract_cn_and_san_dns(&real_der);
+        assert_eq!(cn2.as_deref(), Some("*.unrelated.cn"));
+        assert_eq!(sans2, vec!["api.example.com".to_string()]);
+        let (audit2, _) = inspect_x509_der("certs/real.der", &real_der, 2026);
+        assert!(audit2.has_san_extension);
+        assert!(
+            !audit2.has_wildcard_san,
+            "`*.` in Subject CN must not cause wildcard SAN FP"
+        );
+    }
+
+    #[test]
+    fn streams_large_elf_beyond_512kib_to_detect_tail_crypto_symbols() {
+        let mut big_elf = b"\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00".to_vec();
+        big_elf.resize(600 * 1024, 0u8);
+        big_elf.extend_from_slice(b"\0EVP_md5\0RSA_generate_key\0");
+        let mut cursor = std::io::Cursor::new(&big_elf);
+        let (audit, hits) =
+            scan_elf_crypto_symbols_reader("bin/large.elf", &mut cursor, 4 * 1024 * 1024)
+                .expect("stream scan ok");
+        assert!(audit.is_elf);
+        assert_eq!(audit.broken_symbols, vec!["EVP_md5"]);
+        assert_eq!(audit.quantum_vulnerable_symbols, vec!["RSA_generate_key"]);
+        assert_eq!(hits.len(), 2);
     }
 }

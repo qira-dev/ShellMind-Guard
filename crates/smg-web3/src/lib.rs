@@ -51,7 +51,10 @@ pub fn repo_has_web3_indicators(project_root: &Path, files: &[IndexedFile]) -> b
         match f.language {
             Language::Solidity | Language::Move => return true,
             Language::Rust => {
-                if let Some(text) = read_indexed_text(f) {
+                // Fast pre-check before allocating comment-stripped copy on non-Solana Rust repos
+                if let Some(text) = read_indexed_text(f)
+                    && is_solana_rust_source(&text)
+                {
                     let stripped = smg_graph::taint::strip_comments_simple(&text);
                     if is_solana_rust_source(&stripped) {
                         return true;
@@ -96,6 +99,7 @@ pub fn scan_web3_repo_with_options(
     let mut all_findings = Vec::new();
     let mut proxies: Vec<(String, String, Vec<EvmSlotEntry>)> = Vec::new();
     let mut impls: Vec<(String, String, Vec<EvmSlotEntry>)> = Vec::new();
+    let mut workspace_facet_sigs: Vec<(String, String, usize, String)> = Vec::new();
 
     // Phase 13B (`P13-03`): Hoist workspace-wide Solidity base contracts for multi-file C3 inheritance
     let mut workspace_sol_bases: HashMap<String, ParsedContract> = HashMap::new();
@@ -145,11 +149,31 @@ pub fn scan_web3_repo_with_options(
                         ContractKind::Interface
                             | ContractKind::Library
                             | ContractKind::AbstractContract
-                    ) || c.has_erc7201_namespace
-                    {
+                    ) {
                         continue;
                     }
+                    if c.name.contains("Facet") {
+                        for func in &c.functions {
+                            if !func.is_constructor
+                                && func.name != "fallback"
+                                && func.name != "receive"
+                                && matches!(func.visibility.as_str(), "external" | "public")
+                            {
+                                let sig = ultra_web3::canonical_abi_signature(
+                                    &func.name,
+                                    &func.params_text,
+                                );
+                                workspace_facet_sigs.push((
+                                    c.name.clone(),
+                                    f.rel_path.clone(),
+                                    func.start_line,
+                                    sig,
+                                ));
+                            }
+                        }
+                    }
                     // Phase 16A: Auto-wired `--deep-audit` stateful multi-tx `revm` invariant campaign
+                    // (runs on ERC-7201 contracts too — ERC-7201 only exempts slot-0 proxy/impl pairing)
                     if deep_audit
                         && let Some(art) = ctx.lookup_artifact(&f.rel_path, &c.name)
                         && !art.deployed_bytecode.is_empty()
@@ -218,6 +242,9 @@ pub fn scan_web3_repo_with_options(
                             });
                         }
                     }
+                    if c.has_erc7201_namespace {
+                        continue;
+                    }
                     // Prefer compiler `storageLayout` from Foundry/Hardhat when present
                     let slots = ctx
                         .lookup_artifact(&f.rel_path, &c.name)
@@ -247,13 +274,20 @@ pub fn scan_web3_repo_with_options(
                     Some(&solana_ws_ctx),
                 ));
                 if !smg_core::is_test_source_path(&f.rel_path) {
-                    all_findings.extend(ultra_web3::analyze_solana_pda_depth(&f.rel_path, &text));
+                    all_findings.extend(ultra_web3::analyze_solana_pda_depth_with_ctx(
+                        &f.rel_path,
+                        &text,
+                        Some(&solana_ws_ctx),
+                    ));
                 }
             }
             _ => {}
         }
     }
 
+    if !workspace_facet_sigs.is_empty() {
+        all_findings.extend(detect_diamond_selector_collisions(&workspace_facet_sigs));
+    }
     all_findings.extend(detect_proxy_storage_collisions(&proxies, &impls));
 
     // Deterministic deduplication by (rule_id, rel_path, line) retaining highest severity

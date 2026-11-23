@@ -144,40 +144,78 @@ pub fn scan_rule_pack(rel_path: &str, lang: Language, content: &str) -> Vec<Loca
         let trimmed = line.trim();
 
         if is_rust {
-            if trimmed.starts_with("#[cfg(test)]") {
+            if !in_cfg_test && trimmed.starts_with("#[cfg(test)]") {
                 in_cfg_test = true;
                 brace_depth = 0;
                 saw_brace = false;
             }
             if in_cfg_test {
-                for ch in line.chars() {
-                    if ch == '{' {
-                        brace_depth += 1;
-                        saw_brace = true;
-                    } else if ch == '}' {
-                        brace_depth -= 1;
-                        if saw_brace && brace_depth <= 0 {
-                            in_cfg_test = false;
+                let bytes = line.as_bytes();
+                let mut bi = 0usize;
+                let mut in_str = false;
+                let mut esc = false;
+                let mut saw_semi_outside = false;
+                while bi < bytes.len() {
+                    let b = bytes[bi];
+                    if esc {
+                        esc = false;
+                        bi += 1;
+                        continue;
+                    }
+                    if b == b'\\' && in_str {
+                        esc = true;
+                        bi += 1;
+                        continue;
+                    }
+                    if b == b'"' {
+                        in_str = !in_str;
+                        bi += 1;
+                        continue;
+                    }
+                    if !in_str {
+                        if b == b'/' && bytes.get(bi + 1) == Some(&b'/') {
                             break;
                         }
+                        if b == b'{' {
+                            brace_depth += 1;
+                            saw_brace = true;
+                        } else if b == b'}' {
+                            brace_depth -= 1;
+                            if saw_brace && brace_depth <= 0 {
+                                in_cfg_test = false;
+                                break;
+                            }
+                        } else if b == b';' {
+                            saw_semi_outside = true;
+                        }
                     }
+                    bi += 1;
                 }
-                if !saw_brace && !trimmed.starts_with("#[") && trimmed.ends_with(';') {
+                if in_cfg_test && !saw_brace && !trimmed.starts_with("#[") && saw_semi_outside {
                     in_cfg_test = false;
                 }
                 continue;
             }
         }
 
+        let effective_line = if matches!(lang, Language::Config)
+            && (rel_low.ends_with(".yml") || rel_low.ends_with(".yaml"))
+        {
+            smg_core::yaml::strip_yaml_comment_quoted(line)
+        } else {
+            line
+        };
+        let eff_trimmed = effective_line.trim();
+
         if matches!(lang, Language::Config)
             && (rel_low.ends_with(".yml") || rel_low.ends_with(".yaml"))
         {
-            let indent = line.len() - line.trim_start().len();
-            let low = trimmed.to_ascii_lowercase();
+            let indent = effective_line.len() - effective_line.trim_start().len();
+            let low = eff_trimmed.to_ascii_lowercase();
             if in_capabilities_add
                 && indent <= cap_add_indent
-                && !trimmed.is_empty()
-                && !trimmed.starts_with('-')
+                && !eff_trimmed.is_empty()
+                && !eff_trimmed.starts_with('-')
             {
                 in_capabilities_add = false;
             }
@@ -196,19 +234,19 @@ pub fn scan_rule_pack(rel_path: &str, lang: Language, content: &str) -> Vec<Loca
             }
         }
 
-        if is_comment_or_doc_line(trimmed, lang) {
+        if is_comment_or_doc_line(eff_trimmed, lang) {
             continue;
         }
-        if trimmed.contains("Regex::new(") || trimmed.contains("RegexSet::new(") {
+        if eff_trimmed.contains("Regex::new(") || eff_trimmed.contains("RegexSet::new(") {
             continue;
         }
 
-        let matches = set.matches(line);
+        let matches = set.matches(effective_line);
         if !matches.matched_any() {
             continue;
         }
 
-        let line_low = trimmed.to_ascii_lowercase();
+        let line_low = eff_trimmed.to_ascii_lowercase();
         for pat_idx in matches.iter() {
             let (spec, re) = &specs[pat_idx];
             if !spec.langs.is_empty() && !spec.langs.contains(&lang) {
@@ -229,7 +267,7 @@ pub fn scan_rule_pack(rel_path: &str, lang: Language, content: &str) -> Vec<Loca
                     continue;
                 }
             }
-            if re.is_match(line) {
+            if re.is_match(effective_line) {
                 findings.push(LocalStaticFinding {
                     rule_id: spec.rule_id.to_string(),
                     severity: spec.severity.to_string(),

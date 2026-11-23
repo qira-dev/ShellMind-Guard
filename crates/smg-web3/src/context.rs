@@ -615,23 +615,38 @@ fn parse_foundry_or_hardhat_artifact(
             let Some(label) = entry.get("label").and_then(|v| v.as_str()) else {
                 continue;
             };
-            let slot_str = entry.get("slot").and_then(|v| v.as_str()).unwrap_or("0");
-            let slot = U256::from_str_radix(slot_str, 10).unwrap_or(U256::ZERO);
+            let slot_str = entry
+                .get("slot")
+                .and_then(|v| v.as_str())
+                .unwrap_or("0")
+                .trim();
+            let slot = if let Some(hex) = slot_str
+                .strip_prefix("0x")
+                .or_else(|| slot_str.strip_prefix("0X"))
+            {
+                U256::from_str_radix(hex, 16).unwrap_or(U256::ZERO)
+            } else {
+                U256::from_str_radix(slot_str, 10).unwrap_or(U256::ZERO)
+            };
             let offset = entry.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
             let ty_id = entry
                 .get("type")
                 .and_then(|v| v.as_str())
                 .unwrap_or("t_uint256");
-            let total_bytes = val
-                .pointer(&format!("/storageLayout/types/{ty_id}/numberOfBytes"))
+            let ty_obj = val
+                .get("storageLayout")
+                .and_then(|s| s.get("types"))
+                .and_then(|t| t.get(ty_id));
+            let total_bytes = ty_obj
+                .and_then(|t| t.get("numberOfBytes"))
                 .and_then(|v| {
                     v.as_str()
                         .and_then(|s| s.parse::<u64>().ok())
                         .or_else(|| v.as_u64())
                 })
                 .unwrap_or(32);
-            let ty_label = val
-                .pointer(&format!("/storageLayout/types/{ty_id}/label"))
+            let ty_label = ty_obj
+                .and_then(|t| t.get("label"))
                 .and_then(|v| v.as_str())
                 .unwrap_or(ty_id);
             if total_bytes <= 32 {
