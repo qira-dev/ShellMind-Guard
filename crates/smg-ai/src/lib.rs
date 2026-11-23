@@ -78,7 +78,7 @@ pub fn build_minimal_patch_prompt(
                 if let Ok(raw) = fs::read_to_string(&canon_file) {
                     let lines: Vec<&str> = raw.lines().collect();
                     let start = hop.line.saturating_sub(4).max(1);
-                    let end = (hop.line + 6).min(lines.len());
+                    let end = hop.line.saturating_add(6).min(lines.len());
                     (start..=end)
                         .map(|ln| {
                             format!("{:>4} | {}", ln, lines.get(ln - 1).copied().unwrap_or(""))

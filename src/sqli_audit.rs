@@ -888,10 +888,13 @@ pub fn run_sqli_audit(cfg: &SqliAuditConfig) -> Result<SqliAuditReport> {
     }
 
     let _ = rustls::crypto::ring::default_provider().install_default();
+    let safe_delay = cfg.delay_secs.clamp(1, 30);
     let client = Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(
-            cfg.delay_secs * TIME_PAYLOAD_REPS as u64 + 20,
+            safe_delay
+                .saturating_mul(TIME_PAYLOAD_REPS as u64)
+                .saturating_add(20),
         ))
         .redirect(Policy::none())
         .user_agent(concat!("ShellMind-Guard/", env!("CARGO_PKG_VERSION")))

@@ -371,6 +371,12 @@ fn intercept_http<S: Read + Write>(
                 format!("{}://{}{}", opts.scheme, host, path)
             };
             let parsed = reqwest::Url::parse(&url)?;
+            if parsed.scheme().eq_ignore_ascii_case("https") {
+                bail!(
+                    "Refusing plaintext forwarding for absolute-form https:// request '{}'; use HTTP CONNECT tunneling",
+                    parsed.as_str()
+                );
+            }
             let origin_host = parsed
                 .host_str()
                 .ok_or_else(|| anyhow::anyhow!("request URL missing host"))?

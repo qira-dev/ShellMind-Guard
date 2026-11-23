@@ -314,17 +314,45 @@ const MIN_SAFE_FILE_BYTES: u64 = 1024;
 
 impl ShellMindGuardConfig {
     pub fn load_from_dir(root: &Path) -> Result<Self> {
+        const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
         let cfg_path = root.join(".shellmind-guard.toml");
         if !cfg_path.exists() {
             return Ok(Self::default());
         }
-        let raw = fs::read_to_string(&cfg_path)
+        let canon_root = fs::canonicalize(root)
+            .with_context(|| format!("Failed to canonicalize root {}", root.display()))?;
+        let canon_cfg = fs::canonicalize(&cfg_path)
+            .with_context(|| format!("Failed to canonicalize {}", cfg_path.display()))?;
+        if !canon_cfg.starts_with(&canon_root) {
+            anyhow::bail!(
+                "Refusing .shellmind-guard.toml that resolves outside project root: {}",
+                cfg_path.display()
+            );
+        }
+        use std::io::Read as _;
+        let file = fs::File::open(&canon_cfg)
+            .with_context(|| format!("Failed to open {}", cfg_path.display()))?;
+        let meta = file.metadata()?;
+        if !meta.file_type().is_file() {
+            anyhow::bail!("Refusing non-regular config file {}", cfg_path.display());
+        }
+        let mut buf = Vec::new();
+        file.take(MAX_CONFIG_BYTES + 1)
+            .read_to_end(&mut buf)
             .with_context(|| format!("Failed to read {}", cfg_path.display()))?;
+        if buf.len() as u64 > MAX_CONFIG_BYTES {
+            anyhow::bail!(
+                "Refusing oversized .shellmind-guard.toml (> {} bytes)",
+                MAX_CONFIG_BYTES
+            );
+        }
+        let raw = String::from_utf8(buf)
+            .with_context(|| format!("Invalid UTF-8 in {}", cfg_path.display()))?;
         let mut parsed: Self = toml::from_str(&raw)
             .with_context(|| format!("Invalid TOML in {}", cfg_path.display()))?;
         let max_allowed_threads = std::thread::available_parallelism()
             .map(|n| n.get().saturating_mul(2))
-            .unwrap_or(8)
+            .unwrap_or(16)
             .max(16);
         parsed.scan.max_threads = parsed.scan.max_threads.clamp(1, max_allowed_threads);
         parsed.scan.max_file_bytes = parsed
@@ -334,14 +362,16 @@ impl ShellMindGuardConfig {
         Ok(parsed)
     }
 
-    /// Loads `.shellmind-guard.toml` and strips privileged `[sandbox]` / `[ai]` sections unless
-    /// `trust_repo_config` is explicitly enabled by the operator.
+    /// Loads `.shellmind-guard.toml` and strips privileged `[sandbox]`, `[ai]`,
+    /// `scan.ignore_paths`, and `guards.public_routes` unless `trust_repo_config`
+    /// is explicitly enabled by the operator (Council CASE-001 T1 ruling).
     pub fn load_trusted_from_dir(root: &Path, trust_repo_config: bool) -> Result<Self> {
         let mut cfg = Self::load_from_dir(root)?;
         if !trust_repo_config {
-            cfg.sandbox.boot_cmd = None;
-            cfg.sandbox.base_url = None;
+            cfg.sandbox = SandboxConfig::default();
             cfg.ai = AiConfig::default();
+            cfg.scan.ignore_paths = ScanConfig::default().ignore_paths;
+            cfg.guards.public_routes = GuardConfig::default().public_routes;
         }
         Ok(cfg)
     }

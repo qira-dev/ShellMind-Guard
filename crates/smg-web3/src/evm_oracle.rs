@@ -97,7 +97,13 @@ pub fn execute_revm_sequence(
     for (addr, bal, code_opt, slots) in accounts {
         let info = AccountInfo {
             balance: bal,
-            code: code_opt.map(|c| Bytecode::new_raw(Bytes::from(c))),
+            code: match code_opt {
+                Some(c) => Some(
+                    Bytecode::new_raw_checked(Bytes::from(c))
+                        .map_err(|e| format!("invalid bytecode: {e:?}"))?,
+                ),
+                None => None,
+            },
             ..Default::default()
         };
         db.insert_account_info(addr, info);
@@ -620,7 +626,7 @@ pub fn probe_compiled_selector_unauth(
         target,
         AccountInfo {
             balance: one_eth,
-            code: Some(Bytecode::new_raw(Bytes::from(deployed_bytecode.to_vec()))),
+            code: Bytecode::new_raw_checked(Bytes::from(deployed_bytecode.to_vec())).ok(),
             ..Default::default()
         },
     );
@@ -805,7 +811,7 @@ fn replay_invariant_sequence(
         target,
         AccountInfo {
             balance: cfg.initial_contract_wei,
-            code: Some(Bytecode::new_raw(Bytes::from(deployed_bytecode.to_vec()))),
+            code: Bytecode::new_raw_checked(Bytes::from(deployed_bytecode.to_vec())).ok(),
             ..Default::default()
         },
     );

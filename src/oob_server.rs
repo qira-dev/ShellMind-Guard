@@ -369,6 +369,7 @@ impl OobClient {
         if !host.contains(':') {
             bail!("--oob-server spec '{spec}' must carry a port (host:port)");
         }
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(4))
             .build()?;

@@ -85,7 +85,7 @@ pub fn build_client_hello(
     body.push(0x00); // null compression
 
     let mut exts = Vec::new();
-    if !host.is_empty() && host.parse::<std::net::IpAddr>().is_err() {
+    if !host.is_empty() && host.len() <= 253 && host.parse::<std::net::IpAddr>().is_err() {
         let hbytes = host.as_bytes();
         let list_len = (hbytes.len() + 3) as u16;
         let ext_len = list_len + 2;

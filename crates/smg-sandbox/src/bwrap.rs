@@ -1190,20 +1190,70 @@ mod imp {
             None
         };
 
-        let mut bwrap_script = format!(
-            "bwrap --unshare-all --new-session --cap-drop ALL --die-with-parent --ro-bind /usr /usr --ro-bind /lib /lib --ro-bind /bin /bin --ro-bind '{wsl_root}' /app --tmpfs /tmp --proc /proc --dev /dev --chdir /app --ro-bind '{wsl_cfg}' /tmp/smg-probe-cfg.json --setenv SMG_PROBE_CONFIG_FILE /tmp/smg-probe-cfg.json --setenv PORT {port} --setenv HOST 127.0.0.1 --setenv NODE_ENV test"
+        let port_str = port.to_string();
+        let inner_script = format!(
+            "eval \"$SMG_BOOT_CMD\" >/tmp/smg-boot.log 2>&1 & SMG_SRV_PID=$!; export SMG_SRV_PID; export SMG_BOOT_LOG=/tmp/smg-boot.log; trap 'kill -9 $SMG_SRV_PID 2>/dev/null || true' EXIT; smg __probe-netns --port {port} --mode {mode} --sync-race {concurrency}; EC=$?; kill -9 $SMG_SRV_PID 2>/dev/null || true; exit $EC"
         );
+        let mut cmd = Command::new("wsl.exe");
+        cmd.args([
+            "-e",
+            "bwrap",
+            "--unshare-all",
+            "--new-session",
+            "--cap-drop",
+            "ALL",
+            "--die-with-parent",
+            "--ro-bind",
+            "/usr",
+            "/usr",
+            "--ro-bind",
+            "/lib",
+            "/lib",
+            "--ro-bind",
+            "/bin",
+            "/bin",
+            "--ro-bind",
+            &wsl_root,
+            "/app",
+            "--tmpfs",
+            "/tmp",
+            "--proc",
+            "/proc",
+            "--dev",
+            "/dev",
+            "--chdir",
+            "/app",
+            "--ro-bind",
+            &wsl_cfg,
+            "/tmp/smg-probe-cfg.json",
+            "--setenv",
+            "SMG_PROBE_CONFIG_FILE",
+            "/tmp/smg-probe-cfg.json",
+            "--setenv",
+            "SMG_BOOT_CMD",
+            boot_cmd,
+            "--setenv",
+            "PORT",
+            &port_str,
+            "--setenv",
+            "HOST",
+            "127.0.0.1",
+            "--setenv",
+            "NODE_ENV",
+            "test",
+        ]);
         if let Some(ref wf) = wsl_finding {
-            bwrap_script.push_str(&format!(
-                " --ro-bind '{wf}' /tmp/smg-finding.json --setenv SMG_FINDING_FILE /tmp/smg-finding.json"
-            ));
+            cmd.args([
+                "--ro-bind",
+                wf.as_str(),
+                "/tmp/smg-finding.json",
+                "--setenv",
+                "SMG_FINDING_FILE",
+                "/tmp/smg-finding.json",
+            ]);
         }
-        let escaped_boot = boot_cmd.replace('\'', "'\\''");
-        bwrap_script.push_str(&format!(
-            " -- /bin/sh -c \"({escaped_boot}) >/tmp/smg-boot.log 2>&1 & SMG_SRV_PID=\\$!; export SMG_SRV_PID; export SMG_BOOT_LOG=/tmp/smg-boot.log; trap 'kill -9 \\$SMG_SRV_PID 2>/dev/null || true' EXIT; smg __probe-netns --port {port} --mode {mode} --sync-race {concurrency}; EC=\\$?; kill -9 \\$SMG_SRV_PID 2>/dev/null || true; exit \\$EC\""
-        ));
-        let out = Command::new("wsl.exe")
-            .args(["-e", "sh", "-c", &bwrap_script])
+        cmd.args(["--", "/bin/sh", "-c", &inner_script]);
+        let out = cmd
             .output()
             .context("Failed to execute WSL2 bwrap isolated probe")?;
         let _ = std::fs::remove_dir_all(&probe_dir);

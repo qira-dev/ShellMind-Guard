@@ -77,7 +77,7 @@ pub struct TdxQuoteV4Summary {
 /// Parses and fail-closed verifies an Intel TDX v4 Quote binary buffer:
 /// - Bytes `0..2`: `version == 4` (little-endian)
 /// - Bytes `4..8`: `tee_type == 0x0000_0081` (TDX)
-/// - Rejects debuggable TDs (`TD_ATTR_DEBUG` bit 0 set in TD attributes at offset `48 + 128`)
+/// - Rejects debuggable TDs (`TD_ATTR_DEBUG` bit 0 set in `td_attributes` at offset `48 + 120..48 + 128`)
 /// - Extracts 48-byte `MRTD` measurement (offset `48 + 136..48 + 184`) and matches expected hex if provided.
 pub fn verify_tdx_quote_v4(
     quote: &[u8],
@@ -98,7 +98,7 @@ pub fn verify_tdx_quote_v4(
     if tee_type != 0x0000_0081 {
         bail!("Invalid TDX tee_type 0x{tee_type:08x} (expected 0x00000081)");
     }
-    let td_attrs = u64::from_le_bytes(quote[48 + 128..48 + 136].try_into().unwrap());
+    let td_attrs = u64::from_le_bytes(quote[48 + 120..48 + 128].try_into().unwrap());
     let debug_enabled = (td_attrs & 1) != 0;
     if debug_enabled {
         bail!("Intel TDX enclave has TD_ATTR_DEBUG enabled — rejected fail-closed");
@@ -331,10 +331,12 @@ mod tests {
         tdx[0..2].copy_from_slice(&4u16.to_le_bytes());
         tdx[4..8].copy_from_slice(&0x0000_0081u32.to_le_bytes());
         tdx[48 + 136..48 + 184].fill(0x5A);
+        // Real TDX quotes have XFAM bit 0 (x87) set at 48+128 — must NOT trigger false debug rejection
+        tdx[48 + 128] = 0x03;
         let tdx_ok = verify_tdx_quote_v4(&tdx, Some(&"5a".repeat(48))).unwrap();
         assert!(!tdx_ok.debug_enabled);
-        // Setting TD_ATTR_DEBUG fails closed
-        tdx[48 + 128] = 1;
+        // Setting TD_ATTR_DEBUG at real td_attributes offset 48+120 fails closed
+        tdx[48 + 120] = 1;
         assert!(verify_tdx_quote_v4(&tdx, None).is_err());
 
         // 3. AMD SEV-SNP Report

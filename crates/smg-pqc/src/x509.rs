@@ -125,11 +125,14 @@ pub fn classify_x509_oid(oid: &str) -> (&'static str, bool) {
 
 fn parse_asn1_time_year(tag: u8, bytes: &[u8]) -> Option<u32> {
     let s = std::str::from_utf8(bytes).ok()?;
-    if tag == 0x17 && s.len() >= 2 {
+    if !s.is_ascii() {
+        return None;
+    }
+    if tag == 0x17 && s.len() >= 2 && s.as_bytes()[..2].iter().all(u8::is_ascii_digit) {
         // UTCTime: YYMMDDHHMMSSZ (RFC 5280: >=50 => 19xx, <50 => 20xx)
         let yy: u32 = s[..2].parse().ok()?;
         Some(if yy >= 50 { 1900 + yy } else { 2000 + yy })
-    } else if tag == 0x18 && s.len() >= 4 {
+    } else if tag == 0x18 && s.len() >= 4 && s.as_bytes()[..4].iter().all(u8::is_ascii_digit) {
         // GeneralizedTime: YYYYMMDDHHMMSSZ
         s[..4].parse().ok()
     } else {

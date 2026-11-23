@@ -209,21 +209,21 @@ pub fn pack_storage_vars_with_defs(
                     contract: contract.to_string(),
                     var_name: v.name.clone(),
                     var_type: clean_ty.to_string(),
-                    slot: U256::from(cur_slot + s),
+                    slot: U256::from(cur_slot.saturating_add(s)),
                     byte_offset: 0,
                     byte_len: 32,
                     rel_path: rel_path.to_string(),
                     line: v.line,
                 });
             }
-            cur_slot += span;
+            cur_slot = cur_slot.saturating_add(span);
             continue;
         }
 
         let width = solidity_type_byte_width_with_defs(clean_ty, enums, contracts_and_interfaces);
         if width == 32 {
             if cur_off > 0 {
-                cur_slot += 1;
+                cur_slot = cur_slot.saturating_add(1);
                 cur_off = 0;
             }
             entries.push(EvmSlotEntry {
@@ -236,10 +236,10 @@ pub fn pack_storage_vars_with_defs(
                 rel_path: rel_path.to_string(),
                 line: v.line,
             });
-            cur_slot += 1;
+            cur_slot = cur_slot.saturating_add(1);
         } else {
             if cur_off + width > 32 {
-                cur_slot += 1;
+                cur_slot = cur_slot.saturating_add(1);
                 cur_off = 0;
             }
             entries.push(EvmSlotEntry {
@@ -254,7 +254,7 @@ pub fn pack_storage_vars_with_defs(
             });
             cur_off += width;
             if cur_off >= 32 {
-                cur_slot += 1;
+                cur_slot = cur_slot.saturating_add(1);
                 cur_off = 0;
             }
         }

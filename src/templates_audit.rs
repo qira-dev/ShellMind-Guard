@@ -413,7 +413,10 @@ fn url_decode_component(s: &str) -> String {
     while i < raw.len() {
         if raw[i] == b'%'
             && i + 2 < raw.len()
-            && let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+            && raw[i + 1].is_ascii_hexdigit()
+            && raw[i + 2].is_ascii_hexdigit()
+            && let Ok(hex) = std::str::from_utf8(&raw[i + 1..i + 3])
+            && let Ok(v) = u8::from_str_radix(hex, 16)
         {
             bytes.push(v);
             i += 3;
@@ -493,23 +496,27 @@ fn split_top_level(s: &str, sep: &str) -> Vec<String> {
     let mut cur = String::new();
     let mut in_quote = false;
     let bytes = s.as_bytes();
+    let sep_bytes = sep.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        let ch = bytes[i] as char;
-        if ch == '"' && (i == 0 || bytes[i - 1] != b'\\') {
+        if bytes[i] == b'"' && (i == 0 || bytes[i - 1] != b'\\') {
             in_quote = !in_quote;
-            cur.push(ch);
+            cur.push('"');
             i += 1;
             continue;
         }
-        if !in_quote && s[i..].starts_with(sep) {
+        if !in_quote && bytes[i..].starts_with(sep_bytes) {
             parts.push(cur.trim().to_string());
             cur.clear();
-            i += sep.len();
+            i += sep_bytes.len();
             continue;
         }
-        cur.push(ch);
-        i += 1;
+        if let Some(ch) = s[i..].chars().next() {
+            cur.push(ch);
+            i += ch.len_utf8();
+        } else {
+            break;
+        }
     }
     parts.push(cur.trim().to_string());
     parts
@@ -630,23 +637,24 @@ fn eval_arg(raw: &str, ctx: &DslCtx) -> Option<String> {
 
 fn find_top_level_op(s: &str, op: &str) -> Option<usize> {
     let bytes = s.as_bytes();
+    let op_bytes = op.as_bytes();
     let mut in_quote = false;
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'"' {
             in_quote = !in_quote;
-        } else if !in_quote && s[i..].starts_with(op) {
+        } else if !in_quote && bytes[i..].starts_with(op_bytes) {
             match op {
-                ">" if s[i..].starts_with(">=") => {
+                ">" if bytes[i..].starts_with(b">=") => {
                     i += 1;
                 }
-                "<" if s[i..].starts_with("<=") => {
+                "<" if bytes[i..].starts_with(b"<=") => {
                     i += 1;
                 }
-                "!" if !s[i..].starts_with("!=") => {
+                "!" if !bytes[i..].starts_with(b"!=") => {
                     i += 1;
                 }
-                "=" if s[i..].starts_with("==") => return Some(i),
+                "=" if bytes[i..].starts_with(b"==") => return Some(i),
                 _ => return Some(i),
             }
         }
@@ -1005,7 +1013,7 @@ fn part_text(resp: &HttpResponse, part: Option<&str>) -> String {
 
 fn decode_hex(s: &str) -> Result<Vec<u8>, ()> {
     let s = s.trim();
-    if !s.len().is_multiple_of(2) {
+    if !s.is_ascii() || !s.len().is_multiple_of(2) {
         return Err(());
     }
     (0..s.len())
@@ -1591,6 +1599,20 @@ pub fn execute_network_block(
                 "network host '{host_name}' is not an IP (hostname DNS resolution is outside the network engine scope; use {{Host}} of an IP target)"
             )
         })?;
+        if crate::idor_audit::is_forbidden_metadata_or_special_host(&host_name) {
+            bail!(
+                "network engine: refusing cloud metadata / link-local / unspecified host '{host_name}'"
+            );
+        }
+        let is_lab_ip = match ip {
+            std::net::IpAddr::V4(v4) => {
+                !v4.is_link_local() && (v4.is_loopback() || v4.is_private())
+            }
+            std::net::IpAddr::V6(v6) => v6.is_loopback(),
+        };
+        if !is_lab_ip {
+            bail!("network engine: refusing non-lab host '{host_name}'");
+        }
         let port_list: Vec<u16> = if ports.is_empty() {
             vec![host_port.unwrap_or(80)]
         } else {
@@ -1723,6 +1745,15 @@ pub fn execute_ssl_block(
             (host.clone(), None)
         };
         let port = block.port.or(target_port).unwrap_or(443);
+        if crate::idor_audit::is_forbidden_metadata_or_special_host(&host_name) {
+            bail!(
+                "ssl engine: refusing cloud metadata / link-local / unspecified host '{host_name}'"
+            );
+        }
+        let ssl_check_url = format!("https://{host_name}:{port}");
+        if !crate::idor_audit::is_lab_or_loopback_url(&ssl_check_url).unwrap_or(false) {
+            bail!("ssl engine: refusing non-lab host '{host_name}'");
+        }
         let mut sock = TcpStream::connect((host_name.as_str(), port))
             .with_context(|| format!("ssl engine: TCP connect to {host_name}:{port}"))?;
         sock.set_read_timeout(Some(timeout))?;
@@ -1918,6 +1949,7 @@ pub fn execute_headless_block(
         match action.as_str() {
             "navigate" => {
                 let url = resolve(step.url.as_deref().unwrap_or("{{base_url}}"));
+                crate::idor_audit::validate_live_target_url(&url, false)?;
                 let data = session.navigate_and_collect(&url, 800)?;
                 last_html = data.rendered_html;
                 navigated = true;

@@ -70,12 +70,67 @@ pub struct IdorAuditReport {
     pub outcomes: Vec<IdorCheckOutcome>,
 }
 
+pub fn is_forbidden_metadata_or_special_host(host: &str) -> bool {
+    let clean = host.trim().trim_matches(['[', ']']).to_ascii_lowercase();
+    if matches!(
+        clean.as_str(),
+        "metadata.google.internal" | "metadata.goog" | "metadata.azure.com" | "169.254.169.254"
+    ) {
+        return true;
+    }
+    if let Ok(ip) = clean.parse::<IpAddr>() {
+        return match ip {
+            IpAddr::V4(v4) => v4.is_link_local() || v4.is_unspecified(),
+            IpAddr::V6(v6) => {
+                if let Some(mapped) = v6.to_ipv4_mapped() {
+                    mapped.is_link_local() || mapped.is_unspecified()
+                } else {
+                    v6.is_unspecified()
+                        || (v6.segments()[0] & 0xffc0) == 0xfe80
+                        || clean == "fd00:ec2::254"
+                }
+            }
+        };
+    }
+    false
+}
+
+/// Unified unconditional IMDS / link-local / lab-scope guardrail.
+/// Even when `allow_remote == true`, cloud metadata & link-local addresses are ALWAYS denied.
+pub fn validate_live_target_url(raw_url: &str, allow_remote: bool) -> Result<reqwest::Url> {
+    let parsed = reqwest::Url::parse(raw_url.trim())
+        .with_context(|| format!("Invalid target URL '{raw_url}'"))?;
+    if !matches!(parsed.scheme(), "http" | "https" | "ws" | "wss") {
+        bail!("Unsupported URL scheme '{}'", parsed.scheme());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        bail!("Refusing URL with embedded credentials");
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("Target URL is missing host"))?;
+    if is_forbidden_metadata_or_special_host(host) {
+        bail!(
+            "Refusing cloud metadata / link-local / unspecified host '{host}' (unconditionally denied even with --allow-remote)"
+        );
+    }
+    if !allow_remote && !is_lab_or_loopback_url(parsed.as_str())? {
+        bail!(
+            "Refusing non-lab remote target '{raw_url}' (pass --allow-remote for an explicitly owned staging host)"
+        );
+    }
+    Ok(parsed)
+}
+
 pub fn is_lab_or_loopback_url(base_url: &str) -> Result<bool> {
     let parsed =
         reqwest::Url::parse(base_url).with_context(|| format!("Invalid base_url '{base_url}'"))?;
     let host = parsed
         .host_str()
         .ok_or_else(|| anyhow::anyhow!("base_url is missing host"))?;
+    if is_forbidden_metadata_or_special_host(host) {
+        return Ok(false);
+    }
     if host.eq_ignore_ascii_case("localhost") || host.ends_with(".local") {
         return Ok(true);
     }
@@ -83,7 +138,13 @@ pub fn is_lab_or_loopback_url(base_url: &str) -> Result<bool> {
         return Ok(match ip {
             // Explicitly exclude IPv4 link-local (169.254.0.0/16, cloud IMDS 169.254.169.254)
             IpAddr::V4(v4) => v4.is_loopback() || v4.is_private(),
-            IpAddr::V6(v6) => v6.is_loopback(),
+            IpAddr::V6(v6) => {
+                if let Some(mapped) = v6.to_ipv4_mapped() {
+                    !mapped.is_link_local() && (mapped.is_loopback() || mapped.is_private())
+                } else {
+                    v6.is_loopback()
+                }
+            }
         });
     }
     Ok(false)

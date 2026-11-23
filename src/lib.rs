@@ -1464,7 +1464,7 @@ struct UiLaunchArgs {
 
 fn launch_tui_dashboard(args: UiLaunchArgs) -> Result<()> {
     let t0 = Instant::now();
-    let cfg = ShellMindGuardConfig::load_from_dir(&args.path)?;
+    let cfg = ShellMindGuardConfig::load_trusted_from_dir(&args.path, args.trust_repo_config)?;
     let summary = scan_repository(&args.path, &cfg)?;
     let mut store = StateStore::open(&args.path)?;
     let (delta, _) = store.sync_files(&summary.files)?;
@@ -1723,7 +1723,7 @@ pub(crate) fn execute_scan_pipeline_full(
     cbom_path: Option<&Path>,
 ) -> Result<ScanOutcome> {
     let t0 = Instant::now();
-    let mut cfg = ShellMindGuardConfig::load_from_dir(opts.path)?;
+    let mut cfg = ShellMindGuardConfig::load_trusted_from_dir(opts.path, opts.trust_repo_config)?;
     if opts.deep_audit {
         cfg.scan.deep_audit = true;
     }
@@ -3093,7 +3093,10 @@ pub fn run_cli() -> Result<ExitCode> {
                     .map(|s| {
                         serde_json::json!({
                             "platform": "tdx",
-                            "verified": true,
+                            "verified": false,
+                            "cryptographically_verified": false,
+                            "structural_valid": true,
+                            "reason": "Structural TDX v4 header/MRTD check passed; Intel DCAP PCK signature/TCB verification is not yet enabled (fail-closed)",
                             "version": s.version,
                             "debug_enabled": s.debug_enabled,
                             "mrtd_hex": s.mrtd_hex,
@@ -3108,7 +3111,10 @@ pub fn run_cli() -> Result<ExitCode> {
                 .map(|s| {
                     serde_json::json!({
                         "platform": "sev-snp",
-                        "verified": true,
+                        "verified": false,
+                        "cryptographically_verified": false,
+                        "structural_valid": true,
+                        "reason": "Structural SEV-SNP header/policy check passed; AMD VCEK signature verification is not yet enabled (fail-closed)",
                         "version": s.version,
                         "guest_svn": s.guest_svn,
                         "debug_enabled": s.debug_enabled,
@@ -3129,7 +3135,10 @@ pub fn run_cli() -> Result<ExitCode> {
                     } else {
                         Ok(serde_json::json!({
                             "platform": "nitro",
-                            "verified": true,
+                            "verified": false,
+                            "cryptographically_verified": false,
+                            "structural_valid": true,
+                            "reason": "Structural CBOR COSE_Sign1 framing only; AWS Nitro Root CA / PCR cryptographic verification is not yet enabled (fail-closed)",
                             "cose_sign1_framed": true,
                             "bytes": raw.len(),
                             "merkle_audit_root": merkle_root,
@@ -3142,13 +3151,25 @@ pub fn run_cli() -> Result<ExitCode> {
             };
             match verdict {
                 Ok(v) => {
+                    let crypto_ok = v
+                        .get("cryptographically_verified")
+                        .and_then(|b| b.as_bool())
+                        .unwrap_or(false);
                     if json {
                         println!("{}", serde_json::to_string_pretty(&v)?);
                     } else {
+                        let status_label = if crypto_ok {
+                            "VERIFIED"
+                        } else {
+                            "UNVERIFIED (STRUCTURAL ONLY — FAIL-CLOSED)"
+                        };
                         println!(
-                            "ShellMind Guard Attestation | Platform: {} | Status: VERIFIED | MerkleRoot: {}",
-                            plat, merkle_root
+                            "ShellMind Guard Attestation | Platform: {} | Status: {} | MerkleRoot: {}",
+                            plat, status_label, merkle_root
                         );
+                    }
+                    if !crypto_ok {
+                        std::process::exit(1);
                     }
                 }
                 Err(err) => {
@@ -5076,7 +5097,7 @@ fn run_doctor(path: &Path, probe_ai: bool) {
         }
     );
     if probe_ai {
-        match ShellMindGuardConfig::load_from_dir(path) {
+        match ShellMindGuardConfig::load_trusted_from_dir(path, false) {
             Ok(cfg) => {
                 if !cfg.ai.is_enabled() {
                     println!(

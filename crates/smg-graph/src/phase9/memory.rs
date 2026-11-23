@@ -271,7 +271,7 @@ fn strip_sizeof_clauses(expr: &str) -> String {
     let mut i = 0usize;
     let bytes = expr.as_bytes();
     while i < bytes.len() {
-        if expr[i..].starts_with("sizeof") {
+        if bytes[i..].starts_with(b"sizeof") {
             let mut j = i + 6;
             while j < bytes.len() && bytes[j].is_ascii_whitespace() {
                 j += 1;
@@ -295,8 +295,12 @@ fn strip_sizeof_clauses(expr: &str) -> String {
                 continue;
             }
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        if let Some(ch) = expr[i..].chars().next() {
+            out.push(ch);
+            i += ch.len_utf8();
+        } else {
+            break;
+        }
     }
     out
 }

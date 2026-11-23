@@ -477,14 +477,43 @@ pub fn generate_regression_test(
         .collect::<String>()
         .to_ascii_lowercase();
     let route_parts: Vec<&str> = finding.entry_route.split_whitespace().collect();
-    let (method, route_path) = match route_parts.as_slice() {
+    let (raw_method, raw_route_path) = match route_parts.as_slice() {
         [m, p, ..] => (*m, *p),
         _ => ("POST", "/api/health"),
     };
+    let method = match raw_method.to_ascii_uppercase().as_str() {
+        "GET" => "GET",
+        "POST" => "POST",
+        "PUT" => "PUT",
+        "PATCH" => "PATCH",
+        "DELETE" => "DELETE",
+        "HEAD" => "HEAD",
+        "OPTIONS" => "OPTIONS",
+        _ => "POST",
+    };
+    let clean_route: String = raw_route_path
+        .chars()
+        .filter(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '/' | '_' | '-' | '.' | '{' | '}' | '?' | '&' | '=')
+        })
+        .take(200)
+        .collect();
+    let route_path = if clean_route.starts_with('/') {
+        clean_route.as_str()
+    } else {
+        "/api/health"
+    };
     let lower_file = finding.file.to_ascii_lowercase();
-    let proof_note = verified
+    let raw_proof = verified
         .map(|v| v.evidence.as_str())
         .unwrap_or("Static Guard-Set Lattice witness");
+    let proof_note: String = raw_proof
+        .replace(['\r', '\n'], " ")
+        .chars()
+        .take(240)
+        .collect();
+    let proof_note = proof_note.as_str();
 
     if lower_file.ends_with(".py") {
         let code = format!(

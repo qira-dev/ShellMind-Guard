@@ -95,7 +95,7 @@ app.post('/api/v1/checkout/withdraw', (req, res) => {
                 code: r#"
 import express from 'express';
 const app = express();
-app.post('/api/v1/checkout/withdraw', requireAuth, async (req, res) => {
+app.post('/api/v1/checkout/withdraw', async (req, res) => {
     if (!req.user?.id) {
         return res.status(401).json({ error: 'unauthorized' });
     }
@@ -580,20 +580,33 @@ void* copy_items_safe(const void* src, size_t count, size_t item_sz, size_t cap)
             }],
         },
         AdversarialCase {
-            id: "cfg_secret_vuln_jwt_decode_and_stripe",
+            id: "cfg_vuln_jwt_decode_unverified",
             family: "SEC_CFG",
-            expected_prefix: "SMG-",
+            expected_prefix: "SMG-CFG-JWT",
             expect_finding: true,
             trap_kind: TrapKind::BaselineVuln,
             files: vec![BenchFile {
                 rel_path: "src/auth/jwt_bad.js",
                 lang: Language::JavaScript,
+                code: r#"
+function parseUser(req) {
+    return jwt.decode(req.headers.authorization);
+}
+"#,
+            }],
+        },
+        AdversarialCase {
+            id: "secret_vuln_stripe_live_key",
+            family: "SEC_CFG",
+            expected_prefix: "SMG-SEC",
+            expect_finding: true,
+            trap_kind: TrapKind::BaselineVuln,
+            files: vec![BenchFile {
+                rel_path: "src/auth/stripe_bad.js",
+                lang: Language::JavaScript,
                 code: concat!(
-                    "\nconst STRIPE_LIVE_SECRET = \"sk_live_",
-                    "51H7FakeTestKey9999999999999999999999\";\n",
-                    "function parseUser(req) {\n",
-                    "    return jwt.decode(req.headers.authorization);\n",
-                    "}\n",
+                    "\nconst STRIPE_LIVE_KEY = \"sk_live_",
+                    "51H7Zx9Kq2Rm4Np8Tv6Yw3Bc5Df7Gh9Jk1Mn3Pq\";\n",
                 ),
             }],
         },
@@ -1512,7 +1525,7 @@ export async function shipOrderSafe(req, db) {
                 code: r#"
 package auth
 func validateDigest(digest, macAddress string) bool {
-    if digest == "" || digest != "" { return false }
+    if digest == "" { return false }
     if digest == "sha256" { return true }
     return macAddress != "00:00:00:00:00:00"
 }

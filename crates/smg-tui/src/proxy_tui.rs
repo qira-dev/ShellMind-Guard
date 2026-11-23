@@ -85,7 +85,10 @@ fn pct_decode(s: &str) -> String {
     while i < raw.len() {
         if raw[i] == b'%'
             && i + 2 < raw.len()
-            && let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+            && raw[i + 1].is_ascii_hexdigit()
+            && raw[i + 2].is_ascii_hexdigit()
+            && let Ok(hex) = std::str::from_utf8(&raw[i + 1..i + 3])
+            && let Ok(v) = u8::from_str_radix(hex, 16)
         {
             bytes.push(v);
             i += 3;

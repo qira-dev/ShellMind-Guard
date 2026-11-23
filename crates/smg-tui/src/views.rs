@@ -784,12 +784,22 @@ pub(crate) fn render_slash_palette_popup(
     if matches.is_empty() {
         return;
     }
-    let popup_h = ((matches.len() as u16) + 2)
-        .min(footer_top_y.saturating_sub(2))
-        .max(4);
-    let popup_w = area.width.saturating_sub(4).clamp(40, 86);
-    let y = footer_top_y.saturating_sub(popup_h);
-    let rect = Rect::new(area.x + 2, y, popup_w, popup_h);
+    if area.width < 12 || area.height < 6 || footer_top_y < 4 {
+        return;
+    }
+    let max_h = footer_top_y.saturating_sub(2).min(area.height);
+    let popup_h = ((matches.len() as u16).saturating_add(2))
+        .min(max_h)
+        .max(3)
+        .min(area.height);
+    let max_w = area.width.saturating_sub(4).max(1);
+    let popup_w = max_w.min(86).max(max_w.min(40));
+    let x = area
+        .x
+        .saturating_add(2)
+        .min(area.x.saturating_add(area.width.saturating_sub(popup_w)));
+    let y = footer_top_y.saturating_sub(popup_h).max(area.y);
+    let rect = Rect::new(x, y, popup_w, popup_h);
     f.render_widget(Clear, rect);
 
     let sel = state.palette_selected.min(matches.len() - 1);

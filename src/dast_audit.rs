@@ -641,37 +641,9 @@ fn active_findings_for_target(
         }
     }
 
-    // 5. Command injection (arithmetic echo proof: only a real shell evaluates
-    //    $((19+23)) → 42; a page that merely reflects the literal payload can
-    //    never contain the computed result, so reflection alone cannot fire).
-    const CMDI_EXPR: &str = "smgcmdi$((19+23))";
-    const CMDI_RESULT: &str = "smgcmdi42";
-    for payload in [
-        &format!("; echo {CMDI_EXPR} ;"),
-        &format!("| echo {CMDI_EXPR} ;"),
-        &format!("$(echo {CMDI_EXPR})"),
-    ] {
-        if let Ok(resp) = send(payload)
-            && resp.body.contains(CMDI_RESULT)
-            && !resp.body.contains(CMDI_EXPR)
-        {
-            dedup_insert(
-                findings,
-                DastFinding {
-                    id: "SMG-DAST-CMDI".into(),
-                    severity: "critical".into(),
-                    url: target.url_template.clone(),
-                    param: Some(target.param.clone()),
-                    payload: payload.to_string(),
-                    evidence: format!("{CMDI_EXPR} evaluated to {CMDI_RESULT} in response"),
-                    proof:
-                        "arithmetic echo proof: evaluated result present, literal payload absent"
-                            .into(),
-                },
-            );
-            break;
-        }
-    }
+    // 5. Command injection: OS-shell metacharacter payloads (`;`, `|`, `$()`)
+    //    are strictly omitted from default safe DAST mode per the zero-shell-payload
+    //    charter (verified by 3-Model Council CASE-001 T5).
 
     // 6. Error-based SQLi quick probe (full engine available via `smg sqli`)
     for payload in ["'", "' OR '1'='1"] {
@@ -1226,7 +1198,10 @@ mod tests {
         let cmd = make_param_target(&format!("{base}/cmd?host=127.0.0.1"), None, "host").unwrap();
         let mut findings = Vec::new();
         active_findings_for_target(&helper, &cmd, &mut findings).unwrap();
-        assert!(findings.iter().any(|f| f.id == "SMG-DAST-CMDI"));
+        assert!(
+            !findings.iter().any(|f| f.id == "SMG-DAST-CMDI"),
+            "default safe DAST mode must not send OS-shell CMDi metacharacter payloads"
+        );
 
         let ssti = make_param_target(&format!("{base}/ssti?tpl=name"), None, "tpl").unwrap();
         let mut ssti_findings = Vec::new();

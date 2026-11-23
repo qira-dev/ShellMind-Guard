@@ -226,7 +226,7 @@ fn parse_pax_path(data: &[u8]) -> Option<String> {
         let sp = data[pos..].iter().position(|&b| b == b' ')?;
         let len_str = std::str::from_utf8(&data[pos..pos + sp]).ok()?;
         let rec_len: usize = len_str.parse().ok()?;
-        if rec_len == 0 || pos.saturating_add(rec_len) > data.len() {
+        if rec_len <= sp + 1 || pos.saturating_add(rec_len) > data.len() {
             break;
         }
         let kv = &data[pos + sp + 1..pos + rec_len];

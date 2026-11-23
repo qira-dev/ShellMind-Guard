@@ -281,12 +281,37 @@ fn is_url_strictly_loopback(url: &Url) -> bool {
     false
 }
 
-/// Validates that `--remote-tee` enforces HTTPS on remote endpoints (allowing plain HTTP only on verified loopback).
+/// Validates that `--remote-tee` enforces HTTPS on remote endpoints (allowing plain HTTP only on verified loopback)
+/// and unconditionally denies cloud metadata / link-local / unspecified hosts.
 pub fn validate_tee_endpoint(raw_url: &str) -> Result<Url> {
     let url = Url::parse(raw_url.trim())
         .with_context(|| format!("invalid remote TEE URL `{raw_url}`"))?;
     if !url.username().is_empty() || url.password().is_some() {
         bail!("refusing remote TEE URL with embedded credentials");
+    }
+    if let Some(host) = url.host_str() {
+        let clean = host.trim().trim_matches(['[', ']']).to_ascii_lowercase();
+        if matches!(
+            clean.as_str(),
+            "metadata.google.internal" | "metadata.goog" | "metadata.azure.com" | "169.254.169.254"
+        ) {
+            bail!("refusing cloud metadata host `{host}` for remote TEE endpoint");
+        }
+        if let Ok(ip) = clean.parse::<std::net::IpAddr>() {
+            let forbidden = match ip {
+                std::net::IpAddr::V4(v4) => v4.is_link_local() || v4.is_unspecified(),
+                std::net::IpAddr::V6(v6) => {
+                    if let Some(mapped) = v6.to_ipv4_mapped() {
+                        mapped.is_link_local() || mapped.is_unspecified()
+                    } else {
+                        v6.is_unspecified() || (v6.segments()[0] & 0xffc0) == 0xfe80
+                    }
+                }
+            };
+            if forbidden {
+                bail!("refusing link-local/unspecified IP `{host}` for remote TEE endpoint");
+            }
+        }
     }
     let is_loopback = is_url_strictly_loopback(&url);
     match url.scheme() {
