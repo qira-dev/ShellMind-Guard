@@ -307,6 +307,7 @@ impl<'a> CfgBuilder<'a> {
         if depth >= self.cfg.scan.max_ast_block_depth()
             || self.blocks.len() >= self.cfg.scan.max_cfg_blocks()
         {
+            self.budget_exhausted = true;
             return Some(cur_bb);
         }
         let mut cursor = node.walk();
@@ -472,15 +473,18 @@ impl<'a> CfgBuilder<'a> {
         } else {
             let fall_bb = self.new_block()?;
             self.link(pre_bb, fall_bb);
-            if then_terminated && let Some(b) = self.blocks.get_mut(fall_bb) {
-                // Passing a terminating auth/lock/bounds guard condition grants that guard along the surviving path.
+            if then_terminated
+                && cond_is_negated
+                && let Some(b) = self.blocks.get_mut(fall_bb)
+            {
+                // Only a NEGATED early-return guard (`if (!auth) return 401;`) grants the guard along the surviving fall-through path.
                 b.pre_sink_guards = b.pre_sink_guards.union(cond_guards);
                 b.post_guards = b.post_guards.union(cond_guards);
             }
             Some(fall_bb)
         };
 
-        // Mark abort exits on `if (ok) { ... } else { return 401; }` and propagate guard onto `then_start`.
+        // Mark abort exits on `if (ok) { ... } else { return 401; }` and propagate guard onto `then_start` only when condition is positive (!cond_is_negated).
         if else_end.is_none() {
             if let Some(es) = else_start_idx {
                 for b in &mut self.blocks[es..] {
@@ -489,7 +493,10 @@ impl<'a> CfgBuilder<'a> {
                     }
                 }
             }
-            if !then_terminated && let Some(tb) = self.blocks.get_mut(then_start) {
+            if !then_terminated
+                && !cond_is_negated
+                && let Some(tb) = self.blocks.get_mut(then_start)
+            {
                 tb.pre_sink_guards = tb.pre_sink_guards.union(cond_guards);
                 tb.post_guards = tb.post_guards.union(cond_guards);
             }
@@ -840,8 +847,6 @@ fn stmt_unconditionally_exits(stmt: Node, src: &[u8]) -> bool {
         || code.contains("bail!(")
         || code.contains("panic!(")
         || code.contains("abort(")
-        || code.contains("abortwithstatus")
-        || code.contains("http.error(")
         || code.contains("return res.status(")
 }
 

@@ -760,7 +760,6 @@ fn scan_backend_and_db_deep(
             // 5. Prototype Pollution (`SMG-CFG-PROTO`, JS/TS)
             if matches!(lang, Language::TypeScript | Language::JavaScript)
                 && !has_proto_guard
-                && !block_low.contains("object.create(null)")
                 && is_proto_pollution_write(&trimmed, &block_low, &raw_obj_vars, &scalar_taint_vars)
                 && !existing_hit_keys.contains(&("SMG-CFG-PROTO".to_string(), abs_line))
             {

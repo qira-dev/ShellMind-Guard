@@ -105,7 +105,12 @@ fn is_public_route(entry_route: &str, public_routes: &[String]) -> bool {
     public_routes.iter().any(|p| {
         let pl = p.to_ascii_lowercase();
         if let Some(prefix) = pl.strip_suffix("/*") {
-            return low == prefix || low.starts_with(&format!("{}/", prefix.trim_end_matches('/')));
+            let trimmed = prefix.trim_end_matches('/');
+            if trimmed.is_empty() {
+                return false;
+            }
+            return !has_privileged_seg
+                && (low == trimmed || low.starts_with(&format!("{trimmed}/")));
         }
         low == pl
             || (!has_privileged_seg && low.starts_with(&format!("{}/", pl.trim_end_matches('/'))))
@@ -1000,8 +1005,10 @@ pub fn solve_guard_lattice_with_options(
     }
 
     // Propagate CFG-verified Auth/TxLock guards from resolved middleware & interface-wrapped CHA guard callees
+    // to full convergence (Council CASE-001 T2 ruling: true fixpoint loop, not hardcoded 2 rounds).
     let mut ambiguous_guard_callers: HashSet<(usize, GuardKind)> = HashSet::new();
-    for _ in 0..2 {
+    let max_mw_rounds = graph.node_count().clamp(4, 256);
+    for _ in 0..max_mw_rounds {
         let mut add_guards: Vec<(NodeIndex, HashSet<GuardKind>)> = Vec::new();
         for u in graph.node_indices() {
             let mut found = HashSet::new();
@@ -1045,8 +1052,16 @@ pub fn solve_guard_lattice_with_options(
                 add_guards.push((u, found));
             }
         }
+        let mut changed = false;
         for (u, fg) in add_guards {
+            let before = graph[u].guards.len();
             graph[u].guards.extend(fg);
+            if graph[u].guards.len() > before {
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
         }
     }
 

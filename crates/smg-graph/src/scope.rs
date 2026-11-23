@@ -228,28 +228,27 @@ fn has_direct_tainted_unsanitized_wrap(rhs_txt: &str) -> bool {
 /// Checks if a React `dangerouslySetInnerHTML={{ __html: expr }}` attribute passes
 /// either an inline sanitizer call or a variable tracked as sanitized in [`FileScopeTable`].
 pub fn is_safe_jsx_html_attribute(attr_text: &str, scope: &FileScopeTable) -> bool {
-    let low = attr_text.to_ascii_lowercase();
-    if low.contains("dompurify")
-        || low.contains("sanitizehtml")
-        || low.contains("sanitize_html")
-        || low.contains("escapehtml")
-    {
-        return true;
-    }
     if let Some(idx) = attr_text.find("__html") {
         let after = attr_text[idx + 6..]
             .trim_start()
             .trim_start_matches(':')
             .trim();
         let expr = after.trim_end_matches('}').trim();
-        // Match plain identifier (`__html: clean`) backed by prior sanitizer assignment.
-        if !expr.is_empty()
-            && expr
+        if !expr.is_empty() {
+            let expr_low = expr.to_ascii_lowercase();
+            if has_non_negated_xss_sanitizer(&expr_low)
+                && !has_direct_tainted_unsanitized_wrap(expr)
+            {
+                return true;
+            }
+            // Match plain identifier (`__html: clean`) backed by prior sanitizer assignment.
+            if expr
                 .chars()
-                .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
-            && scope.xss_sanitized_vars.contains(expr)
-        {
-            return true;
+                .all(|c| c.is_alphanumeric() || c == '_' || c == '\u{24}')
+                && scope.xss_sanitized_vars.contains(expr)
+            {
+                return true;
+            }
         }
     }
     false

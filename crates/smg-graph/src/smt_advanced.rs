@@ -222,28 +222,28 @@ impl LinearIneq {
     }
 
     /// Normalizes by positive GCD of all coefficients using integer floor division on `rhs`:
-    /// e.g., `2*x <= 5` becomes `x <= 2` (exact over integers!).
+    /// e.g., `2*x <= 5` becomes `x <= 2` (exact over integers!). Uses `u128` so `i128::MIN` never panics.
     pub fn normalize_int(&mut self) {
-        let mut g: i128 = 0;
+        let mut g: u128 = 0;
         for &c in self.terms.values() {
-            g = gcd_i128(g, c.abs());
-        }
-        if g > 1 {
-            for c in self.terms.values_mut() {
-                *c /= g;
+            let mut a = g;
+            let mut b = c.unsigned_abs();
+            while b != 0 {
+                let t = a % b;
+                a = b;
+                b = t;
             }
-            self.rhs = self.rhs.div_euclid(g);
+            g = a;
+        }
+        if g > 1
+            && let Ok(gi) = i128::try_from(g)
+        {
+            for c in self.terms.values_mut() {
+                *c /= gi;
+            }
+            self.rhs = self.rhs.div_euclid(gi);
         }
     }
-}
-
-fn gcd_i128(mut a: i128, mut b: i128) -> i128 {
-    while b != 0 {
-        let t = a % b;
-        a = b;
-        b = t;
-    }
-    a.abs()
 }
 
 /// Checks satisfiability of a conjunction of `QF_LIA` integer linear inequalities

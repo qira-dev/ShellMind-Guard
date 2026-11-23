@@ -864,6 +864,14 @@ pub fn merge_repo_route_schemas(summaries: &[FileAstSummary]) -> Vec<RouteSchema
         for s in &f.route_schemas {
             let key = (s.method.clone(), s.path.clone());
             if let Some(existing) = by_key.get_mut(&key) {
+                // Order-independent merge: if OpenAPI arrived first and runtime code arrives second,
+                // reset documentation-only `has_positive_bound` flags before merging code bounds.
+                if existing.from_openapi && !s.from_openapi {
+                    for ep in &mut existing.params {
+                        ep.has_positive_bound = false;
+                    }
+                    existing.from_openapi = false;
+                }
                 for p in &s.params {
                     let mut cand = p.clone();
                     // Never let documentation-only OpenAPI `minimum` suppress missing runtime code validation.
@@ -872,7 +880,6 @@ pub fn merge_repo_route_schemas(summaries: &[FileAstSummary]) -> Vec<RouteSchema
                     }
                     add_unique_param(&mut existing.params, cand);
                 }
-                existing.from_openapi |= s.from_openapi;
                 if existing.source_file.is_empty() && !s.source_file.is_empty() {
                     existing.source_file = s.source_file.clone();
                     existing.line = s.line;

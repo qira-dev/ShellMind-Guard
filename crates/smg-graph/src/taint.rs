@@ -200,7 +200,7 @@ impl TaintEnv {
                 .field_direct
                 .keys()
                 .chain(self.field_params.keys())
-                .filter(|(obj, fld)| obj == v || obj == &root_v || fld == v)
+                .filter(|(obj, _fld)| obj == v || obj == &root_v)
                 .cloned()
                 .collect();
             for k in keys {
@@ -4082,9 +4082,11 @@ fn analyze_statement_block_depth(
                     (true, true) => {}
                 }
             } else if then_exits {
-                // Early-return validation narrowing on fall-through path (only when De Morgan guarantees guard holds)
+                // Early-return validation narrowing on fall-through path (only when NEGATED guard exits,
+                // e.g. `if (!isAllowed(url)) return 403;`, and without `&&` which De Morgan turns into `||`).
                 if let Some((ref cond_txt, is_neg, _, has_and)) = cond_meta
-                    && !(is_neg && has_and)
+                    && is_neg
+                    && !has_and
                 {
                     let narrow_mask = condition_narrow_mask(cond_txt);
                     if narrow_mask != 0 {
@@ -4568,6 +4570,21 @@ pub fn extract_frontend_calls_and_bugs(
         return;
     }
     let is_fe = is_likely_frontend_file(rel_path, src);
+    extract_frontend_calls_and_bugs_inner(node, src, rel_path, is_fe, 0, calls_out, bugs_out);
+}
+
+fn extract_frontend_calls_and_bugs_inner(
+    node: Node,
+    src: &[u8],
+    rel_path: &str,
+    is_fe: bool,
+    depth: usize,
+    calls_out: &mut Vec<FrontendApiCall>,
+    bugs_out: &mut Vec<LocalStaticFinding>,
+) {
+    if depth >= 512 {
+        return;
+    }
 
     let kind = node.kind();
 
@@ -4784,7 +4801,15 @@ pub fn extract_frontend_calls_and_bugs(
 
     let mut cursor = node.walk();
     for ch in node.children(&mut cursor) {
-        extract_frontend_calls_and_bugs(ch, src, rel_path, lang, calls_out, bugs_out);
+        extract_frontend_calls_and_bugs_inner(
+            ch,
+            src,
+            rel_path,
+            is_fe,
+            depth + 1,
+            calls_out,
+            bugs_out,
+        );
     }
 }
 

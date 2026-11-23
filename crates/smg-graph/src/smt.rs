@@ -188,15 +188,13 @@ pub fn parse_condition_expr(raw: &str) -> Option<PathConstraint> {
     }
 
     // 2. Top-level logical AND (`&&`, ` and `)
+    // Require ALL conjuncts to parse so negating `A && opaque` never collapses to `!A` (False UNSAT).
     if let Some(parts) =
         split_top_level_logical(s, "&&").or_else(|| split_top_level_word_op(s, "and"))
     {
-        let mut conjuncts = Vec::new();
-        for p in parts {
-            if let Some(c) = parse_condition_expr(p) {
-                conjuncts.push(c);
-            }
-        }
+        let parsed: Option<Vec<PathConstraint>> =
+            parts.into_iter().map(parse_condition_expr).collect();
+        let conjuncts = parsed?;
         return match conjuncts.len() {
             0 => None,
             1 => conjuncts.into_iter().next(),
