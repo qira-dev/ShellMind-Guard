@@ -375,7 +375,9 @@ pub fn analyze_mcp_tool_poisoning(rel_path: &str, source: &str) -> Vec<LocalStat
         if is_rust && cfg_test.should_skip_line(line) {
             continue;
         }
-        let is_rust_pattern_literal = is_rust && trimmed.starts_with('"') && !trimmed.contains(':');
+        let is_rust_pattern_literal = is_rust
+            && (crate::taint::is_pattern_matcher_or_doc_line(line)
+                || (trimmed.starts_with('"') && !trimmed.contains(':')));
         if trimmed.starts_with("//")
             || (!is_json_or_config && trimmed.starts_with('#'))
             || is_rust_pattern_literal

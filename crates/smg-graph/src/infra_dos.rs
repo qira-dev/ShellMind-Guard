@@ -890,7 +890,11 @@ fn scan_zipslip_patterns(
 
     for (idx, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with('#') {
+        if trimmed.is_empty()
+            || trimmed.starts_with("//")
+            || trimmed.starts_with('#')
+            || crate::taint::is_pattern_matcher_or_doc_line(line)
+        {
             continue;
         }
         let low = trimmed.to_ascii_lowercase();
@@ -1143,6 +1147,9 @@ fn scan_async_queue_context(rel_path: &str, content: &str, out: &mut Vec<LocalSt
     let lines: Vec<&str> = content.lines().collect();
     let mut seen_lines = HashSet::new();
     for (idx, line) in lines.iter().enumerate() {
+        if crate::taint::is_pattern_matcher_or_doc_line(line) {
+            continue;
+        }
         let low = line.to_ascii_lowercase();
         let is_job_entry = low.contains("new worker(")
             || low.contains(".process(")
