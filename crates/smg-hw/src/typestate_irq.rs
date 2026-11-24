@@ -363,22 +363,28 @@ fn configure_hw_parser(parser: &mut Parser, lang: Language) -> bool {
     res.is_ok()
 }
 
-fn collect_hw_functions<'a>(node: Node<'a>, src: &[u8], out: &mut Vec<(String, Node<'a>)>) {
-    let k = node.kind();
-    if matches!(k, "function_definition" | "function_item") {
-        let name = extract_c_fn_name(node, src);
-        if !is_c_or_rust_test_fn(node, src, &name) {
-            out.push((name, node));
+fn collect_hw_functions<'a>(root: Node<'a>, src: &[u8], out: &mut Vec<(String, Node<'a>)>) {
+    // Iterative DFS with explicit stack avoids thread stack overflow on deeply nested C macro/AST trees (e.g. Zephyr RTOS).
+    let mut stack: Vec<Node<'a>> = vec![root];
+    while let Some(node) = stack.pop() {
+        let k = node.kind();
+        if matches!(k, "function_definition" | "function_item") {
+            let name = extract_c_fn_name(node, src);
+            if !is_c_or_rust_test_fn(node, src, &name) {
+                out.push((name, node));
+            }
+            continue;
         }
-        return;
-    }
-    // Skip entire Rust `#[cfg(test)] mod tests { ... }` subtree cleanly without bleeding past sibling items
-    if k == "mod_item" && has_cfg_test_attr(node, src) {
-        return;
-    }
-    let mut c = node.walk();
-    for ch in node.children(&mut c) {
-        collect_hw_functions(ch, src, out);
+        // Skip entire Rust `#[cfg(test)] mod tests { ... }` subtree cleanly without bleeding past sibling items
+        if k == "mod_item" && has_cfg_test_attr(node, src) {
+            continue;
+        }
+        let prev_len = stack.len();
+        let mut c = node.walk();
+        for ch in node.children(&mut c) {
+            stack.push(ch);
+        }
+        stack[prev_len..].reverse();
     }
 }
 

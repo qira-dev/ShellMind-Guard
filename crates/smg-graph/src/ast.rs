@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use smg_core::{IndexedFile, Language, ShellMindGuardConfig};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use tree_sitter::{Node, Parser};
@@ -3476,6 +3476,246 @@ fn normalize_rel_path(path: &Path) -> String {
         }
     }
     stack.join("/")
+}
+
+/// Precomputed O(1) import lookup index built once per codebase scan.
+/// Eliminates O(I * F log F) sorting and linear path scanning on large C++/Java/Kotlin repos.
+pub struct ImportFileIndex<'a> {
+    known_files: &'a HashSet<String>,
+    suffix_map: HashMap<String, String>,
+    dir_seg_map: HashMap<(String, String), Vec<String>>,
+}
+
+impl<'a> ImportFileIndex<'a> {
+    pub fn new(known_files: &'a HashSet<String>) -> Self {
+        const INDEXED_DIR_EXTS: &[&str] = &[
+            "php", "phtml", "java", "cs", "kt", "kts", "swift", "dart", "rb", "rake", "ru", "sh",
+            "bash", "zsh", "tf", "tfvars",
+        ];
+        let mut sorted: Vec<&String> = known_files.iter().collect();
+        sorted.sort();
+
+        let mut suffix_map: HashMap<String, String> = HashMap::with_capacity(sorted.len() * 3);
+        let mut dir_seg_map: HashMap<(String, String), Vec<String>> = HashMap::new();
+
+        for f in sorted {
+            let norm = f.replace('\\', "/").to_ascii_lowercase();
+            let parts: Vec<&str> = norm.split('/').filter(|s| !s.is_empty()).collect();
+            if parts.is_empty() {
+                continue;
+            }
+            for start in 0..parts.len() {
+                let tail = parts[start..].join("/");
+                suffix_map.entry(tail).or_insert_with(|| f.clone());
+            }
+            if let Some(ext) = parts
+                .last()
+                .and_then(|name| name.rsplit_once('.').map(|(_, e)| e))
+                && INDEXED_DIR_EXTS.contains(&ext)
+                && parts.len() >= 2
+            {
+                let dir_parts = &parts[..parts.len() - 1];
+                let dlen = dir_parts.len();
+                for i in 0..dlen {
+                    let max_j = (i + 4).min(dlen);
+                    for j in i..max_j {
+                        let seg = dir_parts[i..=j].join("/");
+                        let entry = dir_seg_map.entry((ext.to_string(), seg)).or_default();
+                        if entry.len() < 4 || ext == "tf" || ext == "tfvars" {
+                            entry.push(f.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        Self {
+            known_files,
+            suffix_map,
+            dir_seg_map,
+        }
+    }
+
+    fn find_known_suffix(&self, rel: &str, exts: &[&str]) -> Option<String> {
+        let clean = rel.trim_start_matches("./").replace('\\', "/");
+        let parts: Vec<&str> = clean.split('/').filter(|s| !s.is_empty()).collect();
+        if parts.is_empty() {
+            return None;
+        }
+        for start in 0..parts.len() {
+            let tail = parts[start..].join("/").to_ascii_lowercase();
+            if exts.is_empty() {
+                if let Some(hit) = self.suffix_map.get(&tail) {
+                    return Some(hit.clone());
+                }
+            } else {
+                for e in exts {
+                    let key = if tail.ends_with(&format!(".{}", e)) {
+                        tail.clone()
+                    } else {
+                        format!("{}.{}", tail, e)
+                    };
+                    if let Some(hit) = self.suffix_map.get(&key) {
+                        return Some(hit.clone());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn find_dir_matches(&self, clean: &str, exts: &[&str]) -> Vec<String> {
+        let needle = clean.to_ascii_lowercase();
+        let mut out = Vec::new();
+        for &e in exts {
+            if let Some(hits) = self.dir_seg_map.get(&(e.to_string(), needle.clone())) {
+                for h in hits {
+                    if !out.contains(h) {
+                        out.push(h.clone());
+                    }
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+}
+
+pub fn resolve_import_target_indexed(
+    from_file: &str,
+    spec: &str,
+    index: &ImportFileIndex<'_>,
+) -> Option<String> {
+    if spec.starts_with("rust::")
+        || spec.starts_with("rs::")
+        || spec.starts_with("py::")
+        || spec.starts_with("@/")
+        || spec.starts_with("~/")
+    {
+        return resolve_import_target(from_file, spec, index.known_files);
+    }
+    if let Some(resolved) = resolve_extension_import_indexed(from_file, spec, index) {
+        return Some(resolved);
+    }
+    if spec.starts_with('.') {
+        return resolve_import_target(from_file, spec, index.known_files);
+    }
+    None
+}
+
+fn resolve_extension_import_indexed(
+    from_file: &str,
+    spec: &str,
+    index: &ImportFileIndex<'_>,
+) -> Option<String> {
+    let known_files = index.known_files;
+    if let Some(inc) = spec.strip_prefix("cpp::") {
+        let clean = inc.trim().replace('\\', "/");
+        if clean.is_empty() {
+            return None;
+        }
+        let parent = Path::new(from_file)
+            .parent()
+            .unwrap_or_else(|| Path::new(""));
+        let stem = clean
+            .strip_suffix(".hpp")
+            .or_else(|| clean.strip_suffix(".hxx"))
+            .or_else(|| clean.strip_suffix(".hh"))
+            .or_else(|| clean.strip_suffix(".h"))
+            .unwrap_or(&clean);
+        let mut impl_candidates = Vec::new();
+        for ext in ["cpp", "cc", "cxx", "c"] {
+            impl_candidates.push(format!("{}.{}", stem, ext));
+        }
+        impl_candidates.push(clean.clone());
+        for cand in &impl_candidates {
+            let joined = normalize_rel_path(&parent.join(cand));
+            if known_files.contains(&joined) {
+                return Some(joined);
+            }
+        }
+        for cand in &impl_candidates {
+            if let Some(hit) = index.find_known_suffix(cand, &[]) {
+                return Some(hit);
+            }
+        }
+        return None;
+    }
+
+    if let Some((prefix, body)) = spec.split_once("::") {
+        let exts: &[&str] = match prefix {
+            "php" => &["php", "phtml"],
+            "java" => &["java"],
+            "cs" => &["cs"],
+            "kt" => &["kt", "kts"],
+            "swift" => &["swift"],
+            "dart" => &["dart"],
+            "rb" => &["rb", "rake", "ru"],
+            "sh" => &["sh", "bash", "zsh"],
+            "hcl" => &["tf", "tfvars"],
+            _ => return None,
+        };
+        let clean = body
+            .trim()
+            .trim_start_matches("./")
+            .trim_end_matches("/*")
+            .trim_end_matches('/');
+        if clean.is_empty() {
+            return None;
+        }
+        if prefix == "hcl" && (body.trim().starts_with('.') || !body.contains("://")) {
+            let parent = Path::new(from_file)
+                .parent()
+                .unwrap_or_else(|| Path::new(""));
+            let rel_dir = normalize_rel_path(&parent.join(body.trim()));
+            if !rel_dir.is_empty() {
+                for cand in [format!("{}/main.tf", rel_dir), format!("{}.tf", rel_dir)] {
+                    if known_files.contains(&cand) {
+                        return Some(cand);
+                    }
+                }
+            }
+        }
+        if let Some(hit) = index.find_known_suffix(clean, exts) {
+            return Some(hit);
+        }
+        let dir_matches = index.find_dir_matches(clean, exts);
+        if prefix == "hcl" {
+            if let Some(main_tf) = dir_matches.iter().find(|f| {
+                f.replace('\\', "/")
+                    .to_ascii_lowercase()
+                    .ends_with("/main.tf")
+            }) {
+                return Some(main_tf.clone());
+            }
+            if let Some(first) = dir_matches.first() {
+                return Some(first.clone());
+            }
+        } else if dir_matches.len() == 1 {
+            return Some(dir_matches[0].clone());
+        }
+        return None;
+    }
+
+    let from_ext = Path::new(from_file)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    if matches!(from_ext, "php" | "phtml" | "dart" | "rb" | "sh" | "bash")
+        && !spec.starts_with('.')
+        && !spec.contains("://")
+    {
+        let parent = Path::new(from_file)
+            .parent()
+            .unwrap_or_else(|| Path::new(""));
+        let joined = normalize_rel_path(&parent.join(spec.trim_start_matches('/')));
+        if known_files.contains(&joined) {
+            return Some(joined);
+        }
+        return index.find_known_suffix(spec, &[from_ext]);
+    }
+
+    None
 }
 
 fn find_known_suffix(rel: &str, exts: &[&str], known_files: &HashSet<String>) -> Option<String> {

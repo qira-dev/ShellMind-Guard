@@ -1,4 +1,4 @@
-use crate::ast::{FileAstSummary, resolve_import_target};
+use crate::ast::{FileAstSummary, ImportFileIndex, resolve_import_target_indexed};
 use anyhow::{Result, bail};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -104,10 +104,12 @@ pub fn slice_summaries_for_changed_files<'a>(
         }
     }
 
+    let import_index = ImportFileIndex::new(&known_owned);
     for s in summaries {
         let src = s.rel_path.as_str();
         for imp in &s.imports {
-            if let Some(target) = resolve_import_target(src, &imp.from_specifier, &known_owned)
+            if let Some(target) =
+                resolve_import_target_indexed(src, &imp.from_specifier, &import_index)
                 && let Some(&target_ref) = known_files.get(target.as_str())
             {
                 forward.entry(src).or_default().push(target_ref);

@@ -195,6 +195,8 @@ pub fn compute_wcsd(
     let mut has_recursion = false;
     let mut findings = Vec::new();
 
+    const MAX_WCSD_DEPTH: usize = 128;
+
     #[allow(clippy::too_many_arguments)]
     fn dfs<'a>(
         name: &'a str,
@@ -203,7 +205,11 @@ pub fn compute_wcsd(
         memo: &mut HashMap<String, (u64, Vec<String>)>,
         has_recursion: &mut bool,
         findings: &mut Vec<LocalStaticFinding>,
+        depth: usize,
     ) -> (u64, Vec<String>) {
+        if depth >= MAX_WCSD_DEPTH {
+            return (0, Vec::new());
+        }
         if let Some(cached) = memo.get(name) {
             return cached.clone();
         }
@@ -233,7 +239,15 @@ pub fn compute_wcsd(
         let mut best_child = 0u64;
         let mut best_path = Vec::new();
         for callee in &node.callees {
-            let (c_bytes, c_path) = dfs(callee, map, visiting, memo, has_recursion, findings);
+            let (c_bytes, c_path) = dfs(
+                callee,
+                map,
+                visiting,
+                memo,
+                has_recursion,
+                findings,
+                depth + 1,
+            );
             if c_bytes > best_child {
                 best_child = c_bytes;
                 best_path = c_path;
@@ -262,6 +276,7 @@ pub fn compute_wcsd(
             &mut memo,
             &mut has_recursion,
             &mut findings,
+            0,
         );
         if n.is_isr {
             // Hardware exception frame (32 bytes Cortex-M basic frame) + ISR call chain

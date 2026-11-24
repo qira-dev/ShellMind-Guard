@@ -57,10 +57,13 @@ pub(crate) const PROFILE: LangProfile = LangProfile {
 };
 
 pub(crate) fn extract(root: Node, ctx: &mut ExtractContext<'_>) {
-    walk_node(root, ctx);
+    walk_node(root, ctx, 0);
 }
 
-fn walk_node(node: Node, ctx: &mut ExtractContext<'_>) {
+fn walk_node(node: Node, ctx: &mut ExtractContext<'_>, depth: usize) {
+    if depth >= crate::taint::MAX_AST_WALK_DEPTH {
+        return;
+    }
     let k = node.kind();
 
     if k == "preproc_include" {
@@ -81,7 +84,7 @@ fn walk_node(node: Node, ctx: &mut ExtractContext<'_>) {
     }
 
     if k == "function_definition" {
-        extract_function(node, ctx);
+        extract_function(node, ctx, depth);
         return;
     }
 
@@ -92,20 +95,20 @@ fn walk_node(node: Node, ctx: &mut ExtractContext<'_>) {
 
     let mut c = node.walk();
     for ch in node.children(&mut c) {
-        walk_node(ch, ctx);
+        walk_node(ch, ctx, depth + 1);
     }
 }
 
-fn extract_function(node: Node, ctx: &mut ExtractContext<'_>) {
+fn extract_function(node: Node, ctx: &mut ExtractContext<'_>, depth: usize) {
     let decl = node.child_by_field_name("declarator");
     let fn_name = decl
-        .and_then(|d| extract_c_declarator_name(d, ctx.src))
+        .and_then(|d| extract_c_declarator_name(d, ctx.src, 0))
         .unwrap_or_else(|| "c_fn".to_string());
     if fn_name.starts_with("test_") || fn_name.starts_with("TEST") {
         return;
     }
     let params_txt = decl
-        .and_then(|d| find_param_list_text(d, ctx.src))
+        .and_then(|d| find_param_list_text(d, ctx.src, 0))
         .unwrap_or_default();
     let param_names = extract_param_idents(&params_txt);
     let body = node.child_by_field_name("body");
@@ -131,16 +134,19 @@ fn extract_function(node: Node, ctx: &mut ExtractContext<'_>) {
     ctx.symbols.push(sym);
 
     if let Some(b) = body {
-        walk_node(b, ctx);
+        walk_node(b, ctx, depth + 1);
     }
 }
 
-fn extract_c_declarator_name(node: Node, src: &[u8]) -> Option<String> {
+fn extract_c_declarator_name(node: Node, src: &[u8], depth: usize) -> Option<String> {
+    if depth >= crate::taint::MAX_AST_WALK_DEPTH {
+        return None;
+    }
     let k = node.kind();
     if k == "function_declarator"
         && let Some(inner) = node.child_by_field_name("declarator")
     {
-        return extract_c_declarator_name(inner, src);
+        return extract_c_declarator_name(inner, src, depth + 1);
     }
     if matches!(
         k,
@@ -150,7 +156,7 @@ fn extract_c_declarator_name(node: Node, src: &[u8]) -> Option<String> {
             | "parenthesized_declarator"
     ) && let Some(inner) = node.child_by_field_name("declarator")
     {
-        return extract_c_declarator_name(inner, src);
+        return extract_c_declarator_name(inner, src, depth + 1);
     }
     if matches!(
         k,
@@ -164,20 +170,23 @@ fn extract_c_declarator_name(node: Node, src: &[u8]) -> Option<String> {
     }
     let mut c = node.walk();
     for ch in node.children(&mut c) {
-        if let Some(found) = extract_c_declarator_name(ch, src) {
+        if let Some(found) = extract_c_declarator_name(ch, src, depth + 1) {
             return Some(found);
         }
     }
     None
 }
 
-fn find_param_list_text(node: Node, src: &[u8]) -> Option<String> {
+fn find_param_list_text(node: Node, src: &[u8], depth: usize) -> Option<String> {
+    if depth >= crate::taint::MAX_AST_WALK_DEPTH {
+        return None;
+    }
     if node.kind() == "parameter_list" {
         return Some(node_text(node, src).to_string());
     }
     let mut c = node.walk();
     for ch in node.children(&mut c) {
-        if let Some(found) = find_param_list_text(ch, src) {
+        if let Some(found) = find_param_list_text(ch, src, depth + 1) {
             return Some(found);
         }
     }

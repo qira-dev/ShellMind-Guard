@@ -1,7 +1,7 @@
 use crate::arena::{GuardBitset, SymbolArena, SymbolId};
 use crate::ast::{
-    Confidence, FileAstSummary, GuardKind, LocalStaticFinding, SinkKind, SymbolInfo, SymbolKind,
-    resolve_import_target,
+    Confidence, FileAstSummary, GuardKind, ImportFileIndex, LocalStaticFinding, SinkKind,
+    SymbolInfo, SymbolKind, resolve_import_target_indexed,
 };
 use crate::taint::{TAINT_ALL, TAINT_CMD, TAINT_PATH, TAINT_SQL, TAINT_SSRF, TAINT_XSS};
 use petgraph::Direction;
@@ -131,37 +131,60 @@ fn go_parent_dir(rel_path: &str) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_symbol_in_file(
     target_file: SymbolId,
     symbol_name: SymbolId,
     file_symbols_map: &HashMap<(SymbolId, SymbolId), Vec<NodeIndex>>,
+    defined_symbol_ids: &HashSet<SymbolId>,
     file_imports: &HashMap<SymbolId, Vec<(SymbolId, SymbolId, SymbolId)>>,
     wildcard_id: SymbolId,
     depth: usize,
+    resolve_cache: &mut HashMap<(SymbolId, SymbolId), Vec<NodeIndex>>,
 ) -> Vec<NodeIndex> {
+    if let Some(cached) = resolve_cache.get(&(target_file, symbol_name)) {
+        return cached.clone();
+    }
+    if let Some(indices) = file_symbols_map.get(&(target_file, symbol_name))
+        && !indices.is_empty()
+    {
+        return indices.clone();
+    }
     let mut visited = HashSet::new();
-    resolve_symbol_in_file_memo(
+    let res = resolve_symbol_in_file_memo(
         target_file,
         symbol_name,
         file_symbols_map,
+        defined_symbol_ids,
         file_imports,
         wildcard_id,
         depth,
         &mut visited,
-    )
+        resolve_cache,
+    );
+    if depth == 0 && resolve_cache.len() < 250_000 {
+        resolve_cache.insert((target_file, symbol_name), res.clone());
+    }
+    res
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_symbol_in_file_memo(
     target_file: SymbolId,
     symbol_name: SymbolId,
     file_symbols_map: &HashMap<(SymbolId, SymbolId), Vec<NodeIndex>>,
+    defined_symbol_ids: &HashSet<SymbolId>,
     file_imports: &HashMap<SymbolId, Vec<(SymbolId, SymbolId, SymbolId)>>,
     wildcard_id: SymbolId,
     depth: usize,
     visited: &mut HashSet<(SymbolId, SymbolId)>,
+    resolve_cache: &mut HashMap<(SymbolId, SymbolId), Vec<NodeIndex>>,
 ) -> Vec<NodeIndex> {
-    if !visited.insert((target_file, symbol_name)) {
+    if visited.len() >= 64 || !visited.insert((target_file, symbol_name)) {
         return Vec::new();
+    }
+    if let Some(cached) = resolve_cache.get(&(target_file, symbol_name)) {
+        return cached.clone();
     }
     if let Some(indices) = file_symbols_map.get(&(target_file, symbol_name))
         && !indices.is_empty()
@@ -174,32 +197,40 @@ fn resolve_symbol_in_file_memo(
     let Some(imps) = file_imports.get(&target_file) else {
         return Vec::new();
     };
+    let can_wildcard_match = defined_symbol_ids.contains(&symbol_name);
     let mut out = Vec::new();
     for &(local_name, next_file, remote_name) in imps {
+        if visited.len() >= 64 {
+            break;
+        }
         if local_name == symbol_name {
             let resolved = resolve_symbol_in_file_memo(
                 next_file,
                 remote_name,
                 file_symbols_map,
+                defined_symbol_ids,
                 file_imports,
                 wildcard_id,
                 depth + 1,
                 visited,
+                resolve_cache,
             );
             for idx in resolved {
                 if !out.contains(&idx) {
                     out.push(idx);
                 }
             }
-        } else if local_name == wildcard_id {
+        } else if local_name == wildcard_id && can_wildcard_match {
             let resolved = resolve_symbol_in_file_memo(
                 next_file,
                 symbol_name,
                 file_symbols_map,
+                defined_symbol_ids,
                 file_imports,
                 wildcard_id,
                 depth + 1,
                 visited,
+                resolve_cache,
             );
             for idx in resolved {
                 if !out.contains(&idx) {
@@ -650,6 +681,7 @@ pub fn solve_guard_lattice_with_options(
     let mut namespace_imports: HashMap<(SymbolId, SymbolId), SymbolId> = HashMap::new();
     let mut go_pkg_imports: HashMap<(SymbolId, SymbolId), Vec<SymbolId>> = HashMap::new();
 
+    let import_index = ImportFileIndex::new(&known_files);
     for f in summaries {
         let fid = arena.intern(&f.rel_path);
         let mut imps = Vec::new();
@@ -669,7 +701,7 @@ pub fn solve_guard_lattice_with_options(
                 continue;
             }
             if let Some(target_file) =
-                resolve_import_target(&f.rel_path, &imp.from_specifier, &known_files)
+                resolve_import_target_indexed(&f.rel_path, &imp.from_specifier, &import_index)
             {
                 let remote = imp.remote_name.as_deref().unwrap_or(&imp.symbol_name);
                 let local_id = arena.intern(&imp.symbol_name);
@@ -693,6 +725,10 @@ pub fn solve_guard_lattice_with_options(
     let mut ambiguous_dispatch_edges: HashMap<(usize, usize), Vec<NodeIndex>> = HashMap::new();
     // Phase 12A: Track CHA-resolved guard callees per caller for sound interface-wrapped guard propagation
     let mut caller_cha_guard_groups: HashMap<usize, Vec<Vec<NodeIndex>>> = HashMap::new();
+
+    let defined_symbol_ids: HashSet<SymbolId> =
+        file_symbols_map.keys().map(|&(_, sym_id)| sym_id).collect();
+    let mut resolve_cache: HashMap<(SymbolId, SymbolId), Vec<NodeIndex>> = HashMap::new();
 
     for f in summaries {
         let file_id = arena.intern(&f.rel_path);
@@ -729,9 +765,11 @@ pub fn solve_guard_lattice_with_options(
                             target_file_id,
                             member_id,
                             &file_symbols_map,
+                            &defined_symbol_ids,
                             &file_imports,
                             wildcard_id,
                             0,
+                            &mut resolve_cache,
                         );
                         for idx in resolved {
                             if !dst_indices.contains(&idx) {
@@ -873,9 +911,11 @@ pub fn solve_guard_lattice_with_options(
                                 target_file_id,
                                 remote_name_id,
                                 &file_symbols_map,
+                                &defined_symbol_ids,
                                 &file_imports,
                                 wildcard_id,
                                 0,
+                                &mut resolve_cache,
                             );
                             for idx in resolved {
                                 if !dst_indices.contains(&idx) {
@@ -887,9 +927,11 @@ pub fn solve_guard_lattice_with_options(
                                 target_file_id,
                                 callee_id,
                                 &file_symbols_map,
+                                &defined_symbol_ids,
                                 &file_imports,
                                 wildcard_id,
                                 0,
+                                &mut resolve_cache,
                             );
                             for idx in resolved {
                                 if !dst_indices.contains(&idx) {

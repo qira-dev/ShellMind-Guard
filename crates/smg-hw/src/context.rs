@@ -559,29 +559,34 @@ fn eval_define_expr(raw: &str, env: &HashMap<String, i64>) -> Option<i64> {
         return None;
     }
 
-    fn parse_bitor(toks: &[Tok], pos: &mut usize) -> Option<i64> {
-        let mut lhs = parse_bitand(toks, pos)?;
+    const MAX_EXPR_DEPTH: usize = 64;
+
+    fn parse_bitor(toks: &[Tok], pos: &mut usize, depth: usize) -> Option<i64> {
+        if depth >= MAX_EXPR_DEPTH {
+            return None;
+        }
+        let mut lhs = parse_bitand(toks, pos, depth + 1)?;
         while matches!(toks.get(*pos), Some(Tok::BitOr)) {
             *pos += 1;
-            lhs |= parse_bitand(toks, pos)?;
+            lhs |= parse_bitand(toks, pos, depth + 1)?;
         }
         Some(lhs)
     }
-    fn parse_bitand(toks: &[Tok], pos: &mut usize) -> Option<i64> {
-        let mut lhs = parse_shift(toks, pos)?;
+    fn parse_bitand(toks: &[Tok], pos: &mut usize, depth: usize) -> Option<i64> {
+        let mut lhs = parse_shift(toks, pos, depth)?;
         while matches!(toks.get(*pos), Some(Tok::BitAnd)) {
             *pos += 1;
-            lhs &= parse_shift(toks, pos)?;
+            lhs &= parse_shift(toks, pos, depth)?;
         }
         Some(lhs)
     }
-    fn parse_shift(toks: &[Tok], pos: &mut usize) -> Option<i64> {
-        let mut lhs = parse_add(toks, pos)?;
+    fn parse_shift(toks: &[Tok], pos: &mut usize, depth: usize) -> Option<i64> {
+        let mut lhs = parse_add(toks, pos, depth)?;
         while let Some(op) = toks.get(*pos) {
             match op {
                 Tok::Shl => {
                     *pos += 1;
-                    let r = parse_add(toks, pos)?;
+                    let r = parse_add(toks, pos, depth)?;
                     if !(0..63).contains(&r) {
                         return None;
                     }
@@ -589,7 +594,7 @@ fn eval_define_expr(raw: &str, env: &HashMap<String, i64>) -> Option<i64> {
                 }
                 Tok::Shr => {
                     *pos += 1;
-                    let r = parse_add(toks, pos)?;
+                    let r = parse_add(toks, pos, depth)?;
                     if !(0..63).contains(&r) {
                         return None;
                     }
@@ -600,34 +605,34 @@ fn eval_define_expr(raw: &str, env: &HashMap<String, i64>) -> Option<i64> {
         }
         Some(lhs)
     }
-    fn parse_add(toks: &[Tok], pos: &mut usize) -> Option<i64> {
-        let mut lhs = parse_mul(toks, pos)?;
+    fn parse_add(toks: &[Tok], pos: &mut usize, depth: usize) -> Option<i64> {
+        let mut lhs = parse_mul(toks, pos, depth)?;
         while let Some(op) = toks.get(*pos) {
             match op {
                 Tok::Plus => {
                     *pos += 1;
-                    lhs = lhs.checked_add(parse_mul(toks, pos)?)?;
+                    lhs = lhs.checked_add(parse_mul(toks, pos, depth)?)?;
                 }
                 Tok::Minus => {
                     *pos += 1;
-                    lhs = lhs.checked_sub(parse_mul(toks, pos)?)?;
+                    lhs = lhs.checked_sub(parse_mul(toks, pos, depth)?)?;
                 }
                 _ => break,
             }
         }
         Some(lhs)
     }
-    fn parse_mul(toks: &[Tok], pos: &mut usize) -> Option<i64> {
-        let mut lhs = parse_atom(toks, pos)?;
+    fn parse_mul(toks: &[Tok], pos: &mut usize, depth: usize) -> Option<i64> {
+        let mut lhs = parse_atom(toks, pos, depth)?;
         while let Some(op) = toks.get(*pos) {
             match op {
                 Tok::Star => {
                     *pos += 1;
-                    lhs = lhs.checked_mul(parse_atom(toks, pos)?)?;
+                    lhs = lhs.checked_mul(parse_atom(toks, pos, depth)?)?;
                 }
                 Tok::Slash => {
                     *pos += 1;
-                    let r = parse_atom(toks, pos)?;
+                    let r = parse_atom(toks, pos, depth)?;
                     if r == 0 {
                         return None;
                     }
@@ -638,7 +643,10 @@ fn eval_define_expr(raw: &str, env: &HashMap<String, i64>) -> Option<i64> {
         }
         Some(lhs)
     }
-    fn parse_atom(toks: &[Tok], pos: &mut usize) -> Option<i64> {
+    fn parse_atom(toks: &[Tok], pos: &mut usize, depth: usize) -> Option<i64> {
+        if depth >= MAX_EXPR_DEPTH {
+            return None;
+        }
         match toks.get(*pos)? {
             Tok::Num(n) => {
                 let v = *n;
@@ -647,19 +655,19 @@ fn eval_define_expr(raw: &str, env: &HashMap<String, i64>) -> Option<i64> {
             }
             Tok::Plus => {
                 *pos += 1;
-                parse_atom(toks, pos)
+                parse_atom(toks, pos, depth + 1)
             }
             Tok::Minus => {
                 *pos += 1;
-                parse_atom(toks, pos)?.checked_neg()
+                parse_atom(toks, pos, depth + 1)?.checked_neg()
             }
             Tok::BitNot => {
                 *pos += 1;
-                Some(!parse_atom(toks, pos)?)
+                Some(!parse_atom(toks, pos, depth + 1)?)
             }
             Tok::LParen => {
                 *pos += 1;
-                let v = parse_bitor(toks, pos)?;
+                let v = parse_bitor(toks, pos, depth + 1)?;
                 if !matches!(toks.get(*pos), Some(Tok::RParen)) {
                     return None;
                 }
@@ -671,7 +679,7 @@ fn eval_define_expr(raw: &str, env: &HashMap<String, i64>) -> Option<i64> {
     }
 
     let mut pos = 0;
-    let val = parse_bitor(&toks, &mut pos)?;
+    let val = parse_bitor(&toks, &mut pos, 0)?;
     (pos == toks.len()).then_some(val)
 }
 
