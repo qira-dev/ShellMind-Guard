@@ -2278,13 +2278,34 @@ pub fn append_local_static_findings(
     }
 }
 
+fn is_example_or_benchmark_path(rel_path: &str) -> bool {
+    let low = rel_path.replace('\\', "/").to_ascii_lowercase();
+    low.split('/')
+        .any(|seg| matches!(seg, "examples" | "example" | "benchmark" | "benchmarks"))
+}
+
 fn insert_static_finding(
     best: &mut HashMap<(String, String), LatticeFinding>,
     sf: &LocalStaticFinding,
 ) {
-    if smg_core::is_test_source_path(&sf.rel_path)
-        && sf.missing_guard != GuardKind::SecretPolicy
-        && !sf.rule_id.starts_with("SMG-SEC-")
+    if smg_core::is_test_source_path(&sf.rel_path) {
+        // Suppress dummy test-fixture certificates/keys and non-secret findings inside test trees
+        // while keeping real provider credential leaks (`SMG-SEC-AWS`, `SMG-SEC-STRIPE`, etc.) active.
+        let is_dummy_test_cert_or_env = matches!(
+            sf.rule_id.as_str(),
+            "SMG-SEC-KEY" | "SMG-SEC-PRIVKEY" | "SMG-SEC-ENV"
+        );
+        if is_dummy_test_cert_or_env
+            || (sf.missing_guard != GuardKind::SecretPolicy && !sf.rule_id.starts_with("SMG-SEC-"))
+        {
+            return;
+        }
+    }
+    if is_example_or_benchmark_path(&sf.rel_path)
+        && matches!(
+            sf.rule_id.as_str(),
+            "SMG-ENG-INT" | "SMG-MEM-BOUNDS" | "SMG-ENG-LEAK" | "SMG-SEC-KEY" | "SMG-SEC-ENV"
+        )
     {
         return;
     }

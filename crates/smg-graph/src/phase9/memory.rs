@@ -280,7 +280,9 @@ fn strip_sizeof_clauses(expr: &str) -> String {
     let mut i = 0usize;
     let bytes = expr.as_bytes();
     while i < bytes.len() {
-        if bytes[i..].starts_with(b"sizeof") {
+        if bytes[i..].starts_with(b"sizeof")
+            && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'))
+        {
             let mut j = i + 6;
             while j < bytes.len() && bytes[j].is_ascii_whitespace() {
                 j += 1;
@@ -302,6 +304,26 @@ fn strip_sizeof_clauses(expr: &str) -> String {
                 out.push('1');
                 i = j;
                 continue;
+            } else if j > i + 6 && j < bytes.len() {
+                // Handle unparenthesized unary `sizeof *ptr` or `sizeof var`
+                while j < bytes.len() && (bytes[j] == b'*' || bytes[j].is_ascii_whitespace()) {
+                    j += 1;
+                }
+                let ident_start = j;
+                while j < bytes.len()
+                    && (bytes[j].is_ascii_alphanumeric()
+                        || bytes[j] == b'_'
+                        || bytes[j] == b'.'
+                        || (bytes[j] == b'-' && bytes.get(j + 1) == Some(&b'>'))
+                        || (bytes[j] == b'>' && j > 0 && bytes[j - 1] == b'-'))
+                {
+                    j += 1;
+                }
+                if j > ident_start {
+                    out.push('1');
+                    i = j;
+                    continue;
+                }
             }
         }
         if let Some(ch) = expr[i..].chars().next() {
@@ -541,7 +563,7 @@ fn scan_c_cpp_function(
                         fn_name,
                         SinkKind::MemorySafety,
                         GuardKind::MemoryBounds,
-                        Confidence::Confirmed,
+                        Confidence::Heuristic,
                         "Validate `len <= sizeof(dst)` (checking signedness `len >= 0` if signed) before calling `memcpy`/`memmove`/`read`/`recv`.",
                     ));
                 }
@@ -563,8 +585,10 @@ fn scan_c_cpp_function(
                     .or_else(|| cap.get(4))
                     .map(|m| m.as_str().trim())
                     .unwrap_or("");
-                let has_arith = expr.contains('*') || expr.contains('+') || expr.contains("<<");
                 let cleaned_expr = strip_sizeof_clauses(expr);
+                let has_arith = cleaned_expr.contains('*')
+                    || cleaned_expr.contains('+')
+                    || cleaned_expr.contains("<<");
                 let non_const = ident_tok_re().captures_iter(&cleaned_expr).any(|c| {
                     let tok = &c[1];
                     tok != "sizeof"

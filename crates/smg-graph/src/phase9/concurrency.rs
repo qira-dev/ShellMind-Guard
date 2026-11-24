@@ -1147,7 +1147,7 @@ fn analyze_function_leaks(
                 }
             }
         } else {
-            // Never closed anywhere in non-factory function
+            // Never closed anywhere in non-factory function (heuristic: handle may transfer via struct/out-param)
             out.push(make_phase9_finding(
                 "SMG-ENG-LEAK",
                 "MEDIUM",
@@ -1160,7 +1160,7 @@ fn analyze_function_leaks(
                 &f.fn_name,
                 SinkKind::ResourceLeak,
                 GuardKind::ResourceCleanup,
-                Confidence::Confirmed,
+                Confidence::Heuristic,
                 "Release every acquired file/socket/DB handle with RAII, `defer`, `try-with-resources`/`using`, or `close()`/`free()`.",
             ));
         }

@@ -52,28 +52,54 @@ pub fn repo_has_hw_indicators(project_root: &Path, files: &[IndexedFile]) -> boo
         return !collect_hw_spec_files(project_root, 4, 1).is_empty();
     }
 
-    // Lightweight indicator scan on C/C++/Rust files (comment-stripped) before spinning deeper domains
-    const HW_TOKENS: &[&str] = &[
+    // Lightweight indicator scan on C/C++/Rust files (comment-stripped) before spinning deeper domains.
+    // Whole-identifier tokens require word boundaries so userspace POSIX structs like
+    // `struct __user_cap_data_struct` (nginx/Linux capabilities) do not trigger firmware mode.
+    const HW_EXACT_TOKENS: &[&str] = &[
         "__iomem",
         "ioremap",
-        "HAL_DMA_",
         "SCB_CleanDCache",
-        "NVIC_",
         "__user",
         "copy_from_user",
-        "spin_lock",
+        "spin_lock_irqsave",
         "read_volatile",
         "write_volatile",
-        "#[interrupt]",
-        "IRQHandler",
         "mmio",
         "flash_write",
         "ota_apply",
         "boot_jump",
         "pvPortMalloc",
-        "explicit_bzero",
         "jtag_key",
     ];
+    const HW_SUBSTR_TOKENS: &[&str] = &["HAL_DMA_", "NVIC_", "#[interrupt]", "IRQHandler"];
+
+    fn is_ident_byte(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b == b'_'
+    }
+
+    fn contains_exact_ident(haystack: &str, needle: &str) -> bool {
+        let bytes = haystack.as_bytes();
+        let nlen = needle.len();
+        let mut start = 0usize;
+        while let Some(rel) = haystack[start..].find(needle) {
+            let idx = start + rel;
+            let left_ok = idx == 0 || !is_ident_byte(bytes[idx - 1]);
+            let right_ok = idx + nlen >= bytes.len() || !is_ident_byte(bytes[idx + nlen]);
+            if left_ok && right_ok {
+                return true;
+            }
+            start = idx + 1;
+        }
+        false
+    }
+
+    fn has_hw_token(text: &str) -> bool {
+        HW_SUBSTR_TOKENS.iter().any(|t| text.contains(t))
+            || HW_EXACT_TOKENS
+                .iter()
+                .any(|t| contains_exact_ident(text, t))
+    }
+
     for f in files {
         if !matches!(f.language, Language::C | Language::Cpp | Language::Rust) {
             continue;
@@ -82,19 +108,19 @@ pub fn repo_has_hw_indicators(project_root: &Path, files: &[IndexedFile]) -> boo
             && let Ok(text) = std::str::from_utf8(bytes)
         {
             // Fast raw pre-check avoids comment-stripping allocation on pure Web/CLI Rust/C files.
-            if HW_TOKENS.iter().any(|t| text.contains(t)) {
+            if has_hw_token(text) {
                 let stripped = smg_graph::taint::strip_comments_simple(text);
-                if HW_TOKENS.iter().any(|t| stripped.contains(t)) {
+                if has_hw_token(&stripped) {
                     return true;
                 }
             }
         }
         if f.cached_bytes.is_none()
             && let Ok(text) = fs::read_to_string(&f.abs_path)
-            && HW_TOKENS.iter().any(|t| text.contains(t))
+            && has_hw_token(&text)
         {
             let stripped = smg_graph::taint::strip_comments_simple(&text);
-            if HW_TOKENS.iter().any(|t| stripped.contains(t)) {
+            if has_hw_token(&stripped) {
                 return true;
             }
         }
@@ -267,6 +293,28 @@ mod tests {
         assert!(!repo_has_hw_indicators(
             &dir,
             std::slice::from_ref(&comment_only_rs)
+        ));
+
+        // Userspace Linux capability struct (`__user_cap_data_struct`) must not match `__user`
+        let userspace_c = mk_mem_file(
+            "src/os/unix/ngx_process_cycle.c",
+            Language::C,
+            "void drop_caps(void) { struct __user_cap_data_struct data; explicit_bzero(&data, sizeof(data)); }\n",
+        );
+        assert!(!repo_has_hw_indicators(
+            &dir,
+            std::slice::from_ref(&userspace_c)
+        ));
+
+        // Genuine kernel `__user` annotation still triggers HW indicators
+        let kernel_c = mk_mem_file(
+            "drivers/char/dev.c",
+            Language::C,
+            "ssize_t drv_write(const char __user *buf, size_t n) { return (ssize_t)n; }\n",
+        );
+        assert!(repo_has_hw_indicators(
+            &dir,
+            std::slice::from_ref(&kernel_c)
         ));
     }
 
