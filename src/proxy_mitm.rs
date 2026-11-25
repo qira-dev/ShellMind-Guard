@@ -371,7 +371,11 @@ pub fn drive_client_handshake(
     conn: &mut rustls::ServerConnection,
     sock: &mut TcpStream,
 ) -> Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while conn.is_handshaking() {
+        if std::time::Instant::now() > deadline {
+            anyhow::bail!("client TLS handshake timed out");
+        }
         conn.complete_io(sock).context("client TLS handshake")?;
     }
     Ok(())

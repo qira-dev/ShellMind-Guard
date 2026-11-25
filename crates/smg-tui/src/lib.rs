@@ -2305,9 +2305,18 @@ fn select_finding_by_id(state: &mut TuiState, fid: &str) {
 fn export_report(state: &mut TuiState, fmt: &str) {
     let verified_vec: Vec<VerifiedFinding> = state.verified_map.values().cloned().collect();
     let dir = state.project_root.join(".shellmind-guard");
+    let is_symlink = |p: &Path| fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink());
+    if is_symlink(&dir) {
+        state.push_log(format!("Refused export: {} is a symlink", dir.display()));
+        return;
+    }
     match fmt {
         "html" => {
             let out = dir.join("report.html");
+            if is_symlink(&out) {
+                state.push_log(format!("Refused export: {} is a symlink", out.display()));
+                return;
+            }
             let html = to_html_graph(
                 &state.project_root.display().to_string(),
                 &state.graph,
@@ -2553,9 +2562,28 @@ fn spawn_bg_patch(
                 }
             };
             let smg_dir = root.join(".shellmind-guard");
-            let out_prompt = smg_dir.join(format!("patch_{}.prompt.txt", fid));
-            let _ = fs::create_dir_all(&smg_dir);
-            let _ = fs::write(&out_prompt, &prompt);
+            let safe_fid: String = fid
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            let safe_fid = if safe_fid.is_empty() {
+                "finding".to_string()
+            } else {
+                safe_fid
+            };
+            let is_symlink =
+                |p: &Path| fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink());
+            let out_prompt = smg_dir.join(format!("patch_{}.prompt.txt", safe_fid));
+            if !is_symlink(&smg_dir) && !is_symlink(&out_prompt) {
+                let _ = fs::create_dir_all(&smg_dir);
+                let _ = fs::write(&out_prompt, &prompt);
+            }
 
             let mut diff_out: Option<String> = None;
             let mut note = format!(
@@ -2571,8 +2599,10 @@ fn spawn_bg_patch(
                     Ok(provider) => {
                         match generate_patch_plan(&provider, &root, &cur, v_opt.as_ref()) {
                             Ok(Some(plan)) => {
-                                let out_diff = smg_dir.join(format!("patch_{}.diff", fid));
-                                let _ = fs::write(&out_diff, &plan);
+                                let out_diff = smg_dir.join(format!("patch_{}.diff", safe_fid));
+                                if !is_symlink(&smg_dir) && !is_symlink(&out_diff) {
+                                    let _ = fs::write(&out_diff, &plan);
+                                }
                                 note = format!(
                                     "Generated AI diff ({} B) & context -> {} ([a] Apply-Check)",
                                     plan.len(),

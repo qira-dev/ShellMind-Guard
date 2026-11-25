@@ -3970,19 +3970,41 @@ fn parse_git_commit_invocation_bounded(cmd_str: &str, depth: usize) -> Option<Pa
     let mut current_cd: Option<PathBuf> = None;
     let dq_subs = extract_double_quoted_substitutions(cmd_str);
     for mut tokens in split_shell_commands(cmd_str) {
-        while let Some(first) = tokens.first() {
+        while let Some(first) = tokens.first().cloned() {
             let is_env_assign = first.contains('=')
                 && !first.starts_with('-')
                 && !first.starts_with('/')
                 && !first.starts_with('.');
             let first_norm = first.replace('\\', "");
-            if is_env_assign
-                || matches!(
-                    first_norm.as_str(),
-                    "sudo" | "env" | "command" | "nohup" | "$" | "&"
-                )
-            {
+            if is_env_assign {
+                if let Some(wt) = first.strip_prefix("GIT_WORK_TREE=")
+                    && !wt.is_empty()
+                {
+                    current_cd = Some(PathBuf::from(wt));
+                }
                 tokens.remove(0);
+            } else if matches!(
+                first_norm.as_str(),
+                "sudo" | "env" | "command" | "nohup" | "$" | "&"
+            ) {
+                tokens.remove(0);
+                // Consume wrapper options like `env -i`, `env -u VAR`, `sudo -E`, `sudo -u user`, `command -p`
+                while let Some(opt) = tokens.first() {
+                    if opt == "--" {
+                        tokens.remove(0);
+                        break;
+                    }
+                    if matches!(opt.as_str(), "-u" | "-g" | "-C" | "--unset" | "--chdir") {
+                        tokens.remove(0);
+                        if !tokens.is_empty() {
+                            tokens.remove(0);
+                        }
+                    } else if opt.starts_with('-') && opt.len() > 1 {
+                        tokens.remove(0);
+                    } else {
+                        break;
+                    }
+                }
             } else {
                 break;
             }
@@ -4212,10 +4234,34 @@ fn resolve_hook_scan_path(target_repo: &Path, hook_cwd: Option<&Path>) -> Option
 fn handle_claude_pre_commit() -> Result<ExitCode> {
     use std::io::Read;
     const MAX_HOOK_STDIN_BYTES: u64 = 1024 * 1024;
-    let mut stdin_buf = String::new();
-    let _ = std::io::stdin()
-        .take(MAX_HOOK_STDIN_BYTES)
-        .read_to_string(&mut stdin_buf);
+    let mut raw_bytes = Vec::new();
+    if let Err(e) = std::io::stdin()
+        .take(MAX_HOOK_STDIN_BYTES + 1)
+        .read_to_end(&mut raw_bytes)
+    {
+        eprintln!(
+            "[ShellMind Guard] Failed reading hook stdin (failing closed): {}",
+            e
+        );
+        return Ok(ExitCode::from(2));
+    }
+    if raw_bytes.len() as u64 > MAX_HOOK_STDIN_BYTES {
+        eprintln!(
+            "[ShellMind Guard] Hook stdin exceeded {} byte limit (failing closed)",
+            MAX_HOOK_STDIN_BYTES
+        );
+        return Ok(ExitCode::from(2));
+    }
+    let stdin_buf = match String::from_utf8(raw_bytes) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "[ShellMind Guard] Invalid UTF-8 hook payload on stdin (failing closed): {}",
+                e
+            );
+            return Ok(ExitCode::from(2));
+        }
+    };
     let payload_opt = match serde_json::from_str::<serde_json::Value>(&stdin_buf) {
         Ok(v) => Some(v),
         Err(e) => {

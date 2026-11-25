@@ -415,11 +415,16 @@ impl App {
     fn selected(&self) -> Option<Arc<ProxyEntry>> {
         let entries = self.entries.lock().ok()?;
         let idx = self.list_state.selected()?;
-        entries.get(idx).cloned()
+        let display_len = entries.len().min(500);
+        if idx >= display_len {
+            return None;
+        }
+        let logical_idx = entries.len().checked_sub(1 + idx)?;
+        entries.get(logical_idx).cloned()
     }
 
     fn select_next(&mut self, delta: i64) {
-        let len = self.entries.lock().map(|e| e.len()).unwrap_or(0);
+        let len = self.entries.lock().map(|e| e.len().min(500)).unwrap_or(0);
         if len == 0 {
             return;
         }
@@ -442,7 +447,7 @@ impl App {
         };
         let len = self.entries.lock().map(|e| e.len()).unwrap_or(0);
         if len > 0 {
-            self.list_state.select(Some(len - 1));
+            self.list_state.select(Some(0));
         }
         self.status_message = Some(format!("entry #{id} captured"));
     }
@@ -958,12 +963,26 @@ pub fn run_proxy_tui(
                             app.status_message = Some("nothing selected".into());
                             continue;
                         };
-                        let client = Client::builder()
+                        let is_lab = reqwest::Url::parse(&entry.url)
+                            .ok()
+                            .and_then(|u| u.host_str().map(|s| s.to_ascii_lowercase()))
+                            .is_some_and(|h| {
+                                let clean = h.trim_matches(['[', ']']);
+                                clean == "localhost"
+                                    || clean.ends_with(".localhost")
+                                    || clean.parse::<std::net::IpAddr>().is_ok_and(|ip| {
+                                        ip.is_loopback()
+                                            || matches!(ip, std::net::IpAddr::V4(v4) if v4.is_private())
+                                    })
+                            });
+                        let mut cb = Client::builder()
                             .timeout(Duration::from_secs(10))
-                            .redirect(reqwest::redirect::Policy::none())
-                            // Replayer targets the user's own lab app only.
-                            .danger_accept_invalid_certs(true) // smg-ignore: SMG-CFG-TLS
-                            .build()?;
+                            .redirect(reqwest::redirect::Policy::none());
+                        if is_lab {
+                            // Only accept self-signed certs for local loopback/RFC1918 lab hosts.
+                            cb = cb.danger_accept_invalid_certs(true); // smg-ignore: SMG-CFG-TLS
+                        }
+                        let client = cb.build()?;
                         match replay_entry(&client, &entry) {
                             Ok(replayed) => {
                                 app.push_entry(replayed);

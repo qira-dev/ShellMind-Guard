@@ -2,8 +2,7 @@ use crate::{ScanRunOptions, execute_scan_pipeline, write_ci_workflow};
 use anyhow::Result;
 use serde_json::{Value, json};
 use smg_ai::build_minimal_patch_prompt;
-use smg_core::{ShellMindGuardConfig, StateStore, scan_repository};
-use smg_graph::{analyze_codebase_cached, collect_deep_schema_findings};
+use smg_core::ShellMindGuardConfig;
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
@@ -444,14 +443,23 @@ fn handle_tool_call(params: &Value) -> Result<Value> {
                 .ok_or_else(|| anyhow::anyhow!("Missing required argument `finding_id`"))?;
             let root =
                 validate_mcp_target_path(args.get("path").and_then(|v| v.as_str()).unwrap_or("."))?;
-            let cfg = ShellMindGuardConfig::load_trusted_from_dir(&root, false)?;
-            let summary = scan_repository(&root, &cfg)?;
-            let mut store = StateStore::open(&root)?;
-            let _ = store.sync_files(&summary.files)?;
-            let graph = analyze_codebase_cached(&summary.files, &cfg, &mut store)?;
-            let deep_findings = collect_deep_schema_findings(&graph);
-            let mut findings = graph.findings;
-            findings.extend(deep_findings);
+            let outcome = execute_scan_pipeline(ScanRunOptions {
+                path: &root,
+                layers: &[],
+                min_confidence: None,
+                boot_cmd: None,
+                port: 39911,
+                sync_race: 12,
+                unsafe_host_fallback: false,
+                trust_repo_config: false,
+                deep: true,
+                deep_audit: false,
+                sandbox_mem_mb: None,
+                sandbox_tls: false,
+                mock_shims: false,
+                cgroup_v2: false,
+            })?;
+            let findings = outcome.graph.findings;
             let finding = findings
                 .iter()
                 .find(|f| f.id.eq_ignore_ascii_case(finding_id))
@@ -506,16 +514,29 @@ fn handle_tool_call(params: &Value) -> Result<Value> {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             let cfg_target = root.join(".shellmind-guard.toml");
+            let is_symlink =
+                |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink());
+            if is_symlink(&cfg_target) {
+                anyhow::bail!(
+                    "Refusing to overwrite symlinked config target {}",
+                    cfg_target.display()
+                );
+            }
             if cfg_target.exists() && !overwrite {
                 anyhow::bail!(
                     "{} already exists (pass overwrite: true to replace)",
                     cfg_target.display()
                 );
             }
-            let wf_target = root
-                .join(".github")
-                .join("workflows")
-                .join("shellmind-guard.yml");
+            let gh_dir = root.join(".github");
+            let wf_dir = gh_dir.join("workflows");
+            let wf_target = wf_dir.join("shellmind-guard.yml");
+            if ci && (is_symlink(&gh_dir) || is_symlink(&wf_dir) || is_symlink(&wf_target)) {
+                anyhow::bail!(
+                    "Refusing to write CI workflow through symlink under {}",
+                    gh_dir.display()
+                );
+            }
             if ci && wf_target.exists() && !overwrite {
                 anyhow::bail!(
                     "{} already exists (pass overwrite: true to replace)",
