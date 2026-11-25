@@ -804,56 +804,73 @@ pub fn emit_smtlib2(constraints: &[PathConstraint]) -> String {
         collect_smt_vars(c, &mut bool_vars, &mut int_vars, &mut str_vars);
     }
 
-    // Build collision-free bijection from source variable name -> unique SMT-LIB2 identifier
-    let mut all_names: Vec<String> = bool_vars
-        .iter()
-        .chain(int_vars.iter())
-        .chain(str_vars.iter())
-        .cloned()
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect();
-    all_names.sort();
-    let mut ident_map: HashMap<String, String> = HashMap::with_capacity(all_names.len());
-    let mut used_idents: HashSet<String> = HashSet::with_capacity(all_names.len());
-    for name in all_names {
-        let base = sanitize_smt_ident(&name);
-        let unique = if used_idents.insert(base.clone()) {
-            base
-        } else {
-            let mut suffix = 2usize;
+    // Build collision-free, sort-disambiguated SMT-LIB2 identifiers keyed by (sort_tag, var_name)
+    // so a variable used in multiple sorts (e.g. Int and Bool/String) never emits duplicate
+    // `(declare-const x ...)` statements.
+    const SORT_INT: u8 = 0;
+    const SORT_BOOL: u8 = 1;
+    const SORT_STR: u8 = 2;
+
+    let mut ident_map: HashMap<(u8, String), String> = HashMap::new();
+    let mut declared: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut alloc_ident = |sort: u8, name: &str| -> String {
+        let base = sanitize_smt_ident(name);
+        let preferred = if !declared.contains(&base) {
+            base.clone()
+        } else if sort == SORT_INT {
+            let mut idx = 2usize;
             loop {
-                let cand = format!("{base}_{suffix}");
-                if used_idents.insert(cand.clone()) {
+                let cand = format!("{base}_{idx}");
+                if !declared.contains(&cand) {
                     break cand;
                 }
-                suffix += 1;
+                idx += 1;
+            }
+        } else {
+            let suffix = match sort {
+                SORT_BOOL => "__bool",
+                SORT_STR => "__str",
+                _ => "__int",
+            };
+            let tagged = format!("{base}{suffix}");
+            if !declared.contains(&tagged) {
+                tagged
+            } else {
+                let mut idx = 2usize;
+                loop {
+                    let cand = format!("{base}{suffix}_{idx}");
+                    if !declared.contains(&cand) {
+                        break cand;
+                    }
+                    idx += 1;
+                }
             }
         };
-        ident_map.insert(name, unique);
-    }
+        declared.insert(preferred.clone());
+        preferred
+    };
 
     let mut out = String::from("(set-logic ALL)\n");
-    let mut b_sorted: Vec<_> = bool_vars.into_iter().collect();
-    b_sorted.sort();
-    for v in &b_sorted {
-        if let Some(id) = ident_map.get(v) {
-            out.push_str(&format!("(declare-const {id} Bool)\n"));
-        }
-    }
     let mut i_sorted: Vec<_> = int_vars.into_iter().collect();
     i_sorted.sort();
     for v in &i_sorted {
-        if let Some(id) = ident_map.get(v) {
-            out.push_str(&format!("(declare-const {id} Int)\n"));
-        }
+        let id = alloc_ident(SORT_INT, v);
+        ident_map.insert((SORT_INT, v.clone()), id.clone());
+        out.push_str(&format!("(declare-const {id} Int)\n"));
+    }
+    let mut b_sorted: Vec<_> = bool_vars.into_iter().collect();
+    b_sorted.sort();
+    for v in &b_sorted {
+        let id = alloc_ident(SORT_BOOL, v);
+        ident_map.insert((SORT_BOOL, v.clone()), id.clone());
+        out.push_str(&format!("(declare-const {id} Bool)\n"));
     }
     let mut s_sorted: Vec<_> = str_vars.into_iter().collect();
     s_sorted.sort();
     for v in &s_sorted {
-        if let Some(id) = ident_map.get(v) {
-            out.push_str(&format!("(declare-const {id} String)\n"));
-        }
+        let id = alloc_ident(SORT_STR, v);
+        ident_map.insert((SORT_STR, v.clone()), id.clone());
+        out.push_str(&format!("(declare-const {id} String)\n"));
     }
 
     for c in constraints {
@@ -908,22 +925,25 @@ fn escape_smt_string(raw: &str) -> String {
     raw.replace('"', "\"\"")
 }
 
-fn lookup_smt_ident(raw: &str, ident_map: &HashMap<String, String>) -> String {
+fn lookup_smt_ident(sort: u8, raw: &str, ident_map: &HashMap<(u8, String), String>) -> String {
     ident_map
-        .get(raw)
+        .get(&(sort, raw.to_string()))
         .cloned()
         .unwrap_or_else(|| sanitize_smt_ident(raw))
 }
 
-fn constraint_to_smt2(c: &PathConstraint, ident_map: &HashMap<String, String>) -> String {
+fn constraint_to_smt2(c: &PathConstraint, ident_map: &HashMap<(u8, String), String>) -> String {
+    const SORT_INT: u8 = 0;
+    const SORT_BOOL: u8 = 1;
+    const SORT_STR: u8 = 2;
     match c {
         PathConstraint::ConstBool(b) => if *b { "true" } else { "false" }.to_string(),
         PathConstraint::BoolLit { name, value } => {
-            let id = lookup_smt_ident(name, ident_map);
+            let id = lookup_smt_ident(SORT_BOOL, name, ident_map);
             if *value { id } else { format!("(not {id})") }
         }
         PathConstraint::IntCmp { var, op, value } => {
-            let id = lookup_smt_ident(var, ident_map);
+            let id = lookup_smt_ident(SORT_INT, var, ident_map);
             let lit = if *value < 0 {
                 format!("(- {})", value.unsigned_abs())
             } else {
@@ -935,12 +955,12 @@ fn constraint_to_smt2(c: &PathConstraint, ident_map: &HashMap<String, String>) -
             format!(
                 "({} {} {})",
                 op.smt2_op(),
-                lookup_smt_ident(lhs, ident_map),
-                lookup_smt_ident(rhs, ident_map)
+                lookup_smt_ident(SORT_INT, lhs, ident_map),
+                lookup_smt_ident(SORT_INT, rhs, ident_map)
             )
         }
         PathConstraint::StrEq { var, literal, eq } => {
-            let id = lookup_smt_ident(var, ident_map);
+            let id = lookup_smt_ident(SORT_STR, var, ident_map);
             let esc = escape_smt_string(literal);
             if *eq {
                 format!("(= {id} \"{esc}\")")
@@ -1254,6 +1274,42 @@ fn collect_mutated_vars_in_subtree(
             .to_string();
         if is_valid_var_expr(&cleaned) {
             out.insert(cleaned);
+        }
+    } else if matches!(
+        k,
+        "reference_expression" | "unary_expression" | "pointer_expression"
+    ) {
+        // Invalidate variables passed by mutable/pointer reference (`&mut x`, `&x`)
+        let raw = node_text(node, src).trim();
+        if let Some(after_amp) = raw.strip_prefix('&') {
+            let cleaned = after_amp
+                .trim()
+                .strip_prefix("mut")
+                .map(str::trim)
+                .unwrap_or_else(|| after_amp.trim())
+                .trim_start_matches('*')
+                .trim();
+            if is_valid_var_expr(cleaned) {
+                out.insert(cleaned.to_string());
+                out.insert(format!("{cleaned}_len"));
+            }
+        }
+    } else if matches!(k, "call_expression" | "method_invocation") {
+        // Invalidate receiver `obj` and length aliases on mutating container methods
+        let raw = node_text(node, src).trim();
+        const MUTATING_METHODS: &[&str] = &[
+            ".push(", ".pop(", ".clear(", ".resize(", ".append(", ".insert(", ".remove(",
+        ];
+        for pat in MUTATING_METHODS {
+            if let Some(pos) = raw.find(pat) {
+                let recv = raw[..pos].trim().trim_start_matches('*').trim();
+                if is_valid_var_expr(recv) {
+                    out.insert(recv.to_string());
+                    out.insert(format!("{recv}_len"));
+                    out.insert(format!("{recv}.len()"));
+                    out.insert(format!("{recv}.length"));
+                }
+            }
         }
     }
     let mut cursor = node.walk();

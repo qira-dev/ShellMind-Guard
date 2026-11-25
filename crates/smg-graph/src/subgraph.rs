@@ -82,6 +82,9 @@ pub fn should_force_full_scan_on_diff(changed: &HashSet<String>) -> bool {
                     | ".gitignore"
                     | "dockerfile"
             )
+            || fname.ends_with(".tfvars")
+            || fname == "variables.tf"
+            || fname.ends_with(".auto.tfvars.json")
             || low.contains("/middleware/")
             || low.contains("/auth/")
             || low.contains("/guards/")

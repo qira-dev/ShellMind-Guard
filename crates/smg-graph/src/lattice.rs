@@ -546,6 +546,17 @@ pub fn solve_guard_lattice_with_options(
     public_routes: &[String],
     deep_audit: bool,
 ) -> GraphAnalysisResult {
+    solve_guard_lattice_with_slice_mode(summaries, public_routes, deep_audit, false)
+}
+
+/// Global Cross-File Call Graph + Guard-Set Lattice with slice-mode flag (`is_partial_slice`
+/// suppresses whole-repo contract rules like `SMG-FE-404` when running on a `--changed-since` subset).
+pub fn solve_guard_lattice_with_slice_mode(
+    summaries: &[FileAstSummary],
+    public_routes: &[String],
+    deep_audit: bool,
+    is_partial_slice: bool,
+) -> GraphAnalysisResult {
     let max_cha_targets: usize = if deep_audit { 64 } else { 8 };
     let max_witness_hops: usize = if deep_audit { 256 } else { 64 };
 
@@ -1215,6 +1226,7 @@ pub fn solve_guard_lattice_with_options(
     let mut unrestricted_taint_mask: Vec<u8> = vec![0; node_count];
     let mut taint_field_masks: Vec<HashMap<String, u8>> = vec![HashMap::new(); node_count];
     let mut has_field_restriction: Vec<bool> = vec![false; node_count];
+    let mut kcfa_table = crate::cfa_ssa::KCfaContextTable::default();
     let mut taint_q = VecDeque::new();
 
     #[allow(clippy::too_many_arguments)]
@@ -1231,6 +1243,7 @@ pub fn solve_guard_lattice_with_options(
          unrestricted_taint_mask: &mut [u8],
          taint_field_masks: &mut [HashMap<String, u8>],
          has_field_restriction: &mut [bool],
+         kcfa_table: &mut crate::cfa_ssa::KCfaContextTable,
          taint_q: &mut VecDeque<NodeIndex>| {
             if out_mask == 0 {
                 return;
@@ -1241,6 +1254,13 @@ pub fn solve_guard_lattice_with_options(
             if let Some(vs) = resolved_callee_map.get(&(src_node.index(), cid)) {
                 for &v in vs {
                     let vi = v.index();
+                    let _ = kcfa_table.propagate_call(
+                        src_node.index() as u32,
+                        crate::cfa_ssa::CallString2::default(),
+                        vi as u32,
+                        0,
+                        out_mask as u32,
+                    );
                     if taint_parents[vi].is_none() {
                         taint_parents[vi] = Some(src_node);
                     }
@@ -1331,6 +1351,7 @@ pub fn solve_guard_lattice_with_options(
                     &mut unrestricted_taint_mask,
                     &mut taint_field_masks,
                     &mut has_field_restriction,
+                    &mut kcfa_table,
                     &mut taint_q,
                 );
             }
@@ -1411,6 +1432,7 @@ pub fn solve_guard_lattice_with_options(
                 &mut unrestricted_taint_mask,
                 &mut taint_field_masks,
                 &mut has_field_restriction,
+                &mut kcfa_table,
                 &mut taint_q,
             );
         }
@@ -1447,6 +1469,7 @@ pub fn solve_guard_lattice_with_options(
                 &mut unrestricted_taint_mask,
                 &mut taint_field_masks,
                 &mut has_field_restriction,
+                &mut kcfa_table,
                 &mut taint_q,
             );
             if !graph[w].tainted_field_calls.contains_key(callee)
@@ -1466,6 +1489,7 @@ pub fn solve_guard_lattice_with_options(
                     &mut unrestricted_taint_mask,
                     &mut taint_field_masks,
                     &mut has_field_restriction,
+                    &mut kcfa_table,
                     &mut taint_q,
                 );
             }
@@ -1525,7 +1549,7 @@ pub fn solve_guard_lattice_with_options(
     let repo_bearer_only = repo_has_bearer_auth && !repo_has_cookie_session;
 
     // Deduplicate on the fly by (entry_route, rule_id)
-    let mut best_by_key: HashMap<(String, String), LatticeFinding> = HashMap::new();
+    let mut best_by_key: HashMap<(String, String, String), LatticeFinding> = HashMap::new();
 
     // Helper: returns true if a witness path traverses an ambiguous polymorphic dispatch edge
     // where NOT all concrete sibling targets share the vulnerability/missing guard (Zero-Hallucination gate).
@@ -1726,6 +1750,27 @@ pub fn solve_guard_lattice_with_options(
                 }
                 if reachable[vi] && active_guards.contains(hit.missing_guard) {
                     continue;
+                }
+                // Phase 27B: k-CFA (k=1) context check on direct helper caller edge so clean callers
+                // sharing a 1-hop helper do not cross-contaminate when per-param taint summary is ambiguous.
+                if let Some(direct_parent) = taint_bit_parents[vi]
+                    .get(req_bit.trailing_zeros() as usize)
+                    .copied()
+                    .flatten()
+                    .or(taint_parents[vi])
+                {
+                    let ctx_key = crate::cfa_ssa::ContextKey {
+                        func_id: vi as u32,
+                        ctx: crate::cfa_ssa::CallString2 {
+                            caller: Some(direct_parent.index() as u32),
+                            grand_caller: None,
+                        },
+                    };
+                    if let Some((_, ctx_taint)) = kcfa_table.get(&ctx_key)
+                        && (ctx_taint & (req_bit as u32)) == 0
+                    {
+                        continue;
+                    }
                 }
                 if let Some((entry_route, mut witness)) = reconstruct_taint_witness(
                     &graph,
@@ -1928,7 +1973,8 @@ pub fn solve_guard_lattice_with_options(
     }
 
     // Layer 2d: Frontend <-> Backend API Contract Check (`SMG-FE-404`)
-    if route_entries > 0 {
+    // Suppressed on `--changed-since` partial slices where unchanged backend routes are excluded.
+    if route_entries > 0 && !is_partial_slice {
         let mut all_prefixes: Vec<String> = Vec::new();
         for f in summaries {
             for p in &f.route_prefixes {
@@ -2023,10 +2069,8 @@ pub fn solve_guard_lattice_with_options(
                 });
                 let matched = exact_match || wildcard_match;
                 if !matched {
-                    let key = (
-                        format!("{}:{}", call.rel_path, call.line),
-                        "SMG-FE-404".to_string(),
-                    );
+                    let sink_loc = format!("{}:{}", call.rel_path, call.line);
+                    let key = (sink_loc.clone(), "SMG-FE-404".to_string(), sink_loc);
                     best_by_key.entry(key).or_insert_with(|| LatticeFinding {
                         id: String::new(),
                         rule_id: "SMG-FE-404".into(),
@@ -2206,10 +2250,30 @@ pub fn solve_guard_lattice_with_options(
     }
 }
 
-fn insert_shorter(best: &mut HashMap<(String, String), LatticeFinding>, cand: LatticeFinding) {
-    let key = (cand.entry_route.clone(), cand.rule_id.clone());
+fn confidence_rank(c: Confidence) -> u8 {
+    match c {
+        Confidence::Proven => 3,
+        Confidence::Confirmed => 2,
+        Confidence::Heuristic => 1,
+    }
+}
+
+fn finding_priority(f: &LatticeFinding) -> (u8, u8, usize) {
+    (
+        confidence_rank(f.confidence),
+        4u8.saturating_sub(severity_rank(&f.severity)),
+        usize::MAX - f.witness_path.len(),
+    )
+}
+
+fn insert_shorter(
+    best: &mut HashMap<(String, String, String), LatticeFinding>,
+    cand: LatticeFinding,
+) {
+    let sink_loc = format!("{}:{}", cand.file, cand.line);
+    let key = (cand.entry_route.clone(), cand.rule_id.clone(), sink_loc);
     let replace = match best.get(&key) {
-        Some(prev) => cand.witness_path.len() < prev.witness_path.len(),
+        Some(prev) => finding_priority(&cand) > finding_priority(prev),
         None => true,
     };
     if replace {
@@ -2355,7 +2419,7 @@ fn is_example_or_benchmark_path(rel_path: &str) -> bool {
 }
 
 fn insert_static_finding(
-    best: &mut HashMap<(String, String), LatticeFinding>,
+    best: &mut HashMap<(String, String, String), LatticeFinding>,
     sf: &LocalStaticFinding,
 ) {
     if smg_core::is_test_source_path(&sf.rel_path) {
@@ -2385,8 +2449,8 @@ fn insert_static_finding(
     } else {
         sf.rule_id.clone()
     };
-    let key = (entry_route.clone(), dedup_rule_key);
-    best.entry(key).or_insert_with(|| LatticeFinding {
+    let key = (entry_route.clone(), dedup_rule_key, entry_route.clone());
+    let cand = LatticeFinding {
         id: String::new(),
         rule_id: sf.rule_id.clone(),
         severity: sf.severity.clone(),
@@ -2405,7 +2469,14 @@ fn insert_static_finding(
         }],
         remediation: sf.remediation.clone(),
         proof_reasons: proof_reasons_for_static_rule(&sf.rule_id, sf.confidence),
-    });
+    };
+    let replace = match best.get(&key) {
+        Some(prev) => finding_priority(&cand) > finding_priority(prev),
+        None => true,
+    };
+    if replace {
+        best.insert(key, cand);
+    }
 }
 
 struct BfsTree {
@@ -2415,7 +2486,7 @@ struct BfsTree {
 }
 
 fn can_improve_witness(
-    best: &HashMap<(String, String), LatticeFinding>,
+    best: &HashMap<(String, String, String), LatticeFinding>,
     graph: &DiGraph<SymbolInfo, ()>,
     tree: &BfsTree,
     sink: NodeIndex,
@@ -2426,9 +2497,12 @@ fn can_improve_witness(
         return false;
     };
     let entry_name = &graph[root_idx].name;
+    let sink_loc = format!("{}:{}", graph[sink].rel_path, graph[sink].line_start);
     let cand_len = tree.depth[si].min(graph.node_count().min(64));
-    match best.get(&(entry_name.clone(), rule_id.to_string())) {
-        Some(prev) => cand_len < prev.witness_path.len(),
+    match best.get(&(entry_name.clone(), rule_id.to_string(), sink_loc)) {
+        Some(prev) => {
+            cand_len < prev.witness_path.len() || prev.confidence == Confidence::Heuristic
+        }
         None => true,
     }
 }

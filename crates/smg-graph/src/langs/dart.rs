@@ -39,10 +39,13 @@ pub(crate) const PROFILE: LangProfile = LangProfile {
 };
 
 pub(crate) fn extract(root: Node, ctx: &mut ExtractContext<'_>) {
-    walk_node(root, ctx);
+    walk_node(root, ctx, 0);
 }
 
-fn walk_node(node: Node, ctx: &mut ExtractContext<'_>) {
+fn walk_node(node: Node, ctx: &mut ExtractContext<'_>, depth: usize) {
+    if depth >= crate::taint::MAX_AST_WALK_DEPTH {
+        return;
+    }
     let k = node.kind();
 
     if k == "import_or_export" || k == "library_import" {
@@ -74,7 +77,7 @@ fn walk_node(node: Node, ctx: &mut ExtractContext<'_>) {
             return;
         }
         if let Some(body) = node.child_by_field_name("body") {
-            walk_block_members(body, ctx);
+            walk_block_members(body, ctx, depth + 1);
         }
         return;
     }
@@ -84,12 +87,12 @@ fn walk_node(node: Node, ctx: &mut ExtractContext<'_>) {
         && let Some(sig) = node.child_by_field_name("signature")
     {
         let body = node.child_by_field_name("body");
-        extract_dart_callable(sig, body, node, ctx);
+        extract_dart_callable(sig, body, node, ctx, depth + 1);
         return;
     }
 
     if matches!(k, "program" | "source_file" | "block") {
-        walk_block_members(node, ctx);
+        walk_block_members(node, ctx, depth + 1);
         return;
     }
 
@@ -99,11 +102,14 @@ fn walk_node(node: Node, ctx: &mut ExtractContext<'_>) {
 
     let mut c = node.walk();
     for ch in node.children(&mut c) {
-        walk_node(ch, ctx);
+        walk_node(ch, ctx, depth + 1);
     }
 }
 
-fn walk_block_members(container: Node, ctx: &mut ExtractContext<'_>) {
+fn walk_block_members(container: Node, ctx: &mut ExtractContext<'_>, depth: usize) {
+    if depth >= crate::taint::MAX_AST_WALK_DEPTH {
+        return;
+    }
     let mut cursor = container.walk();
     let children: Vec<Node> = container.children(&mut cursor).collect();
     let mut i = 0;
@@ -113,11 +119,11 @@ fn walk_block_members(container: Node, ctx: &mut ExtractContext<'_>) {
             && i + 1 < children.len()
             && children[i + 1].kind() == "function_body"
         {
-            extract_dart_callable(ch, Some(children[i + 1]), ch, ctx);
+            extract_dart_callable(ch, Some(children[i + 1]), ch, ctx, depth + 1);
             i += 2;
             continue;
         }
-        walk_node(ch, ctx);
+        walk_node(ch, ctx, depth + 1);
         i += 1;
     }
 }
@@ -127,6 +133,7 @@ fn extract_dart_callable(
     body: Option<Node>,
     full_node: Node,
     ctx: &mut ExtractContext<'_>,
+    depth: usize,
 ) {
     let fn_sig = if sig.kind() == "method_signature" {
         sig.named_children(&mut sig.walk())
@@ -192,7 +199,7 @@ fn extract_dart_callable(
     ctx.symbols.push(sym);
 
     if let Some(b) = body {
-        walk_node(b, ctx);
+        walk_node(b, ctx, depth + 1);
     }
 }
 

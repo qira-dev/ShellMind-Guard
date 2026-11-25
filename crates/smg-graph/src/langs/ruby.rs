@@ -186,20 +186,29 @@ pub(crate) fn extract(root: Node, ctx: &mut ExtractContext<'_>) {
         .replace('\\', "/")
         .to_ascii_lowercase()
         .ends_with("routes.rb");
-    walk_program(root, ctx, is_routes_file, "");
+    walk_program(root, ctx, is_routes_file, "", 0);
 }
 
-fn walk_program(node: Node, ctx: &mut ExtractContext<'_>, is_routes_file: bool, prefix: &str) {
+fn walk_program(
+    node: Node,
+    ctx: &mut ExtractContext<'_>,
+    is_routes_file: bool,
+    prefix: &str,
+    depth: usize,
+) {
+    if depth >= crate::taint::MAX_AST_WALK_DEPTH {
+        return;
+    }
     let mut c = node.walk();
     for ch in node.children(&mut c) {
         match ch.kind() {
             "module" => {
                 if let Some(body) = ch.child_by_field_name("body") {
-                    walk_program(body, ctx, is_routes_file, prefix);
+                    walk_program(body, ctx, is_routes_file, prefix, depth + 1);
                 }
             }
             "class" => {
-                extract_class(ch, ctx);
+                extract_class(ch, ctx, depth + 1);
             }
             "method" | "singleton_method" => {
                 if let Some(sym) = extract_ruby_method(ch, ctx, false, None) {
@@ -207,10 +216,10 @@ fn walk_program(node: Node, ctx: &mut ExtractContext<'_>, is_routes_file: bool, 
                 }
             }
             "call" => {
-                handle_top_call(ch, ctx, is_routes_file, prefix);
+                handle_top_call(ch, ctx, is_routes_file, prefix, depth + 1);
             }
             _ => {
-                walk_program(ch, ctx, is_routes_file, prefix);
+                walk_program(ch, ctx, is_routes_file, prefix, depth + 1);
             }
         }
     }
@@ -233,7 +242,16 @@ fn find_block_body(block: Node) -> Option<Node> {
     })
 }
 
-fn handle_top_call(node: Node, ctx: &mut ExtractContext<'_>, is_routes_file: bool, prefix: &str) {
+fn handle_top_call(
+    node: Node,
+    ctx: &mut ExtractContext<'_>,
+    is_routes_file: bool,
+    prefix: &str,
+    depth: usize,
+) {
+    if depth >= crate::taint::MAX_AST_WALK_DEPTH {
+        return;
+    }
     let Some(method_node) = node.child_by_field_name("method") else {
         return;
     };
@@ -288,7 +306,7 @@ fn handle_top_call(node: Node, ctx: &mut ExtractContext<'_>, is_routes_file: boo
             }
         }
         if let Some(body) = find_block_body(block) {
-            walk_program(body, ctx, is_routes_file, &next_prefix);
+            walk_program(body, ctx, is_routes_file, &next_prefix, depth + 1);
         }
         return;
     }
@@ -406,11 +424,14 @@ fn handle_top_call(node: Node, ctx: &mut ExtractContext<'_>, is_routes_file: boo
     if let Some(block) = find_call_block(node)
         && let Some(body) = find_block_body(block)
     {
-        walk_program(body, ctx, is_routes_file, prefix);
+        walk_program(body, ctx, is_routes_file, prefix, depth + 1);
     }
 }
 
-fn extract_class(node: Node, ctx: &mut ExtractContext<'_>) {
+fn extract_class(node: Node, ctx: &mut ExtractContext<'_>, depth: usize) {
+    if depth >= crate::taint::MAX_AST_WALK_DEPTH {
+        return;
+    }
     let class_name = node
         .child_by_field_name("name")
         .map(|n| node_text(n, ctx.src).trim().to_string())
@@ -426,7 +447,7 @@ fn extract_class(node: Node, ctx: &mut ExtractContext<'_>) {
     };
 
     let mut filters = ControllerFilters::default();
-    collect_controller_filters(body, ctx.src, &mut filters);
+    collect_controller_filters(body, ctx.src, &mut filters, depth + 1);
     if filters.csrf_global {
         ctx.file_middleware_guards.insert(GuardKind::CsrfProtection);
     }
@@ -445,10 +466,10 @@ fn extract_class(node: Node, ctx: &mut ExtractContext<'_>) {
             continue;
         }
         match kind {
-            "class" => extract_class(ch, ctx),
+            "class" => extract_class(ch, ctx, depth + 1),
             "module" => {
                 if let Some(sub_body) = ch.child_by_field_name("body") {
-                    walk_program(sub_body, ctx, false, "");
+                    walk_program(sub_body, ctx, false, "", depth + 1);
                 }
             }
             "method" | "singleton_method" => {
@@ -459,13 +480,16 @@ fn extract_class(node: Node, ctx: &mut ExtractContext<'_>) {
                     ctx.symbols.push(sym);
                 }
             }
-            "call" => handle_top_call(ch, ctx, false, ""),
+            "call" => handle_top_call(ch, ctx, false, "", depth + 1),
             _ => {}
         }
     }
 }
 
-fn collect_controller_filters(body: Node, src: &[u8], out: &mut ControllerFilters) {
+fn collect_controller_filters(body: Node, src: &[u8], out: &mut ControllerFilters, depth: usize) {
+    if depth >= crate::taint::MAX_AST_WALK_DEPTH {
+        return;
+    }
     let mut c = body.walk();
     for ch in body.children(&mut c) {
         if ch.kind() != "call" {

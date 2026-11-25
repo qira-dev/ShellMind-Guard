@@ -1140,6 +1140,23 @@ fn collect_go_mw_arg_recursive(
     mw_calls: &mut Vec<String>,
     calls: &mut Vec<String>,
 ) {
+    collect_go_mw_arg_recursive_depth(node, src, cfg, is_mw_pos, guards, mw_calls, calls, 0);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_go_mw_arg_recursive_depth(
+    node: Node,
+    src: &[u8],
+    cfg: &ShellMindGuardConfig,
+    is_mw_pos: bool,
+    guards: &mut HashSet<GuardKind>,
+    mw_calls: &mut Vec<String>,
+    calls: &mut Vec<String>,
+    depth: usize,
+) {
+    if depth >= crate::taint::MAX_AST_WALK_DEPTH {
+        return;
+    }
     let k = node.kind();
     if matches!(k, "(" | ")" | "," | "comment") {
         return;
@@ -1177,7 +1194,7 @@ fn collect_go_mw_arg_recursive(
                 .collect();
             let total = arg_nodes.len();
             for (idx, a) in arg_nodes.drain(..).enumerate() {
-                collect_go_mw_arg_recursive(
+                collect_go_mw_arg_recursive_depth(
                     a,
                     src,
                     cfg,
@@ -1185,6 +1202,7 @@ fn collect_go_mw_arg_recursive(
                     guards,
                     mw_calls,
                     calls,
+                    depth + 1,
                 );
             }
         }
@@ -1338,8 +1356,11 @@ fn scan_direct_go_block_use(
 
 fn collect_go_router_scopes(root: Node, src: &[u8], cfg: &ShellMindGuardConfig) -> GoRouterScopes {
     let mut info = GoRouterScopes::default();
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
+    let mut stack = vec![(root, 0usize)];
+    while let Some((node, depth)) = stack.pop() {
+        if depth >= crate::taint::MAX_AST_WALK_DEPTH {
+            continue;
+        }
         let k = node.kind();
         if k == "call_expression"
             && let Some(func) = node.child_by_field_name("function")
@@ -1563,7 +1584,7 @@ fn collect_go_router_scopes(root: Node, src: &[u8], cfg: &ShellMindGuardConfig) 
         let prev_len = stack.len();
         let mut cursor = node.walk();
         for ch in node.children(&mut cursor) {
-            stack.push(ch);
+            stack.push((ch, depth + 1));
         }
         stack[prev_len..].reverse();
     }

@@ -98,6 +98,64 @@ pub(crate) fn is_nested_fn_or_closure_kind(kind: &str) -> bool {
     )
 }
 
+pub(crate) fn is_leaf_negated_text(raw: &str) -> bool {
+    let t = raw
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')')
+        .trim()
+        .to_ascii_lowercase();
+    if t.is_empty() {
+        return false;
+    }
+    // Go error check `err != nil` (specifically on an `err` identifier, NOT `session != nil`)
+    if let Some((lhs, rhs)) = t.split_once("!=") {
+        let lhs_trim = lhs.trim();
+        let rhs_trim = rhs.trim().trim_start_matches('=').trim();
+        if rhs_trim == "nil" || lhs_trim == "nil" {
+            let other = if rhs_trim == "nil" {
+                lhs_trim
+            } else {
+                rhs_trim
+            };
+            return other == "err" || other.ends_with("_err") || other.ends_with(".err");
+        }
+        let is_empty_or_falsy = |s: &str| {
+            matches!(
+                s,
+                "null" | "undefined" | "none" | "false" | "0" | "\"\"" | "''" | "``"
+            )
+        };
+        if is_empty_or_falsy(rhs_trim) || is_empty_or_falsy(lhs_trim) {
+            // `req.token !== ""`, `user_id != 0`, `authed != false`, `null != session` are POSITIVE checks
+            return false;
+        }
+        // Ownership/role mismatch (`owner_id != user_id`, `role !== "admin"`) -> guard holds on false branch
+        return true;
+    }
+    // Explicit absence / failure / falsy checks -> guard holds on false (fallthrough) branch
+    t.contains("== nil")
+        || t.contains("== null")
+        || t.contains("=== null")
+        || t.contains("== undefined")
+        || t.contains("=== undefined")
+        || t.contains("== none")
+        || t.contains(" is none")
+        || t.contains("== false")
+        || t.contains("=== false")
+        || t.contains(" is false")
+        || t.contains(".is_none(")
+        || t.contains(".is_err(")
+        || t.contains(".is_empty(")
+        || t.starts_with("let err(")
+        || t.starts_with("let none")
+        || ((t.starts_with('!') && !t.starts_with("!!") || t.starts_with("not "))
+            && !t.contains("&&")
+            && !t.contains("||")
+            && !t.contains(" and ")
+            && !t.contains(" or "))
+}
+
 /// Evaluates whether guards strictly dominate every reachable sink (or exit block if sinkless
 /// wrapper) in `fn_node` across linear, early-return, conditional diamond, switch/match,
 /// try/catch/finally, loop, and post-sink paths.
@@ -917,56 +975,7 @@ impl<'a> CfgBuilder<'a> {
 
     fn is_leaf_negated(node: Node, src: &[u8]) -> bool {
         let raw = crate::ast::strip_comments(node_text(node, src));
-        let t = raw.trim().to_ascii_lowercase();
-        if t.is_empty() {
-            return false;
-        }
-        // Go error check `err != nil` (specifically on an `err` identifier, NOT `session != nil`)
-        if let Some((lhs, rhs)) = t.split_once("!=") {
-            let lhs_trim = lhs.trim();
-            let rhs_trim = rhs.trim().trim_start_matches('=').trim();
-            if rhs_trim == "nil" || lhs_trim == "nil" {
-                let other = if rhs_trim == "nil" {
-                    lhs_trim
-                } else {
-                    rhs_trim
-                };
-                return other == "err" || other.ends_with("_err") || other.ends_with(".err");
-            }
-            let is_empty_or_falsy = |s: &str| {
-                matches!(
-                    s,
-                    "null" | "undefined" | "none" | "false" | "0" | "\"\"" | "''" | "``"
-                )
-            };
-            if is_empty_or_falsy(rhs_trim) || is_empty_or_falsy(lhs_trim) {
-                // `req.token !== ""`, `user_id != 0`, `authed != false`, `null != session` are POSITIVE checks
-                return false;
-            }
-            // Ownership/role mismatch (`owner_id != user_id`, `role !== "admin"`) -> guard holds on false branch
-            return true;
-        }
-        // Explicit absence / failure / falsy checks -> guard holds on false (fallthrough) branch
-        t.contains("== nil")
-            || t.contains("== null")
-            || t.contains("=== null")
-            || t.contains("== undefined")
-            || t.contains("=== undefined")
-            || t.contains("== none")
-            || t.contains(" is none")
-            || t.contains("== false")
-            || t.contains("=== false")
-            || t.contains(" is false")
-            || t.contains(".is_none(")
-            || t.contains(".is_err(")
-            || t.contains(".is_empty(")
-            || t.starts_with("let err(")
-            || t.starts_with("let none")
-            || ((t.starts_with('!') && !t.starts_with("!!") || t.starts_with("not "))
-                && !t.contains("&&")
-                && !t.contains("||")
-                && !t.contains(" and ")
-                && !t.contains(" or "))
+        is_leaf_negated_text(&raw)
     }
 
     fn leaf_cond_text_guards(

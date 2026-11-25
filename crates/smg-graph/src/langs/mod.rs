@@ -343,76 +343,294 @@ pub(crate) fn detect_text_guards(
     guards
 }
 
+fn detect_stmt_guards(
+    code: &str,
+    cfg: &ShellMindGuardConfig,
+    profile: &LangProfile,
+) -> HashSet<GuardKind> {
+    let mut guards = detect_text_guards(code, cfg, profile);
+    let active_low = crate::taint::strip_comments_and_non_attr_strings(code).to_ascii_lowercase();
+    if has_ownership_filter(code) || contains_any_ci(&active_low, profile.ownership_markers) {
+        guards.insert(GuardKind::OwnershipCheck);
+    }
+    guards
+}
+
+fn stmt_is_sink_for_dominance(code: &str, profile: &LangProfile) -> bool {
+    let low = code.to_ascii_lowercase();
+    classify_sink_with_profile("", code, profile).is_some()
+        || contains_sink_ci(&low, profile.sql_sinks)
+        || contains_sink_ci(&low, profile.cmd_sinks)
+        || contains_sink_ci(&low, profile.path_sinks)
+        || contains_sink_ci(&low, profile.ssrf_sinks)
+        || low.contains(".delete(")
+        || low.contains(".destroy(")
+        || low.contains(".destroy!")
+        || low.contains(".remove(")
+        || low.contains(".update(")
+}
+
+fn is_cond_node_kind(k: &str) -> bool {
+    matches!(
+        k,
+        "if_statement" | "if_expression" | "if" | "unless" | "elsif"
+    )
+}
+
+fn is_seq_container_kind(k: &str) -> bool {
+    matches!(
+        k,
+        "block"
+            | "statement_block"
+            | "compound_statement"
+            | "body_statement"
+            | "statements"
+            | "do_block"
+            | "then"
+            | "else"
+            | "else_clause"
+            | "function_body"
+            | "program"
+    )
+}
+
+fn ast_node_always_exits(node: Node, src: &[u8], depth: usize) -> bool {
+    if depth >= crate::taint::MAX_AST_WALK_DEPTH {
+        return false;
+    }
+    let k = node.kind();
+    if matches!(
+        k,
+        "return_statement"
+            | "return"
+            | "throw_statement"
+            | "throw_expression"
+            | "raise"
+            | "raise_statement"
+    ) {
+        return true;
+    }
+    if is_cond_node_kind(k) {
+        let cons = extract_if_consequence(node);
+        let alt = extract_if_alternative(node);
+        return match (cons, alt) {
+            (Some(c), Some(a)) => {
+                ast_node_always_exits(c, src, depth + 1) && ast_node_always_exits(a, src, depth + 1)
+            }
+            _ => false,
+        };
+    }
+    if matches!(k, "if_modifier" | "unless_modifier") {
+        return false;
+    }
+    if is_seq_container_kind(k) {
+        let mut cur = node.walk();
+        for ch in node.named_children(&mut cur) {
+            if ast_node_always_exits(ch, src, depth + 1) {
+                return true;
+            }
+        }
+        return false;
+    }
+    // Leaf / call statement check (e.g. `abort(403)`, `exit(1)`, `head :unauthorized`)
+    let raw = strip_comments(node_text(node, src));
+    let low = raw.trim().to_ascii_lowercase();
+    low.starts_with("return ")
+        || low == "return"
+        || low.starts_with("return;")
+        || low.starts_with("throw ")
+        || low.starts_with("raise ")
+        || low.contains("abort(")
+        || low.contains("exit(")
+        || low.contains("die(")
+        || low.starts_with("head :unauthorized")
+        || low.starts_with("head :forbidden")
+}
+
+fn extract_if_condition<'a>(node: Node<'a>) -> Option<Node<'a>> {
+    node.child_by_field_name("condition")
+}
+
+fn extract_if_consequence<'a>(node: Node<'a>) -> Option<Node<'a>> {
+    node.child_by_field_name("consequence")
+        .or_else(|| node.child_by_field_name("body"))
+        .or_else(|| {
+            let mut cur = node.walk();
+            node.named_children(&mut cur).find(|ch| ch.kind() == "then")
+        })
+}
+
+fn extract_if_alternative<'a>(node: Node<'a>) -> Option<Node<'a>> {
+    node.child_by_field_name("alternative").or_else(|| {
+        let mut cur = node.walk();
+        node.named_children(&mut cur)
+            .find(|ch| matches!(ch.kind(), "else" | "else_clause" | "elsif"))
+    })
+}
+
+fn eval_ast_dominating_guards(
+    node: Node,
+    src: &[u8],
+    cfg: &ShellMindGuardConfig,
+    profile: &LangProfile,
+    depth: usize,
+) -> (HashSet<GuardKind>, bool, bool) {
+    if depth >= crate::taint::MAX_AST_WALK_DEPTH {
+        return (HashSet::new(), false, false);
+    }
+    let k = node.kind();
+
+    // Ruby modifier statements: `return head(:unauthorized) unless logged_in?` / `return if !auth`
+    if matches!(k, "if_modifier" | "unless_modifier") {
+        let is_unless = k == "unless_modifier";
+        let cond_node = node.child_by_field_name("condition");
+        let body_node = node.child_by_field_name("body");
+        let body_exits = body_node.is_some_and(|b| ast_node_always_exits(b, src, depth + 1));
+        if body_exits && let Some(cn) = cond_node {
+            let cond_code = strip_comments(node_text(cn, src));
+            let cond_neg = crate::cfg::is_leaf_negated_text(&cond_code);
+            if is_unless != cond_neg {
+                return (detect_stmt_guards(&cond_code, cfg, profile), false, false);
+            }
+        }
+        return (HashSet::new(), false, false);
+    }
+
+    if is_cond_node_kind(k) {
+        let is_unless = k == "unless";
+        let cond_code = extract_if_condition(node)
+            .map(|cn| strip_comments(node_text(cn, src)))
+            .unwrap_or_default();
+        let cond_neg = crate::cfg::is_leaf_negated_text(&cond_code);
+        let cond_guards = detect_stmt_guards(&cond_code, cfg, profile);
+
+        let cons = extract_if_consequence(node);
+        let alt = extract_if_alternative(node);
+
+        let (then_g, then_sink, mut then_exits) = cons
+            .map(|c| eval_ast_dominating_guards(c, src, cfg, profile, depth + 1))
+            .unwrap_or_default();
+        if let Some(c) = cons {
+            then_exits |= ast_node_always_exits(c, src, depth + 1);
+        }
+
+        if let Some(a) = alt {
+            let (else_g, else_sink, mut else_exits) =
+                eval_ast_dominating_guards(a, src, cfg, profile, depth + 1);
+            else_exits |= ast_node_always_exits(a, src, depth + 1);
+            let hit_sink = then_sink || else_sink;
+
+            if then_exits && else_exits {
+                return (HashSet::new(), hit_sink, true);
+            }
+            if then_exits && !else_exits {
+                let mut out = else_g;
+                // Fall-through executes when condition is false (or true for `unless`)
+                if is_unless != cond_neg {
+                    out.extend(cond_guards);
+                }
+                return (out, hit_sink, false);
+            }
+            if else_exits && !then_exits {
+                let mut out = then_g;
+                // Fall-through executes when condition is true (or false for `unless`)
+                if is_unless == cond_neg {
+                    out.extend(cond_guards);
+                }
+                return (out, hit_sink, false);
+            }
+            // Neither branch exits: only guards proven on BOTH branches dominate fall-through!
+            let inter: HashSet<GuardKind> = then_g.intersection(&else_g).copied().collect();
+            return (inter, hit_sink, false);
+        }
+
+        // Single-sided `if` / `unless` without `else`
+        if then_exits {
+            // Only promote negated exiting guard (`if (!auth) return;` / `unless auth; return; end`)
+            if is_unless != cond_neg {
+                return (cond_guards, then_sink, false);
+            }
+            return (HashSet::new(), then_sink, false);
+        }
+        return (HashSet::new(), then_sink, false);
+    }
+
+    if is_seq_container_kind(k) {
+        let mut dominated = HashSet::new();
+        let mut cur = node.walk();
+        for ch in node.named_children(&mut cur) {
+            if ch.kind() == "comment" {
+                continue;
+            }
+            let (g, hit_sink, exited) =
+                eval_ast_dominating_guards(ch, src, cfg, profile, depth + 1);
+            dominated.extend(g);
+            if hit_sink {
+                return (dominated, true, exited);
+            }
+            if exited {
+                return (dominated, false, true);
+            }
+        }
+        return (dominated, false, false);
+    }
+
+    // Simple sequential statement (non-branching)
+    let code = strip_comments(node_text(node, src));
+    let g = detect_stmt_guards(&code, cfg, profile);
+    let hit_sink = stmt_is_sink_for_dominance(&code, profile);
+    let exited = ast_node_always_exits(node, src, depth + 1);
+    (g, hit_sink, exited)
+}
+
 /// Filters body-detected guards so guards that only appear inside a non-exiting side branch
-/// (`if (debug) { requireAuth(); }`) or strictly after the first state-mutating sink do not
-/// falsely dominate the function.
+/// (`if (debug) { requireAuth(); }`), a non-negated exiting branch (`if (is_admin) { return; }`),
+/// only one side of an `if`/`else` diamond, or strictly after the first state-mutating sink
+/// do not falsely dominate the function.
 fn filter_dominating_body_guards(
+    body_node: Option<Node>,
+    src: &[u8],
     body_code: &str,
     raw_body_guards: HashSet<GuardKind>,
     cfg: &ShellMindGuardConfig,
     profile: &LangProfile,
 ) -> HashSet<GuardKind> {
-    if raw_body_guards.is_empty() {
-        return raw_body_guards;
+    if raw_body_guards.is_empty()
+        && !has_ownership_filter(body_code)
+        && !contains_any_ci(
+            &crate::taint::strip_comments_and_non_attr_strings(body_code).to_ascii_lowercase(),
+            profile.ownership_markers,
+        )
+    {
+        return HashSet::new();
     }
+
+    if let Some(bnode) = body_node {
+        let (dominated, _, _) = eval_ast_dominating_guards(bnode, src, cfg, profile, 0);
+        return dominated;
+    }
+
+    // Text-only fallback when no AST body node is available: top-level pre-sink lines only.
     let mut dominated = HashSet::new();
-    // CSRF and OwnershipCheck are structural predicate checks preserved from body analysis
-    for g in [GuardKind::CsrfProtection, GuardKind::OwnershipCheck] {
-        if raw_body_guards.contains(&g) {
-            dominated.insert(g);
-        }
-    }
-
-    let lines: Vec<&str> = body_code.lines().collect();
     let mut brace_depth: i32 = 0;
-    let mut cond_entry_depth: Option<i32> = None;
-    let mut cond_block_guards = HashSet::new();
-    let mut cond_block_exits = false;
-    let mut cond_has_else = false;
-    let mut seen_sink = false;
-
-    for raw in &lines {
+    for raw in body_code.lines() {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             continue;
         }
         let low = trimmed.to_ascii_lowercase();
-        let line_guards = detect_text_guards(trimmed, cfg, profile);
-        let line_is_sink = classify_sink_with_profile("", trimmed, profile).is_some()
-            || contains_sink_ci(&low, profile.sql_sinks)
-            || contains_sink_ci(&low, profile.cmd_sinks)
-            || contains_sink_ci(&low, profile.path_sinks)
-            || contains_sink_ci(&low, profile.ssrf_sinks);
-        let line_exits = low.starts_with("return")
-            || low.contains(" return ")
-            || low.contains(" return;")
-            || low.starts_with("throw ")
-            || low.contains(" throw ")
-            || low.starts_with("raise ")
-            || low.contains("abort(")
-            || low.contains("exit(")
-            || low.contains("die(");
-
-        let is_if_head = low.starts_with("if ") || low.starts_with("if(");
-        if is_if_head && cond_entry_depth.is_none() && !seen_sink {
-            cond_entry_depth = Some(brace_depth);
-            cond_block_guards.extend(line_guards.iter().copied());
-            if line_exits {
-                cond_block_exits = true;
+        let is_branch_head = low.starts_with("if ")
+            || low.starts_with("if(")
+            || low.starts_with("unless ")
+            || low.starts_with("else")
+            || low.starts_with("} else")
+            || low.starts_with("elsif ");
+        if brace_depth == 0 && !is_branch_head {
+            dominated.extend(detect_stmt_guards(trimmed, cfg, profile));
+            if stmt_is_sink_for_dominance(trimmed, profile) {
+                break;
             }
-        } else if cond_entry_depth.is_some() {
-            if low.starts_with("} else") || low.starts_with("else") || low.starts_with("elsif") {
-                cond_has_else = true;
-            }
-            cond_block_guards.extend(line_guards.iter().copied());
-            if line_exits {
-                cond_block_exits = true;
-            }
-        } else if !seen_sink {
-            // Top-level statement before any sink dominates all subsequent statements
-            dominated.extend(line_guards.iter().copied());
         }
-
         for ch in trimmed.chars() {
             if ch == '{' {
                 brace_depth += 1;
@@ -420,36 +638,7 @@ fn filter_dominating_body_guards(
                 brace_depth = (brace_depth - 1).max(0);
             }
         }
-
-        if let Some(ed) = cond_entry_depth
-            && brace_depth <= ed
-        {
-            if cond_block_exits || cond_has_else {
-                dominated.extend(cond_block_guards.iter().copied());
-            }
-            cond_entry_depth = None;
-            cond_block_guards.clear();
-            cond_block_exits = false;
-            cond_has_else = false;
-        }
-
-        if line_is_sink && cond_entry_depth.is_none() {
-            seen_sink = true;
-        }
     }
-
-    // For languages without `{}` blocks (Python/Ruby `if ... end`), fall back to pre-sink check
-    if !body_code.contains('{') {
-        for raw in &lines {
-            let trimmed = raw.trim();
-            let line_guards = detect_text_guards(trimmed, cfg, profile);
-            dominated.extend(line_guards);
-            if classify_sink_with_profile("", trimmed, profile).is_some() {
-                break;
-            }
-        }
-    }
-
     dominated
 }
 
@@ -765,7 +954,14 @@ pub(crate) fn build_analyzed_symbol(
     let combined_guard_text = format!("{}\n{}", attr_text, body_code);
 
     let body_raw_guards = detect_text_guards(&body_code, ctx.cfg, profile);
-    let mut guards = filter_dominating_body_guards(&body_code, body_raw_guards, ctx.cfg, profile);
+    let mut guards = filter_dominating_body_guards(
+        body_node,
+        ctx.src,
+        &body_code,
+        body_raw_guards,
+        ctx.cfg,
+        profile,
+    );
     guards.extend(crate::cfg::compute_cfg_guard_dominance(
         full_node, ctx.src, ctx.cfg,
     ));
@@ -779,15 +975,7 @@ pub(crate) fn build_analyzed_symbol(
         guards.remove(&GuardKind::Auth);
     }
 
-    // Ownership filter check for IDOR (active non-literal principals + scoped query filter)
-    let body_active_low =
-        crate::taint::strip_comments_and_non_attr_strings(&body_code).to_ascii_lowercase();
     let body_low = body_code.to_ascii_lowercase();
-    if has_ownership_filter(&body_code)
-        || contains_any_ci(&body_active_low, profile.ownership_markers)
-    {
-        guards.insert(GuardKind::OwnershipCheck);
-    }
 
     let mut calls = Vec::new();
     collect_calls_generic(full_node, ctx.src, &mut calls);

@@ -39,10 +39,10 @@ fn assign_re() -> &'static Regex {
 }
 
 pub(crate) fn extract(root: Node, ctx: &mut ExtractContext<'_>) {
-    collect_source_imports(root, ctx);
+    collect_source_imports(root, ctx, 0);
 
     let mut fn_ranges: Vec<(usize, usize)> = Vec::new();
-    collect_functions(root, ctx, &mut fn_ranges);
+    collect_functions(root, ctx, &mut fn_ranges, 0);
 
     // Analyze top-level script commands outside function definitions as `<main>`.
     let full_src = std::str::from_utf8(ctx.src).unwrap_or("");
@@ -73,7 +73,10 @@ pub(crate) fn extract(root: Node, ctx: &mut ExtractContext<'_>) {
     ctx.symbols.push(top_sym);
 }
 
-fn collect_source_imports(node: Node, ctx: &mut ExtractContext<'_>) {
+fn collect_source_imports(node: Node, ctx: &mut ExtractContext<'_>, depth: usize) {
+    if depth >= crate::taint::MAX_AST_WALK_DEPTH {
+        return;
+    }
     if node.kind() == "command"
         && let Some(name_node) = node.child_by_field_name("name")
     {
@@ -102,7 +105,7 @@ fn collect_source_imports(node: Node, ctx: &mut ExtractContext<'_>) {
     }
     let mut c = node.walk();
     for ch in node.children(&mut c) {
-        collect_source_imports(ch, ctx);
+        collect_source_imports(ch, ctx, depth + 1);
     }
 }
 
@@ -110,7 +113,11 @@ fn collect_functions(
     node: Node,
     ctx: &mut ExtractContext<'_>,
     fn_ranges: &mut Vec<(usize, usize)>,
+    depth: usize,
 ) {
+    if depth >= crate::taint::MAX_AST_WALK_DEPTH {
+        return;
+    }
     if node.kind() == "function_definition" {
         let name = node
             .child_by_field_name("name")
@@ -145,7 +152,7 @@ fn collect_functions(
     }
     let mut c = node.walk();
     for ch in node.children(&mut c) {
-        collect_functions(ch, ctx, fn_ranges);
+        collect_functions(ch, ctx, fn_ranges, depth + 1);
     }
 }
 
@@ -155,7 +162,11 @@ fn collect_command_calls(
     is_top_level: bool,
     fn_ranges: &[(usize, usize)],
     out: &mut Vec<String>,
+    depth: usize,
 ) {
+    if depth >= crate::taint::MAX_AST_WALK_DEPTH {
+        return;
+    }
     if is_top_level && node.kind() == "function_definition" {
         return;
     }
@@ -180,11 +191,20 @@ fn collect_command_calls(
     }
     let mut c = node.walk();
     for ch in node.children(&mut c) {
-        collect_command_calls(ch, src, is_top_level, fn_ranges, out);
+        collect_command_calls(ch, src, is_top_level, fn_ranges, out, depth + 1);
     }
 }
 
-fn collect_pipe_to_shell_lines(node: Node, src: &[u8], is_top_level: bool, out: &mut Vec<usize>) {
+fn collect_pipe_to_shell_lines(
+    node: Node,
+    src: &[u8],
+    is_top_level: bool,
+    out: &mut Vec<usize>,
+    depth: usize,
+) {
+    if depth >= crate::taint::MAX_AST_WALK_DEPTH {
+        return;
+    }
     if is_top_level && node.kind() == "function_definition" {
         return;
     }
@@ -213,7 +233,7 @@ fn collect_pipe_to_shell_lines(node: Node, src: &[u8], is_top_level: bool, out: 
     }
     let mut c = node.walk();
     for ch in node.children(&mut c) {
-        collect_pipe_to_shell_lines(ch, src, is_top_level, out);
+        collect_pipe_to_shell_lines(ch, src, is_top_level, out, depth + 1);
     }
 }
 
@@ -229,10 +249,10 @@ fn analyze_shell_unit(
     fn_ranges: &[(usize, usize)],
 ) -> SymbolInfo {
     let mut calls = Vec::new();
-    collect_command_calls(ast_node, ctx.src, !is_function, fn_ranges, &mut calls);
+    collect_command_calls(ast_node, ctx.src, !is_function, fn_ranges, &mut calls, 0);
 
     let mut pipe_to_shell_lines = Vec::new();
-    collect_pipe_to_shell_lines(ast_node, ctx.src, !is_function, &mut pipe_to_shell_lines);
+    collect_pipe_to_shell_lines(ast_node, ctx.src, !is_function, &mut pipe_to_shell_lines, 0);
 
     let mut guards = HashSet::new();
     let mut tainted_vars: HashMap<String, u8> = HashMap::new();

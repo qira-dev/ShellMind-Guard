@@ -120,7 +120,7 @@ pub(crate) const PROFILE: LangProfile = LangProfile {
 };
 
 pub(crate) fn extract(root: Node, ctx: &mut ExtractContext<'_>) {
-    walk_node(root, ctx, "", &HashSet::new());
+    walk_node(root, ctx, "", &HashSet::new(), 0);
     // Analyze top-level procedural PHP entrypoints (outside classes/functions) such as `ping.php`.
     let has_named_unit = ctx
         .symbols
@@ -158,7 +158,11 @@ fn walk_node(
     ctx: &mut ExtractContext<'_>,
     route_prefix: &str,
     scope_guards: &HashSet<GuardKind>,
+    depth: usize,
 ) {
+    if depth >= crate::taint::MAX_AST_WALK_DEPTH {
+        return;
+    }
     let k = node.kind();
 
     // 1. `use App\Services\LedgerService;`
@@ -293,7 +297,7 @@ fn walk_node(
     if k == "scoped_call_expression" || k == "member_call_expression" {
         let txt = strip_comments(node_text(node, ctx.src));
         if (txt.contains("Route::") || txt.starts_with("$router->"))
-            && handle_laravel_route_expr(node, ctx, route_prefix, scope_guards)
+            && handle_laravel_route_expr(node, ctx, route_prefix, scope_guards, depth + 1)
         {
             return;
         }
@@ -301,7 +305,7 @@ fn walk_node(
 
     let mut cursor = node.walk();
     for ch in node.children(&mut cursor) {
-        walk_node(ch, ctx, route_prefix, scope_guards);
+        walk_node(ch, ctx, route_prefix, scope_guards, depth + 1);
     }
 }
 
@@ -371,7 +375,11 @@ fn handle_laravel_route_expr(
     ctx: &mut ExtractContext<'_>,
     route_prefix: &str,
     scope_guards: &HashSet<GuardKind>,
+    depth: usize,
 ) -> bool {
+    if depth >= crate::taint::MAX_AST_WALK_DEPTH {
+        return false;
+    }
     let full_txt = strip_comments(node_text(node, ctx.src));
     let mut next_guards = scope_guards.clone();
     next_guards.extend(super::detect_text_guards(&full_txt, ctx.cfg, &PROFILE));
@@ -395,7 +403,7 @@ fn handle_laravel_route_expr(
             route_prefix.to_string()
         };
         if let Some(args) = node.child_by_field_name("arguments") {
-            walk_node(args, ctx, &new_prefix, &next_guards);
+            walk_node(args, ctx, &new_prefix, &next_guards, depth + 1);
         }
         if let Some(obj) = node.child_by_field_name("object") {
             let _ = obj;
@@ -404,10 +412,10 @@ fn handle_laravel_route_expr(
     }
 
     // Look for innermost HTTP verb call on `Route::get('/pay', ...)` or `$router->post(...)`
-    let Some(verb) = find_route_verb_in_chain(node, ctx.src) else {
+    let Some(verb) = find_route_verb_in_chain(node, ctx.src, 0) else {
         return false;
     };
-    let Some(route_sub) = find_route_path_in_chain(node, ctx.src) else {
+    let Some(route_sub) = find_route_path_in_chain(node, ctx.src, 0) else {
         return false;
     };
     let full_path = join_route_prefix(route_prefix, &route_sub);
@@ -421,7 +429,7 @@ fn handle_laravel_route_expr(
     let sym_id = format!("php:route:{}:{}", ctx.rel_path, line_start);
 
     // Check if an inline closure `function (...) { ... }` exists in chain
-    let inline_fn = find_closure_node(node);
+    let inline_fn = find_closure_node(node, 0);
     if let Some(cl) = inline_fn {
         let params_txt = cl
             .child_by_field_name("parameters")
@@ -471,19 +479,25 @@ fn handle_laravel_route_expr(
     true
 }
 
-fn find_route_verb_in_chain(node: Node, src: &[u8]) -> Option<&'static str> {
+fn find_route_verb_in_chain(node: Node, src: &[u8], depth: usize) -> Option<&'static str> {
+    if depth >= crate::taint::MAX_AST_WALK_DEPTH {
+        return None;
+    }
     if let Some(n) = node.child_by_field_name("name")
         && let Some(v) = http_verb_from_ident(node_text(n, src))
     {
         return Some(v);
     }
     if let Some(obj) = node.child_by_field_name("object") {
-        return find_route_verb_in_chain(obj, src);
+        return find_route_verb_in_chain(obj, src, depth + 1);
     }
     None
 }
 
-fn find_route_path_in_chain(node: Node, src: &[u8]) -> Option<String> {
+fn find_route_path_in_chain(node: Node, src: &[u8], depth: usize) -> Option<String> {
+    if depth >= crate::taint::MAX_AST_WALK_DEPTH {
+        return None;
+    }
     if let Some(n) = node.child_by_field_name("name")
         && http_verb_from_ident(node_text(n, src)).is_some()
         && let Some(args) = node.child_by_field_name("arguments")
@@ -491,18 +505,21 @@ fn find_route_path_in_chain(node: Node, src: &[u8]) -> Option<String> {
         return find_first_string_literal(args, src);
     }
     if let Some(obj) = node.child_by_field_name("object") {
-        return find_route_path_in_chain(obj, src);
+        return find_route_path_in_chain(obj, src, depth + 1);
     }
     None
 }
 
-fn find_closure_node(node: Node) -> Option<Node> {
+fn find_closure_node(node: Node, depth: usize) -> Option<Node> {
+    if depth >= crate::taint::MAX_AST_WALK_DEPTH {
+        return None;
+    }
     if matches!(node.kind(), "anonymous_function" | "arrow_function") {
         return Some(node);
     }
     let mut c = node.walk();
     for ch in node.children(&mut c) {
-        if let Some(found) = find_closure_node(ch) {
+        if let Some(found) = find_closure_node(ch, depth + 1) {
             return Some(found);
         }
     }

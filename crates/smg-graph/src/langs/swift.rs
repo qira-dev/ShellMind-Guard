@@ -46,10 +46,18 @@ pub(crate) const PROFILE: LangProfile = LangProfile {
 
 pub(crate) fn extract(root: Node, ctx: &mut ExtractContext<'_>) {
     let mut grouped_auth_vars: HashSet<String> = HashSet::new();
-    walk_node(root, ctx, &mut grouped_auth_vars);
+    walk_node(root, ctx, &mut grouped_auth_vars, 0);
 }
 
-fn walk_node(node: Node, ctx: &mut ExtractContext<'_>, grouped_auth_vars: &mut HashSet<String>) {
+fn walk_node(
+    node: Node,
+    ctx: &mut ExtractContext<'_>,
+    grouped_auth_vars: &mut HashSet<String>,
+    depth: usize,
+) {
+    if depth >= crate::taint::MAX_AST_WALK_DEPTH {
+        return;
+    }
     let k = node.kind();
 
     if k == "import_declaration" {
@@ -98,14 +106,14 @@ fn walk_node(node: Node, ctx: &mut ExtractContext<'_>, grouped_auth_vars: &mut H
         if let Some(body) = node.child_by_field_name("body") {
             let mut c = body.walk();
             for ch in body.children(&mut c) {
-                walk_node(ch, ctx, grouped_auth_vars);
+                walk_node(ch, ctx, grouped_auth_vars, depth + 1);
             }
         }
         return;
     }
 
     if k == "function_declaration" {
-        extract_function(node, ctx, grouped_auth_vars);
+        extract_function(node, ctx, grouped_auth_vars, depth + 1);
         return;
     }
 
@@ -115,7 +123,7 @@ fn walk_node(node: Node, ctx: &mut ExtractContext<'_>, grouped_auth_vars: &mut H
 
     let mut c = node.walk();
     for ch in node.children(&mut c) {
-        walk_node(ch, ctx, grouped_auth_vars);
+        walk_node(ch, ctx, grouped_auth_vars, depth + 1);
     }
 }
 
@@ -123,6 +131,7 @@ fn extract_function(
     node: Node,
     ctx: &mut ExtractContext<'_>,
     grouped_auth_vars: &mut HashSet<String>,
+    depth: usize,
 ) {
     let name = node
         .child_by_field_name("name")
@@ -162,7 +171,7 @@ fn extract_function(
     if let Some(b) = body {
         let mut c = b.walk();
         for ch in b.children(&mut c) {
-            walk_node(ch, ctx, grouped_auth_vars);
+            walk_node(ch, ctx, grouped_auth_vars, depth + 1);
         }
     }
 }
@@ -191,7 +200,7 @@ fn handle_vapor_route(
     let mut path_segments = Vec::new();
     let suffix = named.iter().find(|n| n.kind() == "call_suffix").copied();
     if let Some(suf) = suffix {
-        collect_vapor_path_segments(suf, ctx.src, &mut path_segments);
+        collect_vapor_path_segments(suf, ctx.src, &mut path_segments, 0);
     }
     if path_segments.is_empty() {
         return false;
@@ -211,7 +220,7 @@ fn handle_vapor_route(
     let line_end = node.end_position().row + 1;
     let sym_id = format!("swift:route:{}:{}", ctx.rel_path, line_start);
 
-    let lambda = suffix.and_then(|s| find_kind_recursive(s, "lambda_literal"));
+    let lambda = suffix.and_then(|s| find_kind_recursive(s, "lambda_literal", 0));
     if let Some(lam) = lambda {
         let mut sym = build_analyzed_symbol(
             ctx,
@@ -261,7 +270,10 @@ fn handle_vapor_route(
     true
 }
 
-fn collect_vapor_path_segments(node: Node, src: &[u8], out: &mut Vec<String>) {
+fn collect_vapor_path_segments(node: Node, src: &[u8], out: &mut Vec<String>, depth: usize) {
+    if depth >= crate::taint::MAX_AST_WALK_DEPTH {
+        return;
+    }
     if node.kind() == "lambda_literal" {
         return;
     }
@@ -274,17 +286,20 @@ fn collect_vapor_path_segments(node: Node, src: &[u8], out: &mut Vec<String>) {
     }
     let mut c = node.walk();
     for ch in node.children(&mut c) {
-        collect_vapor_path_segments(ch, src, out);
+        collect_vapor_path_segments(ch, src, out, depth + 1);
     }
 }
 
-fn find_kind_recursive<'a>(node: Node<'a>, target: &str) -> Option<Node<'a>> {
+fn find_kind_recursive<'a>(node: Node<'a>, target: &str, depth: usize) -> Option<Node<'a>> {
+    if depth >= crate::taint::MAX_AST_WALK_DEPTH {
+        return None;
+    }
     if node.kind() == target {
         return Some(node);
     }
     let mut c = node.walk();
     for ch in node.children(&mut c) {
-        if let Some(f) = find_kind_recursive(ch, target) {
+        if let Some(f) = find_kind_recursive(ch, target, depth + 1) {
             return Some(f);
         }
     }

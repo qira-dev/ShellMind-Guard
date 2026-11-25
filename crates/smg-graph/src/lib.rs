@@ -53,6 +53,7 @@ pub use lattice::{
     GraphAnalysisResult, LatticeFinding, RuleHitStat, TraceHop, append_local_static_findings,
     compute_rule_telemetry, finding_matches_layer, solve_guard_lattice,
     solve_guard_lattice_with_options, solve_guard_lattice_with_public,
+    solve_guard_lattice_with_slice_mode,
 };
 pub use phase10::{ParamTypeHint, RouteParamSpec, RouteSchema, collect_deep_schema_findings};
 pub use rules::{RULE_CATALOG, RuleDoc, find_rule_doc};
@@ -193,10 +194,11 @@ pub fn analyze_codebase_cached_changed_since(
     let owned_slice: Vec<FileAstSummary> = sliced.into_iter().cloned().collect();
     Ok((
         full_fallback,
-        solve_guard_lattice_with_options(
+        solve_guard_lattice_with_slice_mode(
             &owned_slice,
             &cfg.guards.public_routes,
             cfg.scan.deep_audit,
+            !full_fallback,
         ),
     ))
 }

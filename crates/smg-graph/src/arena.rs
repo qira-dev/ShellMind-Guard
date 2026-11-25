@@ -37,6 +37,7 @@ pub struct SymbolArena {
     bytes_used: usize,
     budget: ArenaBudget,
     budget_capped: bool,
+    overflow_counter: u32,
 }
 
 impl Default for SymbolArena {
@@ -54,6 +55,7 @@ impl SymbolArena {
             bytes_used: 0,
             budget,
             budget_capped: false,
+            overflow_counter: 0,
         };
         // Reserve `SymbolId(0)` strictly as an uninternable invalid/overflow sentinel,
         // and intern `""` at `SymbolId(1)` (when budget permits) so root-level directories
@@ -67,7 +69,9 @@ impl SymbolArena {
         arena
     }
 
-    /// Interns `value` to a deterministic [`SymbolId`], saturating safely at `SymbolId(0)` once capped.
+    /// Interns `value` to a deterministic [`SymbolId`]. Once the configured budget is exhausted,
+    /// allocates distinct monotonic overflow IDs (`u32::MAX - overflow_counter`) without storing
+    /// the string so two distinct uninterned symbols never collide as equal `SymbolId`s.
     pub fn intern(&mut self, value: &str) -> SymbolId {
         if let Some(&id) = self.lookup.get(value) {
             return id;
@@ -76,7 +80,9 @@ impl SymbolArena {
             || self.bytes_used.saturating_add(value.len()) > self.budget.max_bytes
         {
             self.budget_capped = true;
-            return SymbolId(0);
+            let overflow_id = SymbolId(u32::MAX.saturating_sub(self.overflow_counter));
+            self.overflow_counter = self.overflow_counter.saturating_add(1);
+            return overflow_id;
         }
         let id = SymbolId(self.strings.len() as u32);
         let owned = value.to_string();
@@ -228,9 +234,12 @@ mod tests {
         let b1 = arena.intern("debit");
         assert_ne!(b1, SymbolId(0));
 
-        // Exceeds remaining byte budget -> saturates gracefully at sentinel without panicking
-        let c1 = arena.intern("this_string_exceeds_32_bytes_limit");
-        assert_eq!(c1, SymbolId(0));
+        // Exceeds remaining byte budget -> returns distinct monotonic overflow IDs resolving to ""
+        let c1 = arena.intern("this_string_exceeds_32_bytes_limit_a");
+        let c2 = arena.intern("this_string_exceeds_32_bytes_limit_b");
+        assert_ne!(c1, c2);
+        assert_eq!(arena.resolve(c1), "");
+        assert_eq!(arena.resolve(c2), "");
         assert!(arena.stats().budget_capped);
     }
 

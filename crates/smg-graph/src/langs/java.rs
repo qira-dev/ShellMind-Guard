@@ -107,7 +107,7 @@ pub(crate) const PROFILE: LangProfile = LangProfile {
 };
 
 pub(crate) fn extract(root: Node, ctx: &mut ExtractContext<'_>) {
-    walk_node(root, ctx, "", &HashSet::new());
+    walk_node(root, ctx, "", &HashSet::new(), 0);
 }
 
 fn walk_node(
@@ -115,7 +115,11 @@ fn walk_node(
     ctx: &mut ExtractContext<'_>,
     route_prefix: &str,
     scope_guards: &HashSet<GuardKind>,
+    depth: usize,
 ) {
+    if depth >= crate::taint::MAX_AST_WALK_DEPTH {
+        return;
+    }
     let k = node.kind();
 
     if k == "import_declaration" {
@@ -159,7 +163,9 @@ fn walk_node(
                     "method_declaration" => {
                         extract_method(ch, ctx, &class_prefix, &class_guards);
                     }
-                    "class_declaration" => walk_node(ch, ctx, &class_prefix, &class_guards),
+                    "class_declaration" => {
+                        walk_node(ch, ctx, &class_prefix, &class_guards, depth + 1)
+                    }
                     _ => {}
                 }
             }
@@ -169,7 +175,7 @@ fn walk_node(
 
     let mut c = node.walk();
     for ch in node.children(&mut c) {
-        walk_node(ch, ctx, route_prefix, scope_guards);
+        walk_node(ch, ctx, route_prefix, scope_guards, depth + 1);
     }
 }
 

@@ -129,12 +129,13 @@ fn line_derefs_ptr(line: &str, var: &str) -> bool {
     false
 }
 
-/// Zero-allocation check for `var = ...` reassignment anywhere on the line (excluding `==`).
-fn line_reassigns_ptr(line: &str, var: &str) -> bool {
+/// Zero-allocation check for `var = <rhs>` reassignment anywhere on the line (excluding `==`),
+/// returning the `<rhs>` slice after `=` so callers can inspect RHS dereferences before rebinding.
+fn split_ptr_reassignment_rhs<'a>(line: &'a str, var: &str) -> Option<&'a str> {
     let bytes = line.as_bytes();
     let vb = var.as_bytes();
     if vb.is_empty() || bytes.len() < vb.len() + 2 {
-        return false;
+        return None;
     }
     let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
     let mut i = 0usize;
@@ -150,28 +151,110 @@ fn line_reassigns_ptr(line: &str, var: &str) -> bool {
                     && bytes[j] == b'='
                     && (j + 1 >= bytes.len() || bytes[j + 1] != b'=')
                 {
-                    return true;
+                    return Some(&line[j + 1..]);
                 }
             }
         }
         i += 1;
     }
-    false
+    None
+}
+
+/// Extracts `(start_line_1based, end_line_1based)` spans of C/C++ `function_definition` AST nodes
+/// so `#ifdef` / `#else` brace imbalances cannot bleed state across adjacent functions.
+fn extract_c_cpp_function_spans(rel_path: &str, source: &str) -> Vec<(usize, usize)> {
+    let lower = rel_path.to_ascii_lowercase();
+    let is_cpp = lower.ends_with(".cpp")
+        || lower.ends_with(".cc")
+        || lower.ends_with(".cxx")
+        || lower.ends_with(".hpp")
+        || lower.ends_with(".hh")
+        || lower.ends_with(".hxx");
+    let mut parser = tree_sitter::Parser::new();
+    let lang = if is_cpp {
+        tree_sitter_cpp::LANGUAGE.into()
+    } else {
+        tree_sitter_c::LANGUAGE.into()
+    };
+    if parser.set_language(&lang).is_err() {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return Vec::new();
+    };
+    let mut spans = Vec::new();
+    let mut stack = vec![(tree.root_node(), 0usize)];
+    while let Some((node, depth)) = stack.pop() {
+        if depth >= crate::taint::MAX_AST_WALK_DEPTH {
+            continue;
+        }
+        if node.kind() == "function_definition" {
+            let start = node.start_position().row + 1;
+            let end = node.end_position().row + 1;
+            spans.push((start, end));
+            continue;
+        }
+        let mut cursor = node.walk();
+        for ch in node.children(&mut cursor) {
+            stack.push((ch, depth + 1));
+        }
+    }
+    spans.sort_by_key(|&(s, _)| s);
+    spans
 }
 
 /// Audits C/C++ source code for Use-After-Free, Double-Free, and provable constant
 /// buffer-length overflows (`malloc(N)` / `char buf[N]` -> `memcpy(buf, src, M)` where `M > N`).
 pub fn analyze_c_cpp_memory_typestate(rel_path: &str, source: &str) -> Vec<LocalStaticFinding> {
     let cleaned = crate::ast::strip_comments(source);
+    let all_lines: Vec<&str> = cleaned.lines().collect();
+    let fn_spans = extract_c_cpp_function_spans(rel_path, source);
     let mut findings = Vec::new();
+
+    if !fn_spans.is_empty() {
+        for (start_ln, end_ln) in fn_spans {
+            let start_idx = start_ln.saturating_sub(1).min(all_lines.len());
+            let end_idx = end_ln.min(all_lines.len());
+            if start_idx < end_idx {
+                analyze_c_cpp_lines_window(
+                    rel_path,
+                    &all_lines[start_idx..end_idx],
+                    start_ln,
+                    &mut findings,
+                );
+            }
+        }
+    } else {
+        analyze_c_cpp_lines_window(rel_path, &all_lines, 1, &mut findings);
+    }
+
+    findings
+}
+
+fn analyze_c_cpp_lines_window(
+    rel_path: &str,
+    lines: &[&str],
+    base_line: usize,
+    findings: &mut Vec<LocalStaticFinding>,
+) {
     let mut ptr_states: HashMap<String, PtrState> = HashMap::new();
     let mut buf_sizes: HashMap<String, (usize, i32)> = HashMap::new();
     let mut brace_depth: i32 = 0;
 
-    for (idx, raw_line) in cleaned.lines().enumerate() {
-        let ln = idx + 1;
+    for (idx, raw_line) in lines.iter().enumerate() {
+        let ln = base_line + idx;
         let line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') {
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('#') {
+            // Conditional preprocessor branches (`#else`/`#elif`/`#endif`) may introduce
+            // alternative control-flow paths; clear branch-local Freed states conservatively.
+            if line.starts_with("#else") || line.starts_with("#elif") || line.starts_with("#endif")
+            {
+                ptr_states
+                    .retain(|_, st| !matches!(st, PtrState::Freed(_, d) if *d >= brace_depth));
+            }
             continue;
         }
 
@@ -321,8 +404,27 @@ pub fn analyze_c_cpp_memory_typestate(rel_path: &str, source: &str) -> Vec<Local
                 .collect();
 
             for (var, freed_ln) in freed_vars {
-                // Reassignment (`var = ...`) revives the pointer
-                if line_reassigns_ptr(line, &var) {
+                // Evaluate RHS pointer dereferences (`p = p->next;`, `p = *p;`) BEFORE
+                // transitioning `p` to `Live` so self-referential UAFs are never masked.
+                if let Some(rhs) = split_ptr_reassignment_rhs(line, &var) {
+                    if line_derefs_ptr(rhs, &var) {
+                        findings.push(LocalStaticFinding {
+                            rule_id: "SMG-MEM-BOUNDS".into(),
+                            severity: "CRITICAL".into(),
+                            title: format!(
+                                "Use-after-free: pointer `{var}` dereferenced after `free`/`delete` at line {freed_ln}"
+                            ),
+                            rel_path: rel_path.to_string(),
+                            line: ln,
+                            symbol: var.clone(),
+                            sink_kind: SinkKind::MemorySafety,
+                            missing_guard: GuardKind::MemoryBounds,
+                            confidence: Confidence::Confirmed,
+                            remediation: format!(
+                                "Save `{var}->next` before calling `free({var})`, then nullify `{var} = NULL`."
+                            ),
+                        });
+                    }
                     ptr_states.insert(var, PtrState::Live);
                     continue;
                 }
@@ -347,8 +449,6 @@ pub fn analyze_c_cpp_memory_typestate(rel_path: &str, source: &str) -> Vec<Local
             }
         }
     }
-
-    findings
 }
 
 /// Detects Rust `std::sync::Mutex` / `RwLock` guards held across `.await` points inside `async fn`
@@ -447,10 +547,14 @@ pub fn analyze_rust_async_mutex_across_await(
         }
 
         if let Some(c) = guard_re.captures(line)
-            && let Some(gname) = c.get(1)
+            && let (Some(full_m), Some(gname)) = (c.get(0), c.get(1))
             && !line.contains(".await")
         {
-            active_guards.push((gname.as_str().to_string(), ln, async_depth));
+            // Compute the lexical brace depth at the guard binding site so single-line
+            // scoped locks like `{ let mut g = m.lock().unwrap(); *g += 1; }` drop at `}`.
+            let (opens_before, closes_before) = count_code_braces(&line[..full_m.start()]);
+            let guard_scope_depth = async_depth + opens_before - closes_before;
+            active_guards.push((gname.as_str().to_string(), ln, guard_scope_depth));
         }
 
         // Remove explicitly dropped guards (`drop(guard)`)
@@ -543,5 +647,53 @@ async fn safe_drop(m: &Mutex<u32>) {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].rule_id, "SMG-CONC-DEADLOCK");
         assert!(hits[0].title.contains("acquired at line 4"));
+    }
+
+    #[test]
+    fn catches_uaf_on_self_reassignment_and_handles_ifdef_and_single_line_mutex() {
+        let uaf_rebind = r#"
+void traverse(struct Node *p) {
+    free(p);
+    p = p->next;
+}
+"#;
+        let hits = analyze_c_cpp_memory_typestate("src/list.c", uaf_rebind);
+        assert!(
+            hits.iter().any(|h| h.title.contains("Use-after-free")),
+            "free(p); p = p->next; must trigger UAF before rebinding p"
+        );
+
+        let ifdef_c = r#"
+void fn_one(struct Node *p) {
+#ifdef USE_FAST
+    if (1) {
+#else
+    if (2) {
+#endif
+        free(p);
+    }
+}
+void fn_two(struct Node *p) {
+    p->val = 42;
+}
+"#;
+        let ifdef_hits = analyze_c_cpp_memory_typestate("src/ifdef.c", ifdef_c);
+        assert!(
+            ifdef_hits.is_empty(),
+            "Tree-sitter function spans must isolate fn_two from #ifdef brace drift in fn_one: {ifdef_hits:?}"
+        );
+
+        let single_line_rs = r#"
+use std::sync::Mutex;
+async fn safe_inline_scope(m: &Mutex<u32>) {
+    { let mut g = m.lock().unwrap(); *g += 1; }
+    do_io().await;
+}
+"#;
+        let rs_hits = analyze_rust_async_mutex_across_await("src/inline.rs", single_line_rs);
+        assert!(
+            rs_hits.is_empty(),
+            "single-line scoped mutex guard must drop before .await: {rs_hits:?}"
+        );
     }
 }

@@ -89,7 +89,7 @@ pub(crate) const PROFILE: LangProfile = LangProfile {
 };
 
 pub(crate) fn extract(root: Node, ctx: &mut ExtractContext<'_>) {
-    walk_node(root, ctx, "", &HashSet::new());
+    walk_node(root, ctx, "", &HashSet::new(), 0);
 }
 
 fn walk_node(
@@ -97,7 +97,11 @@ fn walk_node(
     ctx: &mut ExtractContext<'_>,
     route_prefix: &str,
     scope_guards: &HashSet<GuardKind>,
+    depth: usize,
 ) {
+    if depth >= crate::taint::MAX_AST_WALK_DEPTH {
+        return;
+    }
     let k = node.kind();
 
     if k == "import" {
@@ -141,7 +145,7 @@ fn walk_node(
             if matches!(ch.kind(), "class_body" | "enum_class_body") {
                 let mut bc = ch.walk();
                 for member in ch.children(&mut bc) {
-                    walk_node(member, ctx, &class_prefix, &class_guards);
+                    walk_node(member, ctx, &class_prefix, &class_guards, depth + 1);
                 }
             }
         }
@@ -149,17 +153,19 @@ fn walk_node(
     }
 
     if k == "function_declaration" {
-        extract_function(node, ctx, route_prefix, scope_guards);
+        extract_function(node, ctx, route_prefix, scope_guards, depth + 1);
         return;
     }
 
-    if k == "call_expression" && handle_ktor_dsl_call(node, ctx, route_prefix, scope_guards) {
+    if k == "call_expression"
+        && handle_ktor_dsl_call(node, ctx, route_prefix, scope_guards, depth + 1)
+    {
         return;
     }
 
     let mut c = node.walk();
     for ch in node.children(&mut c) {
-        walk_node(ch, ctx, route_prefix, scope_guards);
+        walk_node(ch, ctx, route_prefix, scope_guards, depth + 1);
     }
 }
 
@@ -183,6 +189,7 @@ fn extract_function(
     ctx: &mut ExtractContext<'_>,
     route_prefix: &str,
     scope_guards: &HashSet<GuardKind>,
+    depth: usize,
 ) {
     let mod_txt = collect_child_text(node, "modifiers", ctx.src);
     if mod_txt.contains("@Test") {
@@ -243,7 +250,7 @@ fn extract_function(
     if let Some(b) = body {
         let mut c = b.walk();
         for ch in b.children(&mut c) {
-            walk_node(ch, ctx, route_prefix, scope_guards);
+            walk_node(ch, ctx, route_prefix, scope_guards, depth + 1);
         }
     }
 }
@@ -253,6 +260,7 @@ fn handle_ktor_dsl_call(
     ctx: &mut ExtractContext<'_>,
     route_prefix: &str,
     scope_guards: &HashSet<GuardKind>,
+    depth: usize,
 ) -> bool {
     let mut c = node.walk();
     let named: Vec<Node> = node.named_children(&mut c).collect();
@@ -289,7 +297,7 @@ fn handle_ktor_dsl_call(
         if let Some(lam) = lambda {
             let mut lc = lam.walk();
             for ch in lam.children(&mut lc) {
-                walk_node(ch, ctx, &next_prefix, &next_guards);
+                walk_node(ch, ctx, &next_prefix, &next_guards, depth + 1);
             }
             return true;
         }

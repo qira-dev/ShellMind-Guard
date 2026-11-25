@@ -65,9 +65,63 @@ struct TaintEnv {
     handler_aliases: HashMap<String, Vec<String>>,
     /// Phase 11: Multi-hop object points-to alias graph (`alias_var -> parent_obj_var`).
     object_aliases: HashMap<String, String>,
+    /// Phase 27B: Andersen field-sensitive points-to constraint log for multi-hop alias corroboration.
+    pts_stmts: Vec<crate::cfa_ssa::PointsToStmt>,
+    next_alloc_site: u32,
 }
 
 impl TaintEnv {
+    fn record_pts_alloc(&mut self, var: &str) {
+        if !self
+            .pts_stmts
+            .iter()
+            .any(|s| matches!(s, crate::cfa_ssa::PointsToStmt::Alloc { var: v, .. } if v == var))
+        {
+            let site = crate::cfa_ssa::AllocSite(self.next_alloc_site);
+            self.next_alloc_site = self.next_alloc_site.saturating_add(1);
+            self.pts_stmts.push(crate::cfa_ssa::PointsToStmt::Alloc {
+                var: var.to_string(),
+                site,
+            });
+        }
+    }
+
+    fn record_pts_copy(&mut self, dst: &str, src: &str) {
+        self.record_pts_alloc(src);
+        self.pts_stmts.push(crate::cfa_ssa::PointsToStmt::Copy {
+            dst: dst.to_string(),
+            src: src.to_string(),
+        });
+    }
+
+    fn record_pts_store(&mut self, base: &str, field: &str, taint_bits: u8) {
+        self.record_pts_alloc(base);
+        self.pts_stmts
+            .push(crate::cfa_ssa::PointsToStmt::StoreFieldTaint {
+                base: base.to_string(),
+                field: field.to_string(),
+                taint_bits: taint_bits as u32,
+            });
+    }
+
+    fn record_pts_sanitize(&mut self, base: &str, field: &str, clear_bits: u8) {
+        self.record_pts_alloc(base);
+        self.pts_stmts
+            .push(crate::cfa_ssa::PointsToStmt::SanitizeField {
+                base: base.to_string(),
+                field: field.to_string(),
+                clear_bits: clear_bits as u32,
+            });
+    }
+
+    fn query_andersen_field_taint(&self, var: &str, field: &str) -> u8 {
+        if self.pts_stmts.is_empty() {
+            return 0;
+        }
+        let solved = crate::cfa_ssa::FieldSensitivePointsTo::solve(&self.pts_stmts);
+        solved.query_field_taint(var, field) as u8
+    }
+
     /// Resolves a variable through up to 4 object alias hops (`r2 -> r1 -> payload`) to its canonical root.
     fn resolve_obj_root(&self, var: &str) -> String {
         let mut cur = var;
@@ -155,6 +209,12 @@ impl TaintEnv {
                 .entry(alias.clone())
                 .or_insert_with(|| target.clone());
         }
+        for st in &other.pts_stmts {
+            if !self.pts_stmts.contains(st) {
+                self.pts_stmts.push(st.clone());
+            }
+        }
+        self.next_alloc_site = self.next_alloc_site.max(other.next_alloc_site);
         self.var_cleared_masks.retain(|k, prev| {
             if let Some(ov) = other.var_cleared_masks.get(k) {
                 *prev &= *ov;
@@ -1701,7 +1761,8 @@ fn ast_eval_masks(node: Node, src: &[u8], env: &TaintEnv) -> (u8, u8) {
                 .or_else(|| env.field_params.get(&(raw_base.clone(), field.clone())))
                 .copied();
             if f_direct.is_some() || f_param.is_some() {
-                return (f_direct.unwrap_or(0), f_param.unwrap_or(0));
+                let pts_direct = env.query_andersen_field_taint(&raw_base, &field);
+                return (f_direct.unwrap_or(0) | pts_direct, f_param.unwrap_or(0));
             }
             if env
                 .sanitized_fields
@@ -1713,7 +1774,8 @@ fn ast_eval_masks(node: Node, src: &[u8], env: &TaintEnv) -> (u8, u8) {
                 return (0, 0);
             }
             if env.object_vars.contains(&base) || env.object_vars.contains(&raw_base) {
-                return (0, 0);
+                let pts_direct = env.query_andersen_field_taint(&raw_base, &field);
+                return (pts_direct, 0);
             }
         }
         let mut d = 0u8;
@@ -3586,7 +3648,7 @@ fn analyze_statement_block_depth(
         if has_csrf_exempt_expr(&stmt_code) {
             summary.csrf_exempt = true;
         }
-        if has_csrf_guard_expr(&stmt_code) {
+        if !is_compound && !summary.has_db_crud_sink && has_csrf_guard_expr(&stmt_code) {
             summary.guards.insert(GuardKind::CsrfProtection);
         }
 
@@ -3597,7 +3659,7 @@ fn analyze_statement_block_depth(
             if has_resource_id_expr(&stmt_code, None) {
                 summary.has_resource_id = true;
             }
-            if has_ownership_filter_with_env(&stmt_code, Some(env)) {
+            if !summary.has_db_crud_sink && has_ownership_filter_with_env(&stmt_code, Some(env)) {
                 summary.guards.insert(GuardKind::OwnershipCheck);
             }
             if is_db_crud_stmt(&stmt_code) {
@@ -3763,6 +3825,7 @@ fn analyze_statement_block_depth(
                 env.object_vars.insert(raw_base.clone());
                 env.object_vars.insert(base.clone());
                 if rhs_direct_mask != 0 {
+                    env.record_pts_store(&raw_base, &field, rhs_direct_mask);
                     env.field_direct
                         .insert((base.clone(), field.clone()), rhs_direct_mask);
                     env.sanitized_fields.remove(&(base.clone(), field.clone()));
@@ -3781,6 +3844,7 @@ fn analyze_statement_block_depth(
                     env.field_params.remove(&(base.clone(), field.clone()));
                 }
                 if rhs_direct_mask == 0 && rhs_param_mask == 0 {
+                    env.record_pts_sanitize(&raw_base, &field, TAINT_ALL);
                     env.sanitized_fields.insert((base.clone(), field.clone()));
                 }
                 if rhs_cleared != 0 {
@@ -3923,6 +3987,7 @@ fn analyze_statement_block_depth(
                                     || env.object_aliases.contains_key(rhs_trim))
                             {
                                 let root_obj = env.resolve_obj_root(rhs_trim);
+                                env.record_pts_copy(&n, rhs_trim);
                                 env.object_aliases.insert(n.clone(), root_obj);
                                 env.object_vars.insert(n.clone());
                             } else {
@@ -4368,13 +4433,18 @@ pub fn analyze_function_taint(
     if has_csrf_exempt_expr(&fn_code) {
         summary.csrf_exempt = true;
     }
-    if has_csrf_guard_expr(&fn_code) {
+    // Only check function header/decorators/signature for unconditional CSRF protection;
+    // body-level CSRF checks must strictly dominate sinks (via CFG + pre-sink statement walk).
+    let header_code = if let Some(body) = fn_node.child_by_field_name("body") {
+        let end = body.start_byte().saturating_sub(fn_node.start_byte());
+        let raw_fn = node_text(fn_node, src);
+        strip_comments_simple(&raw_fn[..end.min(raw_fn.len())])
+    } else {
+        String::new()
+    };
+    if has_csrf_guard_expr(&header_code) {
         summary.guards.insert(GuardKind::CsrfProtection);
     }
-    let body_code = fn_node
-        .child_by_field_name("body")
-        .map(|b| strip_comments_simple(node_text(b, src)))
-        .unwrap_or_default();
 
     let (file_safe_literals, file_safe_maps) =
         collect_file_safe_literals_and_const_maps(fn_node, src);
@@ -4440,10 +4510,6 @@ pub fn analyze_function_taint(
                 summary.clears_taint_mask |= cleared;
             }
         }
-    }
-
-    if has_ownership_filter_with_env(&body_code, Some(&env)) {
-        summary.guards.insert(GuardKind::OwnershipCheck);
     }
 
     // Phase 15C: Prune mathematically unreachable (SMT UNSAT) dead-path findings.
