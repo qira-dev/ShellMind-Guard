@@ -154,6 +154,7 @@ fn resolve_symbol_in_file(
         return indices.clone();
     }
     let mut visited = HashSet::new();
+    let mut truncated = false;
     let res = resolve_symbol_in_file_memo(
         target_file,
         symbol_name,
@@ -164,8 +165,9 @@ fn resolve_symbol_in_file(
         depth,
         &mut visited,
         resolve_cache,
+        &mut truncated,
     );
-    if depth == 0 && resolve_cache.len() < 250_000 {
+    if depth == 0 && !truncated && resolve_cache.len() < 250_000 {
         resolve_cache.insert((target_file, symbol_name), res.clone());
     }
     res
@@ -182,8 +184,13 @@ fn resolve_symbol_in_file_memo(
     depth: usize,
     visited: &mut HashSet<(SymbolId, SymbolId)>,
     resolve_cache: &mut HashMap<(SymbolId, SymbolId), Vec<NodeIndex>>,
+    truncated: &mut bool,
 ) -> Vec<NodeIndex> {
-    if visited.len() >= 64 || !visited.insert((target_file, symbol_name)) {
+    if visited.len() >= 64 {
+        *truncated = true;
+        return Vec::new();
+    }
+    if !visited.insert((target_file, symbol_name)) {
         return Vec::new();
     }
     if let Some(cached) = resolve_cache.get(&(target_file, symbol_name)) {
@@ -195,6 +202,7 @@ fn resolve_symbol_in_file_memo(
         return indices.clone();
     }
     if depth >= 6 {
+        *truncated = true;
         return Vec::new();
     }
     let Some(imps) = file_imports.get(&target_file) else {
@@ -204,6 +212,7 @@ fn resolve_symbol_in_file_memo(
     let mut out = Vec::new();
     for &(local_name, next_file, remote_name) in imps {
         if visited.len() >= 64 {
+            *truncated = true;
             break;
         }
         if local_name == symbol_name {
@@ -217,6 +226,7 @@ fn resolve_symbol_in_file_memo(
                 depth + 1,
                 visited,
                 resolve_cache,
+                truncated,
             );
             for idx in resolved {
                 if !out.contains(&idx) {
@@ -234,6 +244,7 @@ fn resolve_symbol_in_file_memo(
                 depth + 1,
                 visited,
                 resolve_cache,
+                truncated,
             );
             for idx in resolved {
                 if !out.contains(&idx) {
@@ -516,6 +527,7 @@ fn is_phase8_pkg_scoped(rel_path: &str) -> bool {
                 | "zsh"
                 | "tf"
                 | "tfvars"
+                | "hcl"
         )
     )
 }
@@ -2325,8 +2337,21 @@ pub fn append_local_static_findings(
 
 fn is_example_or_benchmark_path(rel_path: &str) -> bool {
     let low = rel_path.replace('\\', "/").to_ascii_lowercase();
-    low.split('/')
-        .any(|seg| matches!(seg, "examples" | "example" | "benchmark" | "benchmarks"))
+    let segs: Vec<&str> = low.split('/').filter(|s| !s.is_empty()).collect();
+    segs.iter().enumerate().any(|(i, &seg)| {
+        if matches!(seg, "examples" | "benchmark" | "benchmarks") {
+            return true;
+        }
+        if seg == "example" {
+            let prev = i
+                .checked_sub(1)
+                .and_then(|p| segs.get(p))
+                .copied()
+                .unwrap_or("");
+            return !matches!(prev, "com" | "org" | "net" | "io" | "edu" | "gov");
+        }
+        false
+    })
 }
 
 fn insert_static_finding(

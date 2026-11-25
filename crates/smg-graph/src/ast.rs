@@ -3389,7 +3389,7 @@ fn resolve_extension_import(
             "dart" => &["dart"],
             "rb" => &["rb", "rake", "ru"],
             "sh" => &["sh", "bash", "zsh"],
-            "hcl" => &["tf", "tfvars"],
+            "hcl" => &["tf", "tfvars", "hcl"],
             _ => return None,
         };
         let clean = body
@@ -3406,7 +3406,11 @@ fn resolve_extension_import(
                 .unwrap_or_else(|| Path::new(""));
             let rel_dir = normalize_rel_path(&parent.join(body.trim()));
             if !rel_dir.is_empty() {
-                for cand in [format!("{}/main.tf", rel_dir), format!("{}.tf", rel_dir)] {
+                for cand in [
+                    format!("{}/main.tf", rel_dir),
+                    format!("{}.tf", rel_dir),
+                    format!("{}.hcl", rel_dir),
+                ] {
                     if known_files.contains(&cand) {
                         return Some(cand);
                     }
@@ -3492,7 +3496,7 @@ impl<'a> ImportFileIndex<'a> {
     pub fn new(known_files: &'a HashSet<String>) -> Self {
         const INDEXED_DIR_EXTS: &[&str] = &[
             "php", "phtml", "java", "cs", "kt", "kts", "swift", "dart", "rb", "rake", "ru", "sh",
-            "bash", "zsh", "tf", "tfvars",
+            "bash", "zsh", "tf", "tfvars", "hcl",
         ];
         let mut sorted: Vec<&String> = known_files.iter().collect();
         sorted.sort();
@@ -3519,11 +3523,11 @@ impl<'a> ImportFileIndex<'a> {
                 let dir_parts = &parts[..parts.len() - 1];
                 let dlen = dir_parts.len();
                 for i in 0..dlen {
-                    let max_j = (i + 4).min(dlen);
+                    let max_j = (i + 12).min(dlen);
                     for j in i..max_j {
                         let seg = dir_parts[i..=j].join("/");
                         let entry = dir_seg_map.entry((ext.to_string(), seg)).or_default();
-                        if entry.len() < 4 || ext == "tf" || ext == "tfvars" {
+                        if entry.len() < 4 || ext == "tf" || ext == "tfvars" || ext == "hcl" {
                             entry.push(f.clone());
                         }
                     }
@@ -3654,7 +3658,7 @@ fn resolve_extension_import_indexed(
             "dart" => &["dart"],
             "rb" => &["rb", "rake", "ru"],
             "sh" => &["sh", "bash", "zsh"],
-            "hcl" => &["tf", "tfvars"],
+            "hcl" => &["tf", "tfvars", "hcl"],
             _ => return None,
         };
         let clean = body
@@ -3671,7 +3675,11 @@ fn resolve_extension_import_indexed(
                 .unwrap_or_else(|| Path::new(""));
             let rel_dir = normalize_rel_path(&parent.join(body.trim()));
             if !rel_dir.is_empty() {
-                for cand in [format!("{}/main.tf", rel_dir), format!("{}.tf", rel_dir)] {
+                for cand in [
+                    format!("{}/main.tf", rel_dir),
+                    format!("{}.tf", rel_dir),
+                    format!("{}.hcl", rel_dir),
+                ] {
                     if known_files.contains(&cand) {
                         return Some(cand);
                     }
@@ -4287,6 +4295,26 @@ mod tests {
             rust_ast.static_findings.is_empty(),
             "Pattern matchers and #[cfg(test)] blocks in Rust files must produce 0 non-secret findings: {:?}",
             rust_ast.static_findings
+        );
+    }
+
+    #[test]
+    fn test_new02_import_index_deep_java_pkg_and_hcl_parity() {
+        let mut known = HashSet::new();
+        known.insert("src/main/java/com/acme/cloud/billing/internal/v2/Ledger.java".to_string());
+        known.insert("infra/modules/vpc/network.hcl".to_string());
+        let idx = ImportFileIndex::new(&known);
+        assert_eq!(
+            resolve_import_target_indexed(
+                "src/main/java/com/acme/App.java",
+                "java::com/acme/cloud/billing/internal/v2",
+                &idx
+            ),
+            Some("src/main/java/com/acme/cloud/billing/internal/v2/Ledger.java".to_string())
+        );
+        assert_eq!(
+            resolve_import_target_indexed("infra/main.tf", "hcl::./modules/vpc/network", &idx),
+            Some("infra/modules/vpc/network.hcl".to_string())
         );
     }
 }

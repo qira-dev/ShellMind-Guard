@@ -2336,6 +2336,10 @@ fn export_report(state: &mut TuiState, fmt: &str) {
         }
         "sarif" => {
             let out = dir.join("report.sarif");
+            if is_symlink(&out) {
+                state.push_log(format!("Refused export: {} is a symlink", out.display()));
+                return;
+            }
             let sarif = to_sarif_json(&state.graph.findings, &verified_vec);
             match fs::create_dir_all(&dir).and_then(|_| fs::write(&out, sarif)) {
                 Ok(_) => state.push_log(format!("Exported SARIF -> {}", out.display())),

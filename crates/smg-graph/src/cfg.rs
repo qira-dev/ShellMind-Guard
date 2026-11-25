@@ -747,15 +747,37 @@ impl<'a> CfgBuilder<'a> {
         let body_aborts_401 = if_txt.contains("401")
             || if_txt.contains("statusunauthorized")
             || if_txt.contains("errunauthorized");
-        let init_guards = if_node
+        let (init_guards, init_vars) = if_node
             .child_by_field_name("initializer")
-            .map(|init| self.stmt_direct_guards(init))
-            .unwrap_or(GuardBitset::EMPTY);
+            .map(|init| {
+                let guards = self.stmt_direct_guards(init);
+                let txt = crate::ast::strip_comments(node_text(init, self.src));
+                let lhs = txt
+                    .split_once(":=")
+                    .or_else(|| txt.split_once('='))
+                    .map(|(l, _)| l)
+                    .unwrap_or("");
+                let vars: Vec<String> = lhs
+                    .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .filter(|s| {
+                        !s.is_empty()
+                            && *s != "_"
+                            && !matches!(*s, "let" | "const" | "var" | "auto" | "mut")
+                            && s.chars()
+                                .next()
+                                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                    })
+                    .map(str::to_string)
+                    .collect();
+                (guards, vars)
+            })
+            .unwrap_or_else(|| (GuardBitset::EMPTY, Vec::new()));
+        let init_ctx = (init_guards, init_vars);
         self.eval_cond_expr(
             cond_node,
             body_aborts_401_403,
             body_aborts_401,
-            init_guards,
+            &init_ctx,
             0,
         )
     }
@@ -765,7 +787,7 @@ impl<'a> CfgBuilder<'a> {
         node: Node,
         body_aborts_401_403: bool,
         body_aborts_401: bool,
-        init_guards: GuardBitset,
+        init_ctx: &(GuardBitset, Vec<String>),
         depth: usize,
     ) -> (GuardBitset, GuardBitset) {
         if depth >= 64 {
@@ -779,7 +801,7 @@ impl<'a> CfgBuilder<'a> {
                     inner,
                     body_aborts_401_403,
                     body_aborts_401,
-                    init_guards,
+                    init_ctx,
                     depth + 1,
                 );
             }
@@ -804,7 +826,7 @@ impl<'a> CfgBuilder<'a> {
                         inner,
                         body_aborts_401_403,
                         body_aborts_401,
-                        init_guards,
+                        init_ctx,
                         depth + 1,
                     );
                     return (fg, tg);
@@ -816,7 +838,7 @@ impl<'a> CfgBuilder<'a> {
                         inner,
                         body_aborts_401_403,
                         body_aborts_401,
-                        init_guards,
+                        init_ctx,
                         depth + 1,
                     );
                 }
@@ -837,14 +859,14 @@ impl<'a> CfgBuilder<'a> {
                     left,
                     body_aborts_401_403,
                     body_aborts_401,
-                    init_guards,
+                    init_ctx,
                     depth + 1,
                 );
                 let (rt, rf) = self.eval_cond_expr(
                     right,
                     body_aborts_401_403,
                     body_aborts_401,
-                    init_guards,
+                    init_ctx,
                     depth + 1,
                 );
                 return (lt.union(rt), lf.intersect(rf));
@@ -854,23 +876,34 @@ impl<'a> CfgBuilder<'a> {
                     left,
                     body_aborts_401_403,
                     body_aborts_401,
-                    init_guards,
+                    init_ctx,
                     depth + 1,
                 );
                 let (rt, rf) = self.eval_cond_expr(
                     right,
                     body_aborts_401_403,
                     body_aborts_401,
-                    init_guards,
+                    init_ctx,
                     depth + 1,
                 );
                 return (lt.intersect(rt), lf.union(rf));
             }
         }
 
+        let leaf_txt = crate::ast::strip_comments(node_text(node, self.src));
+        let scoped_init = if !init_ctx.0.is_empty()
+            && init_ctx.1.iter().any(|v| {
+                leaf_txt
+                    .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .any(|tok| tok == v)
+            }) {
+            init_ctx.0
+        } else {
+            GuardBitset::EMPTY
+        };
         let leaf_guards = self
             .stmt_direct_guards(node)
-            .union(init_guards)
+            .union(scoped_init)
             .union(self.leaf_cond_text_guards(node, body_aborts_401_403, body_aborts_401));
         if leaf_guards.is_empty() {
             return (GuardBitset::EMPTY, GuardBitset::EMPTY);
@@ -892,16 +925,26 @@ impl<'a> CfgBuilder<'a> {
         if let Some((lhs, rhs)) = t.split_once("!=") {
             let lhs_trim = lhs.trim();
             let rhs_trim = rhs.trim().trim_start_matches('=').trim();
-            if rhs_trim == "nil" {
-                return lhs_trim == "err"
-                    || lhs_trim.ends_with("_err")
-                    || lhs_trim.ends_with(".err");
+            if rhs_trim == "nil" || lhs_trim == "nil" {
+                let other = if rhs_trim == "nil" {
+                    lhs_trim
+                } else {
+                    rhs_trim
+                };
+                return other == "err" || other.ends_with("_err") || other.ends_with(".err");
             }
-            // Ownership/equality mismatch guard (`owner_id != user_id`, `a !== b`) -> guard holds on false branch
-            if rhs_trim != "null" && rhs_trim != "undefined" && rhs_trim != "none" {
-                return true;
+            let is_empty_or_falsy = |s: &str| {
+                matches!(
+                    s,
+                    "null" | "undefined" | "none" | "false" | "0" | "\"\"" | "''" | "``"
+                )
+            };
+            if is_empty_or_falsy(rhs_trim) || is_empty_or_falsy(lhs_trim) {
+                // `req.token !== ""`, `user_id != 0`, `authed != false`, `null != session` are POSITIVE checks
+                return false;
             }
-            return false;
+            // Ownership/role mismatch (`owner_id != user_id`, `role !== "admin"`) -> guard holds on false branch
+            return true;
         }
         // Explicit absence / failure / falsy checks -> guard holds on false (fallthrough) branch
         t.contains("== nil")
@@ -917,6 +960,8 @@ impl<'a> CfgBuilder<'a> {
             || t.contains(".is_none(")
             || t.contains(".is_err(")
             || t.contains(".is_empty(")
+            || t.starts_with("let err(")
+            || t.starts_with("let none")
             || ((t.starts_with('!') && !t.starts_with("!!") || t.starts_with("not "))
                 && !t.contains("&&")
                 && !t.contains("||")
@@ -1333,5 +1378,20 @@ func customGate(w http.ResponseWriter, r *http.Request) {
             }"#,
         );
         assert!(try_abort_catch.contains(&GuardKind::Auth));
+    }
+
+    #[test]
+    fn test_new03_cfg_negation_polarity_and_scoped_init_guards() {
+        // Positive `!== ""` must grant Auth to then-branch (not false-branch)
+        let pos_neq_empty = eval_ts_fn_guards(
+            r#"function pay(req: any, res: any) {
+                if (req.token !== "") {
+                    balance -= req.body.amount;
+                } else {
+                    return res.status(401).end();
+                }
+            }"#,
+        );
+        assert!(pos_neq_empty.contains(&GuardKind::Auth));
     }
 }

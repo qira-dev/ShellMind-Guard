@@ -29,7 +29,17 @@ pub(crate) const PROFILE: LangProfile = LangProfile {
         "mysql_stmt_prepare",
         "pqexecparams",
     ],
-    cmd_sinks: &["system(", "popen(", "execl(", "execvp(", "shellexecute("],
+    cmd_sinks: &[
+        "system(",
+        "popen(",
+        "execl(",
+        "execvp(",
+        "execve(",
+        "shellexecute(",
+        "createprocess(",
+        "createprocessa(",
+        "createprocessw(",
+    ],
     cmd_sanitizers: &["allowed_cmds", "commandallowlist"],
     path_sinks: &[
         "fopen(",

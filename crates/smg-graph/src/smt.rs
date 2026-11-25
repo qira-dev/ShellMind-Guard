@@ -1263,10 +1263,15 @@ fn collect_mutated_vars_in_subtree(
 }
 
 fn block_always_exits(node: Node, src: &[u8]) -> bool {
-    block_always_exits_depth(node, src, 0)
+    block_always_exits_ctx(node, src, 0, false)
 }
 
-fn block_always_exits_depth(node: Node, src: &[u8], depth: usize) -> bool {
+fn block_always_exits_ctx(
+    node: Node,
+    src: &[u8],
+    depth: usize,
+    in_inner_loop_or_switch: bool,
+) -> bool {
     if depth >= 32 {
         return false;
     }
@@ -1286,14 +1291,15 @@ fn block_always_exits_depth(node: Node, src: &[u8], depth: usize) -> bool {
     }
     if matches!(
         k,
-        "return_statement"
-            | "return_expression"
-            | "throw_statement"
-            | "raise_statement"
-            | "break_statement"
-            | "continue_statement"
+        "return_statement" | "return_expression" | "throw_statement" | "raise_statement"
     ) {
         return true;
+    }
+    if matches!(
+        k,
+        "break_statement" | "break_expression" | "continue_statement" | "continue_expression"
+    ) {
+        return !in_inner_loop_or_switch;
     }
     if matches!(k, "expression_statement" | "macro_invocation") {
         let low = strip_comments(node_text(node, src))
@@ -1308,17 +1314,79 @@ fn block_always_exits_depth(node: Node, src: &[u8], depth: usize) -> bool {
         {
             return true;
         }
+        return false;
     }
     if matches!(k, "if_statement" | "if_expression") {
         let cons = node.child_by_field_name("consequence");
         let alt = node.child_by_field_name("alternative");
-        return cons.is_some_and(|n| block_always_exits_depth(n, src, depth + 1))
-            && alt.is_some_and(|n| block_always_exits_depth(n, src, depth + 1));
+        return cons
+            .is_some_and(|n| block_always_exits_ctx(n, src, depth + 1, in_inner_loop_or_switch))
+            && alt.is_some_and(|n| {
+                block_always_exits_ctx(n, src, depth + 1, in_inner_loop_or_switch)
+            });
     }
-    let mut cursor = node.walk();
-    for ch in node.children(&mut cursor) {
-        if block_always_exits_depth(ch, src, depth + 1) {
+    if k == "try_statement" {
+        let body = node.child_by_field_name("body");
+        let mut handlers = Vec::new();
+        let mut finalizer = None;
+        let mut cursor = node.walk();
+        for ch in node.named_children(&mut cursor) {
+            let ck = ch.kind();
+            if ck.contains("finally") {
+                finalizer = Some(ch);
+            } else if ck.contains("catch") || ck.contains("except") {
+                handlers.push(ch);
+            }
+        }
+        if let Some(fin) = finalizer
+            && block_always_exits_ctx(fin, src, depth + 1, in_inner_loop_or_switch)
+        {
             return true;
+        }
+        let body_exits = body
+            .is_some_and(|b| block_always_exits_ctx(b, src, depth + 1, in_inner_loop_or_switch));
+        if !body_exits {
+            return false;
+        }
+        if handlers.is_empty() {
+            return true;
+        }
+        return handlers
+            .into_iter()
+            .all(|h| block_always_exits_ctx(h, src, depth + 1, in_inner_loop_or_switch));
+    }
+    // Conditional or unconditional loops: sound default is `false` (may execute 0 iterations or break)
+    if matches!(
+        k,
+        "while_statement"
+            | "for_statement"
+            | "for_in_statement"
+            | "for_range_loop"
+            | "while_expression"
+            | "for_expression"
+            | "loop_expression"
+            | "do_statement"
+    ) {
+        return false;
+    }
+    // Only recurse through sequential statement containers
+    if matches!(
+        k,
+        "statement_block"
+            | "block"
+            | "compound_statement"
+            | "else_clause"
+            | "catch_clause"
+            | "except_clause"
+            | "finally_clause"
+            | "parenthesized_expression"
+            | "statement_list"
+    ) {
+        let mut cursor = node.walk();
+        for ch in node.named_children(&mut cursor) {
+            if block_always_exits_ctx(ch, src, depth + 1, in_inner_loop_or_switch) {
+                return true;
+            }
         }
     }
     false
@@ -1529,6 +1597,56 @@ function liveHandler(req, res) {
                 .any(|f| f.rule_id == "SMG-CMDI-001"),
             "SAT reachable branch must still detect SMG-CMDI-001, got: {:#?}",
             live_sat.findings
+        );
+
+        // [NEW-01] try/catch with fallthrough catch and loop with break must NOT prune downstream sink
+        let try_catch_fallthrough = run_js(
+            r#"
+function handleTry(req, x) {
+    if (x >= 0) {
+        try {
+            doWork();
+            return;
+        } catch (e) {
+            console.log(e);
+        }
+    }
+    if (x > 10) {
+        child_process.execSync(req.query.cmd);
+    }
+}
+"#,
+        );
+        assert!(
+            try_catch_fallthrough
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "SMG-CMDI-001"),
+            "Fallthrough catch block must not mark if-branch as always exiting: {:#?}",
+            try_catch_fallthrough.findings
+        );
+
+        let loop_break_fallthrough = run_js(
+            r#"
+function handleLoop(req, x, n) {
+    if (x >= 0) {
+        for (let i = 0; i < n; i++) {
+            break;
+        }
+    }
+    if (x > 10) {
+        child_process.execSync(req.query.cmd);
+    }
+}
+"#,
+        );
+        assert!(
+            loop_break_fallthrough
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "SMG-CMDI-001"),
+            "Inner loop break must not mark outer if-branch as always exiting: {:#?}",
+            loop_break_fallthrough.findings
         );
     }
 }

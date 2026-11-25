@@ -3989,12 +3989,30 @@ fn parse_git_commit_invocation_bounded(cmd_str: &str, depth: usize) -> Option<Pa
             ) {
                 tokens.remove(0);
                 // Consume wrapper options like `env -i`, `env -u VAR`, `sudo -E`, `sudo -u user`, `command -p`
-                while let Some(opt) = tokens.first() {
+                while let Some(opt) = tokens.first().cloned() {
                     if opt == "--" {
                         tokens.remove(0);
                         break;
                     }
-                    if matches!(opt.as_str(), "-u" | "-g" | "-C" | "--unset" | "--chdir") {
+                    if let Some(dir_val) = opt.strip_prefix("--chdir=") {
+                        tokens.remove(0);
+                        if !dir_val.is_empty() {
+                            let next = PathBuf::from(dir_val);
+                            current_cd = Some(match current_cd.take() {
+                                Some(base) if next.is_relative() => base.join(next),
+                                _ => next,
+                            });
+                        }
+                    } else if matches!(opt.as_str(), "-C" | "--chdir") {
+                        tokens.remove(0);
+                        if !tokens.is_empty() {
+                            let next = PathBuf::from(tokens.remove(0));
+                            current_cd = Some(match current_cd.take() {
+                                Some(base) if next.is_relative() => base.join(next),
+                                _ => next,
+                            });
+                        }
+                    } else if matches!(opt.as_str(), "-u" | "-g" | "--unset") {
                         tokens.remove(0);
                         if !tokens.is_empty() {
                             tokens.remove(0);

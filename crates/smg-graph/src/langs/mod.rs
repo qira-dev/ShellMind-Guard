@@ -687,6 +687,28 @@ fn is_dynamic_sql_stmt(stmt: &str, has_sql_var_taint: bool, has_dyn_sql_var: boo
     ((sql_verb_re().is_match(stmt) || has_sql_var_taint) && has_concat_or_interp) || has_dyn_sql_var
 }
 
+fn is_safe_const_exec_call(stmt_low: &str) -> bool {
+    for pat in [
+        "execve(",
+        "createprocess(",
+        "createprocessa(",
+        "createprocessw(",
+    ] {
+        if let Some(pos) = stmt_low.find(pat) {
+            let after = stmt_low[pos + pat.len()..].trim_start();
+            let arg0 = after.split(',').next().unwrap_or("").trim();
+            let is_const_str = (arg0.starts_with('"') && arg0.ends_with('"'))
+                || (arg0.starts_with("l\"") && arg0.ends_with('"'))
+                || (arg0.starts_with("text(\"") && arg0.ends_with("\")"))
+                || (arg0.starts_with("_t(\"") && arg0.ends_with("\")"));
+            if is_const_str {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn is_static_string_only_call(stmt: &str) -> bool {
     // Reject calls whose arguments are purely static literals (e.g. `system("ls -la")`, `exec("git status")`)
     let trimmed_stmt = stmt.trim();
@@ -970,6 +992,11 @@ pub(crate) fn build_analyzed_symbol(
                 continue;
             }
             if is_static_string_only_call(stmt) {
+                continue;
+            }
+            // For shell-free `execve(path, argv, envp)` / `CreateProcess*(app, cmd, ...)`,
+            // suppress when arg0 is a constant string literal (not NULL/nullptr/0 and not dynamic).
+            if bit == TAINT_CMD && is_safe_const_exec_call(&stmt_low) {
                 continue;
             }
             let uses_dyn_sql_var = dynamic_sql_vars

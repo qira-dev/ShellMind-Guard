@@ -402,6 +402,7 @@ struct App {
     entries: Arc<Mutex<Vec<Arc<ProxyEntry>>>>,
     summary: Arc<Mutex<ProxySummary>>,
     list_state: ListState,
+    selected_id: Option<u64>,
     focus: usize, // 0 = history, 1 = request pane, 2 = response pane
     req_scroll: u16,
     resp_scroll: u16,
@@ -414,6 +415,11 @@ struct App {
 impl App {
     fn selected(&self) -> Option<Arc<ProxyEntry>> {
         let entries = self.entries.lock().ok()?;
+        if let Some(target_id) = self.selected_id
+            && let Some(found) = entries.iter().rev().take(500).find(|e| e.id == target_id)
+        {
+            return Some(found.clone());
+        }
         let idx = self.list_state.selected()?;
         let display_len = entries.len().min(500);
         if idx >= display_len {
@@ -423,14 +429,49 @@ impl App {
         entries.get(logical_idx).cloned()
     }
 
+    fn sync_selection(&mut self) {
+        let Ok(entries) = self.entries.lock() else {
+            return;
+        };
+        let display_len = entries.len().min(500);
+        if display_len == 0 {
+            self.selected_id = None;
+            self.list_state.select(None);
+            return;
+        }
+        if let Some(target_id) = self.selected_id
+            && let Some(vis_idx) = entries
+                .iter()
+                .rev()
+                .take(500)
+                .position(|e| e.id == target_id)
+        {
+            self.list_state.select(Some(vis_idx));
+            return;
+        }
+        let idx = self.list_state.selected().unwrap_or(0).min(display_len - 1);
+        self.list_state.select(Some(idx));
+        if let Some(logical_idx) = entries.len().checked_sub(1 + idx) {
+            self.selected_id = entries.get(logical_idx).map(|e| e.id);
+        }
+    }
+
     fn select_next(&mut self, delta: i64) {
-        let len = self.entries.lock().map(|e| e.len().min(500)).unwrap_or(0);
+        self.sync_selection();
+        let Ok(entries) = self.entries.lock() else {
+            return;
+        };
+        let len = entries.len().min(500);
         if len == 0 {
             return;
         }
         let current = self.list_state.selected().unwrap_or(0) as i64;
         let next = (current + delta).clamp(0, len as i64 - 1) as usize;
         self.list_state.select(Some(next));
+        self.selected_id = entries
+            .len()
+            .checked_sub(1 + next)
+            .and_then(|i| entries.get(i).map(|e| e.id));
         self.req_scroll = 0;
         self.resp_scroll = 0;
     }
@@ -445,10 +486,8 @@ impl App {
             entries.push(Arc::new(ProxyEntry { id, ..entry }));
             id
         };
-        let len = self.entries.lock().map(|e| e.len()).unwrap_or(0);
-        if len > 0 {
-            self.list_state.select(Some(0));
-        }
+        self.selected_id = Some(id);
+        self.list_state.select(Some(0));
         self.status_message = Some(format!("entry #{id} captured"));
     }
 }
@@ -524,6 +563,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     // History list (newest first). The three lock sites in `draw` are strictly
     // sequential (each guard drops at the end of its statement/block) — never
     // nested, so no self-deadlock is possible here.
+    app.sync_selection();
     let items: Vec<ListItem> = {
         let entries = app.entries.lock(); // smg-ignore: SMG-ENG-DEADLOCK
         match entries {
@@ -853,6 +893,7 @@ pub fn run_proxy_tui(
         entries,
         summary,
         list_state: ListState::default(),
+        selected_id: None,
         focus: 0,
         req_scroll: 0,
         resp_scroll: 0,
