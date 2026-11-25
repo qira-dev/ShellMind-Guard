@@ -1121,8 +1121,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install ShellMind Guard
         run: |
-          curl -fsSL https://raw.githubusercontent.com/qira-dev/ShellMind-Guard/v1.4.5/install.sh -o install.sh
-          bash install.sh --version v1.4.5
+          curl -fsSL https://raw.githubusercontent.com/qira-dev/ShellMind-Guard/v1.5.0/install.sh -o install.sh
+          bash install.sh --version v1.5.0
           echo "$HOME/.local/bin" >> $GITHUB_PATH
       - name: Run ShellMind Guard 6-Layer Scan (SARIF)
         run: smg scan . --format sarif --sarif shellmind-guard.sarif --ci
