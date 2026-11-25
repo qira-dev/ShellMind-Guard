@@ -135,9 +135,11 @@ fn collect_solana_file_context(node: Node, src: &[u8], sctx: &mut SolanaFileCont
             .map(|n| node_txt(n, src).to_string())
             .unwrap_or_default();
         let body_txt = node_txt(node, src);
+        let body_low = body_txt.to_ascii_lowercase();
         if body_txt.contains("Program<")
             || body_txt.contains("Interface<")
-            || has_anchor_owner_attr(&body_txt.to_ascii_lowercase())
+            || body_low.contains("address =")
+            || body_low.contains("address=")
         {
             sctx.structs_with_validated_program.insert(struct_name);
         }

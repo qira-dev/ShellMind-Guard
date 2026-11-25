@@ -121,21 +121,24 @@ fn is_accounting_state_var(name: &str) -> bool {
 }
 
 fn collect_identifiers(
-    node: Node,
+    root: Node,
     src: &[u8],
     state_names: &HashSet<String>,
     out: &mut HashSet<String>,
 ) {
-    if node.kind() == "identifier" {
-        let txt = node_txt(node, src);
-        if state_names.contains(txt) {
-            out.insert(txt.to_string());
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "identifier" {
+            let txt = node_txt(node, src);
+            if state_names.contains(txt) {
+                out.insert(txt.to_string());
+            }
+            continue;
         }
-        return;
-    }
-    let mut c = node.walk();
-    for ch in node.children(&mut c) {
-        collect_identifiers(ch, src, state_names, out);
+        let mut c = node.walk();
+        for ch in node.children(&mut c) {
+            stack.push(ch);
+        }
     }
 }
 

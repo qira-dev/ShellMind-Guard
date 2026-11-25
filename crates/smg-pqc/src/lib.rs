@@ -47,6 +47,12 @@ pub fn scan_pqc_repo(
                     findings.extend(x509::audit_x509_chain(&parsed));
                     certificates.extend(parsed);
                 }
+                // Also run full DER inspection (expiry, SAN, weak MD5/SHA-1 sigs) on every decoded PEM cert block
+                for der in x509::decode_pem_certificates(&text) {
+                    let (_audit, der_hits) =
+                        x509_starttls_elf::inspect_x509_der(&f.rel_path, &der, current_year);
+                    findings.extend(der_hits);
+                }
             }
         } else if low.ends_with(".der") {
             seen_rel.insert(f.rel_path.clone());
@@ -58,11 +64,15 @@ pub fn scan_pqc_repo(
                 Some(buf)
             });
             if let Some(der) = bytes_opt {
+                if let Some(cert) = x509::parse_x509_der(&f.rel_path, 0, &der) {
+                    findings.extend(x509::audit_x509_chain(std::slice::from_ref(&cert)));
+                    certificates.push(cert);
+                }
                 let (_audit, der_hits) =
                     x509_starttls_elf::inspect_x509_der(&f.rel_path, &der, current_year);
                 findings.extend(der_hits);
             }
-        } else if low.ends_with(".so") || low.ends_with(".elf") {
+        } else if low.ends_with(".so") || low.contains(".so.") || low.ends_with(".elf") {
             seen_rel.insert(f.rel_path.clone());
             if let Some(elf_bytes) = f.cached_bytes.as_deref() {
                 let (_audit, elf_hits) =
@@ -86,15 +96,19 @@ pub fn scan_pqc_repo(
         depth: usize,
         current_year: u32,
         seen: &mut std::collections::HashSet<String>,
+        binary_files_scanned: &mut usize,
         out: &mut Vec<LocalStaticFinding>,
     ) {
-        if depth > 4 || out.len() >= 128 {
+        if depth > 4 || *binary_files_scanned >= 128 {
             return;
         }
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
         };
         for entry in entries.flatten() {
+            if *binary_files_scanned >= 128 {
+                break;
+            }
             let Ok(ft) = entry.file_type() else {
                 continue;
             };
@@ -111,7 +125,15 @@ pub fn scan_pqc_repo(
                 ) {
                     continue;
                 }
-                walk_pqc_binaries(root, &path, depth + 1, current_year, seen, out);
+                walk_pqc_binaries(
+                    root,
+                    &path,
+                    depth + 1,
+                    current_year,
+                    seen,
+                    binary_files_scanned,
+                    out,
+                );
                 continue;
             }
             let rel = path
@@ -124,6 +146,7 @@ pub fn scan_pqc_repo(
             }
             let low = name_str.to_ascii_lowercase();
             if low.ends_with(".der") {
+                *binary_files_scanned += 1;
                 use std::io::Read;
                 if let Ok(file) = std::fs::File::open(&path) {
                     let mut der = Vec::new();
@@ -133,24 +156,28 @@ pub fn scan_pqc_repo(
                         out.extend(hits);
                     }
                 }
-            } else if (low.ends_with(".elf") || low.ends_with(".so"))
+            } else if (low.ends_with(".elf") || low.ends_with(".so") || low.contains(".so."))
                 && let Ok(mut f) = std::fs::File::open(&path)
-                && let Ok((_a, hits)) = x509_starttls_elf::scan_elf_crypto_symbols_reader(
+            {
+                *binary_files_scanned += 1;
+                if let Ok((_a, hits)) = x509_starttls_elf::scan_elf_crypto_symbols_reader(
                     &rel,
                     &mut f,
                     32 * 1024 * 1024,
-                )
-            {
-                out.extend(hits);
+                ) {
+                    out.extend(hits);
+                }
             }
         }
     }
+    let mut binary_files_scanned = 0usize;
     walk_pqc_binaries(
         project_root,
         project_root,
         0,
         current_year,
         &mut seen_rel,
+        &mut binary_files_scanned,
         &mut findings,
     );
     let cbom_json = build_static_cbom_cyclonedx(project_root, &assets, &certificates);

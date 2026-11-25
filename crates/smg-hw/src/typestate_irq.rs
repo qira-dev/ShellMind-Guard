@@ -2102,12 +2102,11 @@ fn analyze_single_hw_function(
                 && !low.contains("cap")
             {
                 // Phase 13A P13-01: Require concrete destination capacity from `local_caps`
-                // (never fabricate a hardcoded `256`-byte guess for opaque `char *dst` parameters).
+                // directly referenced on this copy line (never hijack an unrelated stack array).
                 let dst_cap_opt = ident_re()
                     .find_iter(trimmed)
                     .filter_map(|m| local_caps.get(m.as_str()).copied())
                     .min()
-                    .or_else(|| local_caps.values().copied().min())
                     .and_then(|v| i64::try_from(v).ok());
 
                 if let Some(dst_cap) = dst_cap_opt {

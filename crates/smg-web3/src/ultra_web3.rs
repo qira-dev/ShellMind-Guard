@@ -39,7 +39,40 @@ pub(crate) fn canonical_abi_signature(fn_name: &str, params_text: &str) -> Strin
 }
 
 fn extract_canonical_param_type(param: &str) -> Option<String> {
-    let tokens: Vec<&str> = param.split_whitespace().collect();
+    let trimmed = param.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Recursively canonicalize tuple parameters `(T1 a, T2 b)[] calldata req` -> `(T1,T2)[]`
+    if let Some(after_open) = trimmed.strip_prefix('(') {
+        let mut depth = 1usize;
+        let mut close_idx = None;
+        for (i, ch) in after_open.char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close_idx = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(ci) = close_idx {
+            let inner = &after_open[..ci];
+            let trailing = after_open[ci + 1..].split_whitespace().next().unwrap_or("");
+            let arr_suffix = if trailing.starts_with('[') {
+                trailing
+            } else {
+                ""
+            };
+            let inner_sig = canonical_abi_signature("", inner);
+            return Some(format!("{}{}", inner_sig, arr_suffix));
+        }
+    }
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
     let raw_ty = *tokens.first()?;
     if raw_ty.is_empty() {
         return None;
@@ -405,10 +438,10 @@ pub fn analyze_solana_pda_depth_with_ctx(
     let lines: Vec<&str> = stripped.lines().collect();
     let mut findings = Vec::new();
 
+    let _ = ws_ctx;
     let file_has_validated_program = stripped.contains("Program<'info,")
         || stripped.contains("Program< 'info,")
-        || stripped.contains("Interface<'info,")
-        || ws_ctx.is_some_and(|w| !w.structs_with_validated_program.is_empty());
+        || stripped.contains("Interface<'info,");
 
     for (idx, line) in lines.iter().enumerate() {
         let trimmed = line.trim();

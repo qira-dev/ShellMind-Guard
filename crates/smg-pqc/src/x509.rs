@@ -142,12 +142,14 @@ pub(crate) fn decode_oid(bytes: &[u8]) -> Option<String> {
 /// Maps well-known X.509 signature / public-key OIDs to `(canonical_name, is_shor_vulnerable)`.
 pub fn classify_x509_oid(oid: &str) -> (&'static str, bool) {
     match oid {
+        "1.2.840.113549.1.1.4" => ("MD5-with-RSA", true),
         "1.2.840.113549.1.1.5" => ("SHA1-with-RSA", true),
         "1.2.840.113549.1.1.11" => ("SHA256-with-RSA", true),
         "1.2.840.113549.1.1.12" => ("SHA384-with-RSA", true),
         "1.2.840.113549.1.1.13" => ("SHA512-with-RSA", true),
         "1.2.840.113549.1.1.10" => ("RSASSA-PSS", true),
         "1.2.840.113549.1.1.1" => ("RSA", true),
+        "1.2.840.10045.4.1" => ("ECDSA-with-SHA1", true),
         "1.2.840.10045.4.3.2" => ("ECDSA-with-SHA256", true),
         "1.2.840.10045.4.3.3" => ("ECDSA-with-SHA384", true),
         "1.2.840.10045.4.3.4" => ("ECDSA-with-SHA512", true),
@@ -280,6 +282,25 @@ pub fn parse_x509_der(rel_path: &str, chain_index: usize, der: &[u8]) -> Option<
         remaining_years,
         is_ca,
     })
+}
+
+/// Extracts and base64-decodes all PEM `-----BEGIN CERTIFICATE-----` blocks into raw DER byte vectors.
+pub fn decode_pem_certificates(content: &str) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let begin_marker = "-----BEGIN CERTIFICATE-----";
+    let end_marker = "-----END CERTIFICATE-----";
+    let mut rest = content;
+    while let Some(start) = rest.find(begin_marker) {
+        let after_begin = &rest[start + begin_marker.len()..];
+        let Some(end) = after_begin.find(end_marker) else {
+            break;
+        };
+        if let Some(der) = decode_base64(&after_begin[..end]) {
+            out.push(der);
+        }
+        rest = &after_begin[end + end_marker.len()..];
+    }
+    out
 }
 
 /// Extracts all PEM `-----BEGIN CERTIFICATE-----` blocks in a file and parses their X.509 DER structures.
