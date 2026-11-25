@@ -529,7 +529,7 @@ pub fn builtin_iac_policies() -> &'static [IacPolicySpec] {
         );
         add(
             "CKV_GCP_7",
-            "SMG-CFG-IAC-IPC",
+            "SMG-CFG-IAC-IAM",
             "HIGH",
             "google_container_cluster",
             "GCP GKE cluster enables deprecated Legacy ABAC (`enable_legacy_abac = true`)",
@@ -905,6 +905,22 @@ pub fn evaluate_hcl_resource_policies(res: &HclResourceView<'_>) -> Vec<LocalSta
     for pol in builtin_iac_policies() {
         if pol.resource_type != res.res_type {
             continue;
+        }
+        // AWS KMS rejects automatic annual rotation on asymmetric / HMAC / SIGN_VERIFY keys
+        if pol.checkov_id == "CKV_AWS_7" {
+            let spec = res
+                .attrs
+                .get("customer_master_key_spec")
+                .map(|v| v.trim_matches('"').to_ascii_uppercase())
+                .unwrap_or_default();
+            let usage = res
+                .attrs
+                .get("key_usage")
+                .map(|v| v.trim_matches('"').to_ascii_uppercase())
+                .unwrap_or_default();
+            if (!spec.is_empty() && spec != "SYMMETRIC_DEFAULT") || usage == "SIGN_VERIFY" {
+                continue;
+            }
         }
         if check_matches(&pol.check, res) {
             hits.push(LocalStaticFinding {

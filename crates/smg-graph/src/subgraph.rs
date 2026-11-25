@@ -42,10 +42,19 @@ pub fn should_force_full_scan_on_diff(changed: &HashSet<String>) -> bool {
         let low = rel.to_ascii_lowercase();
         let fname = low.rsplit('/').next().unwrap_or(&low);
         fname.starts_with(".shellmind-guard")
+            || fname.starts_with(".gitleaks")
+            || fname == ".trivyignore"
+            || fname.starts_with("openapi.")
+            || fname.starts_with("swagger.")
             || matches!(
                 fname,
                 "package.json"
                     | "package-lock.json"
+                    | "npm-shrinkwrap.json"
+                    | "yarn.lock"
+                    | "pnpm-lock.yaml"
+                    | "bun.lock"
+                    | "deno.lock"
                     | "cargo.toml"
                     | "cargo.lock"
                     | "go.mod"
@@ -54,6 +63,22 @@ pub fn should_force_full_scan_on_diff(changed: &HashSet<String>) -> bool {
                     | "pyproject.toml"
                     | "poetry.lock"
                     | "uv.lock"
+                    | "pipfile"
+                    | "pipfile.lock"
+                    | "conda-lock.yml"
+                    | "pom.xml"
+                    | "build.gradle"
+                    | "build.gradle.kts"
+                    | "gradle.lockfile"
+                    | "packages.lock.json"
+                    | "composer.json"
+                    | "composer.lock"
+                    | "gemfile"
+                    | "gemfile.lock"
+                    | "package.resolved"
+                    | "pubspec.yaml"
+                    | "pubspec.lock"
+                    | "mix.lock"
                     | ".gitignore"
                     | "dockerfile"
             )

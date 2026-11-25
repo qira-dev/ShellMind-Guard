@@ -204,6 +204,33 @@ fn should_skip_history_path(rel_path: &str, include_tests: bool) -> bool {
     false
 }
 
+fn match_token_for_rule<'a>(rule_id: &str, tokens: &'a [String]) -> &'a str {
+    if tokens.len() <= 1 {
+        return tokens.first().map(String::as_str).unwrap_or("");
+    }
+    let pred: fn(&str) -> bool = match rule_id {
+        "SMG-SEC-AWS" => |t| t.starts_with("AKIA") || t.starts_with("ASIA"),
+        "SMG-SEC-GITHUB" => |t| {
+            t.starts_with("ghp_")
+                || t.starts_with("gho_")
+                || t.starts_with("ghs_")
+                || t.starts_with("github_pat_")
+        },
+        "SMG-SEC-STRIPE" => |t| t.starts_with("sk_live_") || t.starts_with("rk_live_"),
+        "SMG-SEC-SLACK" => |t| t.starts_with("xox"),
+        "SMG-SEC-OPENAI" => |t| t.starts_with("sk-"),
+        "SMG-SEC-ANTHROPIC" => |t| t.starts_with("sk-ant-"),
+        "SMG-SEC-GCP" => |t| t.starts_with("AIza"),
+        _ => |_| false,
+    };
+    tokens
+        .iter()
+        .find(|t| pred(t.as_str()))
+        .or_else(|| tokens.first())
+        .map(String::as_str)
+        .unwrap_or("")
+}
+
 /// Scans git commit history of `repo_root` by streaming `git log -p -U0`.
 ///
 /// - `max_commits`: `None` or `Some(0)` scans full history; `Some(n)` limits to latest `n` commits.
@@ -226,7 +253,7 @@ pub fn scan_git_history(
         .arg("--no-color")
         .arg("--no-ext-diff")
         .arg("--full-history")
-        .arg("--format=SMG_COMMIT_HDR:%H|%an|%aI");
+        .arg("--format=%x00SMG_COMMIT_HDR:%H%x00%aI%x00%an");
 
     if let Some(n) = max_commits
         && n > 0
@@ -253,30 +280,60 @@ pub fn scan_git_history(
     let mut skip_file = false;
     let mut skip_hunk = false;
     let mut cur_line: usize = 0;
+    let mut recent_added: std::collections::VecDeque<String> =
+        std::collections::VecDeque::with_capacity(6);
 
+    const MAX_HISTORY_LINE_BYTES: usize = 64 * 1024;
     let mut reader = BufReader::with_capacity(64 * 1024, stdout);
     let mut raw_buf = Vec::with_capacity(4096);
     loop {
         raw_buf.clear();
-        let Ok(n) = reader.read_until(b'\n', &mut raw_buf) else {
-            break;
-        };
-        if n == 0 {
-            break;
+        let mut eof = false;
+        let mut truncated = false;
+        loop {
+            let Ok(avail) = reader.fill_buf() else {
+                eof = true;
+                break;
+            };
+            if avail.is_empty() {
+                eof = true;
+                break;
+            }
+            if let Some(nl_pos) = avail.iter().position(|&b| b == b'\n') {
+                let take = nl_pos;
+                if !truncated {
+                    let room = MAX_HISTORY_LINE_BYTES.saturating_sub(raw_buf.len());
+                    raw_buf.extend_from_slice(&avail[..take.min(room)]);
+                }
+                reader.consume(nl_pos + 1);
+                break;
+            } else {
+                let len = avail.len();
+                if !truncated {
+                    let room = MAX_HISTORY_LINE_BYTES.saturating_sub(raw_buf.len());
+                    if len <= room {
+                        raw_buf.extend_from_slice(avail);
+                    } else {
+                        raw_buf.extend_from_slice(&avail[..room]);
+                        truncated = true;
+                    }
+                }
+                reader.consume(len);
+            }
         }
-        if raw_buf.ends_with(b"\n") {
-            raw_buf.pop();
+        if eof && raw_buf.is_empty() {
+            break;
         }
         if raw_buf.ends_with(b"\r") {
             raw_buf.pop();
         }
         let line = String::from_utf8_lossy(&raw_buf);
 
-        if let Some(rest) = line.strip_prefix("SMG_COMMIT_HDR:") {
-            let mut parts = rest.splitn(3, '|');
+        if let Some(rest) = line.strip_prefix("\0SMG_COMMIT_HDR:") {
+            let mut parts = rest.splitn(3, '\0');
             let sha = parts.next().unwrap_or("").trim().to_string();
-            let author = parts.next().unwrap_or("unknown").trim().to_string();
             let date = parts.next().unwrap_or("").trim().to_string();
+            let author = parts.next().unwrap_or("unknown").trim().to_string();
             let short_sha = sha.chars().take(8).collect();
             cur_commit = CommitMeta {
                 sha,
@@ -286,6 +343,7 @@ pub fn scan_git_history(
             };
             result.commits_scanned += 1;
             cur_file.clear();
+            recent_added.clear();
             skip_file = false;
             skip_hunk = false;
             continue;
@@ -352,6 +410,11 @@ pub fn scan_git_history(
             continue;
         }
 
+        if recent_added.len() >= 5 {
+            recent_added.pop_front();
+        }
+        recent_added.push_back(added.to_string());
+
         let extracted_tokens = extract_tokens_from_line(added);
 
         // 1. Run built-in secret rules on this added line
@@ -360,9 +423,14 @@ pub fn scan_git_history(
             if !f.rule_id.starts_with("SMG-SEC-") {
                 continue;
             }
-            let primary_tok = extracted_tokens.first().map(String::as_str).unwrap_or("");
+            let primary_tok = match_token_for_rule(&f.rule_id, &extracted_tokens);
             if let Some(cfg) = gitleaks_cfg
-                && cfg.is_allowed(&cur_file, Some(&cur_commit.sha), added, primary_tok)
+                && (cfg.is_fingerprint_ignored(
+                    Some(&cur_commit.sha),
+                    &cur_file,
+                    &f.rule_id,
+                    line_no,
+                ) || cfg.is_allowed(&cur_file, Some(&cur_commit.sha), added, primary_tok))
             {
                 continue;
             }
@@ -389,13 +457,19 @@ pub fn scan_git_history(
                 cur_commit.short_sha, cur_commit.author, cur_commit.date, f.title
             );
             if !primary_tok.is_empty() {
+                let paired_secret = if f.rule_id == "SMG-SEC-AWS" {
+                    let window: Vec<&str> = recent_added.iter().map(String::as_str).collect();
+                    extract_aws_secret_near(&window, window.len().saturating_sub(1))
+                } else {
+                    None
+                };
                 result.candidates.push(SecretCandidate {
                     rule_id: f.rule_id.clone(),
                     file: cur_file.clone(),
                     line: line_no,
                     commit_sha: Some(cur_commit.sha.clone()),
                     raw_token: primary_tok.to_string(),
-                    paired_secret: None,
+                    paired_secret,
                 });
             }
             result.findings.push(f);

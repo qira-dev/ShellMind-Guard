@@ -243,15 +243,26 @@ pub fn analyze_indirect_prompt_injection(rel_path: &str, source: &str) -> Vec<Lo
             tainted_vars.insert(var);
         }
 
-        // Step B: Taint propagation through prompt formatting / interpolation
+        // Step B: Taint propagation through prompt formatting / interpolation & derived LLM output extraction
         if let Some(lhs) = extract_assigned_var(trimmed) {
+            let rhs = trimmed.split_once('=').map(|(_, r)| r).unwrap_or(trimmed);
             if has_sanitizer {
                 tainted_vars.remove(&lhs);
-            } else if tainted_vars
-                .iter()
-                .any(|tv| line_mentions_ident(trimmed, tv))
-            {
-                tainted_vars.insert(lhs.clone());
+                llm_output_vars.remove(&lhs);
+            } else {
+                if tainted_vars.iter().any(|tv| line_mentions_ident(rhs, tv)) {
+                    tainted_vars.insert(lhs.clone());
+                } else if !UNTRUSTED_SOURCES.iter().any(|s| rhs.contains(s)) {
+                    tainted_vars.remove(&lhs);
+                }
+                if llm_output_vars
+                    .iter()
+                    .any(|lv| line_mentions_ident(rhs, lv))
+                {
+                    llm_output_vars.insert(lhs.clone());
+                } else if !LLM_SINKS.iter().any(|s| rhs.contains(s)) {
+                    llm_output_vars.remove(&lhs);
+                }
             }
         }
 
@@ -575,10 +586,24 @@ pub fn inspect_chat_template_ssti(rel_path: &str, content: &str) -> Vec<LocalSta
 
 const DANGEROUS_PICKLE_GLOBALS: &[(&str, &str)] = &[
     ("os", "system"),
+    ("os", "popen"),
+    ("os", "execl"),
+    ("os", "execle"),
+    ("os", "execlp"),
+    ("os", "execv"),
+    ("os", "execve"),
+    ("os", "execvp"),
+    ("os", "spawnl"),
+    ("os", "spawnv"),
     ("posix", "system"),
+    ("posix", "popen"),
     ("nt", "system"),
+    ("nt", "popen"),
     ("subprocess", "Popen"),
     ("subprocess", "check_output"),
+    ("subprocess", "check_call"),
+    ("subprocess", "getoutput"),
+    ("subprocess", "getstatusoutput"),
     ("subprocess", "call"),
     ("subprocess", "run"),
     ("builtins", "eval"),
@@ -587,8 +612,17 @@ const DANGEROUS_PICKLE_GLOBALS: &[(&str, &str)] = &[
     ("__builtin__", "eval"),
     ("__builtin__", "exec"),
     ("__builtin__", "__import__"),
+    ("importlib", "import_module"),
+    ("runpy", "_run_code"),
+    ("runpy", "run_module"),
+    ("marshal", "loads"),
+    ("operator", "attrgetter"),
+    ("operator", "methodcaller"),
     ("pty", "spawn"),
     ("commands", "getoutput"),
+    ("webbrowser", "open"),
+    ("bdb", "Bdb"),
+    ("pdb", "set_trace"),
 ];
 
 fn is_dangerous_pickle_global(module: &str, func: &str) -> bool {
@@ -599,9 +633,22 @@ fn is_dangerous_pickle_global(module: &str, func: &str) -> bool {
 
 #[derive(Debug, Clone)]
 enum PickleVal {
+    Mark,
     Str(String),
     Global(String, String),
     Other,
+}
+
+fn pop_to_mark(stack: &mut Vec<PickleVal>) -> Vec<PickleVal> {
+    let mut items = Vec::new();
+    while let Some(v) = stack.pop() {
+        if matches!(v, PickleVal::Mark) {
+            break;
+        }
+        items.push(v);
+    }
+    items.reverse();
+    items
 }
 
 fn read_line_bytes(bytes: &[u8], pos: &mut usize) -> Option<String> {
@@ -645,7 +692,6 @@ fn walk_pickle_opcodes(bytes: &[u8]) -> Option<(String, String)> {
     let mut pos = 0usize;
     let mut stack: Vec<PickleVal> = Vec::new();
     let mut memo: std::collections::HashMap<usize, PickleVal> = std::collections::HashMap::new();
-    let mut dangerous_globals: Vec<(String, String)> = Vec::new();
     let mut steps = 0usize;
 
     let push_val = |stack: &mut Vec<PickleVal>, v: PickleVal| {
@@ -682,9 +728,6 @@ fn walk_pickle_opcodes(bytes: &[u8]) -> Option<(String, String)> {
                 let Some(f) = read_line_bytes(bytes, &mut pos) else {
                     break;
                 };
-                if is_dangerous_pickle_global(&m, &f) {
-                    dangerous_globals.push((m.clone(), f.clone()));
-                }
                 push_val(&mut stack, PickleVal::Global(m, f));
             }
             // INST: `i<module>\n<name>\n` — directly invokes callable
@@ -695,6 +738,7 @@ fn walk_pickle_opcodes(bytes: &[u8]) -> Option<(String, String)> {
                 let Some(f) = read_line_bytes(bytes, &mut pos) else {
                     break;
                 };
+                let _ = pop_to_mark(&mut stack);
                 if is_dangerous_pickle_global(&m, &f) {
                     return Some((m, f));
                 }
@@ -705,16 +749,23 @@ fn walk_pickle_opcodes(bytes: &[u8]) -> Option<(String, String)> {
                 let name = stack.pop();
                 let module = stack.pop();
                 if let (Some(PickleVal::Str(m)), Some(PickleVal::Str(f))) = (module, name) {
-                    if is_dangerous_pickle_global(&m, &f) {
-                        dangerous_globals.push((m.clone(), f.clone()));
-                    }
                     push_val(&mut stack, PickleVal::Global(m, f));
                 } else {
                     push_val(&mut stack, PickleVal::Other);
                 }
             }
-            // REDUCE ('R'), NEWOBJ (0x81), NEWOBJ_EX (0x92), OBJ ('o')
-            b'R' | 0x81 | 0x92 | b'o' => {
+            // OBJ ('o'): pops back to MARK; callable is the first item above MARK
+            b'o' => {
+                let items = pop_to_mark(&mut stack);
+                if let Some(PickleVal::Global(m, f)) = items.into_iter().next()
+                    && is_dangerous_pickle_global(&m, &f)
+                {
+                    return Some((m, f));
+                }
+                push_val(&mut stack, PickleVal::Other);
+            }
+            // REDUCE ('R'), NEWOBJ (0x81), NEWOBJ_EX (0x92)
+            b'R' | 0x81 | 0x92 => {
                 if op == 0x92 {
                     let _ = stack.pop(); // kwargs
                 }
@@ -723,9 +774,6 @@ fn walk_pickle_opcodes(bytes: &[u8]) -> Option<(String, String)> {
                     && is_dangerous_pickle_global(&m, &f)
                 {
                     return Some((m, f));
-                }
-                if let Some(pair) = dangerous_globals.last() {
-                    return Some(pair.clone());
                 }
                 push_val(&mut stack, PickleVal::Other);
             }
@@ -917,8 +965,12 @@ fn walk_pickle_opcodes(bytes: &[u8]) -> Option<(String, String)> {
                 pos = end;
                 push_val(&mut stack, PickleVal::Other);
             }
+            // MARK ('(')
+            b'(' => {
+                push_val(&mut stack, PickleVal::Mark);
+            }
             // Zero-arg stack-neutral or simple push/pop opcodes
-            b'(' | b')' | b']' | b'}' | b'N' | 0x88 | 0x89 | 0x8f | 0x91 | 0x97 | 0x98 | b'Q' => {
+            b')' | b']' | b'}' | b'N' | 0x88 | 0x89 | 0x8f | 0x91 | 0x97 | 0x98 | b'Q' => {
                 push_val(&mut stack, PickleVal::Other);
             }
             b'0' => {
@@ -947,8 +999,22 @@ fn walk_pickle_opcodes(bytes: &[u8]) -> Option<(String, String)> {
                 let _ = stack.pop();
                 push_val(&mut stack, PickleVal::Other);
             }
-            b'a' | b'b' | b'd' | b'e' | b'l' | b's' | b't' | b'u' | b'1' | 0x90 => {
-                // Container / state mutation ops; keep top intact enough for subsequent REDUCE
+            // TUPLE ('t'), LIST ('l'), DICT ('d'): pop to MARK and push container
+            b't' | b'l' | b'd' => {
+                let _ = pop_to_mark(&mut stack);
+                push_val(&mut stack, PickleVal::Other);
+            }
+            // APPENDS ('e'), SETITEMS ('u'), POP_MARK ('1'), ADDITEMS (0x90): pop to MARK
+            b'e' | b'u' | b'1' | 0x90 => {
+                let _ = pop_to_mark(&mut stack);
+            }
+            // APPEND ('a'), BUILD ('b'): pop 1 item; SETITEM ('s'): pop 2 items
+            b'a' | b'b' => {
+                let _ = stack.pop();
+            }
+            b's' => {
+                let _ = stack.pop();
+                let _ = stack.pop();
             }
             // Unknown opcode -> stop parsing this stream safely (never guess!)
             _ => break,
@@ -1044,8 +1110,11 @@ pub fn inspect_pickle_bytes(rel_path: &str, bytes: &[u8]) -> Vec<LocalStaticFind
         if stream.len() < 4 {
             continue;
         }
-        let looks_like_pickle = (stream[0] == 0x80 && (2..=5).contains(&stream[1]))
-            || matches!(stream[0], b'c' | b'i' | b'(' | b']' | b'}');
+        let looks_like_pickle = (stream[0] == 0x80 && stream[1] <= 5)
+            || matches!(
+                stream[0],
+                b'c' | b'i' | b'(' | b')' | b']' | b'}' | b'S' | b'V' | b'U' | b'X' | 0x8c
+            );
         if !looks_like_pickle {
             continue;
         }

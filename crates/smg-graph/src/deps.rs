@@ -2502,15 +2502,49 @@ fn audit_generic_ecosystem_manifest(
         }
     }
 
-    // Ecosystem-specific quick advisory extraction for Maven (`pom.xml`/`build.gradle*`), PHP (`composer.lock`), Ruby (`Gemfile.lock`), Dart (`pubspec.*`)
-    if matches!(fname, "pom.xml" | "build.gradle" | "build.gradle.kts") {
+    // Resolved dependency extraction across all supported manifests & lockfiles (`pom.xml` with
+    // `groupId:artifactId`, `go.sum`, `Pipfile.lock`, `gradle.lockfile`, `mix.lock`, `composer.lock`,
+    // `Gemfile.lock`, `yarn.lock`, `pnpm-lock.yaml`, `pubspec.lock`, `packages.lock.json`, etc.).
+    let resolved = extract_resolved_dependencies(rel_path, content);
+    if !resolved.is_empty() {
+        type EcoBatch = (Ecosystem, Vec<(String, String, usize)>);
+        let mut by_eco: HashMap<&'static str, EcoBatch> = HashMap::new();
+        for dep in resolved {
+            let mapped = match dep.ecosystem.as_str() {
+                "npm" => Some(("npm", Ecosystem::Npm)),
+                "crates.io" => Some(("crates.io", Ecosystem::Cargo)),
+                "Go" => Some(("Go", Ecosystem::Go)),
+                "PyPI" => Some(("PyPI", Ecosystem::PyPi)),
+                "Maven" => Some(("Maven", Ecosystem::Maven)),
+                "Packagist" => Some(("Packagist", Ecosystem::Packagist)),
+                "RubyGems" => Some(("RubyGems", Ecosystem::RubyGems)),
+                "NuGet" => Some(("NuGet", Ecosystem::NuGet)),
+                "Pub" => Some(("Pub", Ecosystem::Pub)),
+                _ => None,
+            };
+            if let Some((key, eco)) = mapped {
+                by_eco
+                    .entry(key)
+                    .or_insert_with(|| (eco, Vec::new()))
+                    .1
+                    .push((dep.name, dep.version, dep.line));
+            }
+        }
+        for (_, (eco, mut entries)) in by_eco {
+            entries.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
+            check_advisories_batch(eco, &entries, rel_path, None, store, &mut out);
+        }
+    } else if matches!(fname, "pom.xml" | "build.gradle" | "build.gradle.kts") {
         let mut entries = Vec::new();
         for (idx, raw) in lines.iter().enumerate() {
             let low = raw.to_ascii_lowercase();
             for (pkg, marker) in [
-                ("log4j-core", "log4j-core"),
-                ("spring-beans", "spring-beans"),
-                ("jackson-databind", "jackson-databind"),
+                ("org.apache.logging.log4j:log4j-core", "log4j-core"),
+                ("org.springframework:spring-beans", "spring-beans"),
+                (
+                    "com.fasterxml.jackson.core:jackson-databind",
+                    "jackson-databind",
+                ),
             ] {
                 if low.contains(marker) {
                     let window = lines[idx..(idx + 3).min(lines.len())].join(" ");
@@ -2521,30 +2555,6 @@ fn audit_generic_ecosystem_manifest(
             }
         }
         check_advisories_batch(Ecosystem::Maven, &entries, rel_path, None, store, &mut out);
-    } else if matches!(
-        fname,
-        "composer.lock"
-            | "Gemfile.lock"
-            | "yarn.lock"
-            | "pnpm-lock.yaml"
-            | "pubspec.lock"
-            | "packages.lock.json"
-    ) {
-        let eco = match fname {
-            "composer.lock" => Ecosystem::Packagist,
-            "Gemfile.lock" => Ecosystem::RubyGems,
-            "pubspec.lock" => Ecosystem::Pub,
-            "packages.lock.json" => Ecosystem::NuGet,
-            _ => Ecosystem::Npm,
-        };
-        let graph = extract_lockfile_dep_graph(rel_path, content);
-        let mut entries: Vec<(String, String, usize)> = graph
-            .nodes
-            .into_iter()
-            .map(|(pkg, (ver, _is_dev, line))| (pkg, ver, line))
-            .collect();
-        entries.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
-        check_advisories_batch(eco, &entries, rel_path, None, store, &mut out);
     }
 
     out
@@ -2580,10 +2590,11 @@ pub fn scan_dependencies_with_store(
         "requirements.txt" => audit_requirements_txt(rel_path, content, store),
         "pyproject.toml" => audit_pyproject_toml(rel_path, content, store),
         "poetry.lock" | "uv.lock" => audit_python_toml_lock(rel_path, content, store),
-        "yarn.lock" | "pnpm-lock.yaml" | "bun.lock" | "go.sum" | "pom.xml" | "build.gradle"
-        | "build.gradle.kts" | "gradle.lockfile" | "packages.lock.json" | "composer.json"
-        | "composer.lock" | "Gemfile" | "Gemfile.lock" | "Package.resolved" | "pubspec.yaml"
-        | "pubspec.lock" | ".npmrc" | "Pipfile.lock" | "mix.lock" => {
+        "yarn.lock" | "pnpm-lock.yaml" | "bun.lock" | "deno.lock" | "go.sum" | "pom.xml"
+        | "build.gradle" | "build.gradle.kts" | "gradle.lockfile" | "packages.lock.json"
+        | "composer.json" | "composer.lock" | "Gemfile" | "Gemfile.lock" | "Package.resolved"
+        | "pubspec.yaml" | "pubspec.lock" | ".npmrc" | "Pipfile" | "Pipfile.lock"
+        | "conda-lock.yml" | "mix.lock" => {
             audit_generic_ecosystem_manifest(rel_path, content, store)
         }
         _ => Vec::new(),

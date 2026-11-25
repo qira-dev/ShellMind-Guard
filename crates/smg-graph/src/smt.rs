@@ -374,6 +374,12 @@ fn collect_constraints_in_block(
                 }
                 return;
             } else if end_line < target_line {
+                // Invalidate any prior constraints on variables mutated inside this `if`/`else` subtree
+                let mut mutated = HashSet::new();
+                collect_mutated_vars_in_subtree(stmt, src, &mut mutated, 0);
+                if !mutated.is_empty() {
+                    out.retain(|c| !mutated.iter().any(|v| constraint_mentions_var(c, v)));
+                }
                 // Target is strictly AFTER this `if` statement: check early-return guard dominance
                 if let Some(cond) = cond_opt {
                     let cons_exits = cons.is_some_and(|n| block_always_exits(n, src));
@@ -400,6 +406,11 @@ fn collect_constraints_in_block(
 
         // Track simple constant bindings & `assert`/`require` strictly before `target_line`
         if end_line < target_line {
+            let mut mutated = HashSet::new();
+            collect_mutated_vars_in_subtree(stmt, src, &mut mutated, 0);
+            if !mutated.is_empty() {
+                out.retain(|c| !mutated.iter().any(|v| constraint_mentions_var(c, v)));
+            }
             let txt = strip_comments(node_text(stmt, src));
             let trimmed = txt.trim().trim_end_matches(';').trim();
             if let Some(inner) = extract_assert_like_arg(trimmed)
@@ -453,7 +464,9 @@ pub fn solve_path_constraints(constraints: &[PathConstraint], use_z3: bool) -> S
         return builtin;
     }
 
-    // Phase 27/32: Refine with pure-Rust QF_LIA i128 GCD + Fourier-Motzkin solver
+    // Phase 27/32: Refine non-strict bounds with pure-Rust QF_LIA i128 GCD + Fourier-Motzkin solver.
+    // Strict inequalities (`<`, `>`) are NOT tightened by +/- 1 here so untyped float intervals like
+    // `0 < rate < 1` are never falsely pruned as integer UNSAT (dense difference-logic handles strictness).
     let mut lia_ineqs = Vec::new();
     for c in &flat {
         if let PathConstraint::IntCmp { var, op, value } = c {
@@ -466,25 +479,11 @@ pub fn solve_path_constraints(constraints: &[PathConstraint], use_z3: bool) -> S
                         rhs: *value as i128,
                     });
                 }
-                CmpOp::Lt => {
-                    terms.insert(var.clone(), 1i128);
-                    lia_ineqs.push(crate::smt_advanced::LinearIneq {
-                        terms,
-                        rhs: (*value as i128).saturating_sub(1),
-                    });
-                }
                 CmpOp::Ge => {
                     terms.insert(var.clone(), -1i128);
                     lia_ineqs.push(crate::smt_advanced::LinearIneq {
                         terms,
                         rhs: -(*value as i128),
-                    });
-                }
-                CmpOp::Gt => {
-                    terms.insert(var.clone(), -1i128);
-                    lia_ineqs.push(crate::smt_advanced::LinearIneq {
-                        terms,
-                        rhs: -((*value as i128).saturating_add(1)),
                     });
                 }
                 CmpOp::Eq => {
@@ -500,7 +499,7 @@ pub fn solve_path_constraints(constraints: &[PathConstraint], use_z3: bool) -> S
                         rhs: -(*value as i128),
                     });
                 }
-                CmpOp::Neq => {}
+                CmpOp::Lt | CmpOp::Gt | CmpOp::Neq => {}
             }
         }
     }
@@ -599,7 +598,7 @@ fn solve_builtin_conjunction_budgeted(
     // Edge `(u, v, w)` encodes `val(v) - val(u) <= w`.
     let mut owned_var_ids: HashMap<String, usize> = HashMap::new();
     let mut next_id = 1usize;
-    let mut edges: Vec<(usize, usize, i128)> = Vec::new();
+    let mut edges: Vec<(usize, usize, (i128, i128))> = Vec::new();
     let mut int_neqs: Vec<(usize, usize, i128)> = Vec::new(); // `val(lhs) - val(rhs) != c`
 
     let id_of = |name: &str, var_ids: &mut HashMap<String, usize>, next_id: &mut usize| {
@@ -676,33 +675,36 @@ fn solve_builtin_conjunction_budgeted(
             PathConstraint::IntCmp { var, op, value } => {
                 let v = id_of(var, &mut owned_var_ids, &mut next_id);
                 let k = *value as i128;
-                // val(v) - val(0) <= k  <==>  edge (0, v, k)
-                // val(0) - val(v) <= -k <==>  val(v) >= k  <==>  edge (v, 0, -k)
+                // Dense difference-logic weights `(w, eps)` represent `w + eps * ε` (sound over both R and Z):
+                // val(v) - val(0) <= k       <==>  edge (0, v, (k, 0))
+                // val(v) - val(0) < k        <==>  edge (0, v, (k, -1))
+                // val(0) - val(v) <= -k      <==>  edge (v, 0, (-k, 0))
+                // val(0) - val(v) < -k       <==>  edge (v, 0, (-k, -1))
                 match op {
                     CmpOp::Eq => {
-                        edges.push((0, v, k));
-                        edges.push((v, 0, -k));
+                        edges.push((0, v, (k, 0)));
+                        edges.push((v, 0, (-k, 0)));
                     }
-                    CmpOp::Le => edges.push((0, v, k)),
-                    CmpOp::Lt => edges.push((0, v, k - 1)),
-                    CmpOp::Ge => edges.push((v, 0, -k)),
-                    CmpOp::Gt => edges.push((v, 0, -(k + 1))),
+                    CmpOp::Le => edges.push((0, v, (k, 0))),
+                    CmpOp::Lt => edges.push((0, v, (k, -1))),
+                    CmpOp::Ge => edges.push((v, 0, (-k, 0))),
+                    CmpOp::Gt => edges.push((v, 0, (-k, -1))),
                     CmpOp::Neq => int_neqs.push((v, 0, k)),
                 }
             }
             PathConstraint::VarCmp { lhs, op, rhs } => {
                 let l = id_of(lhs, &mut owned_var_ids, &mut next_id);
                 let r = id_of(rhs, &mut owned_var_ids, &mut next_id);
-                // val(l) - val(r) <= w <==> edge (r, l, w)
+                // val(l) - val(r) <= (w, eps) <==> edge (r, l, (w, eps))
                 match op {
                     CmpOp::Eq => {
-                        edges.push((r, l, 0));
-                        edges.push((l, r, 0));
+                        edges.push((r, l, (0, 0)));
+                        edges.push((l, r, (0, 0)));
                     }
-                    CmpOp::Le => edges.push((r, l, 0)),
-                    CmpOp::Lt => edges.push((r, l, -1)),
-                    CmpOp::Ge => edges.push((l, r, 0)),
-                    CmpOp::Gt => edges.push((l, r, -1)),
+                    CmpOp::Le => edges.push((r, l, (0, 0))),
+                    CmpOp::Lt => edges.push((r, l, (0, -1))),
+                    CmpOp::Ge => edges.push((l, r, (0, 0))),
+                    CmpOp::Gt => edges.push((l, r, (0, -1))),
                     CmpOp::Neq => {
                         if l == r {
                             return SmtVerdict::Unsat {
@@ -719,12 +721,12 @@ fn solve_builtin_conjunction_budgeted(
 
     if !edges.is_empty() {
         let n = next_id;
-        // Bellman-Ford from virtual super-source (all dist initialized to 0)
-        let mut dist = vec![0i128; n];
+        // Bellman-Ford from virtual super-source over dense `(w, eps)` weights
+        let mut dist = vec![(0i128, 0i128); n];
         for _ in 0..n {
             let mut changed = false;
-            for &(u, v, w) in &edges {
-                let cand = dist[u].saturating_add(w);
+            for &(u, v, (w, e)) in &edges {
+                let cand = (dist[u].0.saturating_add(w), dist[u].1.saturating_add(e));
                 if cand < dist[v] {
                     dist[v] = cand;
                     changed = true;
@@ -735,24 +737,25 @@ fn solve_builtin_conjunction_budgeted(
             }
         }
         // One more pass: any relaxation means a negative cycle => mathematically UNSAT
-        for &(u, v, w) in &edges {
-            if dist[u].saturating_add(w) < dist[v] {
+        for &(u, v, (w, e)) in &edges {
+            let cand = (dist[u].0.saturating_add(w), dist[u].1.saturating_add(e));
+            if cand < dist[v] {
                 return SmtVerdict::Unsat {
                     solver: "builtin-qf-idl",
-                    reason: "integer difference-logic negative cycle (unsatisfiable bounds)".into(),
+                    reason: "difference-logic negative cycle (unsatisfiable bounds)".into(),
                 };
             }
         }
 
         // Check if any `lhs - rhs != c` is violated when `lhs - rhs == c` is forced
         for &(l, r, c) in &int_neqs {
-            // Forced `val(l) - val(r) == c` iff adding `val(l) - val(r) <= c - 1` AND adding `val(r) - val(l) <= -(c + 1)` both create negative cycles
-            let lt_unsat = has_negative_cycle(n, &edges, (r, l, c - 1));
-            let gt_unsat = has_negative_cycle(n, &edges, (l, r, -(c + 1)));
+            // Forced `val(l) - val(r) == c` iff both `val(l) - val(r) < c` and `val(r) - val(l) < -c` create negative cycles
+            let lt_unsat = has_negative_cycle(n, &edges, (r, l, (c, -1)));
+            let gt_unsat = has_negative_cycle(n, &edges, (l, r, (-c, -1)));
             if lt_unsat && gt_unsat {
                 return SmtVerdict::Unsat {
                     solver: "builtin-qf-idl",
-                    reason: "integer inequality contradicts forced equality".into(),
+                    reason: "inequality contradicts forced equality".into(),
                 };
             }
         }
@@ -766,14 +769,14 @@ fn solve_builtin_conjunction_budgeted(
 
 fn has_negative_cycle(
     n: usize,
-    base_edges: &[(usize, usize, i128)],
-    extra: (usize, usize, i128),
+    base_edges: &[(usize, usize, (i128, i128))],
+    extra: (usize, usize, (i128, i128)),
 ) -> bool {
-    let mut dist = vec![0i128; n];
+    let mut dist = vec![(0i128, 0i128); n];
     for _ in 0..n {
         let mut changed = false;
-        for &(u, v, w) in base_edges.iter().chain(std::iter::once(&extra)) {
-            let cand = dist[u].saturating_add(w);
+        for &(u, v, (w, e)) in base_edges.iter().chain(std::iter::once(&extra)) {
+            let cand = (dist[u].0.saturating_add(w), dist[u].1.saturating_add(e));
             if cand < dist[v] {
                 dist[v] = cand;
                 changed = true;
@@ -783,8 +786,9 @@ fn has_negative_cycle(
             return false;
         }
     }
-    for &(u, v, w) in base_edges.iter().chain(std::iter::once(&extra)) {
-        if dist[u].saturating_add(w) < dist[v] {
+    for &(u, v, (w, e)) in base_edges.iter().chain(std::iter::once(&extra)) {
+        let cand = (dist[u].0.saturating_add(w), dist[u].1.saturating_add(e));
+        if cand < dist[v] {
             return true;
         }
     }
@@ -1212,11 +1216,78 @@ fn parse_string_literal(s: &str) -> Option<String> {
     }
 }
 
-fn block_always_exits(node: Node, src: &[u8]) -> bool {
+fn collect_mutated_vars_in_subtree(
+    node: Node,
+    src: &[u8],
+    out: &mut HashSet<String>,
+    depth: usize,
+) {
+    if depth >= crate::taint::MAX_AST_WALK_DEPTH {
+        return;
+    }
     let k = node.kind();
     if matches!(
         k,
+        "assignment_expression"
+            | "augmented_assignment_expression"
+            | "compound_assignment_expr"
+            | "assignment"
+            | "assignment_statement"
+            | "short_var_declaration"
+    ) {
+        if let Some(lhs) = node.child_by_field_name("left") {
+            let name = node_text(lhs, src)
+                .trim()
+                .trim_start_matches('*')
+                .trim()
+                .to_string();
+            if is_valid_var_expr(&name) {
+                out.insert(name);
+            }
+        }
+    } else if matches!(k, "update_expression" | "inc_statement" | "dec_statement") {
+        let raw = node_text(node, src).trim();
+        let cleaned = raw
+            .trim_start_matches(['+', '-'])
+            .trim_end_matches(['+', '-'])
+            .trim()
+            .to_string();
+        if is_valid_var_expr(&cleaned) {
+            out.insert(cleaned);
+        }
+    }
+    let mut cursor = node.walk();
+    for ch in node.children(&mut cursor) {
+        collect_mutated_vars_in_subtree(ch, src, out, depth + 1);
+    }
+}
+
+fn block_always_exits(node: Node, src: &[u8]) -> bool {
+    block_always_exits_depth(node, src, 0)
+}
+
+fn block_always_exits_depth(node: Node, src: &[u8], depth: usize) -> bool {
+    if depth >= 32 {
+        return false;
+    }
+    let k = node.kind();
+    // Never treat a nested closure/function body's `return` as exiting the outer block
+    if matches!(
+        k,
+        "arrow_function"
+            | "function_expression"
+            | "function_declaration"
+            | "function_definition"
+            | "function_item"
+            | "closure_expression"
+            | "lambda"
+    ) {
+        return false;
+    }
+    if matches!(
+        k,
         "return_statement"
+            | "return_expression"
             | "throw_statement"
             | "raise_statement"
             | "break_statement"
@@ -1224,27 +1295,33 @@ fn block_always_exits(node: Node, src: &[u8]) -> bool {
     ) {
         return true;
     }
-    let mut cursor = node.walk();
-    for ch in node.children(&mut cursor) {
-        if matches!(
-            ch.kind(),
-            "return_statement"
-                | "throw_statement"
-                | "raise_statement"
-                | "break_statement"
-                | "continue_statement"
-        ) {
+    if matches!(k, "expression_statement" | "macro_invocation") {
+        let low = strip_comments(node_text(node, src))
+            .trim()
+            .to_ascii_lowercase();
+        if low.starts_with("panic!(")
+            || low.starts_with("unreachable!(")
+            || low.starts_with("revert(")
+            || low.starts_with("return ")
+            || low == "return;"
+            || low == "return"
+        {
             return true;
         }
     }
-    let txt = crate::taint::strip_comments_and_non_attr_strings(node_text(node, src))
-        .to_ascii_lowercase();
-    txt.contains("return ")
-        || txt.contains("return;")
-        || txt.contains("throw ")
-        || txt.contains("raise ")
-        || txt.contains("revert(")
-        || txt.contains("panic!(")
+    if matches!(k, "if_statement" | "if_expression") {
+        let cons = node.child_by_field_name("consequence");
+        let alt = node.child_by_field_name("alternative");
+        return cons.is_some_and(|n| block_always_exits_depth(n, src, depth + 1))
+            && alt.is_some_and(|n| block_always_exits_depth(n, src, depth + 1));
+    }
+    let mut cursor = node.walk();
+    for ch in node.children(&mut cursor) {
+        if block_always_exits_depth(ch, src, depth + 1) {
+            return true;
+        }
+    }
+    false
 }
 
 fn extract_assert_like_arg(trimmed: &str) -> Option<&str> {

@@ -92,6 +92,8 @@ pub fn scan_protocols_ai_and_workflow(
             | Language::Go
             | Language::Rust
             | Language::Java
+            | Language::Kotlin
+            | Language::Swift
             | Language::CSharp
             | Language::Php
             | Language::Ruby
@@ -430,7 +432,8 @@ fn scan_ai_prompt_and_agent_tools(
                 || rhs_low.contains("safeparse(")
                 || rhs_low.contains("requireconfirmation(")
                 || rhs_low.contains("humanapproval(");
-            if let Some(var) = lhs
+            let lhs_no_type = lhs.split(':').next().unwrap_or(lhs).trim();
+            if let Some(var) = lhs_no_type
                 .split_whitespace()
                 .last()
                 .map(|v| v.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_'))

@@ -137,7 +137,8 @@ impl FieldSensitivePointsTo {
                 state.pts.entry(var.clone()).or_default().insert(*site);
             }
         }
-        loop {
+        const MAX_ANDERSEN_ITERS: usize = 64;
+        for _ in 0..MAX_ANDERSEN_ITERS {
             let mut changed = false;
             for st in stmts {
                 if let PointsToStmt::Copy { dst, src } = st
@@ -156,7 +157,8 @@ impl FieldSensitivePointsTo {
             }
         }
 
-        // Phase 2: Flow-ordered field-sensitive taint & singleton strong-update sanitization
+        // Phase 2: Flow-insensitive sound weak-update field taint (preserves taint across
+        // flattened sibling branches instead of destructively overwriting with 0).
         for st in stmts {
             match st {
                 PointsToStmt::StoreFieldTaint {
@@ -165,14 +167,9 @@ impl FieldSensitivePointsTo {
                     taint_bits,
                 } => {
                     if let Some(sites) = state.pts.get(base) {
-                        let is_singleton = sites.len() == 1;
                         for &site in sites {
                             let entry = state.field_taint.entry((site, field.clone())).or_insert(0);
-                            if is_singleton {
-                                *entry = *taint_bits; // strong update
-                            } else {
-                                *entry |= *taint_bits; // sound weak update
-                            }
+                            *entry |= *taint_bits;
                         }
                     }
                 }
@@ -322,6 +319,7 @@ impl SsaDefUseGraph {
         versions.sort_unstable();
         let mut saw_sanitized_clean = false;
         let mut seen_versions: HashSet<u32> = HashSet::new();
+        let mut cleared_so_far = 0u32;
         for v in versions {
             if !seen_versions.insert(v) {
                 continue;
@@ -331,13 +329,14 @@ impl SsaDefUseGraph {
                 version: v,
             };
             let t = taint.get(&key).copied().unwrap_or(0);
-            if matches!(
-                self.defs.get(&(var_name.to_string(), v)),
-                Some(SsaOp::Sanitize { .. })
-            ) && t == 0
+            if let Some(SsaOp::Sanitize { clear_bits, .. }) =
+                self.defs.get(&(var_name.to_string(), v))
             {
-                saw_sanitized_clean = true;
-            } else if saw_sanitized_clean && t != 0 {
+                cleared_so_far |= *clear_bits;
+                if t == 0 {
+                    saw_sanitized_clean = true;
+                }
+            } else if (saw_sanitized_clean && t != 0) || (cleared_so_far & t) != 0 {
                 return true;
             }
         }
