@@ -564,9 +564,13 @@ fn inspect_solana_instruction_fn(
                 remediation: "Use `Pubkey::find_program_address` or Anchor canonical `bump` seed constraint to prevent non-canonical bump spoofing.".into(),
             });
         }
-        if line.contains("invoke(")
+        if (line.contains("invoke(")
             || line.contains("invoke_signed(")
-            || line.contains("CpiContext::new(")
+            || line.contains("CpiContext::new("))
+            && !smg_graph::taint::is_pattern_matcher_or_doc_line(line)
+            && !line.contains("\"invoke(\"")
+            && !line.contains("\"invoke_signed(\"")
+            && !line.contains("\"CpiContext::new(\"")
         {
             let body_lines: Vec<&str> = body.lines().collect();
             let w_start = idx.saturating_sub(8);
