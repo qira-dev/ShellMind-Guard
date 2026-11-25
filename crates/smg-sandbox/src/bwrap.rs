@@ -53,12 +53,23 @@ pub fn build_macos_seatbelt_profile(abs_root: &Path, port: u16) -> String {
 }
 
 /// Generates a least-privilege macOS Seatbelt (`.sb`) profile with optional extra read-only paths
-/// (e.g. probe binary/config directory) and extra loopback ports (e.g. mock shim server port).
+/// (e.g. probe binary/config directory), extra loopback ports (e.g. mock shim server port),
+/// and a per-run writable `TMPDIR` instead of global `/tmp` / `/private/tmp`.
 pub fn build_macos_seatbelt_profile_with_extras(
     abs_root: &Path,
     port: u16,
     extra_ro_paths: &[&Path],
     extra_ports: &[u16],
+) -> String {
+    build_macos_seatbelt_profile_scoped(abs_root, port, extra_ro_paths, extra_ports, None)
+}
+
+pub fn build_macos_seatbelt_profile_scoped(
+    abs_root: &Path,
+    port: u16,
+    extra_ro_paths: &[&Path],
+    extra_ports: &[u16],
+    private_tmp: Option<&Path>,
 ) -> String {
     let escape_sbpl = |p: &Path| -> String {
         p.to_string_lossy()
@@ -70,6 +81,13 @@ pub fn build_macos_seatbelt_profile_with_extras(
     for p in extra_ro_paths {
         extra_ro_clauses.push_str(&format!(" (subpath \"{}\")", escape_sbpl(p)));
     }
+    let write_clause = if let Some(tmp_dir) = private_tmp {
+        let esc_tmp = escape_sbpl(tmp_dir);
+        extra_ro_clauses.push_str(&format!(" (subpath \"{esc_tmp}\")"));
+        format!("(subpath \"{esc_tmp}\")")
+    } else {
+        "(subpath \"/tmp\") (subpath \"/private/tmp\")".to_string()
+    };
     let mut extra_bind_clauses = String::new();
     let mut extra_out_clauses = String::new();
     for &ep in extra_ports {
@@ -84,13 +102,14 @@ pub fn build_macos_seatbelt_profile_with_extras(
         "(version 1)\n\
          (deny default)\n\
          (allow process-exec process-fork signal (target same-sandbox))\n\
-         (allow file-read* (subpath \"/usr\") (subpath \"/System\") (subpath \"/Library\") (subpath \"/bin\") (subpath \"/tmp\") (subpath \"/private/tmp\") (subpath \"/opt/homebrew\") (subpath \"/usr/local\") (subpath \"{root}\"){extra_ro})\n\
-         (allow file-write* (subpath \"/tmp\") (subpath \"/private/tmp\"))\n\
+         (allow file-read* (subpath \"/usr\") (subpath \"/System\") (subpath \"/Library\") (subpath \"/bin\") (subpath \"/opt/homebrew\") (subpath \"/usr/local\") (subpath \"{root}\"){extra_ro})\n\
+         (allow file-write* {write_clause})\n\
          (allow network-bind (local ip \"localhost:{port}\"){extra_bind})\n\
          (allow network-outbound (remote ip \"localhost:{port}\") (remote ip \"127.0.0.1:{port}\"){extra_out})\n",
         root = escaped_root,
         port = port,
         extra_ro = extra_ro_clauses,
+        write_clause = write_clause,
         extra_bind = extra_bind_clauses,
         extra_out = extra_out_clauses,
     )
@@ -249,6 +268,28 @@ mod imp {
         }
     }
 
+    /// Masks `/app/.git` and any `/app/.env*` files (except `.env.example`/`.env.sample`)
+    /// inside Linux `bwrap` so an untrusted target app cannot exfiltrate repo secrets or git credentials.
+    fn mask_sensitive_app_paths(cmd: &mut Command, abs_root: &Path) {
+        if abs_root.join(".git").exists() {
+            cmd.args(["--tmpfs", "/app/.git"]);
+        }
+        if let Ok(entries) = std::fs::read_dir(abs_root) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                let low = name_str.to_ascii_lowercase();
+                if (low == ".env" || low.starts_with(".env."))
+                    && low != ".env.example"
+                    && low != ".env.sample"
+                    && entry.path().is_file()
+                {
+                    cmd.args(["--ro-bind", "/dev/null", &format!("/app/{name_str}")]);
+                }
+            }
+        }
+    }
+
     fn build_base_bwrap_cmd(bwrap_bin: &Path, abs_root: &Path, port: u16) -> Command {
         let mut cmd = Command::new(bwrap_bin);
         let sandbox_path = build_sandbox_path();
@@ -320,6 +361,7 @@ mod imp {
             "--chdir",
             "/app",
         ]);
+        mask_sensitive_app_paths(&mut cmd, abs_root);
         cmd
     }
 
@@ -618,6 +660,7 @@ mod imp {
                 "SMG_PROBE_CONFIG_FILE",
                 "/tmp/smg-probe-cfg.json",
             ]);
+            mask_sensitive_app_paths(&mut c, &abs_root);
             if finding_json.is_some() {
                 c.args([
                     "--ro-bind",
@@ -670,11 +713,12 @@ mod imp {
             if let Some(oob_port) = port.checked_add(2) {
                 extra_ports.push(oob_port);
             }
-            let profile = super::build_macos_seatbelt_profile_with_extras(
+            let profile = super::build_macos_seatbelt_profile_scoped(
                 &abs_root,
                 port,
                 &extra_ro,
                 &extra_ports,
+                Some(&private_tmp),
             );
             let boot_log_path = probe_dir.join("boot.log");
             let mut c = Command::new("/usr/bin/sandbox-exec");

@@ -906,6 +906,11 @@ enum Commands {
             help = "Render the target in headless Chrome: DOM source-to-sink flows + XHR/Fetch endpoints"
         )]
         spa: bool,
+        #[arg(
+            long,
+            help = "Perform strictly a single passive GET without OpenAPI/GraphQL discovery probes"
+        )]
+        passive_only: bool,
         #[arg(long, default_value_t = 8_000, value_name = "MS")]
         timeout_ms: u64,
         #[arg(
@@ -1115,7 +1120,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install ShellMind Guard
-        run: curl -fsSL https://raw.githubusercontent.com/qira-dev/ShellMind-Guard/main/install.sh | bash && echo "$HOME/.local/bin" >> $GITHUB_PATH
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/qira-dev/ShellMind-Guard/v1.4.5/install.sh -o install.sh
+          bash install.sh --version v1.4.5
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
       - name: Run ShellMind Guard 6-Layer Scan (SARIF)
         run: smg scan . --format sarif --sarif shellmind-guard.sarif --ci
       - name: Upload SARIF to GitHub Code Scanning
@@ -1275,7 +1283,7 @@ fn is_inline_suppressed(
 }
 
 fn count_stale_smg_ignores(root: &Path, pre_findings: &[LatticeFinding]) -> usize {
-    let Ok(cfg) = ShellMindGuardConfig::load_from_dir(root) else {
+    let Ok(cfg) = ShellMindGuardConfig::load_trusted_from_dir(root, false) else {
         return 0;
     };
     let Ok(summary) = scan_repository(root, &cfg) else {
@@ -1599,6 +1607,7 @@ fn apply_phase21_secrets_extensions(
     gitleaks_config_path: Option<&Path>,
     verify_live: bool,
     only_verified: bool,
+    trust_repo_config: bool,
     outcome: &mut ScanOutcome,
 ) -> Result<()> {
     if only_verified && !verify_live {
@@ -1616,8 +1625,17 @@ fn apply_phase21_secrets_extensions(
             )
         });
 
-    // 1. Honor `.gitleaks.toml` allowlists + inline `gitleaks:allow` on working-tree secret findings
+    // 1. Honor `.gitleaks.toml` allowlists on working-tree secret findings ONLY when trusted
     if secrets_layer_active {
+        if !trust_repo_config
+            && gitleaks_cfg
+                .as_ref()
+                .is_some_and(|c| !c.allowlists.is_empty() || !c.ignored_fingerprints.is_empty())
+        {
+            eprintln!(
+                "[!] Ignoring repo `.gitleaks.toml` allowlists / `.gitleaksignore` waivers without --trust-repo-config."
+            );
+        }
         let mut file_cache: HashMap<String, String> = HashMap::new();
         outcome.graph.findings.retain(|f| {
             if !f.rule_id.starts_with("SMG-SEC-") {
@@ -1630,7 +1648,7 @@ fn apply_phase21_secrets_extensions(
             if smg_graph::has_inline_allow_marker(line_str) {
                 return false;
             }
-            if let Some(cfg) = gitleaks_cfg.as_ref() {
+            if trust_repo_config && let Some(cfg) = gitleaks_cfg.as_ref() {
                 let tok = smg_graph::extract_tokens_from_line(line_str)
                     .into_iter()
                     .next()
@@ -1646,7 +1664,8 @@ fn apply_phase21_secrets_extensions(
         if let Some(cfg) = gitleaks_cfg.as_ref()
             && !cfg.custom_rules.is_empty()
         {
-            let smg_cfg = ShellMindGuardConfig::load_from_dir(repo_root)?;
+            let smg_cfg =
+                ShellMindGuardConfig::load_trusted_from_dir(repo_root, trust_repo_config)?;
             let summary = scan_repository(repo_root, &smg_cfg)?;
             let mut custom_hits = Vec::new();
             for indexed in &summary.files {
@@ -2253,7 +2272,8 @@ pub fn run_cli() -> Result<ExitCode> {
                 );
             }
             if online_osv {
-                let smg_cfg = ShellMindGuardConfig::load_from_dir(&path)?;
+                let smg_cfg =
+                    ShellMindGuardConfig::load_trusted_from_dir(&path, trust_repo_config)?;
                 let deps = deps_sync::extract_project_dependencies(&path, &smg_cfg)?;
                 if !deps.is_empty() {
                     let mut adv_store = smg_core::AdvisoryStore::open_default()?;
@@ -2301,14 +2321,22 @@ pub fn run_cli() -> Result<ExitCode> {
                 gitleaks_config.as_deref(),
                 verify_live,
                 only_verified,
+                trust_repo_config,
                 &mut outcome,
             )?;
             if let Some(trivy_ignore) = oci_image::TrivyIgnore::load(&path) {
-                outcome.graph.findings.retain(|f| {
-                    !(f.rule_id.starts_with("SMG-DEP-")
-                        && (trivy_ignore.is_ignored(&f.title)
-                            || trivy_ignore.is_ignored(&f.rule_id)))
-                });
+                if trust_repo_config {
+                    outcome.graph.findings.retain(|f| {
+                        !(f.rule_id.starts_with("SMG-DEP-")
+                            && (trivy_ignore.is_ignored(&f.title)
+                                || trivy_ignore.is_ignored(&f.rule_id)))
+                    });
+                } else if !trivy_ignore.ignored_ids.is_empty() {
+                    eprintln!(
+                        "[!] Ignoring {} repo `.trivyignore` waiver(s) without --trust-repo-config.",
+                        trivy_ignore.ignored_ids.len()
+                    );
+                }
             }
             if let Some(ref vex_out) = openvex {
                 let stmts: Vec<smg_graph::OpenVexStatement> = outcome
@@ -2466,17 +2494,20 @@ pub fn run_cli() -> Result<ExitCode> {
                     path.display(),
                     prev_fps.len()
                 );
-                let init_cfg = ShellMindGuardConfig::load_from_dir(&path)?;
+                let init_cfg =
+                    ShellMindGuardConfig::load_trusted_from_dir(&path, trust_repo_config)?;
                 let mut prev_sig = smg_core::scan_repository_metadata_signature(&path, &init_cfg)?;
                 loop {
                     std::thread::sleep(std::time::Duration::from_millis(800));
-                    let cfg = match ShellMindGuardConfig::load_from_dir(&path) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            eprintln!("[SMG watch] config reload error: {}", e);
-                            continue;
-                        }
-                    };
+                    let cfg =
+                        match ShellMindGuardConfig::load_trusted_from_dir(&path, trust_repo_config)
+                        {
+                            Ok(c) => c,
+                            Err(e) => {
+                                eprintln!("[SMG watch] config reload error: {}", e);
+                                continue;
+                            }
+                        };
                     let cur_sig = match smg_core::scan_repository_metadata_signature(&path, &cfg) {
                         Ok(s) => s,
                         Err(e) => {
@@ -2850,7 +2881,7 @@ pub fn run_cli() -> Result<ExitCode> {
         Commands::Explain { id, path, json } => {
             let direct_doc = find_rule_doc(&id);
             let finding_opt = if path.exists() {
-                ShellMindGuardConfig::load_from_dir(&path)
+                ShellMindGuardConfig::load_trusted_from_dir(&path, false)
                     .ok()
                     .and_then(|cfg| {
                         StateStore::open(&path).ok().and_then(|mut s| {
@@ -3035,6 +3066,27 @@ pub fn run_cli() -> Result<ExitCode> {
                         proto,
                         std::time::Duration::from_secs(5),
                     )?;
+                    if !upgraded {
+                        if json {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "host": host,
+                                    "port": port,
+                                    "starttls_protocol": proto_str,
+                                    "starttls_upgraded": false,
+                                })
+                            );
+                        } else {
+                            println!(
+                                "ShellMind Guard STARTTLS | {}:{} ({}) | Upgraded: false",
+                                host, port, proto_str
+                            );
+                        }
+                        return Ok(ExitCode::from(1));
+                    }
+                    let report =
+                        tls_audit::audit_upgraded_starttls_stream(&target, &host, port, stream)?;
                     if json {
                         println!(
                             "{}",
@@ -3042,19 +3094,35 @@ pub fn run_cli() -> Result<ExitCode> {
                                 "host": host,
                                 "port": port,
                                 "starttls_protocol": proto_str,
-                                "starttls_upgraded": upgraded,
+                                "starttls_upgraded": true,
+                                "tls_report": report,
                             })
                         );
                     } else {
                         println!(
-                            "ShellMind Guard STARTTLS | {}:{} ({}) | Upgraded: {}",
-                            host, port, proto_str, upgraded
+                            "ShellMind Guard STARTTLS | {}:{} ({}) | Upgraded: true | Protocols: [{}] | CertChain: {} | Findings: {}",
+                            host,
+                            port,
+                            proto_str,
+                            report.protocols_supported.join(", "),
+                            report.cert_chain_len,
+                            report.findings.len()
                         );
+                        if let Some(ref c13) = report.negotiated_tls13_cipher {
+                            println!("  TLS 1.3 Cipher: {c13}");
+                        }
+                        if let Some(ref c12) = report.negotiated_tls12_cipher {
+                            println!("  TLS 1.2 Cipher: {c12}");
+                        }
+                        for f in &report.findings {
+                            println!("  [{}] {} — {}", f.severity, f.id, f.title);
+                        }
                     }
-                    if !upgraded {
-                        return Ok(ExitCode::from(1));
-                    }
-                    return Ok(ExitCode::SUCCESS);
+                    return Ok(if report.findings.is_empty() {
+                        ExitCode::SUCCESS
+                    } else {
+                        ExitCode::from(1)
+                    });
                 }
                 #[cfg(not(feature = "pqc"))]
                 {
@@ -3625,6 +3693,7 @@ pub fn run_cli() -> Result<ExitCode> {
             schema,
             graphql,
             spa,
+            passive_only,
             timeout_ms,
             allow_remote,
             json,
@@ -3640,6 +3709,7 @@ pub fn run_cli() -> Result<ExitCode> {
                 schema_file: schema,
                 graphql_endpoint: graphql,
                 spa,
+                discover_schemas: !passive_only,
                 timeout: Duration::from_millis(timeout_ms),
                 allow_remote,
             })?;
@@ -4391,9 +4461,55 @@ fn handle_claude_pre_commit() -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     };
 
+    // F7A-02: When `git commit` is invoked WITHOUT `-a` / `--all`, materialize the staged
+    // git index into a private temporary directory (`git checkout-index --all --prefix=...`)
+    // with an RAII cleanup guard so unstaged edits never mask staged secrets (or vice versa).
+    struct StageCleanupGuard(PathBuf);
+    impl Drop for StageCleanupGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let commit_stages_all = cmd_str.split_whitespace().any(|tok| {
+        tok == "-a" || tok == "--all" || tok.starts_with("-am") || tok.starts_with("-a")
+    });
+    let mut _stage_guard: Option<StageCleanupGuard> = None;
+    let effective_scan_path = if !commit_stages_all && scan_path.join(".git").exists() {
+        let stage_dir = std::env::temp_dir().join(format!(
+            "smg-staged-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        if fs::create_dir_all(&stage_dir).is_ok() {
+            let prefix = format!("{}/", stage_dir.to_string_lossy().trim_end_matches('/'));
+            let ok = Command::new("git")
+                .current_dir(&scan_path)
+                .args(["checkout-index", "--all", "--force", "--prefix", &prefix])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if ok {
+                _stage_guard = Some(StageCleanupGuard(stage_dir.clone()));
+                stage_dir
+            } else {
+                let _ = fs::remove_dir_all(&stage_dir);
+                scan_path.clone()
+            }
+        } else {
+            scan_path.clone()
+        }
+    } else {
+        scan_path.clone()
+    };
+
     let layers = vec!["secrets".to_string(), "config".to_string()];
     let outcome = execute_scan_pipeline(ScanRunOptions {
-        path: &scan_path,
+        path: &effective_scan_path,
         layers: &layers,
         min_confidence: None,
         boot_cmd: None,

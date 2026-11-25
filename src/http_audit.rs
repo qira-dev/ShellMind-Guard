@@ -64,6 +64,9 @@ pub struct HttpAuditConfig {
     /// Render the target in headless Chrome (`--spa`) and report DOM
     /// source-to-sink flows plus background XHR/Fetch endpoints.
     pub spa: bool,
+    /// When `false` (`--passive-only`), perform strictly a single passive `GET`
+    /// without active OpenAPI/GraphQL discovery probes.
+    pub discover_schemas: bool,
     pub timeout: Duration,
     pub allow_remote: bool,
 }
@@ -79,9 +82,14 @@ pub struct HttpAuditReport {
     pub elapsed_ms: u128,
 }
 
-fn client_build(timeout: Duration, headers: &HashMap<String, String>) -> Result<Client> {
+fn client_build(
+    target_url: Option<&str>,
+    allow_remote: bool,
+    timeout: Duration,
+    headers: &HashMap<String, String>,
+) -> Result<Client> {
     crate::idor_audit::ensure_rustls_ring_provider();
-    let builder = Client::builder()
+    let mut builder = Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(timeout)
         .redirect(Policy::none())
@@ -90,6 +98,15 @@ fn client_build(timeout: Duration, headers: &HashMap<String, String>) -> Result<
             env!("CARGO_PKG_VERSION"),
             ")"
         ));
+    if let Some(u) = target_url {
+        let (_, dns_host, pinned_addrs) =
+            crate::idor_audit::resolve_and_pin_live_target_url(u, allow_remote)?;
+        if let Some(ref host) = dns_host
+            && !pinned_addrs.is_empty()
+        {
+            builder = builder.resolve_to_addrs(host, &pinned_addrs);
+        }
+    }
     let mut default_headers = reqwest::header::HeaderMap::new();
     for (k, v) in headers {
         if let (Ok(name), Ok(val)) = (
@@ -368,7 +385,12 @@ pub fn run_http_audit(cfg: &HttpAuditConfig) -> Result<HttpAuditReport> {
         }
     }
 
-    let client = client_build(cfg.timeout, &cfg.headers)?;
+    let client = client_build(
+        (!offline_only).then_some(cfg.url.as_str()),
+        cfg.allow_remote,
+        cfg.timeout,
+        &cfg.headers,
+    )?;
     let mut passive: Vec<DastFinding> = Vec::new();
     let mut schema_findings: Vec<DastFinding> = Vec::new();
     let mut schema_kind: Option<String> = None;
@@ -432,54 +454,56 @@ pub fn run_http_audit(cfg: &HttpAuditConfig) -> Result<HttpAuditReport> {
             }
         }
 
-        // 2. Passive OpenAPI discovery on the origin (plain GETs only).
-        let parsed = reqwest::Url::parse(&target_url)?;
-        for path in OPENAPI_PROBE_PATHS {
-            let Ok(schema_url) = parsed.join(path) else {
-                continue;
-            };
-            if schema_url.scheme() != parsed.scheme()
-                || schema_url.host_str() != parsed.host_str()
-                || schema_url.port_or_known_default() != parsed.port_or_known_default()
-                || crate::idor_audit::validate_live_target_url(
-                    schema_url.as_str(),
-                    cfg.allow_remote,
-                )
-                .is_err()
-            {
-                continue;
-            }
-            let Ok(resp) = client.get(schema_url.as_str()).send() else {
-                continue;
-            };
-            let status = resp.status().as_u16();
-            if !(200..300).contains(&status) {
-                continue;
-            }
-            let mut raw = Vec::new();
-            let _ = std::io::Read::read_to_end(
-                &mut std::io::Read::take(resp, 2 * 1024 * 1024),
-                &mut raw,
-            );
-            let body = String::from_utf8_lossy(&raw).into_owned();
-            if detect_schema_kind(&body) == Some("openapi") {
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) {
-                    schema_findings.extend(lint_openapi(&value, schema_url.as_str()));
-                    schema_kind = Some("openapi".into());
-                    schema_source = Some(format!("live:{path}"));
+        if cfg.discover_schemas {
+            // 2. Passive OpenAPI discovery on the origin (plain GETs only).
+            let parsed = reqwest::Url::parse(&target_url)?;
+            for path in OPENAPI_PROBE_PATHS {
+                let Ok(schema_url) = parsed.join(path) else {
+                    continue;
+                };
+                if schema_url.scheme() != parsed.scheme()
+                    || schema_url.host_str() != parsed.host_str()
+                    || schema_url.port_or_known_default() != parsed.port_or_known_default()
+                    || crate::idor_audit::validate_live_target_url(
+                        schema_url.as_str(),
+                        cfg.allow_remote,
+                    )
+                    .is_err()
+                {
+                    continue;
                 }
-                break;
+                let Ok(resp) = client.get(schema_url.as_str()).send() else {
+                    continue;
+                };
+                let status = resp.status().as_u16();
+                if !(200..300).contains(&status) {
+                    continue;
+                }
+                let mut raw = Vec::new();
+                let _ = std::io::Read::read_to_end(
+                    &mut std::io::Read::take(resp, 2 * 1024 * 1024),
+                    &mut raw,
+                );
+                let body = String::from_utf8_lossy(&raw).into_owned();
+                if detect_schema_kind(&body) == Some("openapi") {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) {
+                        schema_findings.extend(lint_openapi(&value, schema_url.as_str()));
+                        schema_kind = Some("openapi".into());
+                        schema_source = Some(format!("live:{path}"));
+                    }
+                    break;
+                }
             }
-        }
 
-        // 3. Read-only GraphQL introspection probe on the conventional endpoint.
-        let gql = cfg
-            .graphql_endpoint
-            .clone()
-            .or_else(|| parsed.join("graphql").ok().map(|u| u.to_string()));
-        if let Some(endpoint) = gql {
-            crate::idor_audit::validate_live_target_url(&endpoint, cfg.allow_remote)?;
-            probe_graphql_introspection(&client, &endpoint, &mut schema_findings);
+            // 3. Read-only GraphQL introspection probe on the conventional endpoint.
+            let gql = cfg
+                .graphql_endpoint
+                .clone()
+                .or_else(|| parsed.join("graphql").ok().map(|u| u.to_string()));
+            if let Some(endpoint) = gql {
+                crate::idor_audit::validate_live_target_url(&endpoint, cfg.allow_remote)?;
+                probe_graphql_introspection(&client, &endpoint, &mut schema_findings);
+            }
         }
     }
 
@@ -609,6 +633,7 @@ mod tests {
             schema_file: Some(openapi.clone()),
             graphql_endpoint: None,
             spa: false,
+            discover_schemas: true,
             timeout: Duration::from_secs(5),
             allow_remote: false,
         })
@@ -631,6 +656,7 @@ mod tests {
             schema_file: Some(sdl),
             graphql_endpoint: None,
             spa: false,
+            discover_schemas: true,
             timeout: Duration::from_secs(5),
             allow_remote: false,
         })
@@ -691,6 +717,7 @@ mod tests {
             schema_file: None,
             graphql_endpoint: None,
             spa: false,
+            discover_schemas: true,
             timeout: Duration::from_secs(5),
             allow_remote: false,
         })
@@ -729,6 +756,7 @@ mod tests {
             schema_file: None,
             graphql_endpoint: None,
             spa: false,
+            discover_schemas: true,
             timeout: Duration::from_secs(5),
             allow_remote: false,
         });
@@ -743,6 +771,7 @@ mod tests {
             schema_file: None,
             graphql_endpoint: None,
             spa: false,
+            discover_schemas: true,
             timeout: Duration::from_secs(5),
             allow_remote: true,
         });

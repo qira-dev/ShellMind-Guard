@@ -159,13 +159,14 @@ struct HttpHelper {
 }
 
 impl HttpHelper {
-    fn build(
+    fn build_for_url(
+        base_url: Option<&str>,
         timeout: Duration,
         headers: HashMap<String, String>,
         allow_remote: bool,
     ) -> Result<HttpHelper> {
         crate::idor_audit::ensure_rustls_ring_provider();
-        let client = Client::builder()
+        let mut builder = Client::builder()
             .connect_timeout(Duration::from_secs(5))
             .timeout(timeout)
             .redirect(Policy::none())
@@ -173,13 +174,31 @@ impl HttpHelper {
                 "Mozilla/5.0 (compatible; ShellMind-Guard-DAST/",
                 env!("CARGO_PKG_VERSION"),
                 ")"
-            ))
-            .build()?;
+            ));
+        if let Some(url) = base_url {
+            let (_, dns_host, pinned_addrs) =
+                crate::idor_audit::resolve_and_pin_live_target_url(url, allow_remote)?;
+            if let Some(ref host) = dns_host
+                && !pinned_addrs.is_empty()
+            {
+                builder = builder.resolve_to_addrs(host, &pinned_addrs);
+            }
+        }
+        let client = builder.build()?;
         Ok(HttpHelper {
             client,
             headers,
             allow_remote,
         })
+    }
+
+    #[allow(dead_code)]
+    fn build(
+        timeout: Duration,
+        headers: HashMap<String, String>,
+        allow_remote: bool,
+    ) -> Result<HttpHelper> {
+        Self::build_for_url(None, timeout, headers, allow_remote)
     }
 
     fn get(&self, url: &str) -> Result<PageResponse> {
@@ -810,7 +829,12 @@ pub fn run_dast_audit(cfg: &DastConfig) -> Result<DastReport> {
     if !matches!(base.scheme(), "http" | "https") {
         bail!("DAST audit requires an http:// or https:// seed URL");
     }
-    let helper = HttpHelper::build(cfg.timeout, cfg.headers.clone(), cfg.allow_remote)?;
+    let helper = HttpHelper::build_for_url(
+        Some(&cfg.seed_url),
+        cfg.timeout,
+        cfg.headers.clone(),
+        cfg.allow_remote,
+    )?;
     let started = Instant::now();
 
     // Optional headless-browser plane (`--spa`). The engine must outlive the

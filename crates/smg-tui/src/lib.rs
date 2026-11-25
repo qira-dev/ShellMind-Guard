@@ -292,6 +292,7 @@ enum BgEvent {
         mitigated: bool,
         summary: String,
     },
+    WorkerPanic(String),
 }
 
 struct TerminalGuard {
@@ -2449,6 +2450,9 @@ fn handle_bg_events(state: &mut TuiState) {
                 state.push_wire_event(msg.clone());
                 state.push_log(msg);
             }
+            BgEvent::WorkerPanic(reason) => {
+                state.push_log(format!("Background task panicked: {reason}"));
+            }
         }
     }
 }
@@ -2461,8 +2465,18 @@ where
     state.bg_running = Some((label, 0));
     state.bg_rx = Some(rx);
     std::thread::spawn(move || {
-        if let Ok(ev) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
-            let _ = tx.send(ev);
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
+            Ok(ev) => {
+                let _ = tx.send(ev);
+            }
+            Err(payload) => {
+                let msg = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic payload".to_string());
+                let _ = tx.send(BgEvent::WorkerPanic(msg));
+            }
         }
     });
 }
@@ -2480,7 +2494,10 @@ fn spawn_bg_replay(state: &mut TuiState, launch_cfg: &TuiLaunchConfig, cur: Latt
         format!("Running isolated bwrap replay for {}...", fid),
         move || {
             let result = (|| -> Result<(bool, Option<VerifiedFinding>)> {
-                let cfg = ShellMindGuardConfig::load_from_dir(&root)?;
+                let cfg = ShellMindGuardConfig::load_trusted_from_dir(
+                    &root,
+                    cfg_clone.trust_repo_config,
+                )?;
                 let eff_port = if cfg_clone.port != 39911 {
                     cfg_clone.port
                 } else {
@@ -2509,13 +2526,14 @@ fn spawn_bg_rescan(state: &mut TuiState, launch_cfg: &TuiLaunchConfig) {
     let layers = launch_cfg.layers.clone();
     let deep = launch_cfg.deep;
     let min_conf = launch_cfg.min_confidence;
+    let trust_cfg = launch_cfg.trust_repo_config;
     start_bg_job(
         state,
         "Running background delta-cached rescan...".to_string(),
         move || {
             let result = (|| -> Result<(GraphAnalysisResult, u128)> {
                 let t0 = Instant::now();
-                let cfg = ShellMindGuardConfig::load_from_dir(&root)?;
+                let cfg = ShellMindGuardConfig::load_trusted_from_dir(&root, trust_cfg)?;
                 let summary = scan_repository(&root, &cfg)?;
                 let mut store = StateStore::open(&root)?;
                 let (_delta, _) = store.sync_files(&summary.files)?;
@@ -2597,7 +2615,7 @@ fn spawn_bg_patch(
             );
 
             if trust_cfg {
-                match ShellMindGuardConfig::load_from_dir(&root)
+                match ShellMindGuardConfig::load_trusted_from_dir(&root, trust_cfg)
                     .and_then(|cfg| provider_from_config(&cfg.ai))
                 {
                     Ok(provider) => {
@@ -2658,7 +2676,10 @@ fn spawn_bg_apply_check(
         format!("Running isolated --apply-check for {}...", fid),
         move || {
             let (mitigated, summary) = match (|| -> Result<(bool, String)> {
-                let cfg = ShellMindGuardConfig::load_from_dir(&root)?;
+                let cfg = ShellMindGuardConfig::load_trusted_from_dir(
+                    &root,
+                    cfg_clone.trust_repo_config,
+                )?;
                 let eff_port = if cfg_clone.port != 39911 {
                     cfg_clone.port
                 } else {

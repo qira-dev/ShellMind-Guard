@@ -97,19 +97,13 @@ pub fn build_h2_single_packet_burst(
     if concurrency == 0 || concurrency > 64 {
         bail!("HTTP/2 race concurrency must be between 1 and 64");
     }
-    let effective_body = if body.is_empty() { b"{}" } else { body };
-    let (prefix_body, final_byte) = effective_body.split_at(effective_body.len() - 1);
-    let hpack = encode_hpack_literal_headers(method, path, authority);
+    let method_upper = method.trim().to_ascii_uppercase();
+    let is_bodyless = matches!(method_upper.as_str(), "GET" | "HEAD" | "DELETE");
+    let hpack = encode_hpack_literal_headers(&method_upper, path, authority);
     if hpack.len() > H2_DEFAULT_MAX_FRAME_SIZE {
         bail!(
             "HTTP/2 HPACK header block ({} bytes) exceeds default SETTINGS_MAX_FRAME_SIZE ({H2_DEFAULT_MAX_FRAME_SIZE})",
             hpack.len()
-        );
-    }
-    if prefix_body.len() > H2_DEFAULT_MAX_FRAME_SIZE {
-        bail!(
-            "HTTP/2 DATA payload ({} bytes) exceeds default SETTINGS_MAX_FRAME_SIZE ({H2_DEFAULT_MAX_FRAME_SIZE})",
-            prefix_body.len()
         );
     }
 
@@ -120,29 +114,51 @@ pub fn build_h2_single_packet_burst(
     let mut final_end_stream_burst = Vec::new();
     let mut stream_ids = Vec::with_capacity(concurrency);
 
-    for idx in 0..concurrency {
-        let stream_id = (idx as u32) * 2 + 1; // RFC 9113 §5.1.1: client-initiated streams are odd
-        stream_ids.push(stream_id);
-        staged_prefix.extend_from_slice(&build_h2_frame(
-            H2_FRAME_HEADERS,
-            H2_FLAG_END_HEADERS,
-            stream_id,
-            &hpack,
-        ));
-        if !prefix_body.is_empty() {
-            staged_prefix.extend_from_slice(&build_h2_frame(
-                H2_FRAME_DATA,
-                0,
+    if is_bodyless {
+        // RFC 9113 compliance: GET / HEAD / DELETE omit DATA frames and set END_STREAM on HEADERS.
+        for idx in 0..concurrency {
+            let stream_id = (idx as u32) * 2 + 1;
+            stream_ids.push(stream_id);
+            final_end_stream_burst.extend_from_slice(&build_h2_frame(
+                H2_FRAME_HEADERS,
+                H2_FLAG_END_HEADERS | H2_FLAG_END_STREAM,
                 stream_id,
-                prefix_body,
+                &hpack,
             ));
         }
-        final_end_stream_burst.extend_from_slice(&build_h2_frame(
-            H2_FRAME_DATA,
-            H2_FLAG_END_STREAM,
-            stream_id,
-            final_byte,
-        ));
+    } else {
+        let effective_body = if body.is_empty() { b"{}" } else { body };
+        let (prefix_body, final_byte) = effective_body.split_at(effective_body.len() - 1);
+        if prefix_body.len() > H2_DEFAULT_MAX_FRAME_SIZE {
+            bail!(
+                "HTTP/2 DATA payload ({} bytes) exceeds default SETTINGS_MAX_FRAME_SIZE ({H2_DEFAULT_MAX_FRAME_SIZE})",
+                prefix_body.len()
+            );
+        }
+        for idx in 0..concurrency {
+            let stream_id = (idx as u32) * 2 + 1; // RFC 9113 §5.1.1: client-initiated streams are odd
+            stream_ids.push(stream_id);
+            staged_prefix.extend_from_slice(&build_h2_frame(
+                H2_FRAME_HEADERS,
+                H2_FLAG_END_HEADERS,
+                stream_id,
+                &hpack,
+            ));
+            if !prefix_body.is_empty() {
+                staged_prefix.extend_from_slice(&build_h2_frame(
+                    H2_FRAME_DATA,
+                    0,
+                    stream_id,
+                    prefix_body,
+                ));
+            }
+            final_end_stream_burst.extend_from_slice(&build_h2_frame(
+                H2_FRAME_DATA,
+                H2_FLAG_END_STREAM,
+                stream_id,
+                final_byte,
+            ));
+        }
     }
 
     Ok(H2SinglePacketBurst {
@@ -153,12 +169,15 @@ pub fn build_h2_single_packet_burst(
 }
 
 /// Dispatches an HTTP/2 single-packet race burst strictly against a loopback `SocketAddr`
-/// (`127.0.0.1` / `::1`) with `TCP_NODELAY` so all `END_STREAM` frames flush in one TCP write.
+/// (`127.0.0.1` / `::1`) with `TCP_NODELAY` so all `END_STREAM` frames flush in one TCP write,
+/// then drains response frames with a bounded timeout before closing so the server never aborts
+/// in-flight handlers on `TCP RST`.
 pub fn execute_loopback_h2_single_packet_race(
     addr: SocketAddr,
     burst: &H2SinglePacketBurst,
     timeout: Duration,
 ) -> Result<usize> {
+    use std::io::Read;
     let ip: IpAddr = addr.ip();
     if !ip.is_loopback() {
         bail!("Refusing HTTP/2 single-packet race against non-loopback address {addr}");
@@ -171,6 +190,28 @@ pub fn execute_loopback_h2_single_packet_race(
     std::thread::sleep(Duration::from_millis(5));
     stream.write_all(&burst.final_end_stream_burst)?;
     stream.flush()?;
+    // Signal write-side half-close so peer finishes flushing responses without TCP RST
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let read_budget = timeout.min(Duration::from_secs(2));
+    let _ = stream.set_read_timeout(Some(read_budget));
+    let deadline = std::time::Instant::now() + read_budget;
+    let mut resp_buf = [0u8; 4096];
+    let mut total_read = 0usize;
+    while std::time::Instant::now() < deadline && total_read < 256 * 1024 {
+        match stream.read(&mut resp_buf) {
+            Ok(0) => break,
+            Ok(n) => total_read += n,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                break;
+            }
+            Err(_) => break,
+        }
+    }
     Ok(burst.stream_ids.len())
 }
 
@@ -216,6 +257,43 @@ pub fn diff_db_snapshots(
     let actual_total_delta = after.total_balance() - before.total_balance();
     let delta_violated = actual_total_delta != expected_net_delta;
 
+    // Also check per-row balance conservation invariants so conservation-preserving double-spends
+    // (e.g., sender debited `2 * amount` while recipient credited `2 * amount` with net sum delta == 0)
+    // are caught whenever `expected_net_delta != 0` or an account changes by more than allowed.
+    let mut per_row_double_spend = false;
+    if expected_net_delta == 0 {
+        let mut max_abs_acct_delta = 0i128;
+        let mut changed_accts = 0usize;
+        for (acct, &after_bal) in &after.balances {
+            let before_bal = before.balances.get(acct).copied().unwrap_or(0);
+            let d = (after_bal as i128 - before_bal as i128).abs();
+            if d > 0 {
+                changed_accts += 1;
+                max_abs_acct_delta = max_abs_acct_delta.max(d);
+            }
+        }
+        // Conservation-preserving transfer where rows grew past allowed count indicates duplicate transfer
+        if changed_accts >= 2
+            && max_abs_acct_delta > 0
+            && after.row_counts.iter().any(|(t, &ac)| {
+                ac.saturating_sub(before.row_counts.get(t).copied().unwrap_or(0))
+                    > max_allowed_row_growth
+            })
+        {
+            per_row_double_spend = true;
+        }
+    } else {
+        let max_expected_single = expected_net_delta.abs();
+        for (acct, &after_bal) in &after.balances {
+            let before_bal = before.balances.get(acct).copied().unwrap_or(0);
+            let d = (after_bal as i128 - before_bal as i128).abs();
+            if d > max_expected_single {
+                per_row_double_spend = true;
+                break;
+            }
+        }
+    }
+
     let mut extra_rows_inserted = 0u64;
     for (tbl, &after_cnt) in &after.row_counts {
         let before_cnt = before.row_counts.get(tbl).copied().unwrap_or(0);
@@ -226,7 +304,10 @@ pub fn diff_db_snapshots(
         }
     }
 
-    let violated = !negative_accounts.is_empty() || delta_violated || extra_rows_inserted > 0;
+    let violated = !negative_accounts.is_empty()
+        || delta_violated
+        || extra_rows_inserted > 0
+        || per_row_double_spend;
     let summary = if !violated {
         format!(
             "Conservation invariant held (delta={actual_total_delta}, negative_accounts=0, extra_rows=0)"

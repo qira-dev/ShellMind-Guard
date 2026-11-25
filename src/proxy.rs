@@ -73,6 +73,15 @@ fn truncate_for_capture(s: &str, cap: usize) -> String {
     format!("{}\n[truncated {} bytes]", &s[..end], s.len())
 }
 
+fn ip_is_loopback_or_mapped(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_loopback(),
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+    }
+}
+
 struct ConnCtx {
     entries: Arc<Mutex<Vec<Arc<ProxyEntry>>>>,
     summary: Arc<Mutex<ProxySummary>>,
@@ -80,6 +89,7 @@ struct ConnCtx {
     capture_limit: usize,
     log_tx: Option<Sender<Arc<ProxyEntry>>>,
     mitm: Option<Arc<MitmCa>>,
+    peer_is_loopback: bool,
 }
 
 impl ConnCtx {
@@ -174,6 +184,7 @@ pub fn start_proxy(cfg: ProxyConfig) -> Result<ProxyHandle> {
         capture_limit: cfg.capture_limit.max(1024),
         log_tx: if log_enabled { Some(log_tx) } else { None },
         mitm: cfg.mitm,
+        peer_is_loopback: true,
     };
 
     let stop_flag = Arc::clone(&stop);
@@ -184,6 +195,7 @@ pub fn start_proxy(cfg: ProxyConfig) -> Result<ProxyHandle> {
         capture_limit: ctx.capture_limit,
         log_tx: ctx.log_tx.clone(),
         mitm: ctx.mitm.clone(),
+        peer_is_loopback: true,
     };
     let active_conns = Arc::new(AtomicUsize::new(0));
     let listener_thread = thread::spawn(move || {
@@ -192,7 +204,7 @@ pub fn start_proxy(cfg: ProxyConfig) -> Result<ProxyHandle> {
                 break;
             }
             match listener.accept() {
-                Ok((mut stream, _peer)) => {
+                Ok((mut stream, peer)) => {
                     let prev = active_conns.fetch_add(1, Ordering::AcqRel);
                     if prev >= MAX_PROXY_CONNS {
                         active_conns.fetch_sub(1, Ordering::AcqRel);
@@ -219,6 +231,7 @@ pub fn start_proxy(cfg: ProxyConfig) -> Result<ProxyHandle> {
                         capture_limit: listener_ctx.capture_limit,
                         log_tx: listener_ctx.log_tx.clone(),
                         mitm: listener_ctx.mitm.clone(),
+                        peer_is_loopback: ip_is_loopback_or_mapped(peer.ip()),
                     };
                     let guard = ProxyConnGuard(Arc::clone(&active_conns));
                     thread::spawn(move || {
@@ -525,6 +538,15 @@ fn intercept_http<S: Read + Write>(
                     return Err(e);
                 }
             };
+            // F9B-01: Refuse remote LAN clients proxying into host loopback (SSRF pivot protection)
+            if !ctx.peer_is_loopback && addrs.iter().any(|sa| ip_is_loopback_or_mapped(sa.ip())) {
+                let _ = stream.write_all(
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                bail!(
+                    "Refusing remote proxy client access to loopback origin {origin_host}:{origin_port}"
+                );
+            }
             let s = TcpStream::connect_timeout(&addrs[0], Duration::from_secs(15)).with_context(
                 || format!("proxy could not reach origin {origin_host}:{origin_port}"),
             )?;
@@ -608,6 +630,14 @@ fn tunnel(stream: &mut TcpStream, target: &str, ctx: &ConnCtx) -> Result<()> {
             return Err(e);
         }
     };
+    if !ctx.peer_is_loopback && addrs.iter().any(|sa| ip_is_loopback_or_mapped(sa.ip())) {
+        let _ = stream
+            .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        if let Ok(mut s) = ctx.summary.lock() {
+            s.errors += 1;
+        }
+        bail!("Refusing remote proxy client CONNECT to loopback target {host}:{port}");
+    }
     let started = Instant::now();
     match TcpStream::connect_timeout(&addrs[0], Duration::from_secs(15)) {
         Ok(mut origin) => {

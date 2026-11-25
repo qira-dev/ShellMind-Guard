@@ -277,11 +277,59 @@ pub fn validate_provider_endpoint(provider: &AiProvider) -> Result<reqwest::Url>
     }
 }
 
-fn build_http_client(timeout_secs: u64) -> Result<reqwest::blocking::Client> {
+fn build_pinned_http_client(
+    url: &reqwest::Url,
+    allow_loopback_target: bool,
+    timeout_secs: u64,
+) -> Result<reqwest::blocking::Client> {
+    use std::net::{IpAddr, ToSocketAddrs};
     ensure_rustls_provider();
-    reqwest::blocking::Client::builder()
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("AI endpoint URL missing host"))?;
+    let clean_host = host.trim_matches(['[', ']']);
+    let port = url.port_or_known_default().unwrap_or(443);
+
+    let mut builder = reqwest::blocking::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(timeout_secs))
+        .timeout(Duration::from_secs(timeout_secs));
+
+    let is_literal_ip = clean_host.parse::<IpAddr>().is_ok();
+    if !is_literal_ip {
+        let resolved: Vec<std::net::SocketAddr> = (clean_host, port)
+            .to_socket_addrs()
+            .with_context(|| format!("Failed resolving AI endpoint host '{clean_host}'"))?
+            .collect();
+        if resolved.is_empty() {
+            bail!("AI endpoint host '{clean_host}' resolved to zero IP addresses");
+        }
+        let is_loopback_name = is_loopback_host(clean_host);
+        for sa in &resolved {
+            let ip = sa.ip();
+            let denied = match ip {
+                IpAddr::V4(v4) => {
+                    v4.is_link_local()
+                        || v4.is_unspecified()
+                        || (!allow_loopback_target && !is_loopback_name && v4.is_loopback())
+                }
+                IpAddr::V6(v6) => {
+                    let seg0 = v6.segments()[0];
+                    let is_ll = (seg0 & 0xffc0) == 0xfe80;
+                    is_ll
+                        || v6.is_unspecified()
+                        || (!allow_loopback_target && !is_loopback_name && v6.is_loopback())
+                }
+            };
+            if denied {
+                bail!(
+                    "AI endpoint host '{clean_host}' resolved to denied IP {ip} (DNS rebinding / IMDS protection)"
+                );
+            }
+        }
+        builder = builder.resolve_to_addrs(clean_host, &resolved);
+    }
+
+    builder
         .build()
         .context("Failed to construct AI HTTP/TLS client")
 }
@@ -352,7 +400,7 @@ where
             if url.path().trim_end_matches('/').is_empty() {
                 url.set_path("/api/generate");
             }
-            let client = build_http_client(DEFAULT_AI_TIMEOUT_SECS)?;
+            let client = build_pinned_http_client(&url, true, DEFAULT_AI_TIMEOUT_SECS)?;
             let resp = client
                 .post(url.clone())
                 .json(&json!({
@@ -419,7 +467,8 @@ where
             if trimmed_path.is_empty() || trimmed_path == "/v1" {
                 url.set_path("/v1/chat/completions");
             }
-            let client = build_http_client(DEFAULT_AI_TIMEOUT_SECS)?;
+            let allow_lb = url.host_str().is_some_and(is_loopback_host);
+            let client = build_pinned_http_client(&url, allow_lb, DEFAULT_AI_TIMEOUT_SECS)?;
             let resp = client
                 .post(url)
                 .bearer_auth(api_key)

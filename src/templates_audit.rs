@@ -780,8 +780,24 @@ pub struct HttpRunners {
 }
 
 impl HttpRunners {
+    #[cfg(test)]
     pub fn build_with_scope(timeout: Duration, allow_remote: bool) -> Result<HttpRunners> {
+        Self::build_for_url(None, timeout, allow_remote)
+    }
+
+    pub fn build_for_url(
+        base_url: Option<&str>,
+        timeout: Duration,
+        allow_remote: bool,
+    ) -> Result<HttpRunners> {
         crate::idor_audit::ensure_rustls_ring_provider();
+        let pinned = if let Some(u) = base_url {
+            let (_, dns_host, addrs) =
+                crate::idor_audit::resolve_and_pin_live_target_url(u, allow_remote)?;
+            dns_host.map(|h| (h, addrs))
+        } else {
+            None
+        };
         let build = |redirects: bool| -> Result<Client> {
             let policy = if redirects {
                 Policy::custom(move |attempt| {
@@ -803,7 +819,7 @@ impl HttpRunners {
             } else {
                 Policy::none()
             };
-            let client = Client::builder()
+            let mut builder = Client::builder()
                 .connect_timeout(Duration::from_secs(5))
                 .timeout(timeout)
                 .redirect(policy)
@@ -814,8 +830,13 @@ impl HttpRunners {
                 ))
                 // Lab-only runner: loopback/RFC1918 targets frequently use
                 // self-signed certs; remote staging targets verify TLS by default.
-                .danger_accept_invalid_certs(!allow_remote) // smg-ignore: SMG-CFG-TLS
-                .build()?;
+                .danger_accept_invalid_certs(!allow_remote); // smg-ignore: SMG-CFG-TLS
+            if let Some((ref host, ref addrs)) = pinned
+                && !addrs.is_empty()
+            {
+                builder = builder.resolve_to_addrs(host, addrs);
+            }
+            let client = builder.build()?;
             Ok(client)
         };
         Ok(HttpRunners {
@@ -2418,7 +2439,7 @@ pub fn run_template_audit(cfg: &TemplateRunConfig) -> Result<TemplateRunReport> 
     } else {
         parse_target(&cfg.target)?
     };
-    let runners = HttpRunners::build_with_scope(cfg.timeout, cfg.allow_remote)?;
+    let runners = HttpRunners::build_for_url(Some(&cfg.target), cfg.timeout, cfg.allow_remote)?;
     let oob_client =
         cfg.oob_server.as_ref().and_then(
             |spec| match crate::oob_server::OobClient::from_server_spec(spec) {

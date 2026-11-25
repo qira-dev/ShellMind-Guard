@@ -903,8 +903,36 @@ pub fn run_proxy_tui(
         compare_from: None,
     };
 
+    enum ProxyBgMsg {
+        ReplayOk(ProxyEntry),
+        ReplayErr(String),
+        IntruderDone(Vec<(String, u16, usize)>),
+    }
+    let (bg_tx, bg_rx) = std::sync::mpsc::channel::<ProxyBgMsg>();
+
     let result = (|| -> Result<()> {
         loop {
+            while let Ok(msg) = bg_rx.try_recv() {
+                match msg {
+                    ProxyBgMsg::ReplayOk(replayed) => {
+                        app.push_entry(replayed);
+                        app.status_message = Some("replay completed".into());
+                    }
+                    ProxyBgMsg::ReplayErr(e) => {
+                        app.status_message = Some(format!("replay failed: {e}"));
+                    }
+                    ProxyBgMsg::IntruderDone(results) => {
+                        let count = results.len();
+                        if let Modal::Intruder(ref mut st) = app.modal {
+                            st.results = results;
+                            st.message = Some(format!("{count} word(s) tested"));
+                        } else {
+                            app.status_message =
+                                Some(format!("intruder finished: {count} word(s)"));
+                        }
+                    }
+                }
+            }
             terminal.draw(|f| draw(f, &mut app))?;
             if !event::poll(Duration::from_millis(250))? {
                 continue;
@@ -955,10 +983,17 @@ pub fn run_proxy_tui(
                                         .filter(|l| !l.is_empty())
                                         .take(MAX_INTRUDER_WORDS)
                                         .collect();
-                                    state.results =
-                                        intruder_run(&state.url_field, &words, INTRUDER_TIMEOUT);
-                                    state.message =
-                                        Some(format!("{} word(s) tested", state.results.len()));
+                                    let url_tmpl = state.url_field.clone();
+                                    let tx = bg_tx.clone();
+                                    state.message = Some(format!(
+                                        "running intruder ({} word(s)) in background...",
+                                        words.len()
+                                    ));
+                                    std::thread::spawn(move || {
+                                        let results =
+                                            intruder_run(&url_tmpl, &words, INTRUDER_TIMEOUT);
+                                        let _ = tx.send(ProxyBgMsg::IntruderDone(results));
+                                    });
                                 }
                                 Err(e) => {
                                     state.message = Some(format!("wordlist read failed: {e}"));
@@ -1024,12 +1059,16 @@ pub fn run_proxy_tui(
                             cb = cb.danger_accept_invalid_certs(true); // smg-ignore: SMG-CFG-TLS
                         }
                         let client = cb.build()?;
-                        match replay_entry(&client, &entry) {
+                        let tx = bg_tx.clone();
+                        app.status_message = Some("replaying request in background...".into());
+                        std::thread::spawn(move || match replay_entry(&client, &entry) {
                             Ok(replayed) => {
-                                app.push_entry(replayed);
+                                let _ = tx.send(ProxyBgMsg::ReplayOk(replayed));
                             }
-                            Err(e) => app.status_message = Some(format!("replay failed: {e}")),
-                        }
+                            Err(e) => {
+                                let _ = tx.send(ProxyBgMsg::ReplayErr(e.to_string()));
+                            }
+                        });
                     }
                     KeyCode::Char('d') => {
                         let Some(entry) = app.selected() else {

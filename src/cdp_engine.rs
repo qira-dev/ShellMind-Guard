@@ -476,18 +476,47 @@ impl CdpSession {
         if !matches!(parsed.scheme(), "http" | "https") {
             bail!("CDP navigation only permits http:// and https:// URLs");
         }
+        let mut blocked_urls = vec![
+            "*://169.254.169.254/*",
+            "*://[fd00:ec2::254]/*",
+            "*://100.100.100.200/*",
+            "*://192.0.0.192/*",
+            "*://metadata.google.internal/*",
+            "*://metadata.azure.com/*",
+            "file://*",
+        ];
+        // F9B-02: When navigating a remote (non-lab/non-loopback) webpage, block loopback
+        // and RFC1918 subresource requests so a malicious remote page cannot pivot headless
+        // Chrome into local developer daemons.
+        let is_local_or_rfc1918 = parsed.host_str().is_some_and(|h| {
+            let clean = h.trim_matches(['[', ']']).to_ascii_lowercase();
+            clean == "localhost"
+                || clean == "127.0.0.1"
+                || clean == "::1"
+                || clean.starts_with("10.")
+                || clean.starts_with("192.168.")
+                || clean.starts_with("172.16.")
+                || clean.starts_with("172.17.")
+                || clean.starts_with("172.18.")
+                || clean.starts_with("172.19.")
+                || clean.starts_with("172.2")
+                || clean.starts_with("172.30.")
+                || clean.starts_with("172.31.")
+        });
+        if allow_remote && !is_local_or_rfc1918 {
+            blocked_urls.extend_from_slice(&[
+                "*://localhost/*",
+                "*://127.0.0.1/*",
+                "*://[::1]/*",
+                "*://10.*/*",
+                "*://192.168.*/*",
+                "*://172.16.*/*",
+            ]);
+        }
         let _ = self.send(
             "Network.setBlockedURLs",
             json!({
-                "urls": [
-                    "*://169.254.169.254/*",
-                    "*://[fd00:ec2::254]/*",
-                    "*://100.100.100.200/*",
-                    "*://192.0.0.192/*",
-                    "*://metadata.google.internal/*",
-                    "*://metadata.azure.com/*",
-                    "file://*"
-                ]
+                "urls": blocked_urls
             }),
         );
         self.load_fired = false;

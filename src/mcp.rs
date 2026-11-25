@@ -431,6 +431,44 @@ fn handle_tool_call(params: &Value) -> Result<Value> {
                     findings_slice.iter_mut().find(|f| f.witness_path.len() > 2)
                 {
                     long_witness.witness_path.truncate(2);
+                } else if findings_slice.len() == 1 {
+                    // Never drop the final finding (`returned_count: 0` when `total_findings > 0`);
+                    // bound its oversized fields instead and emit cleanly.
+                    let f0 = &mut findings_slice[0];
+                    if f0.title.len() > 512 {
+                        let cut = f0.title.floor_char_boundary(512);
+                        f0.title.truncate(cut);
+                    }
+                    if f0.remediation.len() > 512 {
+                        let cut = f0.remediation.floor_char_boundary(512);
+                        f0.remediation.truncate(cut);
+                    }
+                    if f0.entry_route.len() > 256 {
+                        let cut = f0.entry_route.floor_char_boundary(256);
+                        f0.entry_route.truncate(cut);
+                    }
+                    if f0.proof_reasons.len() > 2 {
+                        f0.proof_reasons.truncate(2);
+                    }
+                    let final_cand = json!({
+                        "path": root.display().to_string(),
+                        "parsed_files": outcome.graph.parsed_files,
+                        "symbol_count": outcome.graph.symbol_count,
+                        "edge_count": outcome.graph.edge_count,
+                        "route_entries": outcome.graph.route_entries,
+                        "total_findings": total_findings,
+                        "returned_count": 1,
+                        "truncated": true,
+                        "budget_bytes": MAX_MCP_RESPONSE_BYTES,
+                        "findings": findings_slice,
+                        "delta": outcome.delta,
+                    });
+                    let final_len = final_cand.to_string().len();
+                    let mut final_val = final_cand;
+                    if let Some(obj) = final_val.as_object_mut() {
+                        obj.insert("response_bytes".into(), json!(final_len));
+                    }
+                    break final_val;
                 } else {
                     findings_slice.pop();
                 }

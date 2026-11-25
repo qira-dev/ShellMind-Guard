@@ -602,7 +602,6 @@ impl rustls::client::danger::ServerCertVerifier for CertCollectorVerifier {
 }
 
 /// Completes a TLS handshake and protocol/cipher/cert audit over an already-upgraded STARTTLS `TcpStream`.
-#[allow(dead_code)]
 pub fn audit_upgraded_starttls_stream(
     target_label: &str,
     host: &str,

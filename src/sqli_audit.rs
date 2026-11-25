@@ -924,8 +924,10 @@ pub fn run_sqli_audit(cfg: &SqliAuditConfig) -> Result<SqliAuditReport> {
     }
 
     crate::idor_audit::ensure_rustls_ring_provider();
+    let (_, dns_host, pinned_addrs) =
+        crate::idor_audit::resolve_and_pin_live_target_url(&cfg.url, cfg.allow_remote)?;
     let safe_delay = cfg.delay_secs.clamp(1, 30);
-    let client = Client::builder()
+    let mut client_builder = Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(
             safe_delay
@@ -933,8 +935,13 @@ pub fn run_sqli_audit(cfg: &SqliAuditConfig) -> Result<SqliAuditReport> {
                 .saturating_add(20),
         ))
         .redirect(Policy::none())
-        .user_agent(concat!("ShellMind-Guard/", env!("CARGO_PKG_VERSION")))
-        .build()?;
+        .user_agent(concat!("ShellMind-Guard/", env!("CARGO_PKG_VERSION")));
+    if let Some(ref host) = dns_host
+        && !pinned_addrs.is_empty()
+    {
+        client_builder = client_builder.resolve_to_addrs(host, &pinned_addrs);
+    }
+    let client = client_builder.build()?;
 
     // Determine the parameter set across all testable surfaces.
     let mut prefs: Vec<ParamRef> = Vec::new();
