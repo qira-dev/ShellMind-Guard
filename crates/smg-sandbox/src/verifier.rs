@@ -634,31 +634,6 @@ pub fn dispatch_h2_single_packet_race_for_finding(
     )
 }
 
-/// Quick non-intrusive probe to detect whether `127.0.0.1:{port}` speaks cleartext HTTP/2 (h2c).
-fn listener_speaks_h2c(port: u16) -> bool {
-    use std::io::{Read, Write};
-    let Ok(addr) = format!("127.0.0.1:{port}").parse::<std::net::SocketAddr>() else {
-        return false;
-    };
-    let Ok(mut s) = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(120)) else {
-        return false;
-    };
-    let _ = s.set_read_timeout(Some(Duration::from_millis(120)));
-    let _ = s.set_write_timeout(Some(Duration::from_millis(120)));
-    let mut probe = Vec::from(crate::h2_race_snapshot::H2_CLIENT_PREFACE);
-    probe.extend_from_slice(&crate::h2_race_snapshot::build_h2_frame(
-        crate::h2_race_snapshot::H2_FRAME_SETTINGS,
-        0,
-        0,
-        &[],
-    ));
-    if s.write_all(&probe).is_err() || s.flush().is_err() {
-        return false;
-    }
-    let mut hdr = [0u8; 9];
-    matches!(s.read_exact(&mut hdr), Ok(()) if hdr[3] == crate::h2_race_snapshot::H2_FRAME_SETTINGS)
-}
-
 pub async fn verify_concurrency_invariant_with_config(
     port: u16,
     finding: &LatticeFinding,
@@ -674,12 +649,6 @@ pub async fn verify_concurrency_invariant_with_config(
             evidence: "Concurrency set to 0; no requests dispatched".into(),
             replay_cmd: format!("smg replay {} --sync-race 12", finding.id),
         });
-    }
-
-    // Automatic HTTP/2 single-packet fast-path when target listener negotiates h2c;
-    // falls through cleanly to HTTP/1.1 last-byte barrier burst for HTTP/1.1-only targets.
-    if !cfg.use_tls && listener_speaks_h2c(port) {
-        let _ = dispatch_h2_single_packet_race_for_finding(port, finding, concurrency, cfg);
     }
 
     let (method, raw_path) = parse_route(&finding.entry_route);
