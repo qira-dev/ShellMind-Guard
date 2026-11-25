@@ -161,6 +161,7 @@ pub fn scan_hardware_repo(
 
     let mut raw_findings = Vec::new();
     let mut lock_summaries: Vec<HardwareFunctionLockSummary> = Vec::new();
+    let mut stack_nodes: Vec<wcsd_dma::FnStackNode> = Vec::new();
 
     if !sources.is_empty() {
         let c_refs: Vec<(String, &str)> = sources
@@ -170,11 +171,16 @@ pub fn scan_hardware_repo(
         let ctx = ingest_firmware_context(project_root, &c_refs);
 
         use rayon::prelude::*;
-        let per_file: Vec<(Vec<LocalStaticFinding>, Vec<HardwareFunctionLockSummary>)> = sources
+        let per_file: Vec<(
+            Vec<LocalStaticFinding>,
+            Vec<HardwareFunctionLockSummary>,
+            Vec<wcsd_dma::FnStackNode>,
+        )> = sources
             .par_iter()
             .map(|(rel, lang, content)| {
                 let mut local_findings = Vec::new();
                 let mut local_locks = Vec::new();
+                let mut local_stack_nodes = Vec::new();
                 analyze_hw_file(
                     rel,
                     *lang,
@@ -185,17 +191,20 @@ pub fn scan_hardware_repo(
                 );
                 if matches!(lang, Language::C | Language::Cpp) {
                     local_findings.extend(wcsd_dma::analyze_dma_cache_coherency(rel, content));
+                    local_stack_nodes.extend(wcsd_dma::extract_c_stack_nodes(rel, content));
                 }
-                (local_findings, local_locks)
+                (local_findings, local_locks, local_stack_nodes)
             })
             .collect();
-        for (lf, ll) in per_file {
+        for (lf, ll, ls) in per_file {
             raw_findings.extend(lf);
             lock_summaries.extend(ll);
+            stack_nodes.extend(ls);
         }
     }
 
     let mut seen_ld_rel_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut min_stack_budget: Option<u64> = None;
     for f in files {
         let low = f.rel_path.to_ascii_lowercase();
         if (low.ends_with(".ld") || low.ends_with(".lds"))
@@ -211,8 +220,11 @@ pub fn scan_hardware_repo(
                 .trim_start_matches("./")
                 .to_string();
             if seen_ld_rel_paths.insert(norm) {
-                let (_regions, _stack, ld_findings) =
+                let (_regions, stack_opt, ld_findings) =
                     wcsd_dma::audit_linker_script(&f.rel_path, &text);
+                if let Some(s) = stack_opt {
+                    min_stack_budget = Some(min_stack_budget.map_or(s, |cur| cur.min(s)));
+                }
                 raw_findings.extend(ld_findings);
             }
         }
@@ -229,10 +241,18 @@ pub fn scan_hardware_repo(
             if seen_ld_rel_paths.insert(norm)
                 && let Ok(text) = fs::read_to_string(&spec_path)
             {
-                let (_regions, _stack, ld_findings) = wcsd_dma::audit_linker_script(&rel, &text);
+                let (_regions, stack_opt, ld_findings) = wcsd_dma::audit_linker_script(&rel, &text);
+                if let Some(s) = stack_opt {
+                    min_stack_budget = Some(min_stack_budget.map_or(s, |cur| cur.min(s)));
+                }
                 raw_findings.extend(ld_findings);
             }
         }
+    }
+    if !stack_nodes.is_empty() {
+        let (_wcsd, wcsd_findings) =
+            wcsd_dma::compute_wcsd(&stack_nodes, min_stack_budget.unwrap_or(0));
+        raw_findings.extend(wcsd_findings);
     }
     if !lock_summaries.is_empty() {
         raw_findings.extend(check_cross_fn_irq_deadlocks(&lock_summaries));
@@ -328,7 +348,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(
             dir.join("board.ld"),
-            "MEMORY {\n  FLASH (rx) : ORIGIN = 0x08000000, LENGTH = 256K\n  SRAM (rwx) : ORIGIN = 0x20000000, LENGTH = 64K\n}\n",
+            "MEMORY {\n  FLASH (rx) : ORIGIN = 0x08000000, LENGTH = 256K\n  SRAM (rw) : ORIGIN = 0x20000000, LENGTH = 64K\n}\n",
         )
         .unwrap();
 
@@ -456,7 +476,7 @@ void sign_tx_safe(const uint8_t *seed) {
         fs::create_dir_all(&dir).unwrap();
         fs::write(
             dir.join("board.ld"),
-            "MEMORY {\n  FLASH (rx) : ORIGIN = 0x08000000, LENGTH = 256K\n  SRAM (rwx) : ORIGIN = 0x20000000, LENGTH = 64K\n}\n",
+            "MEMORY {\n  FLASH (rx) : ORIGIN = 0x08000000, LENGTH = 256K\n  SRAM (rw) : ORIGIN = 0x20000000, LENGTH = 64K\n}\n",
         )
         .unwrap();
 

@@ -248,30 +248,97 @@ fn extract_finding_pkg_candidates(title: &str) -> Vec<String> {
 }
 
 /// Reverse-seeded CVE-only VEX solver: evaluates ONLY advisory-hit `SMG-DEP-*` findings against
-/// `PackageImportIndex` and route-reachable symbol IDs (`build_any_route_bfs_tree`), wasting
-/// zero work on clean lockfile dependencies.
+/// `PackageImportIndex`, optional OSV `AutoVexSymbolIndex`, and route-reachable symbol IDs
+/// (`build_any_route_bfs_tree`), wasting zero work on clean lockfile dependencies.
 pub fn assess_dependency_vex_tier(
     finding: &crate::lattice::LatticeFinding,
     pkg_index: &PackageImportIndex,
     route_reachable_sym_ids: &HashSet<String>,
 ) -> Option<VexReachabilityTier> {
+    assess_dependency_vex_tier_with_auto_vex(finding, pkg_index, route_reachable_sym_ids, None).0
+}
+
+/// Evaluates VEX reachability using both static symbol tables and OSV-extracted `AutoVexSymbolIndex`
+/// (plus inline advisory prose symbol extraction), emitting a populated OpenVEX v0.2.0 statement.
+pub fn assess_dependency_vex_tier_with_auto_vex(
+    finding: &crate::lattice::LatticeFinding,
+    pkg_index: &PackageImportIndex,
+    route_reachable_sym_ids: &HashSet<String>,
+    auto_vex: Option<&crate::vex_osv::AutoVexSymbolIndex>,
+) -> (
+    Option<VexReachabilityTier>,
+    Option<crate::vex_osv::OpenVexStatement>,
+) {
     if !finding.rule_id.starts_with("SMG-DEP-") {
-        return None;
-    }
-    if pkg_index.imported_pkgs.is_empty() {
-        return Some(VexReachabilityTier::DeclaredUnused);
+        return (None, None);
     }
     let candidates = extract_finding_pkg_candidates(&finding.title);
+    let primary_pkg = candidates
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "unknown".to_string());
+    let vuln_id = finding.rule_id.clone();
+
+    let mk_stmt = |tier: VexReachabilityTier, pkg_name: &str| -> crate::vex_osv::OpenVexStatement {
+        let (status, justification, impact) = match tier {
+            VexReachabilityTier::ProvenRouteSymbol => (
+                "affected",
+                None,
+                format!("Vulnerable symbol in `{pkg_name}` is reachable from an entry route"),
+            ),
+            VexReachabilityTier::ImportedSafeApiOnly => (
+                "not_affected",
+                Some("vulnerable_code_not_in_execute_path"),
+                format!("Only non-vulnerable APIs of `{pkg_name}` are imported/invoked"),
+            ),
+            VexReachabilityTier::DeclaredUnused => (
+                "not_affected",
+                Some("component_not_present"),
+                format!("Package `{pkg_name}` is declared in manifest/lockfile but never imported"),
+            ),
+            VexReachabilityTier::ImportedUnprovenSymbol => (
+                "under_investigation",
+                None,
+                format!(
+                    "Package `{pkg_name}` is imported; vulnerable symbol reachability unproven"
+                ),
+            ),
+        };
+        crate::vex_osv::OpenVexStatement {
+            vulnerability_id: vuln_id.clone(),
+            product_purl: format!("pkg:generic/{pkg_name}"),
+            status: status.to_string(),
+            justification: justification.map(String::from),
+            impact_statement: impact,
+        }
+    };
+
+    if pkg_index.imported_pkgs.is_empty() {
+        let tier = VexReachabilityTier::DeclaredUnused;
+        return (Some(tier), Some(mk_stmt(tier, &primary_pkg)));
+    }
     let matched_pkg = candidates
         .iter()
         .find(|c| pkg_index.imported_pkgs.contains(c.as_str()));
     let Some(pkg) = matched_pkg else {
-        return Some(VexReachabilityTier::DeclaredUnused);
+        let tier = VexReachabilityTier::DeclaredUnused;
+        return (Some(tier), Some(mk_stmt(tier, &primary_pkg)));
     };
 
-    let Some(vuln_syms) = known_vulnerable_symbols(pkg) else {
-        return Some(VexReachabilityTier::ImportedUnprovenSymbol);
-    };
+    let mut vuln_syms: HashSet<String> = known_vulnerable_symbols(pkg)
+        .map(|s| s.iter().map(|x| x.to_ascii_lowercase()).collect())
+        .unwrap_or_default();
+    if let Some(idx) = auto_vex {
+        for ((_, p), syms) in &idx.symbols {
+            if p == pkg || norm_pkg_key(p) == norm_pkg_key(pkg) {
+                vuln_syms.extend(syms.iter().cloned());
+            }
+        }
+    }
+    if vuln_syms.is_empty() {
+        let tier = VexReachabilityTier::ImportedUnprovenSymbol;
+        return (Some(tier), Some(mk_stmt(tier, pkg)));
+    }
 
     let calls = pkg_index.call_sites.get(pkg);
     let imported = pkg_index.imported_symbols.get(pkg);
@@ -283,7 +350,7 @@ pub fn assess_dependency_vex_tier(
     if let Some(call_list) = calls {
         for (caller_id, member_low) in call_list {
             saw_any_concrete_call = true;
-            if vuln_syms.contains(&member_low.as_str()) {
+            if vuln_syms.contains(member_low.as_str()) {
                 saw_vuln_call = true;
                 if route_reachable_sym_ids.contains(caller_id) {
                     saw_route_reachable_vuln_call = true;
@@ -293,24 +360,27 @@ pub fn assess_dependency_vex_tier(
     }
 
     if saw_route_reachable_vuln_call {
-        return Some(VexReachabilityTier::ProvenRouteSymbol);
+        let tier = VexReachabilityTier::ProvenRouteSymbol;
+        return (Some(tier), Some(mk_stmt(tier, pkg)));
     }
     if saw_vuln_call {
-        // Vulnerable symbol called, though not proven reachable from an HTTP/entry route
-        return Some(VexReachabilityTier::ImportedUnprovenSymbol);
+        let tier = VexReachabilityTier::ImportedUnprovenSymbol;
+        return (Some(tier), Some(mk_stmt(tier, pkg)));
     }
 
     // Check if only safe named imports or only safe concrete member calls were observed
     let only_safe_named_imports = imported.is_some_and(|syms| {
         !syms.is_empty()
             && !syms.contains("*")
-            && syms.iter().all(|s| !vuln_syms.contains(&s.as_str()))
+            && syms.iter().all(|s| !vuln_syms.contains(s.as_str()))
     });
     if saw_any_concrete_call || only_safe_named_imports {
-        return Some(VexReachabilityTier::ImportedSafeApiOnly);
+        let tier = VexReachabilityTier::ImportedSafeApiOnly;
+        return (Some(tier), Some(mk_stmt(tier, pkg)));
     }
 
-    Some(VexReachabilityTier::ImportedUnprovenSymbol)
+    let tier = VexReachabilityTier::ImportedUnprovenSymbol;
+    (Some(tier), Some(mk_stmt(tier, pkg)))
 }
 
 fn norm_pkg_key(raw: &str) -> String {

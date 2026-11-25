@@ -10,6 +10,90 @@ use super::{ExtractContext, strip_quotes};
 const SENSITIVE_PORTS: &[u16] = &[22, 23, 445, 1433, 3306, 3389, 5432, 6379, 9200, 27017];
 const MAX_HCL_NESTED_DEPTH: usize = 16;
 
+#[derive(Default, Clone)]
+pub(crate) struct WorkspaceHclVars {
+    /// Cross-file `var.<name>` defaults and `*.tfvars` overrides.
+    pub var_defaults: HashMap<String, String>,
+    /// S3 bucket resource names protected by an `aws_s3_bucket_public_access_block` anywhere in the repo.
+    pub protected_s3_buckets: HashSet<String>,
+}
+
+static WORKSPACE_HCL_VARS: std::sync::RwLock<Option<WorkspaceHclVars>> =
+    std::sync::RwLock::new(None);
+
+/// Pre-collects `variable "<name>" { default = ... }`, `*.tfvars` key-values, and
+/// `aws_s3_bucket_public_access_block` resources across all `.tf`/`.tfvars`/`.hcl` files
+/// in the scanned workspace so cross-file `var.xyz` references and S3 public-access blocks resolve.
+pub(crate) fn set_workspace_hcl_vars(files: &[smg_core::IndexedFile]) {
+    let mut ws = WorkspaceHclVars::default();
+    let mut tfvars_overrides: HashMap<String, String> = HashMap::new();
+    let mut parser = tree_sitter::Parser::new();
+    let lang: tree_sitter::Language = tree_sitter_hcl::LANGUAGE.into();
+    let _ = parser.set_language(&lang);
+
+    for f in files {
+        let low = f.rel_path.to_ascii_lowercase();
+        let is_tf_or_hcl = low.ends_with(".tf") || low.ends_with(".hcl");
+        let is_tfvars = low.ends_with(".tfvars") || low.ends_with(".auto.tfvars.json");
+        if !is_tf_or_hcl && !is_tfvars {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&f.abs_path) else {
+            continue;
+        };
+        if low.ends_with(".auto.tfvars.json") {
+            if let Ok(serde_json::Value::Object(map)) = serde_json::from_str(&content) {
+                for (k, v) in map {
+                    let val_str = match v {
+                        serde_json::Value::String(s) => format!("\"{s}\""),
+                        other => other.to_string(),
+                    };
+                    tfvars_overrides.insert(format!("var.{}", k.to_ascii_lowercase()), val_str);
+                }
+            }
+            continue;
+        }
+        if low.ends_with(".tfvars") {
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("//") {
+                    continue;
+                }
+                if let Some((k, v)) = trimmed.split_once('=') {
+                    let key = k.trim().to_ascii_lowercase();
+                    let val = v.trim().trim_end_matches(',').to_string();
+                    if !key.is_empty() && !val.is_empty() {
+                        tfvars_overrides.insert(format!("var.{key}"), val);
+                    }
+                }
+            }
+            continue;
+        }
+        if let Some(tree) = parser.parse(&content, None) {
+            let mut file_g = HclFileGraph::default();
+            collect_hcl_file_graph(tree.root_node(), content.as_bytes(), &mut file_g, 0);
+            for (k, v) in file_g.var_defaults {
+                if k.starts_with("var.") {
+                    ws.var_defaults.insert(k, v);
+                }
+            }
+            ws.protected_s3_buckets.extend(file_g.protected_s3_buckets);
+        }
+    }
+    // `.tfvars` overrides take precedence over `variable { default = ... }`
+    ws.var_defaults.extend(tfvars_overrides);
+
+    if let Ok(mut guard) = WORKSPACE_HCL_VARS.write() {
+        *guard = Some(ws);
+    }
+}
+
+pub(crate) fn clear_workspace_hcl_vars() {
+    if let Ok(mut guard) = WORKSPACE_HCL_VARS.write() {
+        *guard = None;
+    }
+}
+
 #[derive(Default)]
 struct HclFileGraph {
     /// `var.<name>` and `local.<name>` resolved default/literal values.
@@ -20,6 +104,14 @@ struct HclFileGraph {
 
 pub(crate) fn extract(root: Node, ctx: &mut ExtractContext<'_>) {
     let mut graph = HclFileGraph::default();
+    if let Ok(guard) = WORKSPACE_HCL_VARS.read()
+        && let Some(ref ws) = *guard
+    {
+        graph.var_defaults.extend(ws.var_defaults.clone());
+        graph
+            .protected_s3_buckets
+            .extend(ws.protected_s3_buckets.iter().cloned());
+    }
     collect_hcl_file_graph(root, ctx.src, &mut graph, 0);
     walk_hcl_blocks(root, ctx, &graph, 0);
 }

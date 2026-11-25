@@ -241,6 +241,64 @@ pub fn scan_web3_repo_with_options(
                                 remediation: "Enforce caller authorization and protocol solvency invariants across all multi-transaction call sequences.".into(),
                             });
                         }
+                        // Phase 29A: Auto-wired read-only/view reentrancy probe on contracts exposing
+                        // both mutating external calls and view price/share getters (bounded to 4 pairs).
+                        let view_getters: Vec<(&String, [u8; 4])> = art
+                            .abi_functions
+                            .iter()
+                            .filter(|sig| {
+                                let low = sig.to_ascii_lowercase();
+                                low.starts_with("getprice(")
+                                    || low.starts_with("pricepershare(")
+                                    || low.starts_with("getvirtualprice(")
+                                    || low.starts_with("exchangerate(")
+                                    || low.starts_with("totalassets(")
+                            })
+                            .take(2)
+                            .map(|sig| (sig, abi_selector(sig)))
+                            .collect();
+                        if !view_getters.is_empty() {
+                            let mutators: Vec<(&String, [u8; 4])> = art
+                                .abi_functions
+                                .iter()
+                                .filter(|sig| {
+                                    let low = sig.to_ascii_lowercase();
+                                    low.starts_with("withdraw(")
+                                        || low.starts_with("redeem(")
+                                        || low.starts_with("remove_liquidity(")
+                                        || low.starts_with("claim(")
+                                })
+                                .take(2)
+                                .map(|sig| (sig, abi_selector(sig)))
+                                .collect();
+                            'view_probe: for (msig, msel) in &mutators {
+                                for (vsig, vsel) in &view_getters {
+                                    let vr = evm_oracle::probe_view_reentrancy_in_revm(
+                                        &art.deployed_bytecode,
+                                        msel,
+                                        vsel,
+                                    );
+                                    if vr.proven {
+                                        all_findings.push(LocalStaticFinding {
+                                            rule_id: "SMG-WEB3-REENTRANCY".into(),
+                                            severity: "CRITICAL".into(),
+                                            title: format!(
+                                                "[revm PROVEN read-only reentrancy] `{}` view `{vsig}` returned stale value during `{msig}` callback ({})",
+                                                c.name, vr.summary
+                                            ),
+                                            rel_path: f.rel_path.clone(),
+                                            line: c.start_line.max(1),
+                                            symbol: c.name.clone(),
+                                            sink_kind: SinkKind::BalanceUpdate,
+                                            missing_guard: GuardKind::TxLock,
+                                            confidence: Confidence::Proven,
+                                            remediation: "Apply nonReentrant guards to view price/share getters or update all accounting state before external calls.".into(),
+                                        });
+                                        break 'view_probe;
+                                    }
+                                }
+                            }
+                        }
                     }
                     if c.has_erc7201_namespace {
                         continue;

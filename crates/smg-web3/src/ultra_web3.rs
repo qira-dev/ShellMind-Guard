@@ -8,12 +8,21 @@ use crate::context::abi_selector;
 use crate::solidity::{ContractKind, ParsedContract};
 use crate::svm_move::SolanaWorkspaceContext;
 use smg_graph::{Confidence, GuardKind, LocalStaticFinding, SinkKind};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Extracts canonical Solidity ABI signature `"name(type1,type2)"` from parsed function metadata,
 /// stripping parameter names, `memory`/`calldata`/`storage`/`payable` qualifiers, and normalizing
 /// `uint`->`uint256`, `int`->`int256`.
 pub(crate) fn canonical_abi_signature(fn_name: &str, params_text: &str) -> String {
+    canonical_abi_signature_with_defs(fn_name, params_text, &HashSet::new(), &HashSet::new())
+}
+
+pub(crate) fn canonical_abi_signature_with_defs(
+    fn_name: &str,
+    params_text: &str,
+    enums: &HashSet<String>,
+    contracts_and_interfaces: &HashSet<String>,
+) -> String {
     let mut param_types = Vec::new();
     let mut depth = 0usize;
     let mut start = 0usize;
@@ -22,7 +31,11 @@ pub(crate) fn canonical_abi_signature(fn_name: &str, params_text: &str) -> Strin
             '(' | '[' => depth += 1,
             ')' | ']' => depth = depth.saturating_sub(1),
             ',' if depth == 0 => {
-                if let Some(t) = extract_canonical_param_type(&params_text[start..i]) {
+                if let Some(t) = extract_canonical_param_type_with_defs(
+                    &params_text[start..i],
+                    enums,
+                    contracts_and_interfaces,
+                ) {
                     param_types.push(t);
                 }
                 start = i + 1;
@@ -31,14 +44,22 @@ pub(crate) fn canonical_abi_signature(fn_name: &str, params_text: &str) -> Strin
         }
     }
     if start < params_text.len()
-        && let Some(t) = extract_canonical_param_type(&params_text[start..])
+        && let Some(t) = extract_canonical_param_type_with_defs(
+            &params_text[start..],
+            enums,
+            contracts_and_interfaces,
+        )
     {
         param_types.push(t);
     }
     format!("{}({})", fn_name.trim(), param_types.join(","))
 }
 
-fn extract_canonical_param_type(param: &str) -> Option<String> {
+fn extract_canonical_param_type_with_defs(
+    param: &str,
+    enums: &HashSet<String>,
+    contracts_and_interfaces: &HashSet<String>,
+) -> Option<String> {
     let trimmed = param.trim();
     if trimmed.is_empty() {
         return None;
@@ -68,7 +89,8 @@ fn extract_canonical_param_type(param: &str) -> Option<String> {
             } else {
                 ""
             };
-            let inner_sig = canonical_abi_signature("", inner);
+            let inner_sig =
+                canonical_abi_signature_with_defs("", inner, enums, contracts_and_interfaces);
             return Some(format!("{}{}", inner_sig, arr_suffix));
         }
     }
@@ -77,14 +99,25 @@ fn extract_canonical_param_type(param: &str) -> Option<String> {
     if raw_ty.is_empty() {
         return None;
     }
-    let norm = match raw_ty {
-        "uint" => "uint256".to_string(),
-        "int" => "int256".to_string(),
-        other if other.starts_with("uint[") => other.replacen("uint[", "uint256[", 1),
-        other if other.starts_with("int[") => other.replacen("int[", "int256[", 1),
-        other => other.to_string(),
+    let (base_ty, arr_suffix) = match raw_ty.find('[') {
+        Some(idx) => (&raw_ty[..idx], &raw_ty[idx..]),
+        None => (raw_ty, ""),
     };
-    Some(norm)
+    let canon_base = match base_ty {
+        "uint" => "uint256",
+        "int" => "int256",
+        other if enums.contains(other) => "uint8",
+        other
+            if contracts_and_interfaces.contains(other)
+                || (other.starts_with('I')
+                    && other.len() >= 2
+                    && other.as_bytes()[1].is_ascii_uppercase()) =>
+        {
+            "address"
+        }
+        other => other,
+    };
+    Some(format!("{canon_base}{arr_suffix}"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -439,9 +472,8 @@ pub fn analyze_solana_pda_depth_with_ctx(
     let mut findings = Vec::new();
 
     let _ = ws_ctx;
-    let file_has_validated_program = stripped.contains("Program<'info,")
-        || stripped.contains("Program< 'info,")
-        || stripped.contains("Interface<'info,");
+    let validated_program_fields =
+        crate::svm_move::extract_validated_program_fields_from_struct(&stripped);
 
     for (idx, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
@@ -499,9 +531,12 @@ pub fn analyze_solana_pda_depth_with_ctx(
             && !trimmed.starts_with("fn ")
         {
             let win_start = idx.saturating_sub(15);
-            let window = lines[win_start..=idx].join("\n");
-            let checks_program = file_has_validated_program
-                || window.contains("program_id ==")
+            let win_end = (idx + 6).min(lines.len());
+            let window = lines[win_start..win_end].join("\n");
+            let checks_program = crate::svm_move::cpi_targets_validated_program_field(
+                &window,
+                &validated_program_fields,
+            ) || window.contains("program_id ==")
                 || window.contains("key == &spl_token")
                 || window.contains("key == &system_program")
                 || window.contains("Program<'info,")

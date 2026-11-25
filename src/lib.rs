@@ -1768,6 +1768,53 @@ pub(crate) fn execute_scan_pipeline_full(
         let ai_artifact_hits = smg_graph::scan_repo_ai_model_artifacts(opts.path);
         smg_graph::append_local_static_findings(&mut graph_res.findings, &ai_artifact_hits);
     }
+    if let Some(gl_cfg) = smg_graph::GitleaksConfig::load(opts.path, None) {
+        if !gl_cfg.custom_rules.is_empty() {
+            let mut custom_hits = Vec::new();
+            for f in &summary.files {
+                if f.size_bytes > 2 * 1024 * 1024 {
+                    continue;
+                }
+                if let Ok(content) = fs::read_to_string(&f.abs_path) {
+                    for (idx, line) in content.lines().enumerate() {
+                        for (hit, _) in
+                            gl_cfg.scan_custom_rules_line(&f.rel_path, idx + 1, line, None)
+                        {
+                            custom_hits.push(hit);
+                        }
+                    }
+                    custom_hits.extend(gl_cfg.scan_multiline_custom_rules(&f.rel_path, &content));
+                }
+            }
+            smg_graph::append_local_static_findings(&mut graph_res.findings, &custom_hits);
+        }
+        // Honor `.gitleaks.toml` allowlists and `.gitleaksignore` fingerprints on working-tree
+        // findings ONLY when `--trust-repo-config` is explicitly enabled.
+        if opts.trust_repo_config {
+            let mut line_cache: std::collections::HashMap<String, Vec<String>> =
+                std::collections::HashMap::new();
+            graph_res.findings.retain(|f| {
+                if !f.rule_id.starts_with("SMG-SEC-") && !f.rule_id.starts_with("SMG-GITLEAKS-") {
+                    return true;
+                }
+                if gl_cfg.is_fingerprint_ignored(None, &f.file, &f.rule_id, f.line) {
+                    return false;
+                }
+                let lines = line_cache.entry(f.file.clone()).or_insert_with(|| {
+                    fs::read_to_string(opts.path.join(&f.file))
+                        .map(|s| s.lines().map(String::from).collect())
+                        .unwrap_or_default()
+                });
+                let line_txt = f
+                    .line
+                    .checked_sub(1)
+                    .and_then(|i| lines.get(i))
+                    .map(String::as_str)
+                    .unwrap_or("");
+                !gl_cfg.is_allowed(&f.file, None, line_txt, &f.title)
+            });
+        }
+    }
     #[cfg(feature = "web3")]
     {
         let force_web3 = opts.layers.iter().any(|l| {

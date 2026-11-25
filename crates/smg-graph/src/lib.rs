@@ -33,7 +33,7 @@ use std::collections::HashSet;
 pub use ai_mcp_model::{
     analyze_indirect_prompt_injection, analyze_mcp_tool_poisoning,
     analyze_model_deserialization_and_ssti, inspect_chat_template_ssti, inspect_pickle_bytes,
-    scan_repo_ai_model_artifacts,
+    inspect_pickle_file_path, scan_repo_ai_model_artifacts,
 };
 pub use ast::{
     CallSite, Confidence, FileAstSummary, FrontendApiCall, GuardKind, LocalStaticFinding, SinkKind,
@@ -43,7 +43,10 @@ pub use cfa_ssa::{
     AllocSite, CallString2, ContextKey, FieldSensitivePointsTo, KCfaContextTable, PointsToStmt,
     SsaDefUseGraph, SsaOp, SsaVar,
 };
-pub use deps::{ReachableVulnStatus, assess_dependency_reachability, compute_reachable_packages};
+pub use deps::{
+    ReachableVulnStatus, assess_dependency_reachability, assess_dependency_vex_tier_with_auto_vex,
+    compute_reachable_packages,
+};
 pub use git_history::{
     GitHistoryScanResult, SecretCandidate, extract_aws_secret_near, extract_tokens_from_line,
     scan_git_history,
@@ -102,6 +105,7 @@ fn load_or_parse_summaries_cached(
     }
 
     if !to_parse.is_empty() {
+        langs::hcl::set_workspace_hcl_vars(files);
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(cfg.scan.max_threads)
             .stack_size(8 * 1024 * 1024)
@@ -116,6 +120,7 @@ fn load_or_parse_summaries_cached(
                 })
                 .collect()
         });
+        langs::hcl::clear_workspace_hcl_vars();
 
         let mut cache_rows: Vec<(String, String, String)> = Vec::with_capacity(newly_parsed.len());
         for (rel_path, hash, summary) in newly_parsed {
@@ -134,6 +139,7 @@ pub fn analyze_codebase(
     files: &[IndexedFile],
     cfg: &ShellMindGuardConfig,
 ) -> Result<GraphAnalysisResult> {
+    langs::hcl::set_workspace_hcl_vars(files);
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(cfg.scan.max_threads)
         .stack_size(8 * 1024 * 1024)
@@ -145,6 +151,7 @@ pub fn analyze_codebase(
             .filter_map(|f| parse_file_ast(f, cfg))
             .collect()
     });
+    langs::hcl::clear_workspace_hcl_vars();
 
     Ok(solve_guard_lattice_with_options(
         &summaries,

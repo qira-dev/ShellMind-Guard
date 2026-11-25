@@ -132,6 +132,28 @@ pub fn audit_linker_script(
         }
     }
 
+    // 1b. RWX memory region check (`SMG-HW-LINKER`)
+    for r in &regions {
+        let pos_attrs = r.attrs.split('!').next().unwrap_or(&r.attrs);
+        if pos_attrs.contains('r') && pos_attrs.contains('w') && pos_attrs.contains('x') {
+            findings.push(LocalStaticFinding {
+                rule_id: "SMG-HW-LINKER".into(),
+                severity: "HIGH".into(),
+                title: format!(
+                    "Linker script memory region `{}` declares `rwx` (simultaneously writable and executable) permissions",
+                    r.name
+                ),
+                rel_path: rel_path.to_string(),
+                line: r.line,
+                symbol: r.name.clone(),
+                sink_kind: SinkKind::Misconfiguration,
+                missing_guard: GuardKind::MemoryBounds,
+                confidence: Confidence::Proven,
+                remediation: "Enforce W^X separation in the linker script: remove `x` from writable RAM regions (`rw`) and remove `w` from executable FLASH regions (`rx`).".into(),
+            });
+        }
+    }
+
     // 2. Stack budget vs total RAM region check
     if let Some(stack_sz) = min_stack_size {
         let ram_max = regions
@@ -184,6 +206,105 @@ pub struct WcsdResult {
     pub isr_overhead_bytes: u64,
 }
 
+/// Extracts lightweight `FnStackNode` call/frame summaries from a C/C++ source file for WCSD analysis.
+pub fn extract_c_stack_nodes(rel_path: &str, source: &str) -> Vec<FnStackNode> {
+    static ARR_RE: OnceLock<Regex> = OnceLock::new();
+    let arr_re = ARR_RE.get_or_init(|| {
+        Regex::new(r"\b(char|uint8_t|int8_t|uint16_t|int16_t|uint32_t|int32_t|int|uint64_t|int64_t|double|float)\s+[A-Za-z_][A-Za-z0-9_]*\s*\[\s*(\d+)\s*\]")
+            .expect("valid c stack array re")
+    });
+    static CALL_RE: OnceLock<Regex> = OnceLock::new();
+    let call_re = CALL_RE
+        .get_or_init(|| Regex::new(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(").expect("valid c call re"));
+
+    let mut parser = tree_sitter::Parser::new();
+    let is_cpp = rel_path.ends_with(".cpp")
+        || rel_path.ends_with(".cc")
+        || rel_path.ends_with(".cxx")
+        || rel_path.ends_with(".hpp");
+    let lang = if is_cpp {
+        tree_sitter_cpp::LANGUAGE.into()
+    } else {
+        tree_sitter_c::LANGUAGE.into()
+    };
+    if parser.set_language(&lang).is_err() {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return Vec::new();
+    };
+    let src = source.as_bytes();
+    let mut nodes = Vec::new();
+    let mut stack = vec![(tree.root_node(), 0usize)];
+    while let Some((node, depth)) = stack.pop() {
+        if depth >= 128 {
+            continue;
+        }
+        if node.kind() == "function_definition" {
+            let line = node.start_position().row + 1;
+            let fn_txt = node.utf8_text(src).unwrap_or("");
+            let name = fn_txt
+                .split('(')
+                .next()
+                .and_then(|head| {
+                    head.split(|c: char| !c.is_alphanumeric() && c != '_')
+                        .rfind(|tok| !tok.is_empty())
+                })
+                .unwrap_or("")
+                .to_string();
+            if !name.is_empty() {
+                let is_isr = name.contains("IRQHandler")
+                    || name.ends_with("_isr")
+                    || name.ends_with("_ISR")
+                    || fn_txt.contains("__interrupt")
+                    || fn_txt.contains("irqreturn_t");
+                let mut local_frame_bytes = 32u64;
+                for c in arr_re.captures_iter(fn_txt) {
+                    let elem_sz: u64 = match c.get(1).map(|m| m.as_str()).unwrap_or("") {
+                        "char" | "uint8_t" | "int8_t" => 1,
+                        "uint16_t" | "int16_t" => 2,
+                        "uint64_t" | "int64_t" | "double" => 8,
+                        _ => 4,
+                    };
+                    if let Some(count) = c.get(2).and_then(|m| m.as_str().parse::<u64>().ok()) {
+                        local_frame_bytes =
+                            local_frame_bytes.saturating_add(elem_sz.saturating_mul(count));
+                    }
+                }
+                let mut callees = Vec::new();
+                let mut seen = HashSet::new();
+                if let Some(body) = node.child_by_field_name("body") {
+                    let btxt = body.utf8_text(src).unwrap_or("");
+                    for c in call_re.captures_iter(btxt) {
+                        let callee = c[1].to_string();
+                        if !matches!(
+                            callee.as_str(),
+                            "if" | "for" | "while" | "switch" | "return" | "sizeof" | "typeof"
+                        ) && seen.insert(callee.clone())
+                        {
+                            callees.push(callee);
+                        }
+                    }
+                }
+                nodes.push(FnStackNode {
+                    name,
+                    rel_path: rel_path.to_string(),
+                    line,
+                    local_frame_bytes,
+                    callees,
+                    is_isr,
+                });
+            }
+            continue;
+        }
+        let mut cursor = node.walk();
+        for ch in node.children(&mut cursor) {
+            stack.push((ch, depth + 1));
+        }
+    }
+    nodes
+}
+
 /// Computes exact Inter-Procedural Worst-Case Stack Depth (WCSD) across a firmware call graph,
 /// detects unbounded recursion cycles, and adds worst-case ISR nesting overhead.
 pub fn compute_wcsd(
@@ -206,15 +327,15 @@ pub fn compute_wcsd(
         has_recursion: &mut bool,
         findings: &mut Vec<LocalStaticFinding>,
         depth: usize,
-    ) -> (u64, Vec<String>) {
+    ) -> (u64, Vec<String>, bool) {
         if depth >= MAX_WCSD_DEPTH {
-            return (0, Vec::new());
+            return (0, Vec::new(), false);
         }
         if let Some(cached) = memo.get(name) {
-            return cached.clone();
+            return (cached.0, cached.1.clone(), true);
         }
         let Some(node) = map.get(name) else {
-            return (0, Vec::new());
+            return (0, Vec::new(), true);
         };
         if !visiting.insert(name.to_string()) {
             *has_recursion = true;
@@ -233,13 +354,14 @@ pub fn compute_wcsd(
                 confidence: Confidence::Proven,
                 remediation: "Convert recursion to bounded iteration in bare-metal/RTOS firmware (MISRA C Rule 17.2).".into(),
             });
-            return (0, Vec::new());
+            return (0, Vec::new(), false);
         }
 
         let mut best_child = 0u64;
         let mut best_path = Vec::new();
+        let mut cacheable = true;
         for callee in &node.callees {
-            let (c_bytes, c_path) = dfs(
+            let (c_bytes, c_path, c_cacheable) = dfs(
                 callee,
                 map,
                 visiting,
@@ -248,6 +370,9 @@ pub fn compute_wcsd(
                 findings,
                 depth + 1,
             );
+            if !c_cacheable {
+                cacheable = false;
+            }
             if c_bytes > best_child {
                 best_child = c_bytes;
                 best_path = c_path;
@@ -259,8 +384,10 @@ pub fn compute_wcsd(
         let mut chain = Vec::with_capacity(1 + best_path.len());
         chain.push(node.name.clone());
         chain.extend(best_path);
-        memo.insert(name.to_string(), (total, chain.clone()));
-        (total, chain)
+        if cacheable {
+            memo.insert(name.to_string(), (total, chain.clone()));
+        }
+        (total, chain, cacheable)
     }
 
     let mut worst_task_bytes = 0u64;
@@ -269,7 +396,7 @@ pub fn compute_wcsd(
     let mut visiting = HashSet::new();
 
     for n in nodes {
-        let (bytes, chain) = dfs(
+        let (bytes, chain, _) = dfs(
             &n.name,
             &map,
             &mut visiting,

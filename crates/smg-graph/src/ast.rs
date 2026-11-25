@@ -465,7 +465,7 @@ pub fn parse_file_ast_with_hash(
         ));
         for pf in crate::rule_pack::scan_rule_pack(&file.rel_path, file.language, source) {
             let already_covered = static_findings.iter().any(|x| {
-                x.line == pf.line
+                (x.line == pf.line
                     && (x.rule_id == pf.rule_id
                         || (x.rule_id.starts_with("SMG-AI-")
                             && matches!(
@@ -474,7 +474,11 @@ pub fn parse_file_ast_with_hash(
                                     | "ml_pickle_load"
                                     | "np_allow_pickle"
                                     | "hf_trust_remote_code"
-                            )))
+                            ))))
+                    || (file.language == Language::Hcl
+                        && x.rule_id.starts_with("SMG-CFG-IAC")
+                        && pf.rule_id.starts_with("SMG-CFG-IAC")
+                        && (x.rule_id == pf.rule_id || (x.line.abs_diff(pf.line) <= 3)))
             });
             if !already_covered {
                 static_findings.push(pf);

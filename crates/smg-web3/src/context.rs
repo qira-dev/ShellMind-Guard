@@ -186,6 +186,27 @@ pub fn pack_storage_vars_with_defs(
     enums: &HashSet<String>,
     contracts_and_interfaces: &HashSet<String>,
 ) -> Vec<EvmSlotEntry> {
+    pack_storage_vars_with_structs(
+        contract,
+        rel_path,
+        vars,
+        start_slot,
+        enums,
+        contracts_and_interfaces,
+        &HashMap::new(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn pack_storage_vars_with_structs(
+    contract: &str,
+    rel_path: &str,
+    vars: &[StateVarSpec],
+    start_slot: u64,
+    enums: &HashSet<String>,
+    contracts_and_interfaces: &HashSet<String>,
+    struct_slot_sizes: &HashMap<String, u64>,
+) -> Vec<EvmSlotEntry> {
     let mut entries = Vec::new();
     let mut cur_slot = start_slot;
     let mut cur_off: u8 = 0;
@@ -195,6 +216,29 @@ pub fn pack_storage_vars_with_defs(
             continue;
         }
         let clean_ty = v.var_type.trim();
+        // User-defined Solidity `struct` state variables always start on a new 32-byte slot
+        // boundary and consume the exact multi-slot size of their packed fields.
+        if let Some(&struct_slots) = struct_slot_sizes.get(clean_ty) {
+            if cur_off > 0 {
+                cur_slot = cur_slot.saturating_add(1);
+                cur_off = 0;
+            }
+            let span = struct_slots.max(1);
+            for s in 0..span.min(64) {
+                entries.push(EvmSlotEntry {
+                    contract: contract.to_string(),
+                    var_name: v.name.clone(),
+                    var_type: clean_ty.to_string(),
+                    slot: U256::from(cur_slot.saturating_add(s)),
+                    byte_offset: 0,
+                    byte_len: 32,
+                    rel_path: rel_path.to_string(),
+                    line: v.line,
+                });
+            }
+            cur_slot = cur_slot.saturating_add(span);
+            continue;
+        }
         // Fixed static arrays `T[N]` or `T[M][N]` always start on a new 32-byte slot boundary
         if let Some(slots_consumed) =
             parse_fixed_array_slots_with_defs(clean_ty, enums, contracts_and_interfaces)

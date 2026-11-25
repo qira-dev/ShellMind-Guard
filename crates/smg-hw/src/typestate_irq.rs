@@ -2101,10 +2101,16 @@ fn analyze_single_hw_function(
                 && !low.contains("checked_add")
                 && !low.contains("cap")
             {
-                // Phase 13A P13-01: Require concrete destination capacity from `local_caps`
-                // directly referenced on this copy line (never hijack an unrelated stack array).
+                // Phase 13A P13-01 / F5B-04: Parse ONLY the copy call's first argument (`arg0` = destination)
+                // before the first comma and look up `local_caps` strictly on `arg0` so `src`'s array capacity
+                // is never misattributed when `dst` is an opaque pointer (`memcpy(opaque_ptr, local_buf, n)`).
+                let arg0 = trimmed
+                    .find('(')
+                    .map(|open| &trimmed[open + 1..])
+                    .and_then(|after| after.split(',').next())
+                    .unwrap_or("");
                 let dst_cap_opt = ident_re()
-                    .find_iter(trimmed)
+                    .find_iter(arg0)
                     .filter_map(|m| local_caps.get(m.as_str()).copied())
                     .min()
                     .and_then(|v| i64::try_from(v).ok());

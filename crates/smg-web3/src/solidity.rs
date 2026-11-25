@@ -1,5 +1,6 @@
 use crate::context::{
     EvmSlotEntry, StateVarSpec, Web3Context, abi_selector, pack_storage_vars_with_defs,
+    pack_storage_vars_with_structs,
 };
 use crate::evm_oracle::{
     check_amm_spot_skew_bps, probe_compiled_reentrancy_in_revm, probe_compiled_selector_unauth,
@@ -296,6 +297,38 @@ fn walk_fn_body(
     branch_path: &[(usize, u8)],
     in_returning_branch: bool,
 ) {
+    walk_fn_body_depth(
+        node,
+        src,
+        state_names,
+        ops,
+        div_mul,
+        tx_origin,
+        unsafe_dcall,
+        has_auth_guard_in_fn,
+        branch_path,
+        in_returning_branch,
+        0,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_fn_body_depth(
+    node: Node,
+    src: &[u8],
+    state_names: &HashSet<String>,
+    ops: &mut Vec<EffectOp>,
+    div_mul: &mut Vec<usize>,
+    tx_origin: &mut Vec<usize>,
+    unsafe_dcall: &mut Vec<(usize, String)>,
+    has_auth_guard_in_fn: bool,
+    branch_path: &[(usize, u8)],
+    in_returning_branch: bool,
+    depth: usize,
+) {
+    if depth >= 128 {
+        return;
+    }
     let line = node.start_position().row + 1;
     let byte_offset = node.start_byte();
 
@@ -303,7 +336,7 @@ fn walk_fn_body(
         let if_id = node.start_byte();
         // Walk condition
         if let Some(cond) = node.child_by_field_name("condition") {
-            walk_fn_body(
+            walk_fn_body_depth(
                 cond,
                 src,
                 state_names,
@@ -314,6 +347,7 @@ fn walk_fn_body(
                 has_auth_guard_in_fn,
                 branch_path,
                 in_returning_branch,
+                depth + 1,
             );
         }
         // Walk consequence (then-branch = 0) and alternative (else-branch = 1)
@@ -326,7 +360,7 @@ fn walk_fn_body(
             let mut next_path = branch_path.to_vec();
             next_path.push((if_id, branch_idx));
             let branch_rets = in_returning_branch || block_ends_with_return_or_revert(ch, src);
-            walk_fn_body(
+            walk_fn_body_depth(
                 ch,
                 src,
                 state_names,
@@ -337,6 +371,7 @@ fn walk_fn_body(
                 has_auth_guard_in_fn,
                 &next_path,
                 branch_rets,
+                depth + 1,
             );
             branch_idx = branch_idx.saturating_add(1);
         }
@@ -462,7 +497,7 @@ fn walk_fn_body(
 
     let mut c = node.walk();
     for ch in node.children(&mut c) {
-        walk_fn_body(
+        walk_fn_body_depth(
             ch,
             src,
             state_names,
@@ -473,6 +508,7 @@ fn walk_fn_body(
             has_auth_guard_in_fn,
             branch_path,
             in_returning_branch,
+            depth + 1,
         );
     }
 }
@@ -770,6 +806,7 @@ fn extract_contract(
     }
 
     let mut local_enums = file_enums.clone();
+    let mut local_struct_fields: HashMap<String, Vec<StateVarSpec>> = HashMap::new();
     let mut state_vars = Vec::new();
     let mut custom_auth_modifiers = HashSet::new();
     let mut custom_lock_modifiers = HashSet::new();
@@ -794,6 +831,27 @@ fn extract_contract(
                         && preceding.contains("erc7201:")
                     {
                         has_erc7201_struct = true;
+                    }
+                    if let Some(sname_n) = item.child_by_field_name("name") {
+                        let sname = node_txt(sname_n, src).to_string();
+                        let mut members = Vec::new();
+                        let mut mc = item.walk();
+                        for m in item.named_children(&mut mc) {
+                            if m.kind() == "struct_member"
+                                && let (Some(ty_n), Some(nm_n)) =
+                                    (m.child_by_field_name("type"), m.child_by_field_name("name"))
+                            {
+                                members.push(StateVarSpec {
+                                    name: node_txt(nm_n, src).to_string(),
+                                    var_type: node_txt(ty_n, src).to_string(),
+                                    is_constant_or_immutable: false,
+                                    line: m.start_position().row + 1,
+                                });
+                            }
+                        }
+                        if !members.is_empty() {
+                            local_struct_fields.insert(sname, members);
+                        }
                     }
                 }
                 "state_variable_declaration" => {
@@ -845,13 +903,37 @@ fn extract_contract(
     if let Some(ov) = override_state_names {
         state_names.extend(ov.iter().cloned());
     }
-    let packed_slots = pack_storage_vars_with_defs(
+    // Two-pass struct slot size computation so `MyStruct s;` advances `cur_slot` by exact struct size
+    let mut struct_slot_sizes: HashMap<String, u64> = HashMap::new();
+    for _pass in 0..2 {
+        let prev = struct_slot_sizes.clone();
+        for (sname, members) in &local_struct_fields {
+            let packed = pack_storage_vars_with_structs(
+                sname,
+                rel_path,
+                members,
+                0,
+                &local_enums,
+                file_contract_types,
+                &prev,
+            );
+            let slots = packed
+                .iter()
+                .map(|e| e.slot.saturating_to::<u64>() + 1)
+                .max()
+                .unwrap_or(1);
+            struct_slot_sizes.insert(sname.clone(), slots);
+        }
+    }
+
+    let packed_slots = pack_storage_vars_with_structs(
         &name,
         rel_path,
         &state_vars,
         0,
         &local_enums,
         file_contract_types,
+        &struct_slot_sizes,
     );
 
     let mut functions = Vec::new();

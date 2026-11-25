@@ -60,8 +60,9 @@ pub struct SolanaFileContext {
     pub(crate) struct_signers: HashMap<String, HashSet<String>>,
     /// Per `Context<StructName>` fields verified with `.owner ==` inside instructions using that `StructName`
     pub(crate) struct_owners: HashMap<String, HashSet<String>>,
-    /// `#[derive(Accounts)]` structs that validate a program account via `Program<'info, ...>` or `address = ...`
-    pub(crate) structs_with_validated_program: HashSet<String>,
+    /// Per `#[derive(Accounts)]` struct, the exact field identifiers validated via `Program<'info, ...>`,
+    /// `Interface<'info, ...>`, or `#[account(..., address = ...)]`.
+    pub(crate) validated_program_fields: HashMap<String, HashSet<String>>,
 }
 
 /// Workspace-wide Solana/Anchor context hoisted across split instruction & account files (`Phase 13B P13-04`).
@@ -83,7 +84,7 @@ pub fn collect_solana_workspace_context(sources: &[(String, String)]) -> SolanaW
         }
         let stripped = smg_graph::taint::strip_comments_simple(source);
         if let Some(tree) = parser.parse(&stripped, None) {
-            collect_solana_file_context(tree.root_node(), stripped.as_bytes(), &mut sctx);
+            collect_solana_file_context(tree.root_node(), stripped.as_bytes(), &mut sctx, 0);
         }
     }
     sctx
@@ -119,14 +120,95 @@ pub fn analyze_solana_rust_file_with_ctx(
     let mut findings = Vec::new();
 
     let mut sctx = workspace_ctx.cloned().unwrap_or_default();
-    collect_solana_file_context(tree.root_node(), src, &mut sctx);
+    collect_solana_file_context(tree.root_node(), src, &mut sctx, 0);
 
-    walk_rust_solana(tree.root_node(), src, rel_path, &sctx, &mut findings);
+    walk_rust_solana(tree.root_node(), src, rel_path, &sctx, &mut findings, 0);
     findings
 }
 
-fn collect_solana_file_context(node: Node, src: &[u8], sctx: &mut SolanaFileContext) {
-    if has_test_attr(node, src) {
+/// Extracts field names inside an Anchor `#[derive(Accounts)]` struct that are validated
+/// program accounts (`Program<'info, ...>`, `Interface<'info, ...>`, or `#[account(..., address = ...)]`).
+pub(crate) fn extract_validated_program_fields_from_struct(struct_src: &str) -> HashSet<String> {
+    let mut fields = HashSet::new();
+    let mut pending_address_attr = false;
+    for line in struct_src.lines() {
+        let trimmed = line.trim();
+        let low = trimmed.to_ascii_lowercase();
+        if trimmed.starts_with("#[") {
+            if low.contains("address =") || low.contains("address=") {
+                pending_address_attr = true;
+            }
+            continue;
+        }
+        if let Some((lhs, rhs)) = trimmed.split_once(':') {
+            let field_name = lhs
+                .split_whitespace()
+                .last()
+                .unwrap_or("")
+                .trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
+            let is_validated_ty =
+                rhs.contains("Program<") || rhs.contains("Interface<") || pending_address_attr;
+            if !field_name.is_empty() && is_validated_ty {
+                fields.insert(field_name.to_string());
+            }
+            pending_address_attr = false;
+        } else if trimmed == "}" {
+            pending_address_attr = false;
+        }
+    }
+    fields
+}
+
+/// Checks whether a CPI invocation snippet (`invoke`/`invoke_signed`/`CpiContext::new`)
+/// targets a validated program field (from `validated_fields`) rather than an unvalidated `AccountInfo`.
+pub(crate) fn cpi_targets_validated_program_field(
+    window: &str,
+    validated_fields: &HashSet<String>,
+) -> bool {
+    if validated_fields.is_empty() {
+        return false;
+    }
+    // Extract all `<prefix>.<field>` references like `ctx.accounts.target_prog` or `self.token_program`
+    let mut mentioned_account_fields: Vec<&str> = Vec::new();
+    for marker in ["ctx.accounts.", "accounts.", "self."] {
+        let mut rest = window;
+        while let Some(pos) = rest.find(marker) {
+            let after = &rest[pos + marker.len()..];
+            let field = after
+                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                .next()
+                .unwrap_or("");
+            if !field.is_empty() {
+                mentioned_account_fields.push(field);
+            }
+            rest = after;
+        }
+    }
+    if mentioned_account_fields.is_empty() {
+        return false;
+    }
+    // If an explicit program-like field is referenced (e.g. `target_prog`, `program`, `cpi_program`,
+    // `token_program`, `dex_program`), require THAT field to be validated. Otherwise, require at
+    // least one referenced field in the CPI call to be validated AND no unvalidated `*prog*`/`*program*` field.
+    let prog_like: Vec<&str> = mentioned_account_fields
+        .iter()
+        .copied()
+        .filter(|f| {
+            let fl = f.to_ascii_lowercase();
+            fl.contains("prog") || fl.contains("cpi") || fl.contains("callee")
+        })
+        .collect();
+    if !prog_like.is_empty() {
+        prog_like.iter().all(|f| validated_fields.contains(*f))
+    } else {
+        mentioned_account_fields
+            .iter()
+            .any(|f| validated_fields.contains(*f))
+    }
+}
+
+fn collect_solana_file_context(node: Node, src: &[u8], sctx: &mut SolanaFileContext, depth: usize) {
+    if depth >= 128 || has_test_attr(node, src) {
         return;
     }
     if node.kind() == "struct_item" && has_derive_accounts_attr(node, src) {
@@ -135,13 +217,12 @@ fn collect_solana_file_context(node: Node, src: &[u8], sctx: &mut SolanaFileCont
             .map(|n| node_txt(n, src).to_string())
             .unwrap_or_default();
         let body_txt = node_txt(node, src);
-        let body_low = body_txt.to_ascii_lowercase();
-        if body_txt.contains("Program<")
-            || body_txt.contains("Interface<")
-            || body_low.contains("address =")
-            || body_low.contains("address=")
-        {
-            sctx.structs_with_validated_program.insert(struct_name);
+        let validated = extract_validated_program_fields_from_struct(body_txt);
+        if !validated.is_empty() {
+            sctx.validated_program_fields
+                .entry(struct_name)
+                .or_default()
+                .extend(validated);
         }
         return;
     }
@@ -211,7 +292,7 @@ fn collect_solana_file_context(node: Node, src: &[u8], sctx: &mut SolanaFileCont
     }
     let mut c = node.walk();
     for ch in node.children(&mut c) {
-        collect_solana_file_context(ch, src, sctx);
+        collect_solana_file_context(ch, src, sctx, depth + 1);
     }
 }
 
@@ -239,8 +320,9 @@ fn walk_rust_solana(
     rel_path: &str,
     sctx: &SolanaFileContext,
     findings: &mut Vec<LocalStaticFinding>,
+    depth: usize,
 ) {
-    if has_test_attr(node, src) {
+    if depth >= 128 || has_test_attr(node, src) {
         return;
     }
     match node.kind() {
@@ -255,7 +337,7 @@ fn walk_rust_solana(
     }
     let mut c = node.walk();
     for ch in node.children(&mut c) {
-        walk_rust_solana(ch, src, rel_path, sctx, findings);
+        walk_rust_solana(ch, src, rel_path, sctx, findings, depth + 1);
     }
 }
 
@@ -382,25 +464,27 @@ fn inspect_solana_instruction_fn(
         .unwrap_or_else(|| "instruction".into());
     let body = node_txt(fn_node, src);
     let base_line = fn_node.start_position().row + 1;
-    let impl_struct_validated = body.contains("&self") && {
+    let mut active_validated_fields: HashSet<String> = HashSet::new();
+    if body.contains("&self") {
         let mut cur = fn_node.parent();
-        let mut matched = false;
         while let Some(p) = cur {
             if p.kind() == "impl_item" {
                 let impl_txt = node_txt(p, src);
-                matched = sctx
-                    .structs_with_validated_program
-                    .iter()
-                    .any(|st| impl_txt.contains(st));
+                for (st, fields) in &sctx.validated_program_fields {
+                    if impl_txt.contains(st) {
+                        active_validated_fields.extend(fields.iter().cloned());
+                    }
+                }
                 break;
             }
             cur = p.parent();
         }
-        matched
-    };
-    let ctx_has_validated_program = impl_struct_validated
-        || extract_ctx_struct_name(body)
-            .is_some_and(|st| sctx.structs_with_validated_program.contains(&st));
+    }
+    if let Some(st) = extract_ctx_struct_name(body)
+        && let Some(fields) = sctx.validated_program_fields.get(&st)
+    {
+        active_validated_fields.extend(fields.iter().cloned());
+    }
 
     let body_low = body.to_ascii_lowercase();
     // Distinguish actual lamport assignment (`= 0`) from equality check (`== 0`, `!= 0`, `<= 0`, `>= 0`)
@@ -480,30 +564,39 @@ fn inspect_solana_instruction_fn(
                 remediation: "Use `Pubkey::find_program_address` or Anchor canonical `bump` seed constraint to prevent non-canonical bump spoofing.".into(),
             });
         }
-        if (line.contains("invoke(")
+        if line.contains("invoke(")
             || line.contains("invoke_signed(")
-            || line.contains("CpiContext::new("))
-            && !ctx_has_validated_program
-            && !body.contains("Program<'info")
-            && !body.contains("check_program_account")
-            && !body.contains("::ID")
-            && !body.contains("::id()")
+            || line.contains("CpiContext::new(")
         {
-            findings.push(LocalStaticFinding {
-                rule_id: "SMG-WEB3-SOLANA".into(),
-                severity: "CRITICAL".into(),
-                title: format!(
-                    "Arbitrary CPI target in `{fn_name}`: `invoke`/`invoke_signed` without validated program ID or `Program<'info, T>`"
-                ),
-                rel_path: rel_path.into(),
-                line: ln,
+            let body_lines: Vec<&str> = body.lines().collect();
+            let w_start = idx.saturating_sub(8);
+            let w_end = (idx + 6).min(body_lines.len());
+            let cpi_window = body_lines[w_start..w_end].join("\n");
+            let field_validated =
+                cpi_targets_validated_program_field(&cpi_window, &active_validated_fields);
+            if !field_validated
+                && !cpi_window.contains("Program<'info")
+                && !cpi_window.contains("check_program_account")
+                && !cpi_window.contains("::ID")
+                && !cpi_window.contains("::id()")
+                && !cpi_window.contains("program_id ==")
+            {
+                findings.push(LocalStaticFinding {
+                    rule_id: "SMG-WEB3-SOLANA".into(),
+                    severity: "CRITICAL".into(),
+                    title: format!(
+                        "Arbitrary CPI target in `{fn_name}`: `invoke`/`invoke_signed` without validated program ID or `Program<'info, T>`"
+                    ),
+                    rel_path: rel_path.into(),
+                    line: ln,
                 symbol: fn_name.clone(),
                 sink_kind: SinkKind::AuthMutation,
                 missing_guard: GuardKind::Auth,
                 confidence: Confidence::Confirmed,
                 remediation: "Validate target CPI program account against canonical `Program<'info, ...>` or explicit `key() == expected::ID` check.".into(),
-            });
-            break;
+                });
+                break;
+            }
         }
     }
 }

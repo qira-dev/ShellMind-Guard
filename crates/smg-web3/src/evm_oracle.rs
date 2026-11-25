@@ -661,19 +661,29 @@ pub fn probe_compiled_selector_unauth(
         .transact_commit(tx)
         .map_err(|e| format!("revm selector probe error: {e:?}"))?;
     let db = evm.ctx.journaled_state.database;
-    // Count only storage slots whose committed value actually changed from initial 0 (ignoring SLOAD or no-op SSTORE(k, 0))
-    let storage_writes = db
+    // Count storage slots whose committed value changed from 0, PLUS zero-storage ETH drains
+    // (`SELFDESTRUCT` or positive-value `CALL` transferring ETH out of `target` to `EOA_ADDR`).
+    let eoa_post_bal = db
+        .cache
+        .accounts
+        .get(&EOA_ADDR)
+        .map(|a| a.info.balance)
+        .unwrap_or(U256::ZERO);
+    let mut storage_writes = db
         .cache
         .accounts
         .get(&target)
         .map(|a| {
             let mut changed = a.storage.values().filter(|&&v| v != U256::ZERO).count();
-            if a.info.balance != one_eth {
+            if a.info.balance != one_eth || a.info.is_empty_code_hash() {
                 changed += 1;
             }
             changed
         })
-        .unwrap_or(0);
+        .unwrap_or(1);
+    if storage_writes == 0 && eoa_post_bal > one_eth {
+        storage_writes = 1;
+    }
     match res {
         ExecutionResult::Success { gas, .. } => Ok((true, storage_writes, gas.tx_gas_used())),
         ExecutionResult::Revert { gas, .. } | ExecutionResult::Halt { gas, .. } => {
@@ -841,6 +851,11 @@ fn replay_invariant_sequence(
     let mut evm = Context::mainnet().with_db(db).build_mainnet();
     let mut cumulative_deposits = U256::ZERO;
     let mut nonces: std::collections::HashMap<Address, u64> = std::collections::HashMap::new();
+    let actors = [
+        Address::from([0xA1; 20]),
+        Address::from([0xB2; 20]),
+        Address::from([0xC3; 20]),
+    ];
 
     for (step_idx, step) in trace.iter().enumerate() {
         let cur_nonce = *nonces.entry(step.caller).or_insert(0);
@@ -868,7 +883,17 @@ fn replay_invariant_sequence(
             .map(|a| a.info.balance)
             .unwrap_or(U256::ZERO);
 
-        if current_bal < cfg.initial_contract_wei {
+        // Require attacker EOA net balance gain (`attacker_post > attacker_pre`) so protocol
+        // fee/burn transfers to a treasury address do not trigger false SOLVENCY_BREACH alerts.
+        let attacker_gained = actors.iter().any(|actor| {
+            db_ref
+                .cache
+                .accounts
+                .get(actor)
+                .is_some_and(|a| a.info.balance > actor_balance)
+        });
+
+        if current_bal < cfg.initial_contract_wei && attacker_gained {
             return Some(format!(
                 "SOLVENCY_BREACH at step {}: balance {} < initial reserve {} (deposited {})",
                 step_idx + 1,

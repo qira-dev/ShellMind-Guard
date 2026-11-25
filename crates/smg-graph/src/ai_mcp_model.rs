@@ -625,10 +625,67 @@ const DANGEROUS_PICKLE_GLOBALS: &[(&str, &str)] = &[
     ("pdb", "set_trace"),
 ];
 
+fn is_safe_ml_pickle_global(module: &str, func: &str) -> bool {
+    let m = module.trim();
+    let f = func.trim();
+    // Explicitly block known ML/stdlib RCE gadgets even inside allowed namespaces
+    if (m == "torch.storage" && f == "_load_from_bytes")
+        || f.contains("_load_from_bytes")
+        || m.starts_with("numpy.f2py")
+        || m == "ctypes"
+        || m.starts_with("ctypes.")
+        || m == "socket"
+        || m.starts_with("urllib")
+        || m.starts_with("http")
+        || m == "shutil"
+        || m == "tempfile"
+    {
+        return false;
+    }
+    match m {
+        "torch" | "torch._utils" | "torch.nn.parameter" | "torch.nn.modules" => {
+            !matches!(f, "load" | "jit" | "hub" | "compile")
+        }
+        _ if m.starts_with("torch.nn.modules.") => true,
+        "collections" => matches!(f, "OrderedDict" | "defaultdict" | "deque" | "Counter"),
+        "numpy" | "numpy.core.multiarray" | "numpy._core.multiarray" => {
+            matches!(
+                f,
+                "_reconstruct" | "scalar" | "dtype" | "ndarray" | "array" | "frombuffer"
+            )
+        }
+        "_codecs" => f == "encode",
+        "copyreg" | "copy_reg" => f == "_reconstructor",
+        "builtins" | "__builtin__" => matches!(
+            f,
+            "dict"
+                | "list"
+                | "tuple"
+                | "set"
+                | "frozenset"
+                | "slice"
+                | "range"
+                | "int"
+                | "float"
+                | "str"
+                | "bytes"
+                | "bytearray"
+                | "bool"
+                | "complex"
+                | "object"
+        ),
+        _ => false,
+    }
+}
+
 fn is_dangerous_pickle_global(module: &str, func: &str) -> bool {
-    DANGEROUS_PICKLE_GLOBALS
+    if DANGEROUS_PICKLE_GLOBALS
         .iter()
         .any(|(m, f)| *m == module && *f == func)
+    {
+        return true;
+    }
+    !is_safe_ml_pickle_global(module, func)
 }
 
 #[derive(Debug, Clone)]
@@ -1142,10 +1199,171 @@ pub fn inspect_pickle_bytes(rel_path: &str, bytes: &[u8]) -> Vec<LocalStaticFind
 
 /// Walks `project_root` (bounded depth 5, skipping build/VCS dirs & symlinks) for ML model artifacts
 /// (`tokenizer_config.json`, `.pkl`, `.pt`, `.pth`) that source-code indexers skip, and runs
+/// Bounded file-tail ZIP Central Directory reader for large binary model artifacts
+/// (`.pt`, `.pth`, `.ckpt`, `.pkl`, `.pickle`, `.joblib`, `.whl`):
+/// - For files `<= 4 MiB`, inspects directly in memory.
+/// - For larger ZIP-backed checkpoints (multi-hundred-MB PyTorch archives), reads the last `64 KiB`
+///   to locate the ZIP EOCD (`PK\x05\x06`), parses Central Directory entries (`PK\x01\x02`) for
+///   `*.pkl` / `data.pkl`, and seeks directly to each stored `.pkl` stream (up to `4 MiB` each)
+///   so trailing malicious pickle payloads cannot hide past the file head cap.
+pub fn inspect_pickle_file_path(
+    rel_path: &str,
+    abs_path: &std::path::Path,
+) -> Vec<LocalStaticFinding> {
+    use std::io::{Read, Seek, SeekFrom};
+    const MAX_PICKLE_READ_BYTES: u64 = 4 * 1024 * 1024;
+    const MAX_EOCD_TAIL_BYTES: u64 = 64 * 1024;
+    const MAX_CD_READ_BYTES: u64 = 2 * 1024 * 1024;
+
+    let Ok(mut f) = std::fs::File::open(abs_path) else {
+        return Vec::new();
+    };
+    let file_len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    if file_len < 4 {
+        return Vec::new();
+    }
+    if file_len <= MAX_PICKLE_READ_BYTES {
+        let mut buf = Vec::with_capacity(file_len as usize);
+        if f.read_to_end(&mut buf).is_ok() {
+            return inspect_pickle_bytes(rel_path, &buf);
+        }
+        return Vec::new();
+    }
+
+    // Large file (> 4 MiB): check magic header first
+    let mut magic = [0u8; 4];
+    if f.read_exact(&mut magic).is_err() {
+        return Vec::new();
+    }
+    if &magic != b"PK\x03\x04" {
+        // Non-ZIP large raw pickle: bounded head inspection
+        if f.seek(SeekFrom::Start(0)).is_err() {
+            return Vec::new();
+        }
+        let mut buf = Vec::new();
+        if f.take(MAX_PICKLE_READ_BYTES).read_to_end(&mut buf).is_ok() {
+            return inspect_pickle_bytes(rel_path, &buf);
+        }
+        return Vec::new();
+    }
+
+    // ZIP archive > 4 MiB: locate EOCD (`PK\x05\x06`) in the trailing 64 KiB
+    let tail_start = file_len.saturating_sub(MAX_EOCD_TAIL_BYTES);
+    if f.seek(SeekFrom::Start(tail_start)).is_err() {
+        return Vec::new();
+    }
+    let mut tail = Vec::new();
+    if (&f)
+        .take(MAX_EOCD_TAIL_BYTES)
+        .read_to_end(&mut tail)
+        .is_err()
+        || tail.len() < 22
+    {
+        return Vec::new();
+    }
+    let Some(eocd_rel) = tail.windows(4).rposition(|w| w == b"PK\x05\x06") else {
+        return Vec::new();
+    };
+    if eocd_rel + 22 > tail.len() {
+        return Vec::new();
+    }
+    let cd_size = u32::from_le_bytes([
+        tail[eocd_rel + 12],
+        tail[eocd_rel + 13],
+        tail[eocd_rel + 14],
+        tail[eocd_rel + 15],
+    ]) as u64;
+    let cd_offset = u32::from_le_bytes([
+        tail[eocd_rel + 16],
+        tail[eocd_rel + 17],
+        tail[eocd_rel + 18],
+        tail[eocd_rel + 19],
+    ]) as u64;
+    if cd_offset >= file_len || cd_size == 0 {
+        return Vec::new();
+    }
+    if f.seek(SeekFrom::Start(cd_offset)).is_err() {
+        return Vec::new();
+    }
+    let mut cd_buf = Vec::new();
+    if (&f)
+        .take(cd_size.min(MAX_CD_READ_BYTES))
+        .read_to_end(&mut cd_buf)
+        .is_err()
+    {
+        return Vec::new();
+    }
+
+    let mut findings = Vec::new();
+    let mut pos = 0usize;
+    let mut entries = 0usize;
+    while pos + 46 <= cd_buf.len() && entries < 1024 {
+        if &cd_buf[pos..pos + 4] != b"PK\x01\x02" {
+            break;
+        }
+        entries += 1;
+        let method = u16::from_le_bytes([cd_buf[pos + 10], cd_buf[pos + 11]]);
+        let comp_size = u32::from_le_bytes([
+            cd_buf[pos + 20],
+            cd_buf[pos + 21],
+            cd_buf[pos + 22],
+            cd_buf[pos + 23],
+        ]) as u64;
+        let name_len = u16::from_le_bytes([cd_buf[pos + 28], cd_buf[pos + 29]]) as usize;
+        let extra_len = u16::from_le_bytes([cd_buf[pos + 30], cd_buf[pos + 31]]) as usize;
+        let comment_len = u16::from_le_bytes([cd_buf[pos + 32], cd_buf[pos + 33]]) as usize;
+        let local_hdr_offset = u32::from_le_bytes([
+            cd_buf[pos + 42],
+            cd_buf[pos + 43],
+            cd_buf[pos + 44],
+            cd_buf[pos + 45],
+        ]) as u64;
+
+        let name_start = pos + 46;
+        let Some(name_end) = name_start.checked_add(name_len) else {
+            break;
+        };
+        if name_end > cd_buf.len() {
+            break;
+        }
+        let entry_name = String::from_utf8_lossy(&cd_buf[name_start..name_end]);
+        if method == 0
+            && entry_name.to_ascii_lowercase().ends_with(".pkl")
+            && local_hdr_offset + 30 < file_len
+            && f.seek(SeekFrom::Start(local_hdr_offset)).is_ok()
+        {
+            let mut lhdr = [0u8; 30];
+            if f.read_exact(&mut lhdr).is_ok() && &lhdr[0..4] == b"PK\x03\x04" {
+                let l_name_len = u16::from_le_bytes([lhdr[26], lhdr[27]]) as u64;
+                let l_extra_len = u16::from_le_bytes([lhdr[28], lhdr[29]]) as u64;
+                let data_off = local_hdr_offset
+                    .saturating_add(30)
+                    .saturating_add(l_name_len)
+                    .saturating_add(l_extra_len);
+                if data_off < file_len && f.seek(SeekFrom::Start(data_off)).is_ok() {
+                    let read_len = comp_size.min(MAX_PICKLE_READ_BYTES);
+                    let mut pkl_bytes = Vec::new();
+                    if (&f).take(read_len).read_to_end(&mut pkl_bytes).is_ok() {
+                        findings.extend(inspect_pickle_bytes(rel_path, &pkl_bytes));
+                    }
+                }
+            }
+        }
+        let next = name_end
+            .saturating_add(extra_len)
+            .saturating_add(comment_len);
+        if next <= pos {
+            break;
+        }
+        pos = next;
+    }
+
+    findings
+}
+
 /// Jinja2 Chat-Template SSTI and Binary Pickle Opcode inspection end-to-end.
 pub fn scan_repo_ai_model_artifacts(project_root: &std::path::Path) -> Vec<LocalStaticFinding> {
     const MAX_TOKENIZER_JSON_BYTES: u64 = 2 * 1024 * 1024;
-    const MAX_PICKLE_READ_BYTES: u64 = 4 * 1024 * 1024;
 
     fn walk(
         root: &std::path::Path,
@@ -1207,14 +1425,15 @@ pub fn scan_repo_ai_model_artifacts(project_root: &std::path::Path) -> Vec<Local
                         out.extend(inspect_chat_template_ssti(&rel, &text));
                     }
                 }
-            } else if (low.ends_with(".pkl") || low.ends_with(".pt") || low.ends_with(".pth"))
-                && let Ok(f) = std::fs::File::open(&path)
+            } else if low.ends_with(".pkl")
+                || low.ends_with(".pickle")
+                || low.ends_with(".pt")
+                || low.ends_with(".pth")
+                || low.ends_with(".ckpt")
+                || low.ends_with(".joblib")
+                || low.ends_with(".whl")
             {
-                use std::io::Read;
-                let mut buf = Vec::new();
-                if f.take(MAX_PICKLE_READ_BYTES).read_to_end(&mut buf).is_ok() {
-                    out.extend(inspect_pickle_bytes(&rel, &buf));
-                }
+                out.extend(inspect_pickle_file_path(&rel, &path));
             }
         }
     }
