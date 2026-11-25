@@ -3116,6 +3116,10 @@ javascript:
     #[test]
     fn ssl_engine_matches_certificate_and_protocol_attributes() {
         let tls_port = tls_origin_for_templates();
+        #[cfg(feature = "pqc")]
+        let expected_words = r#"["protocol=TLS", "cn=127.0.0.1"]"#;
+        #[cfg(not(feature = "pqc"))]
+        let expected_words = r#"["protocol=TLS"]"#;
         let dir = temp_templates_dir(&[(
             "ssl",
             &format!(
@@ -3129,7 +3133,7 @@ ssl:
   - port: {tls_port}
     matchers:
       - type: word
-        words: ["protocol=TLS", "cn=127.0.0.1"]
+        words: {expected_words}
         condition: and
 "#
             ),
