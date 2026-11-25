@@ -8,6 +8,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.4.4] - 2026-11-25
+
+### Precision, Scalability & Deep-Audit Hardening
+- **Real-World Precision Tuning (`fb2eac3`):** Word-boundary matching for `smg-hw` indicator tokens (`__user` no longer false-matches POSIX `struct __user_cap_data_struct`), unparenthesized `sizeof *ptr` handling, C/C++ variable-length copy & intra-procedural leak confidence calibration (`nginx` confirmed findings `112 -> 3`, `openssl` `1,074 -> 370`), test-fixture cert/key suppression, and shell-free `execve`/`CreateProcess` sink cleanup.
+- **Engine Scalability & Stack Safety (`299f5f0`):** Built O(1) `ImportFileIndex` (`ast.rs`, `lattice.rs`, `subgraph.rs`) and cross-call memoized `resolve_symbol_in_file` with `defined_symbol_ids` short-circuit (`envoy` 265 MB C++ `5m46s+ hang -> 55.3s`, `Signal-Android` 196 MB Kotlin/Java `3m16s+ hang -> 37.2s`); converted `smg-hw` `collect_hw_functions` to iterative explicit-stack DFS and depth-bounded `context.rs`, `wcsd_dma.rs`, and `c_cpp.rs` (eliminating Zephyr RTOS stack overflow).
+- **4-Batch Deep Security Audit Remediation (`152ede5`, `770156e`, `79f0d42`, `4a475a1`, `0b2d595`):**
+  - Fixed Windows `install.ps1` PowerShell syntax corruption (`P0`), distro release isolation (`Debian:12`), untrusted repo `guards` override, CFG compound negation & `break` modeling, Merkle audit proof binding, SQLi `ORDER BY` confirmation, OCI cross-distro version scoping, and `--no-default-features` test gating.
+  - Hardened `smg-graph` SMT solver (dense real+int `(w, eps)` difference logic, mutated-var invalidation, structural `block_always_exits`), CFA/SSA bounds & partial-sanitizer revocation, `--changed-since` lockfile coverage, 11+ lockfile CVE checks, bounded NUL-header `git_history.rs`, `PickleVal::Mark` pickle opcode walker, AI taint propagation, and IaC KMS/GKE policies.
+  - Hardened Frontier crates (`smg-web3` Solana CPI & recursive tuple ABI & iterative Solidity AST, `smg-hw` opaque-pointer bounds, `smg-pqc` PEM/DER inspection, MD5/SHA1-ECDSA OIDs, and `.so.` SONAMEs).
+  - Hardened Proxy/TUI/MCP/CLI (`proxy_tui.rs` reversed history & lab-only TLS replay, `proxy_mitm.rs` 10s handshake deadline, `mcp.rs` full pipeline in `explain_finding` & symlink guards, `smg-tui` symlink & `fid` sanitization, and `claude-pre-commit` wrapper-flag & fail-closed UTF-8 stdin checks).
+
 ## [1.4.1] - 2026-11-24
 
 ### Security & Soundness (6-Batch Full-Workspace Audit Remediation)
