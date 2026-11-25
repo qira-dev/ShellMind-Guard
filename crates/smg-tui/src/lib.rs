@@ -238,7 +238,9 @@ impl CategoryFilter {
     }
 }
 
-#[derive(Debug, Clone)]
+pub type TuiRescanHook = std::sync::Arc<dyn Fn(&Path) -> Result<GraphAnalysisResult> + Send + Sync>;
+
+#[derive(Clone)]
 pub struct TuiLaunchConfig {
     pub boot_cmd: Option<String>,
     pub port: u16,
@@ -252,6 +254,28 @@ pub struct TuiLaunchConfig {
     pub sandbox_tls: bool,
     pub mock_shims: bool,
     pub cgroup_v2: bool,
+    /// Optional full multi-domain rescan callback (preserves Web3/HW/PQC/AI findings on `[r]`).
+    pub rescan_hook: Option<TuiRescanHook>,
+}
+
+impl std::fmt::Debug for TuiLaunchConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TuiLaunchConfig")
+            .field("boot_cmd", &self.boot_cmd)
+            .field("port", &self.port)
+            .field("sync_race", &self.sync_race)
+            .field("unsafe_host_fallback", &self.unsafe_host_fallback)
+            .field("trust_repo_config", &self.trust_repo_config)
+            .field("deep", &self.deep)
+            .field("layers", &self.layers)
+            .field("min_confidence", &self.min_confidence)
+            .field("sandbox_mem_mb", &self.sandbox_mem_mb)
+            .field("sandbox_tls", &self.sandbox_tls)
+            .field("mock_shims", &self.mock_shims)
+            .field("cgroup_v2", &self.cgroup_v2)
+            .field("rescan_hook", &self.rescan_hook.is_some())
+            .finish()
+    }
 }
 
 impl Default for TuiLaunchConfig {
@@ -269,6 +293,7 @@ impl Default for TuiLaunchConfig {
             sandbox_tls: false,
             mock_shims: false,
             cgroup_v2: false,
+            rescan_hook: None,
         }
     }
 }
@@ -2527,22 +2552,26 @@ fn spawn_bg_rescan(state: &mut TuiState, launch_cfg: &TuiLaunchConfig) {
     let deep = launch_cfg.deep;
     let min_conf = launch_cfg.min_confidence;
     let trust_cfg = launch_cfg.trust_repo_config;
+    let rescan_hook = launch_cfg.rescan_hook.clone();
     start_bg_job(
         state,
         "Running background delta-cached rescan...".to_string(),
         move || {
             let result = (|| -> Result<(GraphAnalysisResult, u128)> {
                 let t0 = Instant::now();
-                let cfg = ShellMindGuardConfig::load_trusted_from_dir(&root, trust_cfg)?;
-                let summary = scan_repository(&root, &cfg)?;
-                let mut store = StateStore::open(&root)?;
-                let (_delta, _) = store.sync_files(&summary.files)?;
-                let mut graph_res = analyze_codebase_cached(&summary.files, &cfg, &mut store)?;
-                if deep {
-                    graph_res
-                        .findings
-                        .extend(collect_deep_schema_findings(&graph_res));
-                }
+                let mut graph_res = if let Some(ref hook) = rescan_hook {
+                    hook(&root)?
+                } else {
+                    let cfg = ShellMindGuardConfig::load_trusted_from_dir(&root, trust_cfg)?;
+                    let summary = scan_repository(&root, &cfg)?;
+                    let mut store = StateStore::open(&root)?;
+                    let (_delta, _) = store.sync_files(&summary.files)?;
+                    let mut res = analyze_codebase_cached(&summary.files, &cfg, &mut store)?;
+                    if deep {
+                        res.findings.extend(collect_deep_schema_findings(&res));
+                    }
+                    res
+                };
                 if !layers.is_empty() {
                     graph_res
                         .findings

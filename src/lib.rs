@@ -1548,6 +1548,36 @@ fn launch_tui_dashboard(args: UiLaunchArgs) -> Result<()> {
         &verified_list,
     )?;
     let total_ms = t0.elapsed().as_millis();
+    let hook_layers = args.layers.clone();
+    let hook_min_conf = args.min_confidence;
+    let hook_port = effective_port;
+    let hook_sync_race = args.sync_race;
+    let hook_unsafe_host = args.unsafe_host_fallback;
+    let hook_trust = args.trust_repo_config;
+    let hook_deep = args.deep;
+    let hook_mem = args.sandbox_mem_mb;
+    let hook_tls = args.sandbox_tls;
+    let hook_shims = args.mock_shims;
+    let hook_cg = args.cgroup_v2;
+    let rescan_hook: smg_tui::TuiRescanHook = std::sync::Arc::new(move |root: &Path| {
+        execute_scan_pipeline(ScanRunOptions {
+            path: root,
+            layers: &hook_layers,
+            min_confidence: hook_min_conf,
+            boot_cmd: None,
+            port: hook_port,
+            sync_race: hook_sync_race,
+            unsafe_host_fallback: hook_unsafe_host,
+            trust_repo_config: hook_trust,
+            deep: hook_deep,
+            deep_audit: false,
+            sandbox_mem_mb: hook_mem,
+            sandbox_tls: hook_tls,
+            mock_shims: hook_shims,
+            cgroup_v2: hook_cg,
+        })
+        .map(|o| o.graph)
+    });
     run_tui(
         &args.path,
         graph_res,
@@ -1566,6 +1596,7 @@ fn launch_tui_dashboard(args: UiLaunchArgs) -> Result<()> {
             sandbox_tls: args.sandbox_tls,
             mock_shims: args.mock_shims,
             cgroup_v2: args.cgroup_v2,
+            rescan_hook: Some(rescan_hook),
         },
     )
 }
@@ -2339,18 +2370,66 @@ pub fn run_cli() -> Result<ExitCode> {
                 }
             }
             if let Some(ref vex_out) = openvex {
-                let stmts: Vec<smg_graph::OpenVexStatement> = outcome
-                    .graph
-                    .findings
+                let vex_cfg = ShellMindGuardConfig::load_trusted_from_dir(&path, trust_repo_config)
+                    .unwrap_or_default();
+                let vex_summaries: Vec<smg_graph::FileAstSummary> =
+                    scan_repository(&path, &vex_cfg)
+                        .map(|s| {
+                            s.files
+                                .iter()
+                                .filter_map(|f| smg_graph::parse_file_ast(f, &vex_cfg))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                let pkg_index = smg_graph::deps::build_package_import_index(&vex_summaries);
+                let auto_vex = smg_graph::AutoVexSymbolIndex::default();
+                let route_reachable: std::collections::HashSet<String> = vex_summaries
                     .iter()
-                    .map(|f| smg_graph::OpenVexStatement {
-                        vulnerability_id: f.rule_id.clone(),
-                        product_purl: format!("pkg:generic/{}@local", f.file),
-                        status: "affected".into(),
-                        justification: None,
-                        impact_statement: f.title.clone(),
-                    })
+                    .flat_map(|s| s.symbols.iter())
+                    .filter(|sym| sym.kind == smg_graph::ast::SymbolKind::Route)
+                    .map(|sym| sym.id.clone())
                     .collect();
+
+                let stmts: Vec<smg_graph::OpenVexStatement> =
+                    outcome
+                        .graph
+                        .findings
+                        .iter()
+                        .map(|f| {
+                            if let (_, Some(stmt)) =
+                                smg_graph::assess_dependency_vex_tier_with_auto_vex(
+                                    f,
+                                    &pkg_index,
+                                    &route_reachable,
+                                    Some(&auto_vex),
+                                )
+                            {
+                                return stmt;
+                            }
+                            let (status, justification) =
+                                if f.proof_reasons.iter().any(|r| r == "DeclaredUnusedVEX") {
+                                    ("not_affected", Some("component_not_present".to_string()))
+                                } else if f
+                                    .proof_reasons
+                                    .iter()
+                                    .any(|r| r == "ImportedSafeApiOnlyVEX")
+                                {
+                                    (
+                                        "not_affected",
+                                        Some("vulnerable_code_not_in_execute_path".to_string()),
+                                    )
+                                } else {
+                                    ("affected", None)
+                                };
+                            smg_graph::OpenVexStatement {
+                                vulnerability_id: f.rule_id.clone(),
+                                product_purl: format!("pkg:generic/{}@local", f.file),
+                                status: status.into(),
+                                justification,
+                                impact_statement: f.title.clone(),
+                            }
+                        })
+                        .collect();
                 let vex_json = smg_graph::to_openvex_json("ShellMind Guard", &stmts);
                 if let Some(parent) = vex_out.parent()
                     && !parent.as_os_str().is_empty()
@@ -2644,7 +2723,7 @@ pub fn run_cli() -> Result<ExitCode> {
             patch_file,
             apply_check,
         } => {
-            let cfg = ShellMindGuardConfig::load_trusted_from_dir(&path, false)?;
+            let cfg = ShellMindGuardConfig::load_trusted_from_dir(&path, trust_repo_config)?;
             let mut store = StateStore::open(&path)?;
             let finding = resolve_finding_for_replay(&path, &finding_id, &cfg, &mut store)?;
             let effective_boot = boot_cmd.or_else(|| {
@@ -4639,7 +4718,7 @@ pub(crate) fn install_git_hook(root: &Path) -> Result<PathBuf> {
         })
         .unwrap_or_default();
     let block = format!(
-        "{}\nSMG_BIN=\"$(command -v smg 2>/dev/null || command -v shellmind-guard 2>/dev/null || true)\"\nif [ -z \"$SMG_BIN\" ]; then\n  for cand in \"$HOME/.local/bin/smg\" \"$HOME/.local/bin/shellmind-guard\" \"$HOME/.cargo/bin/smg\" \"$HOME/.cargo/bin/shellmind-guard\" \"/usr/local/bin/smg\" \"/usr/local/bin/shellmind-guard\" \"/opt/homebrew/bin/smg\" \"/opt/homebrew/bin/shellmind-guard\"{exe_fallback}; do\n    if [ -x \"$cand\" ]; then\n      SMG_BIN=\"$cand\"\n      break\n    fi\n  done\nfi\nif [ -n \"$SMG_BIN\" ]; then\n  \"$SMG_BIN\" scan . --layers secrets,config --ci\nelse\n  echo \"[ShellMind Guard] warning: smg/shellmind-guard binary not found in PATH; skipping pre-commit scan\" >&2\nfi\n{}\n",
+        "{}\nSMG_BIN=\"$(command -v smg 2>/dev/null || command -v shellmind-guard 2>/dev/null || true)\"\nif [ -z \"$SMG_BIN\" ]; then\n  for cand in \"$HOME/.local/bin/smg\" \"$HOME/.local/bin/shellmind-guard\" \"$HOME/.cargo/bin/smg\" \"$HOME/.cargo/bin/shellmind-guard\" \"/usr/local/bin/smg\" \"/usr/local/bin/shellmind-guard\" \"/opt/homebrew/bin/smg\" \"/opt/homebrew/bin/shellmind-guard\"{exe_fallback}; do\n    if [ -x \"$cand\" ]; then\n      SMG_BIN=\"$cand\"\n      break\n    fi\n  done\nfi\nif [ -n \"$SMG_BIN\" ]; then\n  SMG_STAGE=\"$(mktemp -d \"${{TMPDIR:-/tmp}}/smg-stage.XXXXXX\" 2>/dev/null || true)\"\n  if [ -n \"$SMG_STAGE\" ] && git checkout-index --all --force --prefix=\"$SMG_STAGE/\" 2>/dev/null; then\n    trap 'rm -rf \"$SMG_STAGE\"' EXIT\n    \"$SMG_BIN\" scan \"$SMG_STAGE\" --layers secrets,config --ci\n  else\n    [ -n \"$SMG_STAGE\" ] && rm -rf \"$SMG_STAGE\"\n    \"$SMG_BIN\" scan . --layers secrets,config --ci\n  fi\nelse\n  echo \"[ShellMind Guard] warning: smg/shellmind-guard binary not found in PATH; skipping pre-commit scan\" >&2\nfi\n{}\n",
         HOOK_START, HOOK_END
     );
 
@@ -5445,7 +5524,79 @@ impl Drop for TempDirCleanup {
 }
 
 fn verify_patch_apply_check(params: &ApplyCheckParams<'_>) -> Result<smg_ai::ApplyCheckOutcome> {
-    verify_patch_in_isolated_copy(params)
+    let mut outcome = verify_patch_in_isolated_copy(params)?;
+    let rule = params.finding.rule_id.as_str();
+    let is_frontier_rule = rule.starts_with("SMG-WEB3-")
+        || rule.starts_with("SMG-SOL-")
+        || rule.starts_with("SMG-MOVE-")
+        || rule.starts_with("SMG-HW-")
+        || rule.starts_with("SMG-PQC-")
+        || rule.starts_with("SMG-AI-");
+    if outcome.mitigated && is_frontier_rule {
+        // Re-verify frontier findings via the full multi-domain pipeline (smg-web3, smg-hw,
+        // smg-pqc, AI model artifacts) so `--apply-check` never claims MITIGATED merely because
+        // core `analyze_codebase` alone does not emit frontier rules.
+        struct FrontierCopyGuard(PathBuf);
+        impl Drop for FrontierCopyGuard {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let tmp_copy = std::env::temp_dir().join(format!(
+            "smg-apply-frontier-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _guard = FrontierCopyGuard(tmp_copy.clone());
+        fs::create_dir_all(&tmp_copy)?;
+        let summary = scan_repository(params.project_root, params.cfg)?;
+        for f in &summary.files {
+            let dst = tmp_copy.join(&f.rel_path);
+            if let Some(p) = dst.parent() {
+                fs::create_dir_all(p)?;
+            }
+            let _ = fs::copy(&f.abs_path, &dst);
+        }
+        let _ = smg_ai::apply_unified_diff_safely(&tmp_copy, params.raw_diff)?;
+        let full_res = execute_scan_pipeline_full(
+            ScanRunOptions {
+                path: &tmp_copy,
+                layers: &[],
+                min_confidence: None,
+                boot_cmd: None,
+                port: params.port,
+                sync_race: params.sync_race,
+                unsafe_host_fallback: params.unsafe_host_fallback,
+                trust_repo_config: false,
+                deep: false,
+                deep_audit: params.cfg.scan.deep_audit,
+                sandbox_mem_mb: params.probe_cfg.memory_limit_mb,
+                sandbox_tls: params.probe_cfg.use_tls,
+                mock_shims: params.probe_cfg.mock_shims,
+                cgroup_v2: params.probe_cfg.use_cgroup_v2,
+            },
+            None,
+            false,
+            rule.starts_with("SMG-PQC-"),
+            None,
+        )?;
+        let still_present = full_res
+            .graph
+            .findings
+            .iter()
+            .any(|f| f.rule_id == params.finding.rule_id && f.file == params.finding.file);
+        if still_present {
+            outcome.mitigated = false;
+            outcome.summary = format!(
+                "Frontier pipeline still detected `{}` in `{}` after applying candidate patch",
+                params.finding.rule_id, params.finding.file
+            );
+        }
+    }
+    Ok(outcome)
 }
 
 #[cfg(test)]

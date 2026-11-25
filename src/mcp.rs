@@ -451,12 +451,13 @@ fn handle_tool_call(params: &Value) -> Result<Value> {
                         f0.proof_reasons.truncate(2);
                     }
                     let final_cand = json!({
-                        "path": root.display().to_string(),
+                        "ok": true,
+                        "elapsed_ms": outcome.elapsed_ms,
                         "parsed_files": outcome.graph.parsed_files,
                         "symbol_count": outcome.graph.symbol_count,
                         "edge_count": outcome.graph.edge_count,
                         "route_entries": outcome.graph.route_entries,
-                        "total_findings": total_findings,
+                        "findings_count": total_findings,
                         "returned_count": 1,
                         "truncated": true,
                         "budget_bytes": MAX_MCP_RESPONSE_BYTES,
