@@ -313,48 +313,64 @@ where
 }
 
 const MAX_GUNZIP_BYTES: usize = 256 * 1024 * 1024;
+const MAX_TOTAL_GUNZIP_BYTES: usize = 512 * 1024 * 1024;
 const MAX_TAR_NEST_DEPTH: usize = 6;
 
-fn maybe_gunzip(bytes: &[u8]) -> Vec<u8> {
-    if bytes.len() >= 2
-        && bytes[0] == 0x1f
-        && bytes[1] == 0x8b
-        && let Ok(mut child) = Command::new("gzip")
+fn maybe_gunzip_budgeted(bytes: &[u8], remaining_budget: &mut usize) -> Result<Vec<u8>> {
+    if bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b {
+        let cap = MAX_GUNZIP_BYTES.min(*remaining_budget);
+        if cap == 0 {
+            bail!(
+                "Cumulative OCI gzip decompression budget ({MAX_TOTAL_GUNZIP_BYTES} bytes) exhausted"
+            );
+        }
+        let mut child = Command::new("gzip")
             .arg("-dc")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-    {
-        if let Some(mut stdin) = child.stdin.take() {
+            .context(
+                "Failed to spawn `gzip -dc` while decompressing `.tar.gz` OCI layer (ensure `gzip` is installed on PATH)",
+            )?;
+        let writer_handle = child.stdin.take().map(|mut stdin| {
             let input = bytes.to_vec();
-            let _ = std::thread::spawn(move || {
+            std::thread::spawn(move || {
                 let _ = stdin.write_all(&input);
-            });
-        }
+            })
+        });
         let mut out = Vec::new();
         let mut exceeded = false;
         if let Some(stdout) = child.stdout.take() {
             use std::io::Read;
-            let _ = stdout
-                .take((MAX_GUNZIP_BYTES + 1) as u64)
-                .read_to_end(&mut out);
-            if out.len() > MAX_GUNZIP_BYTES {
+            let _ = stdout.take((cap + 1) as u64).read_to_end(&mut out);
+            if out.len() > cap {
                 exceeded = true;
             }
         }
         if exceeded {
             let _ = child.kill();
             let _ = child.wait();
-            return Vec::new();
+            if let Some(h) = writer_handle {
+                let _ = h.join();
+            }
+            bail!("OCI gzip layer exceeded {cap} byte decompression safety cap");
         }
-        if let Ok(status) = child.wait()
-            && status.success()
-        {
-            return out;
+        let status = child
+            .wait()
+            .context("Failed waiting on `gzip -dc` subprocess")?;
+        if let Some(h) = writer_handle {
+            let _ = h.join();
         }
+        if !status.success() {
+            bail!(
+                "`gzip -dc` exited with failure status {status} on corrupt or truncated OCI layer"
+            );
+        }
+        *remaining_budget = remaining_budget.saturating_sub(out.len());
+        return Ok(out);
     }
-    bytes.to_vec()
+    Ok(bytes.to_vec())
 }
 
 fn is_supported_app_lockfile(path: &str) -> bool {
@@ -388,13 +404,48 @@ fn inspect_layer_tar(
     os_family: &mut String,
     os_version: &mut String,
     collected: &mut Vec<(ResolvedDependency, String)>,
-) {
-    inspect_layer_tar_depth(layer_name, tar_bytes, os_family, os_version, collected, 0);
+    remaining_budget: &mut usize,
+) -> Result<()> {
+    inspect_layer_tar_depth(
+        layer_name,
+        tar_bytes,
+        os_family,
+        os_version,
+        collected,
+        0,
+        remaining_budget,
+    )
 }
 
 fn looks_like_tar_or_gzip(data: &[u8]) -> bool {
     (data.len() >= 2 && data[0] == 0x1f && data[1] == 0x8b)
         || (data.len() >= 262 && &data[257..262] == b"ustar")
+}
+
+fn format_distro_eco_with_ver(base: &str, os_version: &str) -> String {
+    let v = os_version.trim();
+    if v.is_empty() {
+        return base.to_string();
+    }
+    if base == "Alpine" {
+        let major_minor: String = v.split('.').take(2).collect::<Vec<_>>().join(".");
+        if !major_minor.is_empty() {
+            let tag = if major_minor.starts_with('v') {
+                major_minor
+            } else {
+                format!("v{major_minor}")
+            };
+            return format!("Alpine:{tag}");
+        }
+    } else if base == "Debian" {
+        let major = v.split('.').next().unwrap_or("").trim();
+        if !major.is_empty() && major.bytes().all(|b| b.is_ascii_digit()) {
+            return format!("Debian:{major}");
+        }
+    } else if base == "Ubuntu" {
+        return format!("Ubuntu:{v}");
+    }
+    base.to_string()
 }
 
 fn inspect_layer_tar_depth(
@@ -404,16 +455,31 @@ fn inspect_layer_tar_depth(
     os_version: &mut String,
     collected: &mut Vec<(ResolvedDependency, String)>,
     depth: usize,
-) {
+    remaining_budget: &mut usize,
+) -> Result<()> {
     if depth >= MAX_TAR_NEST_DEPTH {
-        return;
+        return Ok(());
     }
-    let decompressed = maybe_gunzip(tar_bytes);
+    let decompressed = maybe_gunzip_budgeted(tar_bytes, remaining_budget)?;
     let mut dpkg_blobs: Vec<String> = Vec::new();
     let mut apk_blobs: Vec<String> = Vec::new();
+    let mut nested_layers: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut whiteouts: Vec<String> = Vec::new();
 
     walk_tar_bytes(&decompressed, |entry_path, data| {
         let norm = entry_path.trim_start_matches("./").trim_start_matches('/');
+        if let Some((dir, fname)) = norm.rsplit_once('/') {
+            if fname == ".wh..wh..opq" {
+                whiteouts.push(format!("{dir}/"));
+                return;
+            } else if let Some(target_name) = fname.strip_prefix(".wh.") {
+                whiteouts.push(format!("{dir}/{target_name}"));
+                return;
+            }
+        } else if let Some(target_name) = norm.strip_prefix(".wh.") {
+            whiteouts.push(target_name.to_string());
+            return;
+        }
         if norm == "etc/os-release" || norm == "usr/lib/os-release" {
             let text = String::from_utf8_lossy(data);
             let (fam, ver) = parse_os_release(&text);
@@ -427,6 +493,7 @@ fn inspect_layer_tar_depth(
             apk_blobs.push(String::from_utf8_lossy(data).into_owned());
         } else if is_supported_app_lockfile(norm) && data.len() <= 8 * 1024 * 1024 {
             let text = String::from_utf8_lossy(data);
+            collected.retain(|(_, prev_src)| !prev_src.ends_with(&format!(":{norm}")));
             for dep in extract_resolved_dependencies(norm, &text) {
                 collected.push((dep, format!("{layer_name}:{norm}")));
             }
@@ -436,25 +503,71 @@ fn inspect_layer_tar_depth(
                 || norm.ends_with(".tar.gz")
                 || (norm.starts_with("blobs/sha256/") && looks_like_tar_or_gzip(data)))
         {
-            inspect_layer_tar_depth(norm, data, os_family, os_version, collected, depth + 1);
+            nested_layers.push((norm.to_string(), data.to_vec()));
         }
     });
 
-    let deb_eco = if os_family.eq_ignore_ascii_case("Ubuntu") {
+    for wh in &whiteouts {
+        collected.retain(|(_, src)| {
+            let Some((_, path_part)) = src.split_once(':') else {
+                return true;
+            };
+            let clean = path_part.trim_start_matches('/');
+            if wh.ends_with('/') {
+                !clean.starts_with(wh.as_str())
+            } else {
+                clean != wh.as_str()
+            }
+        });
+    }
+
+    let deb_base = if os_family.eq_ignore_ascii_case("Ubuntu") {
         "Ubuntu"
     } else {
         "Debian"
     };
-    for blob in dpkg_blobs {
-        for dep in parse_dpkg_status(&blob, deb_eco) {
-            collected.push((dep, format!("{layer_name}:/var/lib/dpkg/status")));
+    let deb_eco =
+        if os_family.eq_ignore_ascii_case("Ubuntu") || os_family.eq_ignore_ascii_case("Debian") {
+            format_distro_eco_with_ver(deb_base, os_version)
+        } else {
+            deb_base.to_string()
+        };
+    if !dpkg_blobs.is_empty() {
+        // Upper layer `/var/lib/dpkg/status` supersedes base-layer dpkg state (e.g. after `apt-get upgrade`).
+        collected.retain(|(_, src)| !src.ends_with(":/var/lib/dpkg/status"));
+        for blob in dpkg_blobs {
+            for dep in parse_dpkg_status(&blob, &deb_eco) {
+                collected.push((dep, format!("{layer_name}:/var/lib/dpkg/status")));
+            }
         }
     }
-    for blob in apk_blobs {
-        for dep in parse_apk_installed(&blob) {
-            collected.push((dep, format!("{layer_name}:/lib/apk/db/installed")));
+    if !apk_blobs.is_empty() {
+        let apk_eco = if os_family.eq_ignore_ascii_case("Alpine") {
+            format_distro_eco_with_ver("Alpine", os_version)
+        } else {
+            "Alpine".to_string()
+        };
+        collected.retain(|(_, src)| !src.ends_with(":/lib/apk/db/installed"));
+        for blob in apk_blobs {
+            for mut dep in parse_apk_installed(&blob) {
+                dep.ecosystem = apk_eco.clone();
+                collected.push((dep, format!("{layer_name}:/lib/apk/db/installed")));
+            }
         }
     }
+
+    for (nested_name, nested_bytes) in nested_layers {
+        inspect_layer_tar_depth(
+            &nested_name,
+            &nested_bytes,
+            os_family,
+            os_version,
+            collected,
+            depth + 1,
+            remaining_budget,
+        )?;
+    }
+    Ok(())
 }
 
 /// Scans an OCI/Docker image `.tar` / `.tar.gz` archive OR an unpacked rootfs directory.
@@ -470,6 +583,7 @@ pub fn scan_oci_image(
     let mut os_family = "Linux".to_string();
     let mut os_version = String::new();
     let mut raw_collected: Vec<(ResolvedDependency, String)> = Vec::new();
+    let mut remaining_gunzip_budget = MAX_TOTAL_GUNZIP_BYTES;
 
     if target.is_file() {
         use std::io::Read as _;
@@ -496,7 +610,8 @@ pub fn scan_oci_image(
             &mut os_family,
             &mut os_version,
             &mut raw_collected,
-        );
+            &mut remaining_gunzip_budget,
+        )?;
     } else if target.is_dir() {
         // Unpacked rootfs or OCI layout directory
         for rel in ["etc/os-release", "usr/lib/os-release"] {
@@ -508,18 +623,46 @@ pub fn scan_oci_image(
             }
         }
         if let Ok(dpkg) = fs::read_to_string(target.join("var/lib/dpkg/status")) {
-            let eco = if os_family.eq_ignore_ascii_case("Ubuntu") {
+            let base = if os_family.eq_ignore_ascii_case("Ubuntu") {
                 "Ubuntu"
             } else {
                 "Debian"
             };
-            for dep in parse_dpkg_status(&dpkg, eco) {
+            let eco = format_distro_eco_with_ver(base, &os_version);
+            for dep in parse_dpkg_status(&dpkg, &eco) {
                 raw_collected.push((dep, "rootfs:/var/lib/dpkg/status".to_string()));
             }
         }
         if let Ok(apk) = fs::read_to_string(target.join("lib/apk/db/installed")) {
-            for dep in parse_apk_installed(&apk) {
+            let apk_eco = format_distro_eco_with_ver("Alpine", &os_version);
+            for mut dep in parse_apk_installed(&apk) {
+                dep.ecosystem = apk_eco.clone();
                 raw_collected.push((dep, "rootfs:/lib/apk/db/installed".to_string()));
+            }
+        }
+        let blobs_dir = target.join("blobs").join("sha256");
+        if blobs_dir.is_dir()
+            && let Ok(entries) = fs::read_dir(&blobs_dir)
+        {
+            let mut blob_paths: Vec<_> = entries.flatten().map(|e| e.path()).collect();
+            blob_paths.sort();
+            for bp in blob_paths.into_iter().take(128) {
+                if let Ok(meta) = fs::symlink_metadata(&bp)
+                    && meta.is_file()
+                    && meta.len() <= 128 * 1024 * 1024
+                    && let Ok(bytes) = fs::read(&bp)
+                    && looks_like_tar_or_gzip(&bytes)
+                {
+                    let lbl = bp.file_name().and_then(|s| s.to_str()).unwrap_or("blob");
+                    let _ = inspect_layer_tar(
+                        lbl,
+                        &bytes,
+                        &mut os_family,
+                        &mut os_version,
+                        &mut raw_collected,
+                        &mut remaining_gunzip_budget,
+                    );
+                }
             }
         }
     }
@@ -556,7 +699,19 @@ pub fn scan_oci_image(
     let mut findings = Vec::new();
     for (eco, entries) in by_eco {
         let pkg_names: Vec<&str> = entries.iter().map(|(d, _)| d.name.as_str()).collect();
-        if let Ok(rec_map) = store.query_for_packages(&eco, &pkg_names) {
+        let mut merged_rec_map = store
+            .query_for_packages(&eco, &pkg_names)
+            .unwrap_or_default();
+        // Also fall back to release-agnostic family advisories (`Debian` / `Alpine` / `Ubuntu`) if imported without suffix.
+        if let Some((family, _)) = eco.split_once(':')
+            && let Ok(fam_map) = store.query_for_packages(family, &pkg_names)
+        {
+            for (k, v) in fam_map {
+                merged_rec_map.entry(k).or_default().extend(v);
+            }
+        }
+        {
+            let rec_map = merged_rec_map;
             for (dep, src) in entries {
                 let norm = smg_core::advisories::normalize_package_name(&eco, &dep.name);
                 if let Some(records) = rec_map.get(&norm) {
@@ -652,11 +807,20 @@ mod tests {
         let mut os_fam = String::new();
         let mut os_ver = String::new();
         let mut collected = Vec::new();
-        inspect_layer_tar("test.tar", &tar, &mut os_fam, &mut os_ver, &mut collected);
+        let mut budget = 64 * 1024 * 1024usize;
+        inspect_layer_tar(
+            "test.tar",
+            &tar,
+            &mut os_fam,
+            &mut os_ver,
+            &mut collected,
+            &mut budget,
+        )
+        .unwrap();
 
         assert_eq!(os_fam, "Debian");
         assert_eq!(os_ver, "12");
-        assert!(collected.iter().any(|(d, _)| d.ecosystem == "Debian"
+        assert!(collected.iter().any(|(d, _)| d.ecosystem == "Debian:12"
             && d.name == "openssl"
             && d.version == "3.0.11-1~deb12u2"));
         assert!(!collected.iter().any(|(d, _)| d.name == "removed-pkg"));

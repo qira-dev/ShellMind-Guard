@@ -262,19 +262,80 @@ pub fn verify_tee_attestation_quote(
     })
 }
 
+fn is_forbidden_tee_ipv4(v4: std::net::Ipv4Addr) -> bool {
+    let oct = v4.octets();
+    let is_alibaba_imds = oct == [100, 100, 100, 200];
+    let is_oracle_imds = oct == [192, 0, 0, 192];
+    v4.is_link_local()
+        || v4.is_unspecified()
+        || v4.is_broadcast()
+        || v4.is_multicast()
+        || is_alibaba_imds
+        || is_oracle_imds
+}
+
 fn is_forbidden_tee_ip(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v4) => v4.is_link_local() || v4.is_unspecified(),
+        IpAddr::V4(v4) => is_forbidden_tee_ipv4(v4),
         IpAddr::V6(v6) => {
             if let Some(mapped) = v6.to_ipv4_mapped() {
-                mapped.is_link_local() || mapped.is_unspecified()
+                is_forbidden_tee_ipv4(mapped)
             } else {
                 let segs = v6.segments();
                 let is_aws_imds_v6 = segs == [0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254];
-                v6.is_unspecified() || (segs[0] & 0xffc0) == 0xfe80 || is_aws_imds_v6
+                v6.is_unspecified()
+                    || v6.is_multicast()
+                    || (segs[0] & 0xffc0) == 0xfe80
+                    || is_aws_imds_v6
             }
         }
     }
+}
+
+fn is_loopback_tee_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|m| m.is_loopback()),
+    }
+}
+
+/// Returns `true` if `rel_path` names a secret, credential, or private-key artifact that must not
+/// be uploaded to a remote TEE worker by default.
+pub fn is_sensitive_secret_path(rel_path: &str) -> bool {
+    let fname = rel_path
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(rel_path)
+        .trim()
+        .to_ascii_lowercase();
+    if fname.is_empty() {
+        return false;
+    }
+    if fname == ".env"
+        || fname.ends_with(".env")
+        || (fname.starts_with(".env.")
+            && !matches!(
+                fname.as_str(),
+                ".env.example" | ".env.sample" | ".env.template"
+            ))
+    {
+        return true;
+    }
+    if fname.ends_with(".pem")
+        || fname.ends_with(".key")
+        || fname.ends_with(".p12")
+        || fname.ends_with(".pfx")
+        || fname.ends_with(".pkcs8")
+        || fname.ends_with(".kdbx")
+        || fname.ends_with(".keystore")
+        || fname.ends_with(".jks")
+    {
+        return true;
+    }
+    matches!(
+        fname.as_str(),
+        "id_rsa" | "id_ed25519" | "id_ecdsa" | "id_dsa" | ".netrc" | ".npmrc" | ".pypirc"
+    )
 }
 
 fn is_url_strictly_loopback(url: &Url) -> bool {
@@ -313,6 +374,8 @@ pub fn validate_tee_endpoint(raw_url: &str) -> Result<Url> {
                 | "metadata.goog"
                 | "metadata.azure.com"
                 | "169.254.169.254"
+                | "100.100.100.200"
+                | "192.0.0.192"
                 | "fd00:ec2::254"
         ) {
             bail!("refusing cloud metadata host `{host}` for remote TEE endpoint");
@@ -363,13 +426,34 @@ pub fn compute_request_blake3_hex(nonce_hex: &str, files: &HashMap<String, Strin
 }
 
 /// Submits bounded source files over HTTPS/loopback to a remote TEE enclave worker and verifies its
-/// cryptographic PCR0/MRTD quote before returning findings.
+/// cryptographic PCR0/MRTD quote before returning findings. Sensitive secret/key files (`.env`,
+/// `.pem`, `.key`, `id_rsa`, etc.) are excluded from upload payloads by default.
 pub fn execute_remote_tee_scan(
     endpoint_url: &str,
     files: &[IndexedFile],
     license_token_json: Option<&str>,
     policy: &AttestationPolicy,
     now_unix: u64,
+) -> Result<(VerifiedEnclaveSession, RemoteTeeScanResponse)> {
+    execute_remote_tee_scan_with_options(
+        endpoint_url,
+        files,
+        license_token_json,
+        policy,
+        now_unix,
+        false,
+    )
+}
+
+/// Submits bounded source files over HTTPS/loopback to a remote TEE enclave worker with explicit
+/// control over whether sensitive secret/key files may be included in the upload payload.
+pub fn execute_remote_tee_scan_with_options(
+    endpoint_url: &str,
+    files: &[IndexedFile],
+    license_token_json: Option<&str>,
+    policy: &AttestationPolicy,
+    now_unix: u64,
+    include_secret_files: bool,
 ) -> Result<(VerifiedEnclaveSession, RemoteTeeScanResponse)> {
     if files.len() > 256 {
         bail!(
@@ -379,27 +463,93 @@ pub fn execute_remote_tee_scan(
     }
 
     let mut base_url = validate_tee_endpoint(endpoint_url)?;
-    // Verify DNS-resolved destination IPs immediately before outbound connection to block
-    // DNS-rebinding or `/etc/hosts` aliases pointing at cloud IMDS / link-local ranges.
-    if let Some(host) = base_url.host_str() {
-        let clean = host.trim_matches(['[', ']']);
-        let port = base_url.port_or_known_default().unwrap_or(443);
+    let is_strict_loopback = is_url_strictly_loopback(&base_url);
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut client_builder = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(30));
+
+    // Verify DNS-resolved destination IPs and pin them into `reqwest` via `resolve_to_addrs`
+    // to eliminate DNS-rebinding TOCTOU against loopback or cloud IMDS / link-local ranges.
+    if let Some(host_owned) = base_url.host_str().map(str::to_string) {
+        let clean = host_owned.trim_matches(['[', ']']);
+        let default_port = if base_url.scheme() == "http" { 80 } else { 443 };
+        let port = base_url.port_or_known_default().unwrap_or(default_port);
         let resolved: Vec<_> = (clean, port)
             .to_socket_addrs()
-            .with_context(|| format!("failed to resolve remote TEE host `{host}`"))?
+            .with_context(|| format!("failed to resolve remote TEE host `{host_owned}`"))?
             .collect();
-        if resolved.is_empty() || resolved.iter().any(|sa| is_forbidden_tee_ip(sa.ip())) {
-            bail!("refusing remote TEE host `{host}` resolving to link-local/IMDS/unspecified IP");
+        if resolved.is_empty()
+            || resolved.iter().any(|sa| {
+                is_forbidden_tee_ip(sa.ip()) || (!is_strict_loopback && is_loopback_tee_ip(sa.ip()))
+            })
+        {
+            bail!(
+                "refusing remote TEE host `{host_owned}` resolving to loopback/link-local/IMDS/unspecified IP"
+            );
+        }
+        if clean.parse::<IpAddr>().is_err() {
+            client_builder = client_builder.resolve_to_addrs(clean, &resolved);
         }
     }
+
     if !base_url.path().ends_with('/') {
         let with_slash = format!("{}/", base_url.path());
         base_url.set_path(&with_slash);
     }
+    let mut attest_url = base_url.join("v1/attest")?;
+    attest_url
+        .query_pairs_mut()
+        .append_pair("nonce", &policy.expected_nonce_hex);
     let scan_url = base_url.join("v1/attest-and-scan")?;
+
+    let client = client_builder.build()?;
+
+    // Phase 1: Pre-upload enclave attestation handshake (`GET /v1/attest?nonce=...`) BEFORE
+    // reading or transmitting any repository source files or license token.
+    let pre_resp = client
+        .get(attest_url)
+        .send()
+        .context("remote TEE pre-upload attestation probe (`GET /v1/attest`) failed")?;
+    let pre_session = if pre_resp.status().is_success() {
+        const MAX_ATTEST_BYTES: usize = 64 * 1024;
+        let mut pre_bytes = Vec::new();
+        pre_resp
+            .take((MAX_ATTEST_BYTES + 1) as u64)
+            .read_to_end(&mut pre_bytes)
+            .context("failed to read remote TEE pre-attestation quote")?;
+        if pre_bytes.len() > MAX_ATTEST_BYTES {
+            bail!("fail-closed remote TEE scan: pre-attestation quote exceeds 64 KiB limit");
+        }
+        let pre_quote: TeeAttestationQuote = serde_json::from_slice(&pre_bytes)
+            .context("invalid remote TEE pre-attestation quote JSON")?;
+        let pre_now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(now_unix)
+            .max(now_unix);
+        Some(verify_tee_attestation_quote(&pre_quote, policy, pre_now)?)
+    } else if is_strict_loopback
+        && base_url.scheme() == "http"
+        && matches!(
+            pre_resp.status(),
+            reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
+        )
+    {
+        None
+    } else {
+        bail!(
+            "fail-closed remote TEE pre-attestation (`GET /v1/attest`) returned HTTP {}",
+            pre_resp.status()
+        );
+    };
 
     let mut payload_files = HashMap::with_capacity(files.len());
     for f in files {
+        if !include_secret_files && is_sensitive_secret_path(&f.rel_path) {
+            continue;
+        }
         let text = if let Some(bytes) = f.cached_bytes.as_deref() {
             std::str::from_utf8(bytes)
                 .with_context(|| format!("file `{}` is not valid UTF-8", f.rel_path))?
@@ -447,11 +597,6 @@ pub fn execute_remote_tee_scan(
         files: payload_files,
     };
 
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let client = reqwest::blocking::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
     let resp = client
         .post(scan_url)
         .json(&req_body)
@@ -476,10 +621,8 @@ pub fn execute_remote_tee_scan(
     let Some(ref quoted_req_hash) = body.quote.request_blake3_hex else {
         bail!("fail-closed TEE attestation: quote is missing mandatory request_blake3_hex binding");
     };
-    if !quoted_req_hash
-        .trim()
-        .eq_ignore_ascii_case(&expected_req_hash)
-    {
+    let quoted_req_norm = quoted_req_hash.trim().to_ascii_lowercase();
+    if !ct_eq_bytes(quoted_req_norm.as_bytes(), expected_req_hash.as_bytes()) {
         bail!(
             "fail-closed TEE attestation: request transcript BLAKE3 mismatch (expected {}, got {})",
             expected_req_hash,
@@ -493,10 +636,8 @@ pub fn execute_remote_tee_scan(
     };
     let findings_json = serde_json::to_vec(&body.findings).unwrap_or_default();
     let expected_fin_hash = blake3::hash(&findings_json).to_hex().to_string();
-    if !quoted_fin_hash
-        .trim()
-        .eq_ignore_ascii_case(&expected_fin_hash)
-    {
+    let quoted_fin_norm = quoted_fin_hash.trim().to_ascii_lowercase();
+    if !ct_eq_bytes(quoted_fin_norm.as_bytes(), expected_fin_hash.as_bytes()) {
         bail!(
             "fail-closed TEE attestation: findings transcript BLAKE3 mismatch (expected {}, got {})",
             expected_fin_hash,
@@ -510,6 +651,16 @@ pub fn execute_remote_tee_scan(
         .unwrap_or(now_unix)
         .max(now_unix);
     let session = verify_tee_attestation_quote(&body.quote, policy, verify_now)?;
+    if let Some(ref pre) = pre_session
+        && !ct_eq_bytes(
+            session.pcr0_verified.as_bytes(),
+            pre.pcr0_verified.as_bytes(),
+        )
+    {
+        bail!(
+            "fail-closed TEE attestation: enclave PCR0/MRTD changed between pre-attestation and scan"
+        );
+    }
     Ok((session, body))
 }
 
@@ -579,10 +730,23 @@ mod tests {
         bad_nonce.nonce_hex = "cafebabe01020304".into();
         assert!(verify_tee_attestation_quote(&bad_nonce, &policy, 1_795_000_060).is_err());
 
-        // Remote non-HTTPS endpoint refused
+        // Remote non-HTTPS endpoint refused & cloud IMDS endpoints blocked
         assert!(validate_tee_endpoint("http://tee.example.com").is_err());
         assert!(validate_tee_endpoint("https://tee.example.com").is_ok());
+        assert!(validate_tee_endpoint("https://100.100.100.200:8443").is_err());
+        assert!(validate_tee_endpoint("https://192.0.0.192:8443").is_err());
+        assert!(validate_tee_endpoint("https://[::ffff:169.254.169.254]:8443").is_err());
+        assert!(validate_tee_endpoint("https://[::ffff:100.100.100.200]:8443").is_err());
         assert!(validate_tee_endpoint("http://127.0.0.1:8443").is_ok());
         assert!(validate_tee_endpoint("http://127.0.0.2:8443").is_ok());
+
+        // Sensitive secret/key files excluded by default
+        assert!(is_sensitive_secret_path(".env"));
+        assert!(is_sensitive_secret_path("config/.env.production"));
+        assert!(is_sensitive_secret_path("certs/private.pem"));
+        assert!(is_sensitive_secret_path("keys/tls.key"));
+        assert!(is_sensitive_secret_path(".ssh/id_rsa"));
+        assert!(!is_sensitive_secret_path(".env.example"));
+        assert!(!is_sensitive_secret_path("src/app.ts"));
     }
 }

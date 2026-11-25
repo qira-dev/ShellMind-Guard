@@ -9,5 +9,5 @@
 - [ ] Preserves strict `stdout` hygiene in `shellmind-guard mcp` and `shellmind-guard ui`
 - [ ] `cargo fmt --all -- --check` passes
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings` passes with 0 warnings
-- [ ] `cargo test --workspace` passes
-- [ ] `cargo run --release -- scan .` produces 0 false positives on ShellMind Guard crates
+- [ ] `SMG_ENFORCE_PRECISION_GATE=1 cargo test --workspace` passes across all 11 crates
+- [ ] `cargo run --release -- scan src --ci` and `cargo run --release -- scan crates --ci` produce 0 false positives on ShellMind Guard crates

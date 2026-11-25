@@ -30,9 +30,27 @@ jobs:
       - name: Check formatting (Ubuntu)
         if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
-      - name: Check minimal build without default features (Ubuntu)
+      - name: Validate installer scripts (Unix)
+        if: runner.os != 'Windows'
+        run: bash -n install.sh
+      - name: Validate PowerShell installer AST (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile("$PWD/install.ps1", [ref]$null, [ref]$errors)
+          if ($errors -and $errors.Count -gt 0) {
+            throw ($errors | Out-String)
+          }
+      - name: Check minimal & per-feature builds (Ubuntu)
         if: runner.os == 'Linux'
-        run: cargo check -p shellmind-guard --all-targets --no-default-features --locked
+        run: |
+          cargo check -p shellmind-guard --all-targets --no-default-features --locked
+          cargo test -p shellmind-guard --no-default-features --locked
+          cargo check -p shellmind-guard --no-default-features --features hw --locked
+          cargo check -p shellmind-guard --no-default-features --features web3 --locked
+          cargo check -p shellmind-guard --no-default-features --features pqc --locked
+          cargo check -p shellmind-guard --no-default-features --features enterprise --locked
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Run Workspace Tests

@@ -161,6 +161,7 @@ impl CdpEngine {
             .arg("--headless=new")
             .arg("--remote-debugging-port=0")
             .arg(format!("--user-data-dir={}", user_data_dir.display()))
+            .arg("--host-resolver-rules=MAP metadata.google.internal ~NOTFOUND, MAP metadata.azure.com ~NOTFOUND, MAP instance-data ~NOTFOUND, MAP 169.254.169.254 ~NOTFOUND, MAP 100.100.100.200 ~NOTFOUND, MAP 192.0.0.192 ~NOTFOUND")
             .arg("--no-first-run")
             .arg("--disable-gpu")
             .arg("--disable-dev-shm-usage")
@@ -460,12 +461,35 @@ impl CdpSession {
     /// Navigates to `url`, waits for load + settle, and collects the rendered
     /// DOM, background endpoints, and DOM source-sink findings.
     pub fn navigate_and_collect(&mut self, url: &str, settle_ms: u64) -> Result<CdpPageData> {
+        self.navigate_and_collect_with_scope(url, settle_ms, false)
+    }
+
+    pub fn navigate_and_collect_with_scope(
+        &mut self,
+        url: &str,
+        settle_ms: u64,
+        allow_remote: bool,
+    ) -> Result<CdpPageData> {
         // Unconditionally deny file://, chrome://, javascript:, IMDS, and link-local
-        // URLs before driving Page.navigate (Council T5).
-        let parsed = crate::idor_audit::validate_live_target_url(url, true)?;
+        // URLs (and enforce lab scope when `!allow_remote`) before driving Page.navigate.
+        let parsed = crate::idor_audit::validate_live_target_url(url, allow_remote)?;
         if !matches!(parsed.scheme(), "http" | "https") {
             bail!("CDP navigation only permits http:// and https:// URLs");
         }
+        let _ = self.send(
+            "Network.setBlockedURLs",
+            json!({
+                "urls": [
+                    "*://169.254.169.254/*",
+                    "*://[fd00:ec2::254]/*",
+                    "*://100.100.100.200/*",
+                    "*://192.0.0.192/*",
+                    "*://metadata.google.internal/*",
+                    "*://metadata.azure.com/*",
+                    "file://*"
+                ]
+            }),
+        );
         self.load_fired = false;
         self.xhr_urls.clear();
         let id = self.send("Page.navigate", json!({ "url": url }))?;

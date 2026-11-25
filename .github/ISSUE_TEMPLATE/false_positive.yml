@@ -31,7 +31,10 @@ body:
         - "Go (net/http, Gin, Echo, Chi)"
         - "Python (FastAPI, Flask, Django)"
         - "Rust (Axum, Actix-Web)"
-        - "Dockerfile / Manifest / .env"
+        - "Java / Kotlin / C# / PHP / Ruby / Swift / Dart"
+        - "C / C++ / Embedded Firmware (smg-hw)"
+        - "Solidity / Solana / Move (smg-web3)"
+        - "Terraform / HCL / Kubernetes / Dockerfile / CI-CD / .env"
     validations:
       required: true
 

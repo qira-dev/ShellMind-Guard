@@ -55,9 +55,15 @@ impl SymbolArena {
             budget,
             budget_capped: false,
         };
-        // Reserve `SymbolId(0)` as empty/wildcard sentinel so lookups never panic.
+        // Reserve `SymbolId(0)` strictly as an uninternable invalid/overflow sentinel,
+        // and intern `""` at `SymbolId(1)` (when budget permits) so root-level directories
+        // (`go_parent_dir == ""`) receive a valid non-zero `SymbolId`.
         arena.strings.push(String::new());
-        arena.lookup.insert(String::new(), SymbolId(0));
+        if arena.strings.len() < arena.budget.max_strings {
+            let empty_id = SymbolId(arena.strings.len() as u32);
+            arena.strings.push(String::new());
+            arena.lookup.insert(String::new(), empty_id);
+        }
         arena
     }
 

@@ -458,13 +458,27 @@ pub fn verify_single_token(
     }
 }
 
+fn sanitize_printable_hint(raw: &str, max_chars: usize) -> String {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| !c.is_control() && *c != '\x1b')
+        .take(max_chars)
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        "active".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 fn extract_identity_hint(body: &str) -> String {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
         for key in ["login", "username", "email", "name", "team", "id"] {
             if let Some(s) = v.get(key).and_then(|x| x.as_str())
                 && !s.is_empty()
             {
-                let safe: String = s.chars().take(32).collect();
+                let safe = sanitize_printable_hint(s, 32);
                 return format!("{key}={safe}");
             }
         }
@@ -541,8 +555,8 @@ fn verify_aws_sts(
             .split("<Arn>")
             .nth(1)
             .and_then(|s| s.split("</Arn>").next())
-            .unwrap_or("active-iam")
-            .to_string();
+            .map(|s| sanitize_printable_hint(s, 96))
+            .unwrap_or_else(|| "active-iam".to_string());
         LiveVerifyStatus::VerifiedLive {
             provider: "AWS-STS",
             identity_hint: arn,
@@ -565,10 +579,34 @@ fn verify_aws_sts(
 fn sanitize_reqwest_error(e: &reqwest::Error) -> String {
     let raw = e.to_string();
     let without_url = raw.split(" for url (").next().unwrap_or(&raw).trim();
-    if without_url.is_empty() {
+    let scrubbed: String = without_url
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(120)
+        .collect();
+    if scrubbed.is_empty() {
         "request failed".to_string()
     } else {
-        without_url.to_string()
+        scrubbed
+    }
+}
+
+fn token_matches_rule_hint(tok: &str, rule_id: &str) -> bool {
+    match rule_id {
+        "SMG-SEC-AWS" => tok.starts_with("AKIA") || tok.starts_with("ASIA"),
+        "SMG-SEC-GITHUB" => {
+            tok.starts_with("ghp_")
+                || tok.starts_with("gho_")
+                || tok.starts_with("ghu_")
+                || tok.starts_with("ghs_")
+                || tok.starts_with("github_pat_")
+        }
+        "SMG-SEC-STRIPE" => tok.starts_with("sk_live_") || tok.starts_with("rk_live_"),
+        "SMG-SEC-SLACK" => tok.starts_with("xox"),
+        "SMG-SEC-OPENAI" => tok.starts_with("sk-") && !tok.starts_with("sk-ant-"),
+        "SMG-SEC-ANTHROPIC" => tok.starts_with("sk-ant-"),
+        "SMG-SEC-GOOGLE" => tok.starts_with("AIza"),
+        _ => false,
     }
 }
 
@@ -645,16 +683,25 @@ pub fn run_live_secret_verification(
         } else {
             let content = file_cache.entry(f.file.clone()).or_insert_with(|| {
                 use std::io::Read;
-                let Ok(canon_root) = fs::canonicalize(repo_root) else {
+                let Ok(canon_target) = fs::canonicalize(repo_root) else {
                     return String::new();
                 };
-                let Ok(canon_file) = fs::canonicalize(repo_root.join(&f.file)) else {
-                    return String::new();
+                let (base_dir, candidate_file) = if canon_target.is_file() {
+                    let parent = canon_target
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| canon_target.clone());
+                    (parent, canon_target)
+                } else {
+                    let Ok(cf) = fs::canonicalize(repo_root.join(&f.file)) else {
+                        return String::new();
+                    };
+                    (canon_target, cf)
                 };
-                if !canon_file.starts_with(&canon_root) {
+                if !candidate_file.starts_with(&base_dir) {
                     return String::new();
                 }
-                let Ok(file) = fs::File::open(&canon_file) else {
+                let Ok(file) = fs::File::open(&candidate_file) else {
                     return String::new();
                 };
                 let mut buf = Vec::new();
@@ -665,7 +712,11 @@ pub fn run_live_secret_verification(
             let line_idx = f.line.saturating_sub(1);
             let line_str = lines.get(line_idx).copied().unwrap_or("");
             let toks = extract_tokens_from_line(line_str);
-            let tok = match toks.into_iter().next() {
+            let matched_by_rule = toks
+                .iter()
+                .find(|t| token_matches_rule_hint(t, &f.rule_id))
+                .cloned();
+            let tok = match matched_by_rule.or_else(|| toks.into_iter().next()) {
                 Some(t) => t,
                 None => {
                     if only_verified {
@@ -682,7 +733,11 @@ pub fn run_live_secret_verification(
             (tok, paired)
         };
 
-        let tok_hash = sha256_hex(raw_token.as_bytes());
+        let cache_material = match &paired_secret {
+            Some(ps) => format!("{raw_token}\0{ps}"),
+            None => raw_token.clone(),
+        };
+        let tok_hash = sha256_hex(cache_material.as_bytes());
         let status = if let Some(cached) = verdict_cache.get(&tok_hash) {
             cached.clone()
         } else {

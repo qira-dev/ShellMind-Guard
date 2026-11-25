@@ -393,15 +393,31 @@ fn multipart_boundary(cfg: &SqliAuditConfig) -> Option<String> {
 
 fn extract_multipart_name(head: &str) -> Option<String> {
     let low = head.to_ascii_lowercase();
-    let pos = low.find("name=\"")?;
-    let rest = &head[pos + "name=\"".len()..];
-    let end = rest.find('"')?;
-    let name = rest[..end].trim();
-    if name.is_empty() {
-        None
-    } else {
-        Some(name.to_string())
+    let mut search_from = 0usize;
+    while let Some(rel_pos) = low[search_from..].find("name=") {
+        let pos = search_from + rel_pos;
+        let prev_is_ident = pos > 0
+            && (low.as_bytes()[pos - 1].is_ascii_alphanumeric()
+                || low.as_bytes()[pos - 1] == b'_'
+                || low.as_bytes()[pos - 1] == b'-');
+        if prev_is_ident {
+            search_from = pos + 5;
+            continue;
+        }
+        let rest = head[pos + 5..].trim_start();
+        if let Some(quoted) = rest.strip_prefix('"') {
+            let end = quoted.find('"')?;
+            let name = quoted[..end].trim();
+            return (!name.is_empty()).then(|| name.to_string());
+        } else {
+            let end = rest
+                .find([';', '\r', '\n', ' ', '\t'])
+                .unwrap_or(rest.len());
+            let name = rest[..end].trim();
+            return (!name.is_empty()).then(|| name.to_string());
+        }
     }
+    None
 }
 
 /// Extracts non-file text field `(name, value)` pairs from a multipart/form-data body.
@@ -414,9 +430,9 @@ fn parse_multipart_fields(body: &str, boundary: &str) -> Vec<(String, String)> {
             continue;
         }
         let (head, val) = if let Some((h, v)) = trimmed.split_once("\r\n\r\n") {
-            (h, v.trim_end_matches("\r\n"))
+            (h, v.strip_suffix("\r\n").unwrap_or(v))
         } else if let Some((h, v)) = trimmed.split_once("\n\n") {
-            (h, v.trim_end_matches('\n'))
+            (h, v.strip_suffix('\n').unwrap_or(v))
         } else {
             continue;
         };
@@ -630,11 +646,12 @@ fn inject_value(cfg: &SqliAuditConfig, pref: &ParamRef, url_str: &str, value: &s
                 .push((pref.name.to_ascii_lowercase(), value.to_string()));
         }
         ParamLocation::Cookie => {
+            let safe_cookie_val = value.replace(';', "%3B");
             let rebuilt: Vec<String> = cookie_pairs(cfg)
                 .iter()
                 .map(|(k, v)| {
                     if k.eq_ignore_ascii_case(&pref.name) {
-                        format!("{k}={value}")
+                        format!("{k}={safe_cookie_val}")
                     } else {
                         format!("{k}={v}")
                     }
@@ -1181,6 +1198,7 @@ pub fn run_sqli_audit(cfg: &SqliAuditConfig) -> Result<SqliAuditReport> {
 
             // 4. UNION column-count detection (ORDER BY enumeration, detection-only)
             let mut columns: Option<usize> = None;
+            let mut k1_close_to_base = false;
             for k in 1..=UNION_MAX_COLUMNS {
                 let payload = if numeric {
                     format!("{orig_value} ORDER BY {k}")
@@ -1190,12 +1208,30 @@ pub fn run_sqli_audit(cfg: &SqliAuditConfig) -> Result<SqliAuditReport> {
                 match send_probe(&payload) {
                     Ok(resp) => {
                         probes_succeeded += 1;
+                        if matches!(resp.status, 429 | 413 | 414 | 503) {
+                            break;
+                        }
+                        if k == 1 {
+                            k1_close_to_base =
+                                resp.status == base.status && body_close(&resp, base);
+                            if !k1_close_to_base {
+                                break;
+                            }
+                        }
                         let broke = scan_error_signatures(&resp.body).is_some()
                             || resp.status != base.status
                             || body_diverges(&resp, base);
                         if broke {
-                            if k > 1 {
-                                columns = Some(k - 1);
+                            if k > 1 && k1_close_to_base {
+                                // Confirm break is deterministic rather than transient rate-limit
+                                if let Ok(confirm_resp) = send_probe(&payload)
+                                    && !matches!(confirm_resp.status, 429 | 503)
+                                    && (scan_error_signatures(&confirm_resp.body).is_some()
+                                        || confirm_resp.status != base.status
+                                        || body_diverges(&confirm_resp, base))
+                                {
+                                    columns = Some(k - 1);
+                                }
                             }
                             break;
                         }

@@ -41,7 +41,7 @@ public_routes = [
 custom_routes = []
 
 [scan]
-ignore_paths = ["node_modules", "target", "dist", "build", ".next", ".shellmind-guard"]
+ignore_paths = ["node_modules", "target", "dist", "build", ".next", ".shellmind-guard", "fixtures"]
 max_threads = 4
 max_file_bytes = 2097152
 

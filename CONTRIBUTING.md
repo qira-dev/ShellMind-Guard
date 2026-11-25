@@ -24,7 +24,7 @@ Thank you for contributing to **ShellMind Guard**! To keep the codebase fast, de
    - In `shellmind-guard ui` (`crates/smg-tui`), child `bwrap` output and internal logs must route to the bounded ring-buffer (`[L]` drawer), never corrupting the `ratatui` alternate screen.
 
 5. **Zero Self-Scan False Positives:**
-   - Running `shellmind-guard scan .` on the ShellMind Guard repository itself must always produce **0 findings** across all ShellMind Guard crates (`crates/*` and `src/*`).
+   - Running `smg scan src --ci` and `smg scan crates --ci` on the ShellMind Guard repository itself must always produce **0 findings** across all ShellMind Guard crates (`crates/*` and `src/*`; note `fixtures/` intentionally contains vulnerable test cases).
 
 ---
 
@@ -39,11 +39,12 @@ cargo fmt --all -- --check
 # 2. Run Clippy with all warnings treated as errors
 cargo clippy --workspace --all-targets -- -D warnings
 
-# 3. Run all unit & integration tests across all 6 crates
-cargo test --workspace
+# 3. Run all unit & integration tests across all 11 workspace crates
+SMG_ENFORCE_PRECISION_GATE=1 cargo test --workspace
 
 # 4. Dogfooding check: verify 0 false positives on ShellMind Guard crates
-cargo run --release -- scan .
+cargo run --release -- scan src --ci
+cargo run --release -- scan crates --ci
 ```
 
 ---

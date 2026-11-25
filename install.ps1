@@ -66,9 +66,7 @@ if (-not $FromSource) {
             throw [System.Security.SecurityException]"Checksum for $Asset not found in SHA256SUMS.txt"
         }
         $ExpectedHash = ($ExpectedLine -split "\s+")[0].ToUpperInvariant()
-        if ($ExpectedHash -notmatch '^[0-9A-F]{64}
-Write-Host "[ShellMind Guard] Installed 'smg' (and 'shellmind-guard' alias). Run 'smg' for TUI, 'smg scan .', or 'smg mcp'."
-) {
+        if ($ExpectedHash -notmatch '^[0-9A-F]{64}$') {
             throw [System.Security.SecurityException]"Malformed SHA256 digest in SHA256SUMS.txt for $Asset"
         }
         $ActualHash = (Get-FileHash -Path $ZipPath -Algorithm SHA256).Hash.ToUpperInvariant()

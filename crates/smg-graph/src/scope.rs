@@ -70,7 +70,14 @@ fn walk_scope(node: Node, src: &[u8], lang: Language, table: &mut FileScopeTable
 
     if matches!(
         kind,
-        "variable_declarator" | "assignment_expression" | "assignment" | "short_var_declaration"
+        "variable_declarator"
+            | "assignment_expression"
+            | "assignment"
+            | "short_var_declaration"
+            | "augmented_assignment_expression"
+            | "augmented_assignment"
+            | "compound_assignment_expr"
+            | "assignment_statement"
     ) {
         let lhs_node = node
             .child_by_field_name("name")
@@ -78,6 +85,19 @@ fn walk_scope(node: Node, src: &[u8], lang: Language, table: &mut FileScopeTable
         let rhs_node = node
             .child_by_field_name("value")
             .or_else(|| node.child_by_field_name("right"));
+
+        let is_compound_append = matches!(
+            kind,
+            "augmented_assignment_expression" | "augmented_assignment" | "compound_assignment_expr"
+        ) || {
+            let mut oc = node.walk();
+            node.children(&mut oc).any(|ch| {
+                !ch.is_named() && {
+                    let op = node_text(ch, src).trim();
+                    op != "=" && op != ":=" && op.ends_with('=')
+                }
+            })
+        };
 
         if let (Some(lhs), Some(rhs)) = (lhs_node, rhs_node) {
             let var_name = node_text(lhs, src)
@@ -89,7 +109,11 @@ fn walk_scope(node: Node, src: &[u8], lang: Language, table: &mut FileScopeTable
                 .trim()
                 .to_string();
             if !var_name.is_empty() {
-                update_binding_from_rhs(&var_name, rhs, src, lang, table);
+                if is_compound_append {
+                    update_compound_binding_from_rhs(&var_name, rhs, src, table);
+                } else {
+                    update_binding_from_rhs(&var_name, rhs, src, lang, table);
+                }
             }
         }
     }
@@ -164,7 +188,7 @@ fn update_binding_from_rhs(
         }
     }
 
-    let is_direct_xss_san = contains_xss_sanitizer_call(rhs, src)
+    let is_direct_xss_san = contains_xss_sanitizer_call_with_table(rhs, src, table, 0)
         || (table.xss_sanitized_vars.contains(rhs_txt) && !has_taint_source_expr(rhs_txt));
     if is_direct_xss_san
         && !has_direct_tainted_unsanitized_wrap(rhs_txt)
@@ -177,6 +201,41 @@ fn update_binding_from_rhs(
             .insert(var_name.to_string());
         table.xss_sanitized_vars.remove(var_name);
     }
+}
+
+fn update_compound_binding_from_rhs(
+    var_name: &str,
+    rhs: Node,
+    src: &[u8],
+    table: &mut FileScopeTable,
+) {
+    let rhs_txt = node_text(rhs, src).trim();
+    let rhs_safe = (contains_xss_sanitizer_call_with_table(rhs, src, table, 0)
+        || is_pure_string_literal_node(rhs)
+        || (table.xss_sanitized_vars.contains(rhs_txt) && !has_taint_source_expr(rhs_txt)))
+        && !has_direct_tainted_unsanitized_wrap(rhs_txt);
+    if !(table.xss_sanitized_vars.contains(var_name) && rhs_safe) {
+        table
+            .unsanitized_or_shadowed_vars
+            .insert(var_name.to_string());
+        table.xss_sanitized_vars.remove(var_name);
+    }
+}
+
+fn is_pure_string_literal_node(node: Node) -> bool {
+    if !matches!(
+        node.kind(),
+        "string" | "string_literal" | "raw_string_literal" | "interpreted_string_literal"
+    ) {
+        return false;
+    }
+    let mut c = node.walk();
+    !node.children(&mut c).any(|ch| {
+        matches!(
+            ch.kind(),
+            "template_substitution" | "interpolation" | "embedded_expression"
+        )
+    })
 }
 
 fn has_non_negated_xss_sanitizer(low: &str) -> bool {
@@ -202,21 +261,106 @@ fn has_non_negated_xss_sanitizer(low: &str) -> bool {
     false
 }
 
-fn contains_xss_sanitizer_call(node: Node, src: &[u8]) -> bool {
-    let k = node.kind();
-    if matches!(k, "call_expression" | "call")
-        && let Some(func) = node.child_by_field_name("function")
-    {
-        let ftxt = node_text(func, src).trim();
-        let full = node_text(node, src).trim();
-        if is_call_sanitizer_for(ftxt, full, TAINT_XSS)
-            || ftxt.to_ascii_lowercase().contains("dompurify")
-        {
-            return true;
-        }
+fn contains_xss_sanitizer_call_with_table(
+    node: Node,
+    src: &[u8],
+    table: &FileScopeTable,
+    depth: usize,
+) -> bool {
+    if depth >= MAX_AST_WALK_DEPTH {
+        return false;
     }
-    let low = node_text(node, src).to_ascii_lowercase();
-    has_non_negated_xss_sanitizer(&low)
+    let k = node.kind();
+    if matches!(
+        k,
+        "parenthesized_expression"
+            | "await_expression"
+            | "as_expression"
+            | "satisfies_expression"
+            | "non_null_expression"
+            | "type_assertion"
+    ) {
+        let mut c = node.walk();
+        let named: Vec<Node> = node.named_children(&mut c).collect();
+        if let Some(&inner) = named.first() {
+            return contains_xss_sanitizer_call_with_table(inner, src, table, depth + 1);
+        }
+        return false;
+    }
+    if k == "identifier" {
+        let ident = node_text(node, src).trim();
+        return table.xss_sanitized_vars.contains(ident);
+    }
+    if matches!(k, "ternary_expression" | "conditional_expression") {
+        if let (Some(cons), Some(alt)) = (
+            node.child_by_field_name("consequence"),
+            node.child_by_field_name("alternative"),
+        ) {
+            let c_san = contains_xss_sanitizer_call_with_table(cons, src, table, depth + 1);
+            let a_san = contains_xss_sanitizer_call_with_table(alt, src, table, depth + 1);
+            let c_ok = c_san || is_pure_string_literal_node(cons);
+            let a_ok = a_san || is_pure_string_literal_node(alt);
+            return c_ok && a_ok && (c_san || a_san);
+        }
+        let mut c = node.walk();
+        let named: Vec<Node> = node.named_children(&mut c).collect();
+        if named.len() == 3 {
+            // Python `true_expr if cond else false_expr`
+            let c_san = contains_xss_sanitizer_call_with_table(named[0], src, table, depth + 1);
+            let a_san = contains_xss_sanitizer_call_with_table(named[2], src, table, depth + 1);
+            let c_ok = c_san || is_pure_string_literal_node(named[0]);
+            let a_ok = a_san || is_pure_string_literal_node(named[2]);
+            return c_ok && a_ok && (c_san || a_san);
+        }
+        return false;
+    }
+    if matches!(k, "binary_expression" | "boolean_operator") {
+        let left = node.child_by_field_name("left");
+        let right = node.child_by_field_name("right");
+        if let (Some(l), Some(r)) = (left, right) {
+            let l_san = contains_xss_sanitizer_call_with_table(l, src, table, depth + 1);
+            let r_san = contains_xss_sanitizer_call_with_table(r, src, table, depth + 1);
+            let l_ok = l_san || is_pure_string_literal_node(l);
+            let r_ok = r_san || is_pure_string_literal_node(r);
+            return l_ok && r_ok && (l_san || r_san);
+        }
+        return false;
+    }
+    if k == "template_string" {
+        let mut c = node.walk();
+        let mut saw_san = false;
+        for ch in node.children(&mut c) {
+            if ch.kind() == "template_substitution" {
+                let mut sc = ch.walk();
+                let subs: Vec<Node> = ch.named_children(&mut sc).collect();
+                if subs.is_empty() {
+                    return false;
+                }
+                for sub in subs {
+                    let s_san = contains_xss_sanitizer_call_with_table(sub, src, table, depth + 1);
+                    if !s_san && !is_pure_string_literal_node(sub) {
+                        return false;
+                    }
+                    saw_san |= s_san;
+                }
+            }
+        }
+        return saw_san;
+    }
+    if matches!(k, "call_expression" | "call") {
+        if let Some(func) = node.child_by_field_name("function") {
+            let ftxt = node_text(func, src).trim();
+            let full = node_text(node, src).trim();
+            if is_call_sanitizer_for(ftxt, full, TAINT_XSS)
+                || ftxt.to_ascii_lowercase().contains("dompurify")
+            {
+                return true;
+            }
+        }
+        let low = node_text(node, src).to_ascii_lowercase();
+        return has_non_negated_xss_sanitizer(&low);
+    }
+    false
 }
 
 fn has_direct_tainted_unsanitized_wrap(rhs_txt: &str) -> bool {
@@ -236,7 +380,10 @@ pub fn is_safe_jsx_html_attribute(attr_text: &str, scope: &FileScopeTable) -> bo
         let expr = after.trim_end_matches('}').trim();
         if !expr.is_empty() {
             let expr_low = expr.to_ascii_lowercase();
-            if has_non_negated_xss_sanitizer(&expr_low)
+            let has_untrusted_branch_op =
+                expr.contains('?') || expr.contains("||") || expr.contains("&&");
+            if !has_untrusted_branch_op
+                && has_non_negated_xss_sanitizer(&expr_low)
                 && !has_direct_tainted_unsanitized_wrap(expr)
             {
                 return true;

@@ -386,31 +386,42 @@ pub fn run_http_audit(cfg: &HttpAuditConfig) -> Result<HttpAuditReport> {
         if cfg.spa {
             match crate::cdp_engine::CdpEngine::launch() {
                 Ok(engine) => match engine.session() {
-                    Ok(mut session) => match session.navigate_and_collect(&target_url, 800) {
-                        Ok(data) => {
-                            for f in data.dom_findings {
-                                let payload = f.sink.clone();
-                                let evidence =
-                                    format!("source '{}' flows into sink '{}'", f.source, f.sink);
-                                dedup_insert(
-                                    &mut passive,
-                                    DastFinding {
-                                        id: "SMG-DAST-DOMXSS-SRC-SINK".into(),
-                                        severity: "high".into(),
-                                        url: target_url.clone(),
-                                        param: None,
-                                        payload,
-                                        evidence,
-                                        proof: f.value,
-                                    },
-                                );
+                    Ok(mut session) => {
+                        if !cfg.headers.is_empty() {
+                            let _ = session.set_extra_headers(&cfg.headers);
+                        }
+                        match session.navigate_and_collect_with_scope(
+                            &target_url,
+                            800,
+                            cfg.allow_remote,
+                        ) {
+                            Ok(data) => {
+                                for f in data.dom_findings {
+                                    let payload = f.sink.clone();
+                                    let evidence = format!(
+                                        "source '{}' flows into sink '{}'",
+                                        f.source, f.sink
+                                    );
+                                    dedup_insert(
+                                        &mut passive,
+                                        DastFinding {
+                                            id: "SMG-DAST-DOMXSS-SRC-SINK".into(),
+                                            severity: "high".into(),
+                                            url: target_url.clone(),
+                                            param: None,
+                                            payload,
+                                            evidence,
+                                            proof: f.value,
+                                        },
+                                    );
+                                }
+                                spa_xhr_endpoints = data.xhr_urls;
                             }
-                            spa_xhr_endpoints = data.xhr_urls;
+                            Err(e) => {
+                                eprintln!("  smg http-audit: SPA render failed: {e}");
+                            }
                         }
-                        Err(e) => {
-                            eprintln!("  smg http-audit: SPA render failed: {e}");
-                        }
-                    },
+                    }
                     Err(e) => {
                         eprintln!("  smg http-audit: CDP session failed: {e}");
                     }

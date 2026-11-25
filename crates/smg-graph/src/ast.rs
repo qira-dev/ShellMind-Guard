@@ -444,13 +444,15 @@ pub fn parse_file_ast_with_hash(
             | ".trufflehog.yaml"
             | ".trufflehog.yml"
             | ".detect-secrets.cfg"
+            | ".semgrep.yml"
+            | ".semgrep.yaml"
     );
     let mut static_findings = if is_scanner_rule_cfg {
         Vec::new()
     } else {
         crate::secrets_config::scan_secrets_and_config(&file.rel_path, source)
     };
-    if !matches!(file.language, Language::Solidity | Language::Move) {
+    if !is_scanner_rule_cfg && !matches!(file.language, Language::Solidity | Language::Move) {
         static_findings.extend(crate::infra_dos::scan_infra_dos_crypto_and_queues(
             &file.rel_path,
             file.language,

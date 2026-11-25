@@ -137,9 +137,11 @@ pub fn start_oob_server(listen: SocketAddr, log_path: Option<PathBuf>) -> Result
     }
     let tcp_listener = TcpListener::bind(listen)
         .with_context(|| format!("failed to bind OOB TCP listener on {listen}"))?;
-    let udp_sock = UdpSocket::bind(listen)
-        .with_context(|| format!("failed to bind OOB UDP listener on {listen}"))?;
     let bound_addr = tcp_listener.local_addr()?;
+    let preferred_udp = SocketAddr::new(bound_addr.ip(), bound_addr.port());
+    let udp_sock = UdpSocket::bind(preferred_udp)
+        .or_else(|_| UdpSocket::bind(listen))
+        .with_context(|| format!("failed to bind OOB UDP listener on {listen}"))?;
     let udp_addr = udp_sock.local_addr()?;
     tcp_listener.set_nonblocking(true)?;
     udp_sock.set_nonblocking(true)?;
@@ -302,12 +304,24 @@ fn handle_tcp_callback(
                     .find_map(|kv| kv.strip_prefix("token=").map(|t| t.trim().to_string()))
             })
             .unwrap_or_default();
-        let hits: Vec<OobHit> = if token.len() < 12 {
+        let is_valid_token = token.len() >= 12
+            && token.len() <= 64
+            && token
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+        let hits: Vec<OobHit> = if !is_valid_token {
             Vec::new()
         } else {
             store
                 .matching(&token)
                 .into_iter()
+                .filter(|h| {
+                    if h.proto == "tcp" {
+                        h.path.contains(&token) || h.host.contains(&token)
+                    } else {
+                        h.payload.contains(&token)
+                    }
+                })
                 .take(MAX_CHECK_HITS_RETURNED)
                 .collect()
         };

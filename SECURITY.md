@@ -16,8 +16,8 @@ ShellMind Guard is designed to analyze untrusted or AI-generated codebases safel
 
 ### 1. Offline-First Static Mode (`shellmind-guard index` / `shellmind-guard scan`)
 - Static indexing and Guard-Set Lattice analysis operate **100% offline** by default with zero telemetry.
-- Dependency and lockfile auditing (`crates/smg-graph/src/deps.rs`) uses an embedded deterministic advisory table offline; outbound OSV advisory sync occurs **only** when explicitly requested via `shellmind-guard deps-sync` or `--online-osv`.
-- Live dynamic audit subcommands (`tls`, `idor`, `templates`, `oob`, `sqli`, `dast`, `proxy`, `http-audit`) are opt-in, enforce loopback-only by default (unless `--allow-remote` is explicitly passed), and unconditionally deny cloud metadata / link-local IMDS addresses (`169.254.169.254`, `fe80::/10`, etc.) on final resolved destinations.
+- Dependency and lockfile auditing (`crates/smg-graph/src/deps.rs`) uses an embedded deterministic advisory table plus the local SQLite advisory store offline; outbound OSV advisory sync occurs **only** when explicitly requested via `smg deps sync` (`shellmind-guard deps sync`) or `--online-osv`.
+- Live dynamic audit subcommands (`tls`, `idor`, `templates`, `oob`, `sqli`, `dast`, `proxy`, `http-audit`) are opt-in, enforce loopback/RFC1918 lab scope by default (unless `--allow-remote` is explicitly passed), pin validated DNS socket addresses against rebinding, and unconditionally deny cloud metadata / link-local IMDS addresses (`169.254.169.254`, `100.100.100.200`, `192.0.0.192`, `fe80::/10`, etc.).
 - The optional AI patch prompt builder (`crates/smg-ai`) is **disabled by default** and never transmits source code over the network unless explicitly invoked with `--patch` and an operator-configured provider.
 
 ### 2. OS-Isolated Bubblewrap Sandbox (`--boot-cmd`)

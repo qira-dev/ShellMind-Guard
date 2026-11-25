@@ -89,14 +89,35 @@ pub struct IdorAuditReport {
 /// - IPv6 link-local (`fe80::/10`), unspecified (`::`), AWS IPv6 IMDS (`fd00:ec2::254`),
 ///   and IPv4-mapped IPv6 encodings of forbidden IPv4 addresses.
 pub fn is_forbidden_metadata_or_special_ip(ip: IpAddr) -> bool {
+    let is_forbidden_v4 = |v4: std::net::Ipv4Addr| {
+        v4.is_link_local()
+            || v4.is_unspecified()
+            || v4.is_multicast()
+            || v4.is_broadcast()
+            || v4.octets() == [100, 100, 100, 200]
+            || v4.octets() == [192, 0, 0, 192]
+    };
     match ip {
-        IpAddr::V4(v4) => v4.is_link_local() || v4.is_unspecified(),
+        IpAddr::V4(v4) => is_forbidden_v4(v4),
         IpAddr::V6(v6) => {
             if let Some(mapped) = v6.to_ipv4_mapped() {
-                mapped.is_link_local() || mapped.is_unspecified()
+                is_forbidden_v4(mapped)
             } else {
                 let segs = v6.segments();
+                // RFC 6052 Well-Known Prefix 64:ff9b::/96 NAT64 embedded IPv4
+                if segs[0..6] == [0x0064, 0xff9b, 0, 0, 0, 0] {
+                    let embedded = std::net::Ipv4Addr::new(
+                        (segs[6] >> 8) as u8,
+                        (segs[6] & 0xff) as u8,
+                        (segs[7] >> 8) as u8,
+                        (segs[7] & 0xff) as u8,
+                    );
+                    if is_forbidden_v4(embedded) {
+                        return true;
+                    }
+                }
                 v6.is_unspecified()
+                    || v6.is_multicast()
                     || (segs[0] & 0xffc0) == 0xfe80
                     || segs == [0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254]
             }
@@ -277,6 +298,57 @@ pub fn validate_live_target_url(raw_url: &str, allow_remote: bool) -> Result<req
     Ok(parsed)
 }
 
+/// Resolves `raw_url` fail-closed and returns `(parsed_url, clean_dns_host_opt, pinned_addrs)`
+/// so live HTTP `reqwest::blocking::Client` builders can pin `.resolve_to_addrs(...)`
+/// and completely eliminate DNS-rebinding TOCTOU.
+pub fn resolve_and_pin_live_target_url(
+    raw_url: &str,
+    allow_remote: bool,
+) -> Result<(reqwest::Url, Option<String>, Vec<SocketAddr>)> {
+    let parsed = validate_live_target_url(raw_url, allow_remote)?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("Target URL is missing host"))?;
+    let clean = host.trim_matches(['[', ']']);
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    let addrs = resolve_and_validate_live_addrs(clean, port, allow_remote)?;
+    let dns_host = if clean.parse::<IpAddr>().is_ok() {
+        None
+    } else {
+        Some(clean.to_string())
+    };
+    Ok((parsed, dns_host, addrs))
+}
+
+fn looks_like_html_or_error_envelope(body: &str) -> bool {
+    let t = body.trim();
+    if t.is_empty() {
+        return true;
+    }
+    let low = t.to_ascii_lowercase();
+    if low.starts_with("<!doctype html") || low.starts_with("<html") {
+        return true;
+    }
+    if t.starts_with('{')
+        && let Ok(val) = serde_json::from_str::<serde_json::Value>(t)
+        && let Some(obj) = val.as_object()
+    {
+        if obj.get("ok").and_then(|v| v.as_bool()) == Some(false)
+            || obj.get("success").and_then(|v| v.as_bool()) == Some(false)
+        {
+            return true;
+        }
+        if obj.len() <= 3
+            && (obj.contains_key("error") || obj.contains_key("errors"))
+            && !obj.contains_key("data")
+            && !obj.contains_key("id")
+        {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn is_strictly_loopback_url(base_url: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(base_url) else {
         return false;
@@ -324,7 +396,8 @@ pub fn run_idor_audit_config_with_options(
     allow_remote: bool,
     allow_mutations: bool,
 ) -> Result<IdorAuditReport> {
-    let base_parsed = validate_live_target_url(&cfg.base_url, allow_remote)?;
+    let (base_parsed, pinned_host, pinned_addrs) =
+        resolve_and_pin_live_target_url(&cfg.base_url, allow_remote)?;
     if !matches!(base_parsed.scheme(), "http" | "https") {
         bail!("IDOR audit requires http:// or https:// base_url");
     }
@@ -344,12 +417,15 @@ pub fn run_idor_audit_config_with_options(
     }
 
     ensure_rustls_ring_provider();
-    let client = Client::builder()
+    let mut builder = Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(10))
         .redirect(Policy::none())
-        .user_agent(concat!("ShellMind-Guard/", env!("CARGO_PKG_VERSION")))
-        .build()?;
+        .user_agent(concat!("ShellMind-Guard/", env!("CARGO_PKG_VERSION")));
+    if let Some(ref host_name) = pinned_host {
+        builder = builder.resolve_to_addrs(host_name, &pinned_addrs);
+    }
+    let client = builder.build()?;
 
     let base = cfg.base_url.trim_end_matches('/');
     let mut outcomes = Vec::with_capacity(cfg.checks.len());
@@ -417,22 +493,20 @@ pub fn run_idor_audit_config_with_options(
         let (st_u, body_u) =
             send_with_headers(&client, method, &url, &HashMap::new(), chk.body.as_ref())?;
 
-        let owner_marker_present_a = chk
+        let configured_marker = chk
             .owner_marker
             .as_deref()
-            .filter(|m| !m.is_empty())
+            .map(str::trim)
+            .filter(|m| !m.is_empty());
+        let owner_marker_present_a = configured_marker
             .map(|m| body_a.contains(m))
-            .unwrap_or(true);
-        let marker_leaked_b = chk
-            .owner_marker
-            .as_deref()
-            .map(|m| !m.is_empty() && body_b.contains(m))
-            .unwrap_or(true);
-        let marker_leaked_u = chk
-            .owner_marker
-            .as_deref()
-            .map(|m| !m.is_empty() && body_u.contains(m))
-            .unwrap_or(true);
+            .unwrap_or_else(|| !looks_like_html_or_error_envelope(&body_a));
+        let marker_leaked_b = configured_marker
+            .map(|m| body_b.contains(m))
+            .unwrap_or_else(|| !looks_like_html_or_error_envelope(&body_b));
+        let marker_leaked_u = configured_marker
+            .map(|m| body_u.contains(m))
+            .unwrap_or_else(|| !looks_like_html_or_error_envelope(&body_u));
 
         let (verdict, detail) = if (200..300).contains(&st_u) && marker_leaked_u {
             failures += 1;

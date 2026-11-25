@@ -112,8 +112,11 @@ fn is_public_route(entry_route: &str, public_routes: &[String]) -> bool {
             return !has_privileged_seg
                 && (low == trimmed || low.starts_with(&format!("{trimmed}/")));
         }
+        let trimmed = pl.trim_end_matches('/');
         low == pl
-            || (!has_privileged_seg && low.starts_with(&format!("{}/", pl.trim_end_matches('/'))))
+            || (!trimmed.is_empty()
+                && !has_privileged_seg
+                && low.starts_with(&format!("{trimmed}/")))
     })
 }
 

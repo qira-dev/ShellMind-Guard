@@ -4468,6 +4468,7 @@ pub fn normalize_api_path(raw: &str) -> String {
     let mut segs: Vec<String> = Vec::new();
     for seg in without_query.split('/').filter(|s| !s.is_empty()) {
         if seg.starts_with(':')
+            || seg.starts_with('*')
             || (seg.starts_with('{') && seg.ends_with('}'))
             || (seg.starts_with('[') && seg.ends_with(']'))
             || seg.contains("${")

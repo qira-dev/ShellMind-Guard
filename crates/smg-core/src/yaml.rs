@@ -202,9 +202,9 @@ pub fn parse_structural_yaml_entries_with_offset(doc: &str, start_line: usize) -
     const MAX_MERGE_ALIASES_PER_LINE: usize = 32;
 
     let mut entries = Vec::new();
-    let mut anchors: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    let mut anchors: HashMap<String, Vec<(usize, String, String)>> = HashMap::new();
     let mut scalar_anchors: HashMap<String, String> = HashMap::new();
-    let mut current_anchor: Option<(String, usize)> = None;
+    let mut current_anchor: Option<(String, usize, Option<usize>)> = None;
 
     for (idx, raw_line) in doc.lines().enumerate() {
         if entries.len() >= MAX_YAML_ENTRIES {
@@ -222,7 +222,7 @@ pub fn parse_structural_yaml_entries_with_offset(doc: &str, start_line: usize) -
             .sum();
         let trimmed = line.trim();
 
-        if let Some((_, a_indent)) = &current_anchor
+        if let Some((_, a_indent, _)) = &current_anchor
             && indent <= *a_indent
         {
             current_anchor = None;
@@ -250,13 +250,17 @@ pub fn parse_structural_yaml_entries_with_offset(doc: &str, start_line: usize) -
                 let inline_scalar = parts.next().unwrap_or("").trim().to_string();
                 if !aname.is_empty() {
                     if inline_scalar.is_empty() {
-                        current_anchor = Some((aname, indent));
+                        anchors.remove(&aname);
+                        current_anchor = Some((aname, indent, None));
                         val.clear();
                     } else {
                         let clean_scalar = inline_scalar
                             .trim_matches(|c| c == '"' || c == '\'')
                             .to_string();
-                        scalar_anchors.insert(aname, clean_scalar.clone());
+                        if scalar_anchors.contains_key(&aname) || scalar_anchors.len() < MAX_ANCHORS
+                        {
+                            scalar_anchors.insert(aname, clean_scalar.clone());
+                        }
                         val = clean_scalar;
                     }
                 }
@@ -277,21 +281,25 @@ pub fn parse_structural_yaml_entries_with_offset(doc: &str, start_line: usize) -
                 if !alias_names.is_empty() {
                     for alias in alias_names.into_iter().take(MAX_MERGE_ALIASES_PER_LINE) {
                         if let Some(merged) = anchors.get(&alias).cloned() {
-                            for (mk, mv) in merged {
+                            for (rel_indent, mk, mv) in merged {
                                 if entries.len() >= MAX_YAML_ENTRIES {
                                     break;
                                 }
-                                if let Some((ref aname, a_indent)) = current_anchor
+                                let merged_indent = indent.saturating_add(rel_indent);
+                                if let Some((ref aname, a_indent, ref mut base_child)) =
+                                    current_anchor
                                     && indent > a_indent
                                     && (anchors.contains_key(aname) || anchors.len() < MAX_ANCHORS)
                                 {
+                                    let base = *base_child.get_or_insert(indent);
+                                    let child_rel = merged_indent.saturating_sub(base);
                                     let slot = anchors.entry(aname.clone()).or_default();
                                     if slot.len() < MAX_ANCHOR_ENTRIES {
-                                        slot.push((mk.clone(), mv.clone()));
+                                        slot.push((child_rel, mk.clone(), mv.clone()));
                                     }
                                 }
                                 entries.push(YamlEntry {
-                                    indent,
+                                    indent: merged_indent,
                                     line: ln,
                                     key: mk,
                                     value: mv,
@@ -312,12 +320,15 @@ pub fn parse_structural_yaml_entries_with_offset(doc: &str, start_line: usize) -
             }
 
             let clean_val = val.trim_matches(|c| c == '"' || c == '\'').to_string();
-            if let Some((ref aname, a_indent)) = current_anchor
+            if let Some((ref aname, a_indent, ref mut base_child)) = current_anchor
                 && indent > a_indent
+                && (anchors.contains_key(aname) || anchors.len() < MAX_ANCHORS)
             {
+                let base = *base_child.get_or_insert(indent);
+                let rel_indent = indent.saturating_sub(base);
                 let slot = anchors.entry(aname.clone()).or_default();
                 if slot.len() < MAX_ANCHOR_ENTRIES {
-                    slot.push((key.clone(), clean_val.clone()));
+                    slot.push((rel_indent, key.clone(), clean_val.clone()));
                 }
             }
 
@@ -418,5 +429,18 @@ mod tests {
                 .count(),
             3
         );
+
+        let nested = "x-sec: &sec\n  securityContext:\n    privileged: true\npod:\n  <<: *sec\n";
+        let nested_entries = parse_structural_yaml_entries(nested);
+        let merged_sc = nested_entries
+            .iter()
+            .rfind(|e| e.key == "securityContext")
+            .unwrap();
+        let merged_priv = nested_entries
+            .iter()
+            .rfind(|e| e.key == "privileged")
+            .unwrap();
+        assert_eq!(merged_sc.indent, 2);
+        assert_eq!(merged_priv.indent, 4);
     }
 }

@@ -47,8 +47,36 @@ fn input_re() -> &'static Regex {
 }
 
 fn attr_value(tag: &str, name: &str) -> Option<String> {
-    let re = Regex::new(&format!(r#"\b{name}\s*=\s*["']([^"']*)["']"#)).ok()?;
-    re.captures(tag).map(|c| c[1].to_string())
+    let low_tag = tag.to_ascii_lowercase();
+    let low_name = name.to_ascii_lowercase();
+    let mut from = 0usize;
+    while let Some(rel) = low_tag[from..].find(&low_name) {
+        let pos = from + rel;
+        let prev_is_ident = pos > 0
+            && (low_tag.as_bytes()[pos - 1].is_ascii_alphanumeric()
+                || matches!(low_tag.as_bytes()[pos - 1], b'_' | b'-' | b':'));
+        let after_idx = pos + low_name.len();
+        if prev_is_ident {
+            from = after_idx;
+            continue;
+        }
+        let rest = tag[after_idx..].trim_start();
+        let Some(after_eq) = rest.strip_prefix('=') else {
+            from = after_idx;
+            continue;
+        };
+        let val_rest = after_eq.trim_start();
+        if let Some(q) = val_rest.strip_prefix('"') {
+            let end = q.find('"')?;
+            return Some(q[..end].to_string());
+        }
+        if let Some(q) = val_rest.strip_prefix('\'') {
+            let end = q.find('\'')?;
+            return Some(q[..end].to_string());
+        }
+        from = after_idx;
+    }
+    None
 }
 
 fn js_path_re() -> &'static Regex {
@@ -566,11 +594,23 @@ fn active_findings_for_target(
     const XSS_PAYLOAD_B: &str = "smg'><img src=x onerror=alert(smgxss)>";
     let mut xss_payload: Option<String> = None;
     for payload in [XSS_PAYLOAD_A, XSS_PAYLOAD_B] {
-        if let Ok(resp) = send(payload)
-            && (resp.body.contains("<svg/onload=") || resp.body.contains("<img src=x onerror="))
-        {
-            xss_payload = Some(payload.to_string());
-            break;
+        if let Ok(resp) = send(payload) {
+            let ct = header_value(&resp.headers, "Content-Type")
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let nosniff = header_value(&resp.headers, "X-Content-Type-Options")
+                .unwrap_or_default()
+                .eq_ignore_ascii_case("nosniff");
+            let renders_markup = ct.contains("text/html")
+                || ct.contains("application/xhtml")
+                || ct.contains("image/svg")
+                || (ct.is_empty() && !nosniff);
+            if renders_markup
+                && (resp.body.contains("<svg/onload=") || resp.body.contains("<img src=x onerror="))
+            {
+                xss_payload = Some(payload.to_string());
+                break;
+            }
         }
     }
     if let Some(payload) = xss_payload {
@@ -802,10 +842,16 @@ pub fn run_dast_audit(cfg: &DastConfig) -> Result<DastReport> {
     let mut visited: HashSet<String> = HashSet::new();
     let mut pages: Vec<PageResponse> = Vec::new();
     let mut forms: Vec<(String, Form)> = Vec::new();
+    let mut queued: HashSet<String> = HashSet::new();
+    let max_queue_cap = cfg.max_pages.saturating_mul(8).max(64);
+    queued.insert(base.to_string());
     queue.push_back((base.to_string(), 0));
 
     while let Some((url, depth)) = queue.pop_front() {
-        if visited.contains(&url) || pages.len() >= cfg.max_pages {
+        if pages.len() >= cfg.max_pages {
+            break;
+        }
+        if visited.contains(&url) {
             continue;
         }
         visited.insert(url.clone());
@@ -822,12 +868,18 @@ pub fn run_dast_audit(cfg: &DastConfig) -> Result<DastReport> {
         }
         if depth < cfg.max_depth {
             for cap in link_re().captures_iter(&page.body) {
-                if let Some(next) = resolve_url(&base, &cap[1]) {
+                if let Some(next) = resolve_url(&base, &cap[1])
+                    && queued.len() < max_queue_cap
+                    && queued.insert(next.clone())
+                {
                     queue.push_back((next, depth + 1));
                 }
             }
             for cap in js_path_re().captures_iter(&page.body) {
-                if let Some(next) = resolve_url(&base, &cap[1]) {
+                if let Some(next) = resolve_url(&base, &cap[1])
+                    && queued.len() < max_queue_cap
+                    && queued.insert(next.clone())
+                {
                     queue.push_back((next, depth + 1));
                 }
             }
@@ -836,7 +888,7 @@ pub fn run_dast_audit(cfg: &DastConfig) -> Result<DastReport> {
         // SPA pass: render in headless Chrome, harvest client-side routes,
         // background XHR/Fetch endpoints, and DOM source-sink flows.
         if let Some((session, _engine)) = spa.as_mut() {
-            match session.navigate_and_collect(&url, SPA_SETTLE_MS) {
+            match session.navigate_and_collect_with_scope(&url, SPA_SETTLE_MS, cfg.allow_remote) {
                 Ok(data) => {
                     for f in data.dom_findings {
                         let payload = f.sink.clone();
@@ -857,12 +909,18 @@ pub fn run_dast_audit(cfg: &DastConfig) -> Result<DastReport> {
                     }
                     if depth < cfg.max_depth {
                         for cap in link_re().captures_iter(&data.rendered_html) {
-                            if let Some(next) = resolve_url(&base, &cap[1]) {
+                            if let Some(next) = resolve_url(&base, &cap[1])
+                                && queued.len() < max_queue_cap
+                                && queued.insert(next.clone())
+                            {
                                 queue.push_back((next, depth + 1));
                             }
                         }
                         for cap in js_path_re().captures_iter(&data.rendered_html) {
-                            if let Some(next) = resolve_url(&base, &cap[1]) {
+                            if let Some(next) = resolve_url(&base, &cap[1])
+                                && queued.len() < max_queue_cap
+                                && queued.insert(next.clone())
+                            {
                                 queue.push_back((next, depth + 1));
                             }
                         }
@@ -870,7 +928,10 @@ pub fn run_dast_audit(cfg: &DastConfig) -> Result<DastReport> {
                     // Background API endpoints behave like crawlable pages for
                     // the param-harvesting phase.
                     for xhr in data.xhr_urls {
-                        if let Some(next) = resolve_url(&base, &xhr) {
+                        if let Some(next) = resolve_url(&base, &xhr)
+                            && queued.len() < max_queue_cap
+                            && queued.insert(next.clone())
+                        {
                             queue.push_back((next, depth + 1));
                         }
                     }

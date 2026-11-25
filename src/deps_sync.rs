@@ -239,7 +239,14 @@ pub fn sync_osv_to_store(
     let mut consecutive_errors = 0usize;
     let mut batch: Vec<AdvisoryRecord> = Vec::new();
     const UPSERT_BATCH_SIZE: usize = 25;
-    for vuln_id in unique_ids.iter().take(2000) {
+    const MAX_OSV_VULN_FETCHES: usize = 5000;
+    if unique_ids.len() > MAX_OSV_VULN_FETCHES {
+        eprintln!(
+            "[SMG OSV] Warning: {} advisory IDs matched; capping detail fetch to first {MAX_OSV_VULN_FETCHES}.",
+            unique_ids.len()
+        );
+    }
+    for vuln_id in unique_ids.iter().take(MAX_OSV_VULN_FETCHES) {
         let vuln_url = append_endpoint_segments(&base_url, &["v1", "vulns", vuln_id])?;
         let resp = match client.get(vuln_url.clone()).send() {
             Ok(r) => r,

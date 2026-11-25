@@ -155,12 +155,14 @@ impl Language {
             "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => Some(Language::Cpp),
             "rb" | "rake" | "ru" => Some(Language::Ruby),
             "sh" | "bash" | "zsh" => Some(Language::Bash),
-            "tf" | "tfvars" => Some(Language::Hcl),
+            "tf" | "tfvars" | "hcl" => Some(Language::Hcl),
             "sql" => Some(Language::Sql),
             "sol" => Some(Language::Solidity),
             "move" => Some(Language::Move),
             "dockerfile" | "yml" | "yaml" | "toml" | "json" | "ini" | "cfg" | "conf"
-            | "properties" | "pem" | "crt" | "cer" | "key" => Some(Language::Config),
+            | "properties" | "pem" | "crt" | "cer" | "key" | "ld" | "lds" | "svd" => {
+                Some(Language::Config)
+            }
             _ => None,
         }
     }
@@ -257,16 +259,43 @@ fn is_skipped_test_filename(fname: &str) -> bool {
 
 static INCLUDE_TESTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+thread_local! {
+    static THREAD_INCLUDE_TESTS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+fn effective_include_tests() -> bool {
+    THREAD_INCLUDE_TESTS
+        .with(|c| c.get())
+        .unwrap_or_else(|| INCLUDE_TESTS.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+/// Runs `f` with a thread-scoped `include_tests` override that never bleeds to concurrent threads.
+pub fn with_include_tests<T>(enabled: bool, f: impl FnOnce() -> T) -> T {
+    struct Guard(Option<bool>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            THREAD_INCLUDE_TESTS.with(|c| c.set(self.0));
+        }
+    }
+    let prev = THREAD_INCLUDE_TESTS.with(|c| {
+        let p = c.get();
+        c.set(Some(enabled));
+        p
+    });
+    let _g = Guard(prev);
+    f()
+}
+
 /// Enables or disables scanning of test/mock/harness source paths (used by `--include-tests`
 /// for security benchmark / PoC repositories such as `DeFiVulnLabs`).
 pub fn set_include_tests(enabled: bool) {
-    INCLUDE_TESTS.store(enabled, std::sync::atomic::Ordering::Relaxed);
+    INCLUDE_TESTS.store(enabled, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// Identifies dedicated unit/integration test, mock, and formal-verification harness paths so
 /// scanners can suppress noisy non-secret findings while preserving secret/credential leak checks.
 pub fn is_test_source_path(rel_path: &str) -> bool {
-    if INCLUDE_TESTS.load(std::sync::atomic::Ordering::Relaxed) {
+    if effective_include_tests() {
         return false;
     }
     let low = rel_path.replace('\\', "/").to_ascii_lowercase();
@@ -341,6 +370,14 @@ fn should_visit_entry(
         if rel_norm.is_empty() {
             return true;
         }
+        let is_cargo_or_maven_target = name == "target"
+            && entry
+                .path()
+                .parent()
+                .is_some_and(|p| p.join("Cargo.toml").exists() || p.join("pom.xml").exists());
+        if is_cargo_or_maven_target {
+            return false;
+        }
         let parent_is_source_pkg = rel_norm
             .rsplit_once('/')
             .map(|(parent, _)| {
@@ -352,13 +389,10 @@ fn should_visit_entry(
                             | "pkg"
                             | "cmd"
                             | "lib"
-                            | "app"
                             | "controllers"
-                            | "services"
                             | "routes"
                             | "handlers"
                             | "domain"
-                            | "core"
                             | "models"
                     )
                 })
@@ -384,6 +418,22 @@ fn should_visit_entry(
     true
 }
 
+fn is_extra_sensitive_filename(low: &str) -> bool {
+    low == ".env"
+        || (low.starts_with(".env.")
+            && !matches!(
+                low,
+                ".env.example" | ".env.sample" | ".env.template" | ".env.dist"
+            ))
+        || low == ".envrc"
+        || low == ".npmrc"
+        || low.ends_with(".pem")
+        || low.ends_with(".key")
+        || low == "id_rsa"
+        || low == "id_ecdsa"
+        || low == "id_ed25519"
+}
+
 pub fn scan_repository(root: &Path, cfg: &ShellMindGuardConfig) -> Result<ScanSummary> {
     scan_repository_with_options(root, cfg, &ScanOptions::default())
 }
@@ -397,7 +447,7 @@ pub fn scan_repository_with_options(
     let canon_root = fs::canonicalize(root)?;
     let total_seen = AtomicUsize::new(0);
     let skipped = AtomicUsize::new(0);
-    let include_tests = INCLUDE_TESTS.load(Ordering::Relaxed);
+    let include_tests = effective_include_tests();
 
     let ignore_set: Vec<String> = cfg
         .scan
@@ -480,19 +530,7 @@ pub fn scan_repository_with_options(
             continue;
         }
         let low = entry.file_name().to_string_lossy().to_ascii_lowercase();
-        let is_high_val = low == ".env"
-            || (low.starts_with(".env.")
-                && !matches!(
-                    low.as_str(),
-                    ".env.example" | ".env.sample" | ".env.template" | ".env.dist"
-                ))
-            || low.ends_with(".pem")
-            || low.ends_with(".key")
-            || low.ends_with(".p12")
-            || low.ends_with(".pfx")
-            || low == "id_rsa"
-            || low == "id_ed25519";
-        if !is_high_val {
+        if !is_extra_sensitive_filename(&low) {
             continue;
         }
         let path = entry.path();
@@ -625,8 +663,16 @@ pub fn scan_repository_metadata_signature(
     root: &Path,
     cfg: &ShellMindGuardConfig,
 ) -> Result<Vec<(String, i64, u64)>> {
+    scan_repository_metadata_signature_with_options(root, cfg, &ScanOptions::default())
+}
+
+pub fn scan_repository_metadata_signature_with_options(
+    root: &Path,
+    cfg: &ShellMindGuardConfig,
+    opts: &ScanOptions,
+) -> Result<Vec<(String, i64, u64)>> {
     let canon_root = fs::canonicalize(root)?;
-    let include_tests = INCLUDE_TESTS.load(Ordering::Relaxed);
+    let include_tests = effective_include_tests();
     let ignore_set: Vec<String> = cfg
         .scan
         .ignore_paths
@@ -651,6 +697,7 @@ pub fn scan_repository_metadata_signature(
 
     let max_bytes = cfg.scan.max_file_bytes;
     let mut sig = Vec::new();
+    let mut seen_rel: std::collections::HashSet<String> = std::collections::HashSet::new();
     for entry in walker.flatten() {
         if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
             continue;
@@ -667,7 +714,7 @@ pub fn scan_repository_metadata_signature(
             && let Ok(meta) = fs::metadata(&canon_file)
         {
             let rel_norm = rel.to_string_lossy().replace('\\', "/");
-            if is_generated_file_path(&rel_norm) {
+            if !opts.include_generated && is_generated_file_path(&rel_norm) {
                 continue;
             }
             let size_bytes = meta.len();
@@ -685,9 +732,64 @@ pub fn scan_repository_metadata_signature(
                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                 .map(|d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
                 .unwrap_or(0);
-            sig.push((rel_norm, mtime_ns, size_bytes));
+            if seen_rel.insert(rel_norm.clone()) {
+                sig.push((rel_norm, mtime_ns, size_bytes));
+            }
         }
     }
+
+    const MAX_EXTRA_SENSITIVE_FILES: usize = 2048;
+    let root_for_sens = canon_root.clone();
+    let ignore_for_sens = ignore_set;
+    let sens_walker = WalkBuilder::new(&canon_root)
+        .hidden(false)
+        .follow_links(false)
+        .require_git(false)
+        .ignore(false)
+        .git_ignore(false)
+        .git_global(false)
+        .git_exclude(false)
+        .threads(1)
+        .filter_entry(move |entry| {
+            should_visit_entry(entry, &root_for_sens, &ignore_for_sens, include_tests)
+        })
+        .build();
+    let mut extra_sens = 0usize;
+    for entry in sens_walker.flatten() {
+        if extra_sens >= MAX_EXTRA_SENSITIVE_FILES {
+            break;
+        }
+        if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+            continue;
+        }
+        let low = entry.file_name().to_string_lossy().to_ascii_lowercase();
+        if !is_extra_sensitive_filename(&low) {
+            continue;
+        }
+        let path = entry.path();
+        if let Ok(rel) = path.strip_prefix(&canon_root)
+            && let Ok(canon_file) = fs::canonicalize(path)
+            && canon_file.starts_with(&canon_root)
+            && let Ok(meta) = fs::metadata(&canon_file)
+        {
+            let size_bytes = meta.len();
+            if size_bytes > max_bytes {
+                continue;
+            }
+            let rel_norm = rel.to_string_lossy().replace('\\', "/");
+            if seen_rel.insert(rel_norm.clone()) {
+                let mtime_ns = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
+                    .unwrap_or(0);
+                sig.push((rel_norm, mtime_ns, size_bytes));
+                extra_sens += 1;
+            }
+        }
+    }
+
     sig.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(sig)
 }

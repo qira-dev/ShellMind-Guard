@@ -311,6 +311,33 @@ pub fn parse_server_hello(buf: &[u8]) -> Option<ServerHelloSummary> {
     })
 }
 
+fn read_tls_record_bounded(stream: &mut TcpStream) -> Option<Vec<u8>> {
+    let mut buf = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 4096];
+    while buf.len() < 16_389 {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.len() >= 5 {
+                    if buf[0] != 0x16 {
+                        break;
+                    }
+                    let rec_len = u16::from_be_bytes([buf[3], buf[4]]) as usize;
+                    if buf.len() >= 5 + rec_len {
+                        break;
+                    }
+                }
+            }
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::Interrupted) => {
+                continue;
+            }
+            Err(_) => break,
+        }
+    }
+    if buf.is_empty() { None } else { Some(buf) }
+}
+
 fn probe_raw_tls(
     addr: &SocketAddr,
     host: &str,
@@ -324,9 +351,8 @@ fn probe_raw_tls(
     let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
     stream.write_all(&ch).ok()?;
-    let mut buf = [0u8; 4096];
-    let n = stream.read(&mut buf).ok()?;
-    parse_server_hello(&buf[..n])
+    let buf = read_tls_record_bounded(&mut stream)?;
+    parse_server_hello(&buf)
 }
 
 pub fn cipher_suite_name(code: u16) -> String {
@@ -374,7 +400,7 @@ pub fn run_tls_audit(target: &str) -> Result<TlsAuditReport> {
     let modern_ciphers: &[u16] = &[
         0x1301, 0x1302, 0x1303, 0xc02f, 0xc030, 0xc02b, 0xc02c, 0xcca8, 0xcca9, 0x002f, 0x0035,
     ];
-    let weak_ciphers: &[u16] = &[0x0004, 0x0005, 0xc011, 0x000a, 0x0000];
+    let weak_ciphers: &[u16] = &[0x0004, 0x0005, 0xc011, 0xc012, 0x000a];
     let classical_groups: &[u16] = &[0x001d, 0x0017, 0x0018];
     let pqc_groups: &[u16] = &[0x11ec, 0x11eb, 0x11ed];
 
@@ -469,6 +495,7 @@ pub fn run_tls_audit(target: &str) -> Result<TlsAuditReport> {
         true,
         pqc_groups,
     ) && sh.version == [0x03, 0x04]
+        && !sh.is_hello_retry_request
         && let Some(g) = sh.selected_group
         && matches!(g, 0x11eb..=0x11ed)
     {
@@ -486,12 +513,27 @@ pub fn run_tls_audit(target: &str) -> Result<TlsAuditReport> {
     }
 
     let (hsts_header, cert_chain_len) = inspect_https_headers_and_certs(&addr, &host);
-    if hsts_header.is_none() && !protocols_supported.is_empty() {
+    let hsts_disabled_or_missing = match hsts_header.as_deref() {
+        None => true,
+        Some(hv) => hv
+            .split(';')
+            .find_map(|d| {
+                d.trim()
+                    .to_ascii_lowercase()
+                    .strip_prefix("max-age=")
+                    .map(|v| v.trim().to_string())
+            })
+            .and_then(|v| v.parse::<u64>().ok())
+            .is_some_and(|secs| secs == 0),
+    };
+    if hsts_disabled_or_missing && !protocols_supported.is_empty() {
         findings.push(TlsFinding {
             id: "SMG-TLS-HSTS".into(),
             severity: "MEDIUM".into(),
-            title: "Missing `Strict-Transport-Security` (HSTS) response header".into(),
-            detail: format!("HTTPS response from {host}:{port} did not include HSTS."),
+            title: "Missing or zero `Strict-Transport-Security` (HSTS) response header".into(),
+            detail: format!(
+                "HTTPS response from {host}:{port} did not enforce a positive HSTS max-age."
+            ),
             remediation:
                 "Add `Strict-Transport-Security: max-age=31536000; includeSubDomains; preload`."
                     .into(),
@@ -559,6 +601,85 @@ impl rustls::client::danger::ServerCertVerifier for CertCollectorVerifier {
     }
 }
 
+/// Completes a TLS handshake and protocol/cipher/cert audit over an already-upgraded STARTTLS `TcpStream`.
+#[allow(dead_code)]
+pub fn audit_upgraded_starttls_stream(
+    target_label: &str,
+    host: &str,
+    port: u16,
+    mut sock: TcpStream,
+) -> Result<TlsAuditReport> {
+    crate::idor_audit::ensure_rustls_ring_provider();
+    let _ = sock.set_read_timeout(Some(IO_TIMEOUT));
+    let _ = sock.set_write_timeout(Some(IO_TIMEOUT));
+    let collector = Arc::new(CertCollectorVerifier {
+        chain_len: std::sync::Mutex::new(0),
+    });
+    let cfg = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(collector.clone())
+        .with_no_client_auth();
+    let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
+        .map_err(|_| anyhow::anyhow!("Invalid TLS SNI host '{host}'"))?;
+    let mut conn = rustls::ClientConnection::new(Arc::new(cfg), server_name)
+        .context("Failed initializing rustls client connection for STARTTLS")?;
+    while conn.is_handshaking() {
+        conn.complete_io(&mut sock)
+            .context("STARTTLS TLS handshake failed")?;
+    }
+
+    let mut protocols_supported = Vec::new();
+    let mut negotiated_tls13_cipher = None;
+    let mut negotiated_tls12_cipher = None;
+    let mut findings = Vec::new();
+
+    if let Some(proto) = conn.protocol_version() {
+        match proto {
+            rustls::ProtocolVersion::TLSv1_3 => {
+                protocols_supported.push("TLS 1.3".into());
+                if let Some(cs) = conn.negotiated_cipher_suite() {
+                    negotiated_tls13_cipher = Some(format!("{:?}", cs.suite()));
+                }
+            }
+            rustls::ProtocolVersion::TLSv1_2 => {
+                protocols_supported.push("TLS 1.2".into());
+                if let Some(cs) = conn.negotiated_cipher_suite() {
+                    negotiated_tls12_cipher = Some(format!("{:?}", cs.suite()));
+                }
+            }
+            other => {
+                let lbl = format!("{other:?}");
+                findings.push(TlsFinding {
+                    id: "SMG-TLS-LEGACY".into(),
+                    severity: "HIGH".into(),
+                    title: format!(
+                        "Deprecated STARTTLS protocol {lbl} negotiated on {host}:{port}"
+                    ),
+                    detail: format!("Upgraded STARTTLS session selected {lbl}"),
+                    remediation: "Enforce TLS 1.2+ (prefer TLS 1.3) on STARTTLS listeners.".into(),
+                });
+                protocols_supported.push(lbl);
+            }
+        }
+    }
+
+    let cert_chain_len = collector.chain_len.lock().map(|g| *g).unwrap_or(0);
+    Ok(TlsAuditReport {
+        target: target_label.to_string(),
+        host: host.to_string(),
+        port,
+        protocols_supported,
+        negotiated_tls13_cipher,
+        negotiated_tls12_cipher,
+        pqc_hybrid_supported: false,
+        pqc_group_negotiated: None,
+        weak_ciphers_accepted: false,
+        hsts_header: None,
+        cert_chain_len,
+        findings,
+    })
+}
+
 fn inspect_https_headers_and_certs(addr: &SocketAddr, host: &str) -> (Option<String>, usize) {
     crate::idor_audit::ensure_rustls_ring_provider();
     let collector = Arc::new(CertCollectorVerifier {
@@ -580,11 +701,28 @@ fn inspect_https_headers_and_certs(addr: &SocketAddr, host: &str) -> (Option<Str
     let _ = sock.set_read_timeout(Some(IO_TIMEOUT));
     let _ = sock.set_write_timeout(Some(IO_TIMEOUT));
     let mut tls = rustls::Stream::new(&mut conn, &mut sock);
-    let req = format!("HEAD / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    let host_hdr = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    let req = format!("HEAD / HTTP/1.1\r\nHost: {host_hdr}\r\nConnection: close\r\n\r\n");
     let _ = tls.write_all(req.as_bytes());
-    let mut resp = [0u8; 4096];
-    let n = tls.read(&mut resp).unwrap_or(0);
-    let text = String::from_utf8_lossy(&resp[..n]);
+    let mut resp = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 4096];
+    while resp.len() < 65_536 {
+        match tls.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                resp.extend_from_slice(&chunk[..n]);
+                if resp.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let text = String::from_utf8_lossy(&resp);
     let hsts = text.lines().find_map(|ln| {
         let (k, v) = ln.split_once(':')?;
         if k.trim().eq_ignore_ascii_case("strict-transport-security") {

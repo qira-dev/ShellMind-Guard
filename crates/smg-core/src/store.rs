@@ -37,17 +37,85 @@ pub fn cache_base_dir() -> PathBuf {
                 .or_else(|| std::env::var_os("USERPROFILE"))
                 .map(|h| std::path::PathBuf::from(h).join(".cache"))
         })
-        .unwrap_or_else(std::env::temp_dir)
+        .unwrap_or_else(temp_cache_fallback_dir)
 }
 
-#[cfg(unix)]
-fn set_private_mode(path: &Path, mode: u32) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
+fn temp_cache_fallback_dir() -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let uid_tag = fs::metadata("/proc/self")
+            .map(|m| m.uid().to_string())
+            .ok()
+            .or_else(|| std::env::var("UID").ok())
+            .or_else(|| std::env::var("USER").ok())
+            .unwrap_or_else(|| "local".to_string());
+        let safe_tag: String = uid_tag
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .collect();
+        std::env::temp_dir().join(format!("smg-cache-{}", safe_tag))
+    }
+    #[cfg(not(unix))]
+    {
+        std::env::temp_dir()
+    }
 }
 
-#[cfg(not(unix))]
-fn set_private_mode(_path: &Path, _mode: u32) {}
+pub(crate) fn ensure_private_dir(path: &Path) -> Result<()> {
+    let sys_tmp = std::env::temp_dir();
+    if path == sys_tmp {
+        return Ok(());
+    }
+    if let Ok(meta) = fs::symlink_metadata(path)
+        && meta.file_type().is_symlink()
+    {
+        anyhow::bail!(
+            "Refusing to use symlinked cache directory '{}'",
+            path.display()
+        );
+    }
+    fs::create_dir_all(path)?;
+    let meta = fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        anyhow::bail!("Cache path '{}' is not a real directory", path.display());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if let Ok(self_meta) = fs::metadata("/proc/self")
+            && meta.uid() != self_meta.uid()
+        {
+            anyhow::bail!(
+                "Refusing cache directory '{}' owned by uid {} (expected {})",
+                path.display(),
+                meta.uid(),
+                self_meta.uid()
+            );
+        }
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+pub(crate) fn set_private_file_mode(path: &Path) -> Result<()> {
+    let meta = fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() {
+        anyhow::bail!("Refusing symlinked cache file '{}'", path.display());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        for ext in ["-wal", "-shm"] {
+            let sidecar = PathBuf::from(format!("{}{}", path.display(), ext));
+            if sidecar.exists() {
+                let _ = fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o600));
+            }
+        }
+    }
+    Ok(())
+}
 
 pub struct StateStore {
     conn: Connection,
@@ -59,12 +127,16 @@ impl StateStore {
         let repo_key = blake3::hash(canon.to_string_lossy().as_bytes()).to_hex();
         let parent_dir = cache_base_dir().join("shellmind-guard");
         let smg_dir = parent_dir.join(&repo_key.as_str()[..16]);
-        fs::create_dir_all(&smg_dir)?;
-        set_private_mode(&parent_dir, 0o700);
-        set_private_mode(&smg_dir, 0o700);
+        ensure_private_dir(&parent_dir)?;
+        ensure_private_dir(&smg_dir)?;
         let db_path = smg_dir.join("state.db");
+        if let Ok(meta) = fs::symlink_metadata(&db_path)
+            && meta.file_type().is_symlink()
+        {
+            anyhow::bail!("Refusing symlinked state DB '{}'", db_path.display());
+        }
         let mut conn = Connection::open(&db_path)?;
-        set_private_mode(&db_path, 0o600);
+        set_private_file_mode(&db_path)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
 
         conn.execute_batch(

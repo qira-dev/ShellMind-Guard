@@ -944,30 +944,53 @@ pub fn execute_http_block(
     let follow = block.redirects.unwrap_or(false);
 
     if let Some(raws) = &block.raw {
-        if let Some(raw) = raws.to_vec().into_iter().next() {
+        let raw_list = raws.to_vec();
+        if raw_list.is_empty() {
+            return BlockOutcome::Skipped("raw block had no requests".into());
+        }
+        let mut last_resp: Option<HttpResponse> = None;
+        let mut last_err: Option<String> = None;
+        for raw in raw_list {
             let substituted = substitute(&raw, vars, extra);
             if has_unresolved_vars(&substituted) {
-                return BlockOutcome::Skipped(
-                    "raw request has unresolved template variables".into(),
-                );
+                last_err = Some("raw request has unresolved template variables".into());
+                continue;
             }
             let Some(parsed) = parse_raw_request(&substituted) else {
-                return BlockOutcome::Skipped("raw request could not be parsed".into());
+                last_err = Some("raw request could not be parsed".into());
+                continue;
             };
             let Ok(method) = reqwest::Method::from_bytes(parsed.method.as_bytes()) else {
-                return BlockOutcome::Skipped(format!("unsupported HTTP method {}", parsed.method));
+                last_err = Some(format!("unsupported HTTP method {}", parsed.method));
+                continue;
             };
             let url = build_url(&vars.base_url, &parsed.target);
             let mut headers = parsed.headers;
             if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("host")) {
                 headers.push(("Host".into(), vars.hostname.clone()));
             }
-            return match send_request(runners, &method, &url, &headers, &parsed.body, follow) {
-                Ok(resp) => BlockOutcome::Response(resp),
-                Err(e) => BlockOutcome::Skipped(format!("HTTP request failed: {e}")),
-            };
+            match send_request(runners, &method, &url, &headers, &parsed.body, follow) {
+                Ok(resp) => {
+                    if !block.matchers.is_empty()
+                        && evaluate_matchers(
+                            &block.matchers,
+                            block.matchers_condition.as_deref(),
+                            &resp,
+                            vars,
+                        )
+                        .matched
+                    {
+                        return BlockOutcome::Response(resp);
+                    }
+                    last_resp = Some(resp);
+                }
+                Err(e) => last_err = Some(format!("HTTP request failed: {e}")),
+            }
         }
-        return BlockOutcome::Skipped("raw block had no requests".into());
+        return match last_resp {
+            Some(r) => BlockOutcome::Response(r),
+            None => BlockOutcome::Skipped(last_err.unwrap_or_else(|| "raw block failed".into())),
+        };
     }
 
     let Some(paths) = &block.path else {
@@ -986,10 +1009,17 @@ pub fn execute_http_block(
             "method {method_name} not allowed in detection mode"
         ));
     }
-    if let Some(path) = paths.to_vec().into_iter().next() {
+    let path_list = paths.to_vec();
+    if path_list.is_empty() {
+        return BlockOutcome::Skipped("path block had no requests".into());
+    }
+    let mut last_resp: Option<HttpResponse> = None;
+    let mut last_err: Option<String> = None;
+    for path in path_list {
         let substituted = substitute(&path, vars, extra);
         if has_unresolved_vars(&substituted) {
-            return BlockOutcome::Skipped("path has unresolved template variables".into());
+            last_err = Some("path has unresolved template variables".into());
+            continue;
         }
         let url = build_url(&vars.base_url, &substituted);
         let mut headers = block_headers(block);
@@ -998,11 +1028,27 @@ pub fn execute_http_block(
         }
         let body = substitute(block.body.as_deref().unwrap_or_default(), vars, extra);
         match send_request(runners, &method, &url, &headers, &body, follow) {
-            Ok(resp) => return BlockOutcome::Response(resp),
-            Err(e) => return BlockOutcome::Skipped(format!("HTTP request failed: {e}")),
+            Ok(resp) => {
+                if !block.matchers.is_empty()
+                    && evaluate_matchers(
+                        &block.matchers,
+                        block.matchers_condition.as_deref(),
+                        &resp,
+                        vars,
+                    )
+                    .matched
+                {
+                    return BlockOutcome::Response(resp);
+                }
+                last_resp = Some(resp);
+            }
+            Err(e) => last_err = Some(format!("HTTP request failed: {e}")),
         }
     }
-    BlockOutcome::Skipped("path block had no requests".into())
+    match last_resp {
+        Some(r) => BlockOutcome::Response(r),
+        None => BlockOutcome::Skipped(last_err.unwrap_or_else(|| "path block failed".into())),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1193,6 +1239,7 @@ pub fn run_extractors(extractors: &[Extractor], resp: &HttpResponse) -> Vec<(Str
     let mut out = Vec::new();
     for ex in extractors {
         let name = ex.name.clone().unwrap_or_else(|| ex.kind.clone());
+        let target_text = part_text(resp, ex.part.as_deref());
         match ex.kind.as_str() {
             "regex" => {
                 for p in ex.regex.as_ref().map(|r| r.to_vec()).unwrap_or_default() {
@@ -1200,7 +1247,7 @@ pub fn run_extractors(extractors: &[Extractor], resp: &HttpResponse) -> Vec<(Str
                         .size_limit(256 * 1024)
                         .dfa_size_limit(256 * 1024)
                         .build()
-                        && let Some(cap) = re.captures(&resp.body)
+                        && let Some(cap) = re.captures(&target_text)
                         && let Some(v) = cap.get(1).or_else(|| cap.get(0))
                     {
                         out.push((name.clone(), v.as_str().to_string()));
@@ -1209,7 +1256,7 @@ pub fn run_extractors(extractors: &[Extractor], resp: &HttpResponse) -> Vec<(Str
             }
             "word" => {
                 for w in ex.words.as_ref().map(|r| r.to_vec()).unwrap_or_default() {
-                    if resp.body.contains(&w) {
+                    if target_text.contains(&w) {
                         out.push((name.clone(), w));
                     }
                 }
@@ -1792,8 +1839,10 @@ pub fn execute_ssl_block(
             .with_context(|| format!("ssl engine: TCP connect to {host_name}:{port}"))?;
         sock.set_read_timeout(Some(timeout))?;
         sock.set_write_timeout(Some(timeout))?;
-        // Certificate-inspection handshake (no application credentials/body sent).
-        let cfg = build_tls_client_config(true);
+        let is_lab = crate::idor_audit::is_lab_ip(addr.ip());
+        // Restrict insecure certificate acceptance to loopback/RFC1918 lab targets;
+        // enforce root-store validation on remote endpoints unless only reading peer certs.
+        let cfg = build_tls_client_config(is_lab);
         let server_name = block.sni.clone().unwrap_or_else(|| host_name.clone());
         let name = rustls::pki_types::ServerName::try_from(server_name)
             .map_err(|e| anyhow::anyhow!("ssl engine: invalid SNI/server name: {e}"))?;
@@ -2011,7 +2060,8 @@ pub fn execute_headless_block(
                 navigated = true;
             }
             "wait" => {
-                let secs = step.duration.unwrap_or(1.0).clamp(0.05, 10.0);
+                let raw_secs = step.duration.filter(|d| d.is_finite()).unwrap_or(1.0);
+                let secs = raw_secs.clamp(0.05, 10.0);
                 std::thread::sleep(Duration::from_secs_f64(secs));
             }
             _ => {} // unsupported actions are skipped (documented subset)
@@ -2109,6 +2159,24 @@ pub fn execute_file_block(block: &FileBlock, target: &str) -> Result<Vec<(String
     let root = Path::new(raw_path);
     if !root.exists() {
         return Ok(Vec::new());
+    }
+    if let Ok(smeta) = fs::symlink_metadata(root)
+        && smeta.file_type().is_symlink()
+    {
+        bail!("Refusing symlinked file-engine target '{}'", root.display());
+    }
+    let canon_root = fs::canonicalize(root)
+        .with_context(|| format!("Failed canonicalizing file target '{}'", root.display()))?;
+    const SENSITIVE_SYSTEM_PREFIXES: &[&str] = &["/etc", "/proc", "/sys", "/dev", "/root", "/boot"];
+    let root_str = canon_root.to_string_lossy();
+    if SENSITIVE_SYSTEM_PREFIXES
+        .iter()
+        .any(|p| root_str == *p || root_str.starts_with(&format!("{p}/")))
+    {
+        bail!(
+            "Refusing system directory '{}' in template `file:` engine",
+            canon_root.display()
+        );
     }
     const MAX_FILES: usize = 256;
     const MAX_FILE_BYTES: u64 = 512 * 1024;
@@ -2418,7 +2486,9 @@ pub fn run_template_audit(cfg: &TemplateRunConfig) -> Result<TemplateRunReport> 
             extra.insert(k.clone(), val);
         }
         let mut oob_token: Option<String> = None;
-        if let Some(oob) = &oob_client {
+        if loaded.uses_oob
+            && let Some(oob) = &oob_client
+        {
             let token = oob.token_for_target(&id, &cfg.target);
             extra.insert("interactsh-url".into(), oob.url_for(&id, &cfg.target));
             extra.insert("interactsh-host".into(), oob.host.clone());
@@ -2523,6 +2593,20 @@ pub fn run_template_audit(cfg: &TemplateRunConfig) -> Result<TemplateRunReport> 
         }
 
         for block in &tpl.dns {
+            if !cfg.allow_remote {
+                let target_host = vars.fqdn.to_ascii_lowercase();
+                let is_local_dns = target_host == "localhost"
+                    || target_host.ends_with(".local")
+                    || target_host
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(crate::idor_audit::is_lab_ip);
+                if !is_local_dns {
+                    block_skips.push(
+                        "dns block skipped without --allow-remote on non-lab hostname".into(),
+                    );
+                    continue;
+                }
+            }
             match execute_dns_block(block, &vars, cfg.timeout, &id, &extra) {
                 DnsOutcome::Failed(reason) => block_skips.push(reason),
                 DnsOutcome::Records(records) => {
@@ -2557,21 +2641,15 @@ pub fn run_template_audit(cfg: &TemplateRunConfig) -> Result<TemplateRunReport> 
             }
         }
 
-        if !tpl.network.is_empty() {
-            match execute_network_block(
-                &tpl.network[0],
-                &vars,
-                cfg.timeout,
-                &extra,
-                cfg.allow_remote,
-            ) {
+        for net_block in &tpl.network {
+            match execute_network_block(net_block, &vars, cfg.timeout, &extra, cfg.allow_remote) {
                 Err(e) => block_skips.push(format!("network engine: {e}")),
                 Ok(responses) => {
                     for resp in responses {
                         executed += 1;
                         let result = evaluate_matchers(
-                            &tpl.network[0].matchers,
-                            tpl.network[0].matchers_condition.as_deref(),
+                            &net_block.matchers,
+                            net_block.matchers_condition.as_deref(),
                             &resp,
                             &vars,
                         );
@@ -2584,13 +2662,13 @@ pub fn run_template_audit(cfg: &TemplateRunConfig) -> Result<TemplateRunReport> 
                                 template_path: loaded.path.display().to_string(),
                                 url: format!("{}:{}", vars.host, vars.port),
                                 engine: "network".into(),
-                                matcher_types: tpl.network[0]
+                                matcher_types: net_block
                                     .matchers
                                     .iter()
                                     .map(|m| m.kind.clone())
                                     .collect(),
                                 evidence: result.evidence,
-                                extracted: run_extractors(&tpl.network[0].extractors, &resp),
+                                extracted: run_extractors(&net_block.extractors, &resp),
                             });
                         }
                     }
@@ -2599,7 +2677,7 @@ pub fn run_template_audit(cfg: &TemplateRunConfig) -> Result<TemplateRunReport> 
         }
 
         // ---- ssl: engine (TLS attribute matching) ----
-        if let Some(block) = tpl.ssl.first() {
+        for block in &tpl.ssl {
             match execute_ssl_block(block, &vars, &extra, cfg.timeout, cfg.allow_remote) {
                 Err(e) => block_skips.push(format!("ssl engine: {e}")),
                 Ok(responses) => {
@@ -2671,7 +2749,7 @@ pub fn run_template_audit(cfg: &TemplateRunConfig) -> Result<TemplateRunReport> 
         }
 
         // ---- headless: engine (rendered-DOM matching via CDP) ----
-        if let Some(block) = tpl.headless.first() {
+        for block in &tpl.headless {
             match execute_headless_block(
                 block,
                 &vars,

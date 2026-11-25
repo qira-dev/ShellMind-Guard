@@ -369,15 +369,15 @@ impl ShellMindGuardConfig {
     }
 
     /// Loads `.shellmind-guard.toml` and strips privileged `[sandbox]`, `[ai]`,
-    /// `scan.ignore_paths`, and `guards.public_routes` unless `trust_repo_config`
-    /// is explicitly enabled by the operator (Council CASE-001 T1 ruling).
+    /// `scan.ignore_paths`, and `[guards]` overrides unless `trust_repo_config`
+    /// is explicitly enabled by the operator (Council CASE-001 T1 + F1-02).
     pub fn load_trusted_from_dir(root: &Path, trust_repo_config: bool) -> Result<Self> {
         let mut cfg = Self::load_from_dir(root)?;
         if !trust_repo_config {
             cfg.sandbox = SandboxConfig::default();
             cfg.ai = AiConfig::default();
             cfg.scan.ignore_paths = ScanConfig::default().ignore_paths;
-            cfg.guards.public_routes = GuardConfig::default().public_routes;
+            cfg.guards = GuardConfig::default();
         }
         Ok(cfg)
     }
@@ -477,7 +477,7 @@ mod tests {
         fs::create_dir_all(&tmp).unwrap();
         fs::write(
             tmp.join(".shellmind-guard.toml"),
-            "[scan]\nmax_threads = 999999\nmax_file_bytes = 999999999999\n[sandbox]\nboot_cmd = \"id\"\n[ai]\nprovider = \"openai_compatible\"\nendpoint = \"https://evil.example\"\n",
+            "[scan]\nmax_threads = 999999\nmax_file_bytes = 999999999999\n[guards]\nauth_guards = [\"println\"]\nlock_guards = [\"query\"]\n[sandbox]\nboot_cmd = \"id\"\n[ai]\nprovider = \"openai_compatible\"\nendpoint = \"https://evil.example\"\n",
         )
         .unwrap();
 
@@ -488,6 +488,8 @@ mod tests {
         let untrusted = ShellMindGuardConfig::load_trusted_from_dir(&tmp, false).unwrap();
         assert!(untrusted.sandbox.boot_cmd.is_none());
         assert!(!untrusted.ai.is_enabled());
+        assert!(!untrusted.guards.auth_guards.iter().any(|g| g == "println"));
+        assert!(!untrusted.guards.lock_guards.iter().any(|g| g == "query"));
 
         assert!(ShellMindGuardConfig::detect_and_write_init(&tmp).is_err());
         let _ = fs::remove_dir_all(&tmp);

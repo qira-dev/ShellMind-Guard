@@ -199,14 +199,59 @@ fn parse_distro_version(raw: &str) -> Option<(u64, &str, &str)> {
     Some((epoch, upstream, rev))
 }
 
-fn cmp_distro_versions(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+fn normalize_alpine_prerelease(upstream: &str) -> String {
+    let mut out = String::with_capacity(upstream.len());
+    let bytes = upstream.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'_' {
+            let rest = &upstream[i + 1..];
+            let rest_low = rest.to_ascii_lowercase();
+            let is_apk_pre = ["alpha", "beta", "pre", "rc"].iter().any(|tag| {
+                rest_low
+                    .strip_prefix(tag)
+                    .is_some_and(|after| after.is_empty() || after.as_bytes()[0].is_ascii_digit())
+            });
+            if is_apk_pre {
+                out.push('~');
+                i += 1;
+                continue;
+            }
+        }
+        let ch = upstream[i..].chars().next().unwrap_or('_');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn cmp_distro_versions_for_eco(
+    canon_eco: Option<&str>,
+    a: &str,
+    b: &str,
+) -> Option<std::cmp::Ordering> {
     let (ea, ua, ra) = parse_distro_version(a)?;
     let (eb, ub, rb) = parse_distro_version(b)?;
-    Some(
-        ea.cmp(&eb)
-            .then_with(|| cmp_dpkg_fragment(ua, ub))
-            .then_with(|| cmp_dpkg_fragment(ra, rb)),
-    )
+    if canon_eco == Some("Alpine") {
+        let ua_norm = normalize_alpine_prerelease(ua);
+        let ub_norm = normalize_alpine_prerelease(ub);
+        Some(
+            ea.cmp(&eb)
+                .then_with(|| cmp_dpkg_fragment(&ua_norm, &ub_norm))
+                .then_with(|| cmp_dpkg_fragment(ra, rb)),
+        )
+    } else {
+        Some(
+            ea.cmp(&eb)
+                .then_with(|| cmp_dpkg_fragment(ua, ub))
+                .then_with(|| cmp_dpkg_fragment(ra, rb)),
+        )
+    }
+}
+
+#[allow(dead_code)]
+fn cmp_distro_versions(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    cmp_distro_versions_for_eco(None, a, b)
 }
 
 fn split_numeric_and_suffix(part: &str) -> Option<(u64, String)> {
@@ -226,13 +271,37 @@ fn split_numeric_and_suffix(part: &str) -> Option<(u64, String)> {
     Some((num, tail))
 }
 
+fn classify_dot_qualifier(part: &str) -> Option<Option<String>> {
+    let q = part.trim().to_ascii_lowercase();
+    if q.is_empty() {
+        return None;
+    }
+    if matches!(q.as_str(), "final" | "release" | "ga") {
+        return Some(None);
+    }
+    if q.starts_with("post") || q.starts_with("sp") {
+        return Some(Some(q));
+    }
+    if q.starts_with("dev")
+        || q.starts_with("alpha")
+        || q.starts_with("beta")
+        || q.starts_with("rc")
+        || q.starts_with("cr")
+        || q.starts_with("pre")
+        || split_alpha_num_ident(&q).is_some_and(|(p, _)| matches!(p, "a" | "b" | "c" | "m"))
+    {
+        return Some(Some(q));
+    }
+    None
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SemverKey {
     major: u64,
     minor: u64,
     patch: u64,
     fourth: u64,
-    /// `0` = pre-release (`-alpha`, `1.0.0rc1`, Go `vX.Y.Z-0.<ts>-<hash>`), `1` = normal release, `2` = PEP 440 post-release (`post1`)
+    /// `0` = pre-release (`-alpha`, `1.0.0rc1`, `.dev1`, Go `vX.Y.Z-0.<ts>-<hash>`), `1` = normal release (`.Final`/`.RELEASE`), `2` = post-release (`post1`, `.SP1`)
     tier: u8,
     pre: String,
 }
@@ -255,28 +324,39 @@ fn parse_semver_key(raw: &str) -> Option<SemverKey> {
     }
     let mut parts = core.split('.');
     let major = parts.next()?.parse::<u64>().ok()?;
-    let (minor, minor_tail) = match parts.next() {
-        Some(p) => split_numeric_and_suffix(p)?,
-        None => (0, String::new()),
-    };
-    let (patch, patch_tail) = match parts.next() {
-        Some(p) => split_numeric_and_suffix(p)?,
-        None => (0, String::new()),
-    };
-    let (fourth, fourth_tail) = match parts.next() {
-        Some(p) => split_numeric_and_suffix(p)?,
-        None => (0, String::new()),
-    };
-    let mut pre_norm = prerelease.unwrap_or("").trim().to_ascii_lowercase();
-    if !fourth_tail.is_empty() && pre_norm.is_empty() {
-        pre_norm = fourth_tail;
-    } else if !patch_tail.is_empty() && pre_norm.is_empty() {
-        pre_norm = patch_tail;
-    } else if !minor_tail.is_empty() && pre_norm.is_empty() {
-        pre_norm = minor_tail;
+    let mut nums = [0u64; 3];
+    let mut dot_qual: Option<String> = None;
+    for (slot_idx, part) in parts.enumerate() {
+        if let Some((n, tail)) = split_numeric_and_suffix(part) {
+            if slot_idx < 3 {
+                nums[slot_idx] = n;
+            }
+            if !tail.is_empty()
+                && dot_qual.is_none()
+                && !matches!(tail.as_str(), "final" | "release" | "ga")
+            {
+                dot_qual = Some(tail);
+            }
+        } else {
+            let qual_opt = classify_dot_qualifier(part)?;
+            if let Some(q) = qual_opt
+                && dot_qual.is_none()
+            {
+                dot_qual = Some(q);
+            }
+        }
     }
-    // PEP 440 post-release (`post1`) sorts AFTER the release; Go `vX.Y.Z-0.<ts>-<hash>` is a pre-release (< vX.Y.Z).
-    let is_post_tag = pre_norm.starts_with("post");
+    let mut pre_norm = prerelease.unwrap_or("").trim().to_ascii_lowercase();
+    if matches!(pre_norm.as_str(), "final" | "release" | "ga") {
+        pre_norm.clear();
+    }
+    if pre_norm.is_empty()
+        && let Some(dq) = dot_qual
+    {
+        pre_norm = dq;
+    }
+    // PEP 440 post-release (`post1`) & Maven `.SP1` sort AFTER the release; Go `vX.Y.Z-0.<ts>-<hash>` is a pre-release (< vX.Y.Z).
+    let is_post_tag = pre_norm.starts_with("post") || pre_norm.starts_with("sp");
     let tier = if pre_norm.is_empty() {
         1
     } else if is_post_tag {
@@ -286,9 +366,9 @@ fn parse_semver_key(raw: &str) -> Option<SemverKey> {
     };
     Some(SemverKey {
         major,
-        minor,
-        patch,
-        fourth,
+        minor: nums[0],
+        patch: nums[1],
+        fourth: nums[2],
         tier,
         pre: pre_norm,
     })
@@ -303,6 +383,16 @@ fn split_alpha_num_ident(s: &str) -> Option<(&str, u64)> {
     Some((&s[..alpha_len], num))
 }
 
+fn prerelease_phase_rank(prefix: &str) -> Option<u8> {
+    match prefix {
+        "dev" => Some(0),
+        "a" | "alpha" => Some(1),
+        "b" | "beta" => Some(2),
+        "pre" | "c" | "cr" | "rc" | "m" => Some(3),
+        _ => None,
+    }
+}
+
 fn cmp_prerelease_ident(a: &str, b: &str) -> std::cmp::Ordering {
     match (a.parse::<u64>(), b.parse::<u64>()) {
         (Ok(na), Ok(nb)) => na.cmp(&nb),
@@ -312,9 +402,27 @@ fn cmp_prerelease_ident(a: &str, b: &str) -> std::cmp::Ordering {
         (Err(_), Err(_)) => {
             if let (Some((pa, na)), Some((pb, nb))) =
                 (split_alpha_num_ident(a), split_alpha_num_ident(b))
-                && pa == pb
             {
-                return na.cmp(&nb);
+                if pa == pb {
+                    return na.cmp(&nb);
+                }
+                if let (Some(ra), Some(rb)) = (prerelease_phase_rank(pa), prerelease_phase_rank(pb))
+                    && ra != rb
+                {
+                    return ra.cmp(&rb);
+                }
+            }
+            let pa_word = a.bytes().take_while(|c| c.is_ascii_alphabetic()).count();
+            let pb_word = b.bytes().take_while(|c| c.is_ascii_alphabetic()).count();
+            if pa_word > 0
+                && pb_word > 0
+                && let (Some(ra), Some(rb)) = (
+                    prerelease_phase_rank(&a[..pa_word]),
+                    prerelease_phase_rank(&b[..pb_word]),
+                )
+                && ra != rb
+            {
+                return ra.cmp(&rb);
             }
             a.cmp(b)
         }
@@ -378,7 +486,7 @@ pub fn version_matches_range(
         }
         let intro_trimmed = introduced.trim();
         if !intro_trimmed.is_empty() && intro_trimmed != "0" {
-            let Some(ord) = cmp_distro_versions(installed, intro_trimmed) else {
+            let Some(ord) = cmp_distro_versions_for_eco(canon_eco, installed, intro_trimmed) else {
                 return false;
             };
             if ord == std::cmp::Ordering::Less {
@@ -387,7 +495,7 @@ pub fn version_matches_range(
         }
         let fixed_trimmed = fixed.trim();
         if !fixed_trimmed.is_empty() {
-            let Some(ord) = cmp_distro_versions(installed, fixed_trimmed) else {
+            let Some(ord) = cmp_distro_versions_for_eco(canon_eco, installed, fixed_trimmed) else {
                 return false;
             };
             if ord != std::cmp::Ordering::Less {
@@ -396,7 +504,7 @@ pub fn version_matches_range(
         }
         let last_trimmed = last_affected.trim();
         if !last_trimmed.is_empty() {
-            let Some(ord) = cmp_distro_versions(installed, last_trimmed) else {
+            let Some(ord) = cmp_distro_versions_for_eco(canon_eco, installed, last_trimmed) else {
                 return false;
             };
             if ord == std::cmp::Ordering::Greater {
@@ -505,8 +613,15 @@ impl AdvisoryStore {
             return Ok(Self { conn });
         }
 
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            crate::store::ensure_private_dir(parent)?;
+        }
+        if let Ok(meta) = fs::symlink_metadata(path)
+            && meta.file_type().is_symlink()
+        {
+            bail!("Refusing symlinked advisory DB '{}'", path.display());
         }
         let conn = Connection::open(path)
             .with_context(|| format!("Failed to open advisory DB '{}'", path.display()))?;
@@ -533,6 +648,7 @@ impl AdvisoryStore {
             CREATE INDEX IF NOT EXISTS idx_adv_eco_pkg ON advisories (ecosystem, package);
             ",
         )?;
+        crate::store::set_private_file_mode(path)?;
         Ok(Self { conn })
     }
 
@@ -544,6 +660,14 @@ impl AdvisoryStore {
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let mut upserted = 0usize;
+        let mut seen_pks: std::collections::HashSet<(
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+        )> = std::collections::HashSet::new();
         {
             let mut stmt = tx.prepare_cached(
                 "INSERT INTO advisories
@@ -561,6 +685,17 @@ impl AdvisoryStore {
                     .unwrap_or_else(|| rec.ecosystem.trim().to_string());
                 let pkg = normalize_package_name(&eco_key, &rec.package);
                 if rec.id.trim().is_empty() || pkg.is_empty() {
+                    continue;
+                }
+                let pk = (
+                    rec.id.trim().to_string(),
+                    eco_key.clone(),
+                    pkg.clone(),
+                    rec.introduced.trim().to_string(),
+                    rec.fixed.trim().to_string(),
+                    rec.last_affected.trim().to_string(),
+                );
+                if !seen_pks.insert(pk) {
                     continue;
                 }
                 stmt.execute(params![
@@ -783,7 +918,8 @@ fn cvss_vector_to_severity(vector: &str) -> Option<&'static str> {
         } else {
             (impact + exploitability).min(10.0)
         };
-        let score = (raw * 10.0).ceil() / 10.0;
+        let int_input = (raw * 100_000.0).round() as i64;
+        let score = ((int_input + 9_999) / 10_000) as f64 / 10.0;
         return Some(if score >= 9.0 {
             "CRITICAL"
         } else if score >= 7.0 {
@@ -793,6 +929,40 @@ fn cvss_vector_to_severity(vector: &str) -> Option<&'static str> {
         } else {
             "LOW"
         });
+    }
+    if vector.starts_with("CVSS:4.") {
+        let mut av = "N";
+        let mut at = "N";
+        let mut pr = "N";
+        let mut ui = "N";
+        let mut high_impact = false;
+        let mut any_impact = false;
+        for part in vector.split('/').skip(1) {
+            if let Some((k, v)) = part.split_once(':') {
+                match k {
+                    "AV" => av = v,
+                    "AT" => at = v,
+                    "PR" => pr = v,
+                    "UI" => ui = v,
+                    "VC" | "VI" | "VA" | "SC" | "SI" | "SA" => {
+                        if v == "H" {
+                            high_impact = true;
+                            any_impact = true;
+                        } else if v == "L" {
+                            any_impact = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if !any_impact {
+            return Some("LOW");
+        }
+        if high_impact && av == "N" && at == "N" && pr == "N" && ui == "N" {
+            return Some("CRITICAL");
+        }
+        return Some(if high_impact { "HIGH" } else { "MEDIUM" });
     }
     None
 }
@@ -810,6 +980,21 @@ pub fn parse_osv_value_into_records(val: &Value, timestamp: i64) -> Result<Vec<A
     };
 
     let mut out = Vec::new();
+    let mut seen_pks: std::collections::HashSet<(String, String, String, String, String, String)> =
+        std::collections::HashSet::new();
+    let mut push_unique = |rec: AdvisoryRecord| {
+        let pk = (
+            rec.id.clone(),
+            rec.ecosystem.clone(),
+            rec.package.clone(),
+            rec.introduced.clone(),
+            rec.fixed.clone(),
+            rec.last_affected.clone(),
+        );
+        if seen_pks.insert(pk) {
+            out.push(rec);
+        }
+    };
     for vuln in items {
         let Some(id) = vuln.get("id").and_then(Value::as_str) else {
             continue;
@@ -839,13 +1024,13 @@ pub fn parse_osv_value_into_records(val: &Value, timestamp: i64) -> Result<Vec<A
                 .get("ecosystem")
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            let Some(eco) = canonical_ecosystem(raw_eco) else {
+            let Some(eco) = canonical_ecosystem_key(raw_eco) else {
                 continue;
             };
             let Some(raw_pkg) = pkg_obj.get("name").and_then(Value::as_str) else {
                 continue;
             };
-            let pkg = normalize_package_name(eco, raw_pkg);
+            let pkg = normalize_package_name(&eco, raw_pkg);
 
             let mut extracted_any_range = false;
             if let Some(ranges) = aff.get("ranges").and_then(Value::as_array) {
@@ -861,9 +1046,9 @@ pub fn parse_osv_value_into_records(val: &Value, timestamp: i64) -> Result<Vec<A
                     for ev in events {
                         if let Some(intro) = ev.get("introduced").and_then(Value::as_str) {
                             if let Some(prev) = pending_intro.take() {
-                                out.push(AdvisoryRecord {
+                                push_unique(AdvisoryRecord {
                                     id: id.to_string(),
-                                    ecosystem: eco.to_string(),
+                                    ecosystem: eco.clone(),
                                     package: pkg.clone(),
                                     introduced: prev,
                                     fixed: String::new(),
@@ -878,9 +1063,9 @@ pub fn parse_osv_value_into_records(val: &Value, timestamp: i64) -> Result<Vec<A
                             pending_intro = Some(intro.to_string());
                         } else if let Some(fixed) = ev.get("fixed").and_then(Value::as_str) {
                             let intro = pending_intro.take().unwrap_or_else(|| "0".into());
-                            out.push(AdvisoryRecord {
+                            push_unique(AdvisoryRecord {
                                 id: id.to_string(),
-                                ecosystem: eco.to_string(),
+                                ecosystem: eco.clone(),
                                 package: pkg.clone(),
                                 introduced: intro,
                                 fixed: fixed.to_string(),
@@ -893,9 +1078,9 @@ pub fn parse_osv_value_into_records(val: &Value, timestamp: i64) -> Result<Vec<A
                             extracted_any_range = true;
                         } else if let Some(limit) = ev.get("limit").and_then(Value::as_str) {
                             let intro = pending_intro.take().unwrap_or_else(|| "0".into());
-                            out.push(AdvisoryRecord {
+                            push_unique(AdvisoryRecord {
                                 id: id.to_string(),
-                                ecosystem: eco.to_string(),
+                                ecosystem: eco.clone(),
                                 package: pkg.clone(),
                                 introduced: intro,
                                 fixed: limit.to_string(),
@@ -908,9 +1093,9 @@ pub fn parse_osv_value_into_records(val: &Value, timestamp: i64) -> Result<Vec<A
                             extracted_any_range = true;
                         } else if let Some(last) = ev.get("last_affected").and_then(Value::as_str) {
                             let intro = pending_intro.take().unwrap_or_else(|| "0".into());
-                            out.push(AdvisoryRecord {
+                            push_unique(AdvisoryRecord {
                                 id: id.to_string(),
-                                ecosystem: eco.to_string(),
+                                ecosystem: eco.clone(),
                                 package: pkg.clone(),
                                 introduced: intro,
                                 fixed: String::new(),
@@ -924,9 +1109,9 @@ pub fn parse_osv_value_into_records(val: &Value, timestamp: i64) -> Result<Vec<A
                         }
                     }
                     if let Some(unfixed_intro) = pending_intro.take() {
-                        out.push(AdvisoryRecord {
+                        push_unique(AdvisoryRecord {
                             id: id.to_string(),
-                            ecosystem: eco.to_string(),
+                            ecosystem: eco.clone(),
                             package: pkg.clone(),
                             introduced: unfixed_intro,
                             fixed: String::new(),
@@ -945,9 +1130,9 @@ pub fn parse_osv_value_into_records(val: &Value, timestamp: i64) -> Result<Vec<A
                 && let Some(versions) = aff.get("versions").and_then(Value::as_array)
             {
                 for ver in versions.iter().filter_map(Value::as_str) {
-                    out.push(AdvisoryRecord {
+                    push_unique(AdvisoryRecord {
                         id: id.to_string(),
-                        ecosystem: eco.to_string(),
+                        ecosystem: eco.clone(),
                         package: pkg.clone(),
                         introduced: ver.to_string(),
                         fixed: String::new(),
@@ -1190,6 +1375,53 @@ mod tests {
         assert!(version_matches_range(
             "NuGet", "1.2.3.4", "1.2.3.0", "1.2.3.5", ""
         ));
+        // F1-03: Maven .Final / .RELEASE and PEP 440 .devN / .postN
+        assert!(version_matches_range(
+            "Maven",
+            "4.1.99.Final",
+            "0",
+            "4.1.100.Final",
+            ""
+        ));
+        assert!(!version_matches_range(
+            "Maven",
+            "4.1.100.Final",
+            "0",
+            "4.1.100.Final",
+            ""
+        ));
+        assert!(version_matches_range(
+            "PyPI",
+            "2.1.0.dev1",
+            "0",
+            "2.1.0",
+            ""
+        ));
+        assert!(version_matches_range(
+            "PyPI",
+            "2.1.0",
+            "0",
+            "2.1.0.post1",
+            ""
+        ));
+        // F1-06: Alpine _rc1 pre-release sorts before release
+        assert!(version_matches_range(
+            "Alpine:v3.19",
+            "3.0.0_rc1-r0",
+            "0",
+            "3.0.0-r0",
+            ""
+        ));
+        // F1-01: Distro release stream suffix preserved on import + query
+        let deb_json = serde_json::json!({
+            "id": "DSA-5000-1",
+            "affected": [{
+                "package": { "ecosystem": "Debian:12", "name": "openssl" },
+                "ranges": [{ "type": "ECOSYSTEM", "events": [{ "introduced": "0" }, { "fixed": "3.0.11-1~deb12u2" }] }]
+            }]
+        });
+        let deb_recs = parse_osv_value_into_records(&deb_json, 1).unwrap();
+        assert_eq!(deb_recs[0].ecosystem, "Debian:12");
         assert_eq!(
             cvss_vector_to_severity("CVSS:3.1/AV:L/AC:H/PR:H/UI:R/S:U/C:H/I:H/A:H"),
             Some("MEDIUM")

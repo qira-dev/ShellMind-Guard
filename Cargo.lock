@@ -4107,7 +4107,7 @@ name = "smg-enterprise"
 version = "1.4.1"
 dependencies = [
  "anyhow",
- "base64 0.23.1",
+ "base64 0.22.1",
  "blake3",
  "hex",
  "reqwest",
@@ -4207,7 +4207,6 @@ dependencies = [
  "smg-graph",
  "tokio",
  "tokio-rustls",
- "tracing",
 ]
 
 [[package]]

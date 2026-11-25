@@ -253,6 +253,8 @@ struct CfgBuilder<'a> {
     cfg: &'a ShellMindGuardConfig,
     blocks: Vec<CfgBlock>,
     budget_exhausted: bool,
+    break_targets: Vec<usize>,
+    continue_targets: Vec<usize>,
 }
 
 impl<'a> CfgBuilder<'a> {
@@ -261,6 +263,8 @@ impl<'a> CfgBuilder<'a> {
             src,
             cfg,
             budget_exhausted: false,
+            break_targets: Vec::new(),
+            continue_targets: Vec::new(),
             blocks: vec![CfgBlock {
                 preds: Vec::new(),
                 succs: Vec::new(),
@@ -319,18 +323,68 @@ impl<'a> CfgBuilder<'a> {
             ) {
                 continue;
             }
-            // Skip Python docstrings
-            if sk == "expression_statement" {
+            // Skip Python docstrings and unwrap Rust expression statements wrapping control-flow expressions
+            let stmt = if sk == "expression_statement" {
                 let mut sc = stmt.walk();
                 let children: Vec<Node> = stmt.named_children(&mut sc).collect();
-                if children.len() == 1 && matches!(children[0].kind(), "string" | "string_literal")
-                {
-                    continue;
+                if children.len() == 1 {
+                    let ck = children[0].kind();
+                    if matches!(ck, "string" | "string_literal") {
+                        continue;
+                    }
+                    if matches!(
+                        ck,
+                        "if_expression"
+                            | "match_expression"
+                            | "loop_expression"
+                            | "while_expression"
+                            | "for_expression"
+                            | "break_expression"
+                            | "continue_expression"
+                            | "return_expression"
+                    ) {
+                        children[0]
+                    } else {
+                        stmt
+                    }
+                } else {
+                    stmt
                 }
-            }
+            } else {
+                stmt
+            };
+            let sk = stmt.kind();
+
             // Ignore nested inner function/closure declarations (analyzed as their own symbols)
             if is_uninvoked_closure_binding(stmt) {
                 continue;
+            }
+
+            if matches!(sk, "break_statement" | "break_expression" | "break")
+                && !self.break_targets.is_empty()
+            {
+                let has_label = stmt.child_by_field_name("label").is_some() || {
+                    let mut bc = stmt.walk();
+                    stmt.named_children(&mut bc)
+                        .any(|ch| ch.kind().contains("label"))
+                };
+                if has_label {
+                    let targets = self.break_targets.clone();
+                    for t in targets {
+                        self.link(cur_bb, t);
+                    }
+                } else if let Some(&target) = self.break_targets.last() {
+                    self.link(cur_bb, target);
+                }
+                return None;
+            }
+            if matches!(
+                sk,
+                "continue_statement" | "continue_expression" | "continue"
+            ) && let Some(&target) = self.continue_targets.last()
+            {
+                self.link(cur_bb, target);
+                return None;
             }
 
             if matches!(sk, "if_statement" | "if_expression" | "elif_clause") {
@@ -407,23 +461,9 @@ impl<'a> CfgBuilder<'a> {
 
     fn lower_if(&mut self, if_node: Node, pre_bb: usize, depth: usize) -> Option<usize> {
         let cond_node = if_node.child_by_field_name("condition");
-        let (cond_guards, cond_is_negated) = cond_node
-            .map(|c| {
-                let g = self
-                    .stmt_direct_guards(c)
-                    .union(self.early_cond_text_guards(if_node));
-                let c_txt = crate::ast::strip_comments(node_text(c, self.src));
-                let t = c_txt.trim_start().trim_start_matches('(').trim_start();
-                let neg = t.starts_with('!')
-                    || t.starts_with("not ")
-                    || t.contains("!= nil")
-                    || t.contains("== nil")
-                    || t.contains("== null")
-                    || t.contains("== false")
-                    || t.contains("=== false");
-                (g, neg)
-            })
-            .unwrap_or_else(|| (self.early_cond_text_guards(if_node), false));
+        let (true_guards, false_guards) = cond_node
+            .map(|c| self.eval_cond_guards(if_node, c))
+            .unwrap_or_else(|| (self.early_cond_text_guards(if_node), GuardBitset::EMPTY));
 
         let consequence = if_node
             .child_by_field_name("consequence")
@@ -433,13 +473,12 @@ impl<'a> CfgBuilder<'a> {
         let then_start = self.new_block()?;
         self.link(pre_bb, then_start);
         // Positive branch condition (`if (verifyJwt(req)) { sink(); }`, `if (idx < cap) { ... }`)
-        // grants condition guards inside `then_start` even when `else` does not abort.
-        if !cond_is_negated
-            && !cond_guards.is_empty()
+        // grants `true_guards` inside `then_start` even when `else` does not abort.
+        if !true_guards.is_empty()
             && let Some(tb) = self.blocks.get_mut(then_start)
         {
-            tb.pre_sink_guards = tb.pre_sink_guards.union(cond_guards);
-            tb.post_guards = tb.post_guards.union(cond_guards);
+            tb.pre_sink_guards = tb.pre_sink_guards.union(true_guards);
+            tb.post_guards = tb.post_guards.union(true_guards);
         }
         let then_end = if let Some(cons) = consequence {
             self.lower_block(cons, then_start, depth)
@@ -461,30 +500,29 @@ impl<'a> CfgBuilder<'a> {
             let else_start = self.new_block()?;
             else_start_idx = Some(else_start);
             self.link(pre_bb, else_start);
-            // Negated condition (`if (!verifyJwt(req)) { ... } else { sink(); }`) grants guard on `else_start`.
-            if cond_is_negated
-                && !cond_guards.is_empty()
+            // Negated condition (`if (!verifyJwt(req)) { ... } else { sink(); }`) grants `false_guards` on `else_start`.
+            if !false_guards.is_empty()
                 && let Some(eb) = self.blocks.get_mut(else_start)
             {
-                eb.pre_sink_guards = eb.pre_sink_guards.union(cond_guards);
-                eb.post_guards = eb.post_guards.union(cond_guards);
+                eb.pre_sink_guards = eb.pre_sink_guards.union(false_guards);
+                eb.post_guards = eb.post_guards.union(false_guards);
             }
             self.lower_block(alt, else_start, depth)
         } else {
             let fall_bb = self.new_block()?;
             self.link(pre_bb, fall_bb);
             if then_terminated
-                && cond_is_negated
+                && !false_guards.is_empty()
                 && let Some(b) = self.blocks.get_mut(fall_bb)
             {
-                // Only a NEGATED early-return guard (`if (!auth) return 401;`) grants the guard along the surviving fall-through path.
-                b.pre_sink_guards = b.pre_sink_guards.union(cond_guards);
-                b.post_guards = b.post_guards.union(cond_guards);
+                // Only guards proven when the condition is FALSE (`if (!auth) return 401;`) hold along `fall_bb`.
+                b.pre_sink_guards = b.pre_sink_guards.union(false_guards);
+                b.post_guards = b.post_guards.union(false_guards);
             }
             Some(fall_bb)
         };
 
-        // Mark abort exits on `if (ok) { ... } else { return 401; }` and propagate guard onto `then_start` only when condition is positive (!cond_is_negated).
+        // Mark abort exits on `if (ok) { ... } else { return 401; }` and propagate `true_guards` onto `then_start`.
         if else_end.is_none() {
             if let Some(es) = else_start_idx {
                 for b in &mut self.blocks[es..] {
@@ -494,11 +532,11 @@ impl<'a> CfgBuilder<'a> {
                 }
             }
             if !then_terminated
-                && !cond_is_negated
+                && !true_guards.is_empty()
                 && let Some(tb) = self.blocks.get_mut(then_start)
             {
-                tb.pre_sink_guards = tb.pre_sink_guards.union(cond_guards);
-                tb.post_guards = tb.post_guards.union(cond_guards);
+                tb.pre_sink_guards = tb.pre_sink_guards.union(true_guards);
+                tb.post_guards = tb.post_guards.union(true_guards);
             }
         }
 
@@ -564,9 +602,15 @@ impl<'a> CfgBuilder<'a> {
             return Some(pre_bb);
         }
 
+        let join = self.new_block()?;
+        self.break_targets.push(join);
         let mut surviving_ends = Vec::new();
+        let mut budget_failed = false;
         for arm in arm_nodes {
-            let arm_start = self.new_block()?;
+            let Some(arm_start) = self.new_block() else {
+                budget_failed = true;
+                break;
+            };
             self.link(pre_bb, arm_start);
             if let Some(end_bb) = self.lower_block(arm, arm_start, depth + 1) {
                 surviving_ends.push(end_bb);
@@ -578,20 +622,24 @@ impl<'a> CfgBuilder<'a> {
                 }
             }
         }
+        self.break_targets.pop();
+        if budget_failed {
+            return None;
+        }
         // If switch/match has no default/wildcard arm, an unmatched value bypasses all cases.
         if !has_default_arm {
             let bypass_bb = self.new_block()?;
             self.link(pre_bb, bypass_bb);
             surviving_ends.push(bypass_bb);
         }
-        if surviving_ends.is_empty() {
-            return None;
-        }
-        let join = self.new_block()?;
         for end_bb in surviving_ends {
             self.link(end_bb, join);
         }
-        Some(join)
+        if self.blocks[join].preds.is_empty() {
+            None
+        } else {
+            Some(join)
+        }
     }
 
     fn lower_try(&mut self, try_node: Node, pre_bb: usize, depth: usize) -> Option<usize> {
@@ -661,21 +709,292 @@ impl<'a> CfgBuilder<'a> {
 
     fn lower_loop(&mut self, loop_node: Node, pre_bb: usize, depth: usize) -> Option<usize> {
         let is_unconditional_loop = loop_node.kind() == "loop_expression";
+        let join = self.new_block()?;
         let body_start = self.new_block()?;
         self.link(pre_bb, body_start);
+        self.break_targets.push(join);
+        self.continue_targets.push(body_start);
         let body_end = self.lower_block(loop_node, body_start, depth + 1);
-        let join = self.new_block()?;
-        if let Some(be) = body_end {
-            self.link(be, join);
-        }
+        self.continue_targets.pop();
+        self.break_targets.pop();
+
         // Conditional `for`/`while` loops may execute 0 iterations, so guards inside the loop
         // body do not dominate statements after the loop unless verified before the loop.
         if !is_unconditional_loop {
+            if let Some(be) = body_end {
+                self.link(be, join);
+            }
             self.link(pre_bb, join);
-        } else if body_end.is_none() {
-            return None;
+        } else if let Some(be) = body_end {
+            // In a Rust `loop { ... }`, reaching the end of the body without `break` loops back;
+            // only explicit `break` edges reach `join`.
+            self.link(be, body_start);
         }
-        Some(join)
+        if self.blocks[join].preds.is_empty() {
+            None
+        } else {
+            Some(join)
+        }
+    }
+
+    fn eval_cond_guards(&self, if_node: Node, cond_node: Node) -> (GuardBitset, GuardBitset) {
+        let if_txt = crate::ast::strip_comments(node_text(if_node, self.src)).to_ascii_lowercase();
+        let body_aborts_401_403 = if_txt.contains("401")
+            || if_txt.contains("403")
+            || if_txt.contains("unauthoriz")
+            || if_txt.contains("statusunauthorized")
+            || if_txt.contains("errunauthorized");
+        let body_aborts_401 = if_txt.contains("401")
+            || if_txt.contains("statusunauthorized")
+            || if_txt.contains("errunauthorized");
+        let init_guards = if_node
+            .child_by_field_name("initializer")
+            .map(|init| self.stmt_direct_guards(init))
+            .unwrap_or(GuardBitset::EMPTY);
+        self.eval_cond_expr(
+            cond_node,
+            body_aborts_401_403,
+            body_aborts_401,
+            init_guards,
+            0,
+        )
+    }
+
+    fn eval_cond_expr(
+        &self,
+        node: Node,
+        body_aborts_401_403: bool,
+        body_aborts_401: bool,
+        init_guards: GuardBitset,
+        depth: usize,
+    ) -> (GuardBitset, GuardBitset) {
+        if depth >= 64 {
+            return (GuardBitset::EMPTY, GuardBitset::EMPTY);
+        }
+        let kind = node.kind();
+        if kind == "parenthesized_expression" {
+            let mut c = node.walk();
+            if let Some(inner) = node.named_children(&mut c).next() {
+                return self.eval_cond_expr(
+                    inner,
+                    body_aborts_401_403,
+                    body_aborts_401,
+                    init_guards,
+                    depth + 1,
+                );
+            }
+        }
+        if kind == "not_operator" || kind == "unary_expression" {
+            let raw = crate::ast::strip_comments(node_text(node, self.src));
+            let trimmed = raw.trim_start();
+            let is_not = kind == "not_operator"
+                || (trimmed.starts_with('!') && !trimmed.starts_with("!!"))
+                || trimmed.starts_with("not ")
+                || trimmed.starts_with("not(");
+            if is_not {
+                let inner_opt = node
+                    .child_by_field_name("argument")
+                    .or_else(|| node.child_by_field_name("operand"))
+                    .or_else(|| {
+                        let mut c = node.walk();
+                        node.named_children(&mut c).last()
+                    });
+                if let Some(inner) = inner_opt {
+                    let (tg, fg) = self.eval_cond_expr(
+                        inner,
+                        body_aborts_401_403,
+                        body_aborts_401,
+                        init_guards,
+                        depth + 1,
+                    );
+                    return (fg, tg);
+                }
+            } else if trimmed.starts_with("!!") {
+                let mut c = node.walk();
+                if let Some(inner) = node.named_children(&mut c).last() {
+                    return self.eval_cond_expr(
+                        inner,
+                        body_aborts_401_403,
+                        body_aborts_401,
+                        init_guards,
+                        depth + 1,
+                    );
+                }
+            }
+        }
+
+        if matches!(
+            kind,
+            "binary_expression" | "boolean_operator" | "logical_expression"
+        ) && let (Some(left), Some(right)) = (
+            node.child_by_field_name("left"),
+            node.child_by_field_name("right"),
+        ) {
+            let op_slice = &self.src[left.end_byte()..right.start_byte()];
+            let op = std::str::from_utf8(op_slice).unwrap_or("").trim();
+            if op == "&&" || op == "and" {
+                let (lt, lf) = self.eval_cond_expr(
+                    left,
+                    body_aborts_401_403,
+                    body_aborts_401,
+                    init_guards,
+                    depth + 1,
+                );
+                let (rt, rf) = self.eval_cond_expr(
+                    right,
+                    body_aborts_401_403,
+                    body_aborts_401,
+                    init_guards,
+                    depth + 1,
+                );
+                return (lt.union(rt), lf.intersect(rf));
+            }
+            if op == "||" || op == "or" {
+                let (lt, lf) = self.eval_cond_expr(
+                    left,
+                    body_aborts_401_403,
+                    body_aborts_401,
+                    init_guards,
+                    depth + 1,
+                );
+                let (rt, rf) = self.eval_cond_expr(
+                    right,
+                    body_aborts_401_403,
+                    body_aborts_401,
+                    init_guards,
+                    depth + 1,
+                );
+                return (lt.intersect(rt), lf.union(rf));
+            }
+        }
+
+        let leaf_guards = self
+            .stmt_direct_guards(node)
+            .union(init_guards)
+            .union(self.leaf_cond_text_guards(node, body_aborts_401_403, body_aborts_401));
+        if leaf_guards.is_empty() {
+            return (GuardBitset::EMPTY, GuardBitset::EMPTY);
+        }
+        if Self::is_leaf_negated(node, self.src) {
+            (GuardBitset::EMPTY, leaf_guards)
+        } else {
+            (leaf_guards, GuardBitset::EMPTY)
+        }
+    }
+
+    fn is_leaf_negated(node: Node, src: &[u8]) -> bool {
+        let raw = crate::ast::strip_comments(node_text(node, src));
+        let t = raw.trim().to_ascii_lowercase();
+        if t.is_empty() {
+            return false;
+        }
+        // Go error check `err != nil` (specifically on an `err` identifier, NOT `session != nil`)
+        if let Some((lhs, rhs)) = t.split_once("!=") {
+            let lhs_trim = lhs.trim();
+            let rhs_trim = rhs.trim().trim_start_matches('=').trim();
+            if rhs_trim == "nil" {
+                return lhs_trim == "err"
+                    || lhs_trim.ends_with("_err")
+                    || lhs_trim.ends_with(".err");
+            }
+            // Ownership/equality mismatch guard (`owner_id != user_id`, `a !== b`) -> guard holds on false branch
+            if rhs_trim != "null" && rhs_trim != "undefined" && rhs_trim != "none" {
+                return true;
+            }
+            return false;
+        }
+        // Explicit absence / failure / falsy checks -> guard holds on false (fallthrough) branch
+        t.contains("== nil")
+            || t.contains("== null")
+            || t.contains("=== null")
+            || t.contains("== undefined")
+            || t.contains("=== undefined")
+            || t.contains("== none")
+            || t.contains(" is none")
+            || t.contains("== false")
+            || t.contains("=== false")
+            || t.contains(" is false")
+            || t.contains(".is_none(")
+            || t.contains(".is_err(")
+            || t.contains(".is_empty(")
+            || ((t.starts_with('!') && !t.starts_with("!!") || t.starts_with("not "))
+                && !t.contains("&&")
+                && !t.contains("||")
+                && !t.contains(" and ")
+                && !t.contains(" or "))
+    }
+
+    fn leaf_cond_text_guards(
+        &self,
+        leaf: Node,
+        body_aborts_401_403: bool,
+        body_aborts_401: bool,
+    ) -> GuardBitset {
+        let leaf_raw = crate::ast::strip_comments(node_text(leaf, self.src));
+        let cond_head = leaf_raw.trim().to_ascii_lowercase();
+        let mut bits = GuardBitset::EMPTY;
+
+        let is_user_forbidden = body_aborts_401_403
+            && (cond_head.contains("req.user")
+                || cond_head.contains("session.user")
+                || cond_head.contains("current_user"));
+        let is_unauth_early_exit = body_aborts_401
+            && (cond_head.contains("req.user")
+                || cond_head.contains("req.session")
+                || cond_head.contains("req.auth")
+                || cond_head.contains("req.token")
+                || cond_head.contains("req.headers")
+                || cond_head.contains("req.cookies")
+                || cond_head.contains("session")
+                || cond_head.contains("sess")
+                || cond_head.contains("user")
+                || cond_head.contains("auth")
+                || cond_head.contains("token")
+                || cond_head.contains("claims")
+                || cond_head == "ok"
+                || cond_head.starts_with("err "));
+        if is_user_forbidden || is_unauth_early_exit {
+            bits.insert(GuardKind::Auth);
+        }
+        if (cond_head.contains("owner_id")
+            || cond_head.contains("ownerid")
+            || cond_head.contains("user_id")
+            || cond_head.contains("userid")
+            || cond_head.contains("tenant_id")
+            || cond_head.contains("org_id"))
+            && (cond_head.contains("==")
+                || cond_head.contains("===")
+                || cond_head.contains("!=")
+                || cond_head.contains("!=="))
+        {
+            bits.insert(GuardKind::OwnershipCheck);
+        }
+        if cond_head.contains("csrf") {
+            bits.insert(GuardKind::CsrfProtection);
+        }
+        if cond_head.contains("startswith(")
+            || cond_head.contains("starts_with(")
+            || cond_head.contains("hasprefix(")
+            || cond_head.contains("isallowedpath")
+        {
+            bits.insert(GuardKind::PathSanitizer);
+        }
+        if cond_head.contains("allowed_hosts")
+            || cond_head.contains("allowedhosts")
+            || cond_head.contains("is_private")
+            || cond_head.contains("is_loopback")
+        {
+            bits.insert(GuardKind::SsrfSanitizer);
+        }
+        if cond_head.contains("sizeof(")
+            || cond_head.contains(".len()")
+            || cond_head.contains(".length")
+            || cond_head.contains("checked_add")
+            || cond_head.contains("checked_mul")
+        {
+            bits.insert(GuardKind::MemoryBounds);
+        }
+        bits
     }
 
     fn early_cond_text_guards(&self, if_node: Node) -> GuardBitset {
