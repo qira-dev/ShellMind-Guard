@@ -22,7 +22,7 @@
 
 <br>
 
-<img src="assets/demo.svg" alt="ShellMind Guard v1.5.5 Terminal Demo" width="880">
+<img src="assets/demo.gif" alt="ShellMind Guard v1.5.5 Multi-Domain Real-World Benchmark Demo" width="900">
 
 </div>
 
