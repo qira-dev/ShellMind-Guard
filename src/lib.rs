@@ -364,7 +364,7 @@ struct ScanCmdArgs {
     #[arg(
         long,
         value_delimiter = ',',
-        help = "Suppress findings matching specific rule IDs (e.g. SMG-CFG-001,SMG-MOBILE-001)"
+        help = "Suppress findings matching specific rule IDs (e.g. SMG-CFG-CORS,SMG-MOB-TLS)"
     )]
     exclude_rule: Vec<String>,
     #[arg(
@@ -604,7 +604,7 @@ enum Commands {
     Rules {
         #[arg(
             long,
-            help = "Filter rules by layer (auth, race, idor, sqli, cmdi, secrets, config, deps, cicd, k8s, dos, zip, crypto, queue, engine, mobile, frontend, deep)"
+            help = "Filter rules by layer (auth, race, idor, sqli, cmdi, path, ssrf, xss, csrf, secrets, config, deps, frontend, engine, memory, mobile, deep, cicd, k8s, dos, zip, crypto, queue, api, ai, oauth, smuggle, state, hw, web3, pqc, dast)"
         )]
         layer: Option<String>,
         #[arg(long)]

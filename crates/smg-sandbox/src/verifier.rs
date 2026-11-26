@@ -634,6 +634,91 @@ pub fn dispatch_h2_single_packet_race_for_finding(
     )
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RaceLedgerVerdict {
+    NoLedgerTelemetry,
+    InvariantViolated(String),
+    SerializedSolvent(String),
+}
+
+fn classify_race_ledger_bodies(req_body: &str, ok_bodies: &[String]) -> RaceLedgerVerdict {
+    if ok_bodies.len() < 2 {
+        return RaceLedgerVerdict::NoLedgerTelemetry;
+    }
+    let req_delta: Option<i64> = serde_json::from_str::<serde_json::Value>(req_body)
+        .ok()
+        .and_then(|v| {
+            ["amount", "qty", "quantity", "delta", "value"]
+                .iter()
+                .find_map(|k| v.get(*k).and_then(|n| n.as_i64()))
+        });
+    let parsed: Vec<serde_json::Value> = ok_bodies
+        .iter()
+        .filter_map(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+        .collect();
+    if parsed.len() < 2 {
+        return RaceLedgerVerdict::NoLedgerTelemetry;
+    }
+
+    for &field in &[
+        "balance",
+        "remaining",
+        "credits",
+        "available",
+        "stock",
+        "quantity",
+    ] {
+        let vals: Vec<i64> = parsed
+            .iter()
+            .filter_map(|v| v.get(field).and_then(|n| n.as_i64()))
+            .collect();
+        if vals.len() != ok_bodies.len() {
+            continue;
+        }
+        if let Some(&min_val) = vals.iter().min()
+            && min_val < 0
+        {
+            return RaceLedgerVerdict::InvariantViolated(format!(
+                "state proof: overdraft {field}={min_val} (< 0)"
+            ));
+        }
+        if let Some(amt) = req_delta
+            && amt != 0
+        {
+            let distinct: HashSet<i64> = vals.iter().copied().collect();
+            if distinct.len() < vals.len() {
+                let lost = vals.len() - distinct.len();
+                if distinct.len() == 1 && amt > 0 {
+                    let post = vals[0];
+                    let total_req = (vals.len() as i64).saturating_mul(amt);
+                    return RaceLedgerVerdict::InvariantViolated(format!(
+                        "state proof: {}x amount={amt} mutations returned identical {field}={post} [{lost} lost updates, {total_req} total requested]",
+                        vals.len()
+                    ));
+                }
+                return RaceLedgerVerdict::InvariantViolated(format!(
+                    "state proof: {}x non-zero mutations produced only {} distinct `{field}` states [{lost} lost updates]",
+                    vals.len(),
+                    distinct.len()
+                ));
+            }
+            // All N responses carried distinct non-negative balances; check if they form a strictly
+            // serialized arithmetic step sequence (`step == |amt|`), meaning sufficient balance existed.
+            let step = amt.unsigned_abs();
+            let mut sorted = vals;
+            sorted.sort_unstable();
+            if step > 0 && sorted.windows(2).all(|w| w[1].abs_diff(w[0]) == step) {
+                return RaceLedgerVerdict::SerializedSolvent(format!(
+                    "serialized {field} steps {}..={}",
+                    sorted[0],
+                    sorted[sorted.len() - 1]
+                ));
+            }
+        }
+    }
+    RaceLedgerVerdict::NoLedgerTelemetry
+}
+
 pub async fn verify_concurrency_invariant_with_config(
     port: u16,
     finding: &LatticeFinding,
@@ -729,6 +814,7 @@ pub async fn verify_concurrency_invariant_with_config(
     let mut blocked = 0usize;
     let mut first_2xx_code: Option<u16> = None;
     let mut distinct_bodies: HashSet<String> = HashSet::new();
+    let mut ok_bodies: Vec<String> = Vec::new();
 
     while let Some(joined) = set.join_next().await {
         if let Ok(Some((code, resp_body, is_html))) = joined {
@@ -741,7 +827,8 @@ pub async fn verify_concurrency_invariant_with_config(
                 if first_2xx_code.is_none() {
                     first_2xx_code = Some(code);
                 }
-                distinct_bodies.insert(resp_body);
+                distinct_bodies.insert(resp_body.clone());
+                ok_bodies.push(resp_body);
             } else if code > 0 {
                 blocked += 1;
             }
@@ -750,6 +837,12 @@ pub async fn verify_concurrency_invariant_with_config(
 
     let pre_failed = failed_count.load(Ordering::SeqCst);
     let is_read_only_method = matches!(method, "GET" | "HEAD");
+    let ledger_verdict = classify_race_ledger_bodies(body, &ok_bodies);
+    let mock_tag = if cfg.mock_shims {
+        " [mock-shims active]"
+    } else {
+        ""
+    };
     let (status, evidence) = if pre_failed > 0 && valid_2xx == 0 && blocked == 0 {
         (
             VerificationStatus::SuspectUnverified,
@@ -758,20 +851,37 @@ pub async fn verify_concurrency_invariant_with_config(
                 pre_failed
             ),
         )
+    } else if matches!(ledger_verdict, RaceLedgerVerdict::SerializedSolvent(_)) {
+        let RaceLedgerVerdict::SerializedSolvent(detail) = ledger_verdict else {
+            unreachable!()
+        };
+        (
+            VerificationStatus::SuspectUnverified,
+            format!(
+                "Last-Byte Sync ({}x): {}/{} returned HTTP {} ({}; sufficient balance, double-spend not proven){}",
+                concurrency,
+                valid_2xx,
+                concurrency,
+                first_2xx_code.unwrap_or(200),
+                detail,
+                mock_tag
+            ),
+        )
     } else if valid_2xx >= 2 && (!is_read_only_method || distinct_bodies.len() >= 2) {
+        let state_note = match ledger_verdict {
+            RaceLedgerVerdict::InvariantViolated(note) => format!("; {note}"),
+            _ => String::new(),
+        };
         (
             VerificationStatus::Proven,
             format!(
-                "{}/{} concurrent requests returned HTTP {} (Last-Byte Sync, {} distinct bodies){}",
+                "{}/{} concurrent requests returned HTTP {} (Last-Byte Sync, {} distinct bodies{}){}",
                 valid_2xx,
                 concurrency,
                 first_2xx_code.unwrap_or(200),
                 distinct_bodies.len(),
-                if cfg.mock_shims {
-                    " [mock-shims active]"
-                } else {
-                    ""
-                }
+                state_note,
+                mock_tag
             ),
         )
     } else if valid_2xx >= 2 {
@@ -2407,6 +2517,7 @@ mod tests {
                             body
                         );
                         let _ = sock.write_all(resp.as_bytes()).await;
+                        let _ = sock.shutdown().await;
                     });
                 }
             }
@@ -2461,6 +2572,7 @@ mod tests {
                             body
                         );
                         let _ = sock.write_all(resp.as_bytes()).await;
+                        let _ = sock.shutdown().await;
                     });
                 }
             }
@@ -2680,6 +2792,7 @@ mod tests {
                             body
                         );
                         let _ = sock.write_all(resp.as_bytes()).await;
+                        let _ = sock.shutdown().await;
                     });
                 }
             }
@@ -2882,17 +2995,32 @@ mod tests {
                 };
                 tokio::spawn(async move {
                     let mut buf = [0u8; 2048];
-                    let _ = s.read(&mut buf).await;
+                    let mut total = 0usize;
+                    while total < buf.len() {
+                        match s.read(&mut buf[total..]).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                total += n;
+                                if String::from_utf8_lossy(&buf[..total]).ends_with('}') {
+                                    break;
+                                }
+                            }
+                        }
+                    }
                     if let Ok(mut db) = TcpStream::connect(("127.0.0.1", proxy_port)).await {
                         let _ = db
                             .write_all(b"UPDATE balances SET amount = amount - 10 WHERE id = 1")
                             .await;
+                        let _ = db.shutdown().await;
+                        let mut ack = [0u8; 16];
+                        let _ = db.read(&mut ack).await;
                     }
                     let _ = s
                         .write_all(
                             b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
                         )
                         .await;
+                    let _ = s.shutdown().await;
                 });
             }
         });
@@ -3180,5 +3308,45 @@ mod tests {
             "expected auto-wired PROVEN SMG-IDOR-001 from verify_route_fuzz_with_config, got: {:#?}",
             auto_hits
         );
+    }
+
+    #[test]
+    fn test_classify_race_ledger_bodies_distinguishes_lost_update_overdraft_and_solvent_serial() {
+        let req = r#"{"userId":"u1","amount":80}"#;
+
+        // 1. Lost-update race: 12 concurrent debits of 80 all read balance=90 and return balance=10
+        let lost_bodies = vec![r#"{"ok":true,"balance":10}"#.to_string(); 12];
+        match classify_race_ledger_bodies(req, &lost_bodies) {
+            RaceLedgerVerdict::InvariantViolated(msg) => {
+                assert!(msg.contains("12x amount=80"), "msg: {msg}");
+                assert!(msg.contains("balance=10"), "msg: {msg}");
+                assert!(msg.contains("11 lost updates"), "msg: {msg}");
+            }
+            other => panic!("expected InvariantViolated, got {other:?}"),
+        }
+
+        // 2. Negative balance overdraft
+        let overdraft = vec![
+            r#"{"ok":true,"balance":20}"#.to_string(),
+            r#"{"ok":true,"balance":-60}"#.to_string(),
+        ];
+        match classify_race_ledger_bodies(req, &overdraft) {
+            RaceLedgerVerdict::InvariantViolated(msg) => {
+                assert!(msg.contains("overdraft balance=-60"), "msg: {msg}");
+            }
+            other => panic!("expected overdraft InvariantViolated, got {other:?}"),
+        }
+
+        // 3. Solvent serialized execution (initial balance 1000 -> 920, 840, 760, 680) must NOT claim double-spend
+        let solvent = vec![
+            r#"{"ok":true,"balance":920}"#.to_string(),
+            r#"{"ok":true,"balance":840}"#.to_string(),
+            r#"{"ok":true,"balance":760}"#.to_string(),
+            r#"{"ok":true,"balance":680}"#.to_string(),
+        ];
+        assert!(matches!(
+            classify_race_ledger_bodies(req, &solvent),
+            RaceLedgerVerdict::SerializedSolvent(_)
+        ));
     }
 }

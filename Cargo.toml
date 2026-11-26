@@ -19,7 +19,7 @@ version = "1.5.5"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/qira-dev/ShellMind-Guard"
-description = "Deterministic multi-file AST Guard-Set Lattice & Bubblewrap PoC verifier for business-logic, auth, and payment race-condition bugs."
+description = "Compiler-grade polyglot security, business-logic, concurrency & frontier verifier (17 Tree-sitter ASTs + Move + SQL, HW, Web3 revm, PQC CBOM, TEE) with cross-OS sandbox proofs & stdio MCP."
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

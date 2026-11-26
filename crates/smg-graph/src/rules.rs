@@ -244,6 +244,56 @@ pub const RULE_CATALOG: &[RuleDoc] = &[
         remediation: "Roll payment keys immediately in provider dashboard and load exclusively from encrypted secret env vars.",
     },
     RuleDoc {
+        rule_id: "SMG-SEC-OPENAI",
+        layer: "secrets",
+        severity: "CRITICAL",
+        title: "Exposed OpenAI API secret key (`sk-...` / `sk-proj-...`)",
+        description: "Hardcoded OpenAI project or user API key detected in source or git commit history.",
+        vulnerable_example: "const OPENAI_KEY = 'sk-proj-...';",
+        fixed_example: "const OPENAI_KEY = process.env.OPENAI_API_KEY;",
+        remediation: "Revoke the exposed OpenAI key immediately and inject credentials via environment variables or a secret manager.",
+    },
+    RuleDoc {
+        rule_id: "SMG-SEC-ANTHROPIC",
+        layer: "secrets",
+        severity: "CRITICAL",
+        title: "Exposed Anthropic API secret key (`sk-ant-...`)",
+        description: "Hardcoded Anthropic Claude API key detected in source or git commit history.",
+        vulnerable_example: "const ANTHROPIC_KEY = 'sk-ant-api03-...';",
+        fixed_example: "const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;",
+        remediation: "Revoke the Anthropic key in the Anthropic Console and load it exclusively from runtime secret storage.",
+    },
+    RuleDoc {
+        rule_id: "SMG-SEC-GCP",
+        layer: "secrets",
+        severity: "CRITICAL",
+        title: "Exposed Google Cloud / Gemini API key (`AIza...`)",
+        description: "Hardcoded Google Cloud or Gemini `AIza...` API credential detected in git history or configuration.",
+        vulnerable_example: "const GCP_KEY = 'AIzaSy...';",
+        fixed_example: "const GCP_KEY = process.env.GOOGLE_API_KEY;",
+        remediation: "Rotate and restrict the API key in Google Cloud Console (API + IP/referrer scopes) and load from secret env vars.",
+    },
+    RuleDoc {
+        rule_id: "SMG-SEC-GOOGLE",
+        layer: "secrets",
+        severity: "CRITICAL",
+        title: "Exposed live-verified Google API credential (`AIza...`)",
+        description: "Hardcoded Google API credential detected and targeted by opt-in live provider verification.",
+        vulnerable_example: "const GOOGLE_API_KEY = 'AIzaSy...';",
+        fixed_example: "const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;",
+        remediation: "Revoke or restrict the Google API key in Google Cloud Console and move it to secret environment configuration.",
+    },
+    RuleDoc {
+        rule_id: "SMG-SEC-SLACK",
+        layer: "secrets",
+        severity: "CRITICAL",
+        title: "Exposed Slack bot, user, or app token (`xoxb-` / `xoxp-` / `xoxa-`)",
+        description: "Hardcoded Slack token detected in source or git commit history.",
+        vulnerable_example: "const SLACK_TOKEN = 'xoxb-...';",
+        fixed_example: "const SLACK_TOKEN = process.env.SLACK_BOT_TOKEN;",
+        remediation: "Revoke the Slack token in Slack App Management and inject workspace tokens from encrypted secret storage.",
+    },
+    RuleDoc {
         rule_id: "SMG-SEC-ENTROPY",
         layer: "secrets",
         severity: "HIGH",
@@ -252,6 +302,16 @@ pub const RULE_CATALOG: &[RuleDoc] = &[
         vulnerable_example: "const SECRET = 'xK9mZp4qR2wL8vN1tY5bC7dF0hJ3nQ==';",
         fixed_example: "const SECRET = process.env.APP_SECRET;",
         remediation: "Move secrets into runtime secret managers, ignore `.env*` in `.gitignore`, and rotate exposed credentials.",
+    },
+    RuleDoc {
+        rule_id: "SMG-SEC-CUSTOM",
+        layer: "secrets",
+        severity: "HIGH",
+        title: "Organization custom `.gitleaks.toml` secret pattern (`SMG-SEC-CUSTOM-<ID>`)",
+        description: "Secret literal matched a custom organization regex defined in `.gitleaks.toml` (`[[rules]]`).",
+        vulnerable_example: "const ACME_TOKEN = 'acme_live_9x8K2mPqR7vW4nZ1aB3cD5eF';",
+        fixed_example: "const ACME_TOKEN = process.env.ACME_LIVE_TOKEN;",
+        remediation: "Rotate the organization-specific token immediately and inject it via runtime secret storage.",
     },
     RuleDoc {
         rule_id: "SMG-CFG-JWT-LOGIC",
@@ -1254,6 +1314,16 @@ pub const RULE_CATALOG: &[RuleDoc] = &[
         remediation: "Clean D-Cache before DMA TX, invalidate D-Cache after DMA RX, or place DMA buffers in non-cacheable MPU/DTCM memory.",
     },
     RuleDoc {
+        rule_id: "SMG-HW-LINKER",
+        layer: "hw",
+        severity: "HIGH",
+        title: "Firmware linker script declares `rwx` (writable + executable) memory region violating W^X",
+        description: "GNU `.ld`/`.lds` `MEMORY` block grants simultaneous read, write, and execute (`rwx`) permissions to an SRAM/Flash region without negation, allowing DMA or stack/heap corruption to execute shellcode in place.",
+        vulnerable_example: "MEMORY {\n  SRAM (rwx) : ORIGIN = 0x20000000, LENGTH = 64K\n}",
+        fixed_example: "MEMORY {\n  FLASH (rx) : ORIGIN = 0x08000000, LENGTH = 256K\n  SRAM  (rw) : ORIGIN = 0x20000000, LENGTH = 64K\n}",
+        remediation: "Enforce W^X separation in linker scripts and MPU configuration: mark SRAM `rw` (non-executable) and Flash `rx` (read-only).",
+    },
+    RuleDoc {
         rule_id: "SMG-X509-WEAK-SIG",
         layer: "pqc",
         severity: "CRITICAL",
@@ -1432,6 +1502,16 @@ pub const RULE_CATALOG: &[RuleDoc] = &[
         vulnerable_example: "// HTTPS 200 response with no Strict-Transport-Security header",
         fixed_example: "Strict-Transport-Security: max-age=31536000; includeSubDomains",
         remediation: "Emit `Strict-Transport-Security: max-age=31536000; includeSubDomains` on all HTTPS responses.",
+    },
+    RuleDoc {
+        rule_id: "SMG-TLS-LEGACY",
+        layer: "pqc",
+        severity: "HIGH",
+        title: "Upgraded STARTTLS or TLS session negotiated legacy protocol version (< TLS 1.2)",
+        description: "Active STARTTLS/TLS audit completed a handshake using deprecated SSLv3, TLS 1.0, or TLS 1.1.",
+        vulnerable_example: "smtpd_tls_mandatory_protocols = !SSLv2, !SSLv3",
+        fixed_example: "smtpd_tls_mandatory_protocols = >=TLSv1.2",
+        remediation: "Restrict STARTTLS and TLS listeners strictly to TLS 1.2 and TLS 1.3.",
     },
     RuleDoc {
         rule_id: "SMG-BOOT-001",
@@ -1666,6 +1746,10 @@ pub fn find_rule_doc(id: &str) -> Option<&'static RuleDoc> {
         return RULE_CATALOG
             .iter()
             .find(|r| r.rule_id == "SMG-TLS-WEAK-CIPHER");
+    }
+    // Dynamic `.gitleaks.toml` custom rules (`SMG-SEC-CUSTOM-<ID>`) map to `SMG-SEC-CUSTOM`.
+    if q.starts_with("SMG-SEC-CUSTOM-") {
+        return RULE_CATALOG.iter().find(|r| r.rule_id == "SMG-SEC-CUSTOM");
     }
     // Numbered variant fallback ONLY: e.g. `SMG-RACE-002` -> `SMG-RACE-001` or `SMG-AUTH-002` -> `SMG-AUTH-001`.
     // Never cross-alias unrelated named sub-rules (e.g. `SMG-CFG-UNKNOWN` must NOT alias `SMG-CFG-COOKIE`).

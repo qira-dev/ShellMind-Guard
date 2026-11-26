@@ -99,54 +99,53 @@ impl WireDiffProxy {
 
         let task = tokio::spawn(async move {
             loop {
-                let Ok((mut client, _)) = listener.accept().await else {
+                let Ok((client, _)) = listener.accept().await else {
                     break;
                 };
                 let writes_conn = Arc::clone(&writes_srv);
                 tokio::spawn(async move {
-                    let Ok(mut upstream) = TcpStream::connect(("127.0.0.1", upstream_port)).await
+                    let Ok(upstream) = TcpStream::connect(("127.0.0.1", upstream_port)).await
                     else {
                         return;
                     };
-                    let (mut cr, mut cw) = client.split();
-                    let (mut ur, mut uw) = upstream.split();
+                    let (mut cr, mut cw) = client.into_split();
+                    let (mut ur, mut uw) = upstream.into_split();
 
-                    let mut c2u_buf = [0u8; 8192];
-                    let mut u2c_buf = [0u8; 8192];
-                    loop {
-                        tokio::select! {
-                            res = cr.read(&mut c2u_buf) => {
-                                match res {
-                                    Ok(0) | Err(_) => break,
-                                    Ok(n) => {
-                                        let payload = String::from_utf8_lossy(&c2u_buf[..n]).to_ascii_uppercase();
-                                        if payload.contains("INSERT ")
-                                            || payload.contains("UPDATE ")
-                                            || payload.contains("DELETE ")
-                                            || payload.contains("DECR")
-                                            || payload.contains("INCR")
-                                            || payload.contains("\r\nSET\r\n")
-                                        {
-                                            writes_conn.fetch_add(1, Ordering::SeqCst);
-                                        }
-                                        if uw.write_all(&c2u_buf[..n]).await.is_err() {
-                                            break;
-                                        }
-                                    }
-                                }
+                    let c2u = async move {
+                        let mut buf = [0u8; 8192];
+                        while let Ok(n) = cr.read(&mut buf).await {
+                            if n == 0 {
+                                break;
                             }
-                            res = ur.read(&mut u2c_buf) => {
-                                match res {
-                                    Ok(0) | Err(_) => break,
-                                    Ok(n) => {
-                                        if cw.write_all(&u2c_buf[..n]).await.is_err() {
-                                            break;
-                                        }
-                                    }
-                                }
+                            let payload = String::from_utf8_lossy(&buf[..n]).to_ascii_uppercase();
+                            if payload.contains("INSERT ")
+                                || payload.contains("UPDATE ")
+                                || payload.contains("DELETE ")
+                                || payload.contains("DECR")
+                                || payload.contains("INCR")
+                                || payload.contains("\r\nSET\r\n")
+                            {
+                                writes_conn.fetch_add(1, Ordering::SeqCst);
+                            }
+                            if uw.write_all(&buf[..n]).await.is_err() {
+                                break;
                             }
                         }
-                    }
+                        let _ = uw.shutdown().await;
+                    };
+                    let u2c = async move {
+                        let mut buf = [0u8; 8192];
+                        while let Ok(n) = ur.read(&mut buf).await {
+                            if n == 0 {
+                                break;
+                            }
+                            if cw.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                        let _ = cw.shutdown().await;
+                    };
+                    let _ = tokio::join!(c2u, u2c);
                 });
             }
         });
