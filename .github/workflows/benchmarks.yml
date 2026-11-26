@@ -1,0 +1,62 @@
+name: Benchmarks
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "scripts/run_benchmarks.sh"
+      - ".github/workflows/benchmarks.yml"
+    tags:
+      - "v*"
+  pull_request:
+    paths:
+      - "src/**"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "scripts/run_benchmarks.sh"
+      - ".github/workflows/benchmarks.yml"
+  schedule:
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  precision-and-latency-gate:
+    name: Precision, Scaling & Phase Latency Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+
+      - name: Validate benchmark runner syntax
+        run: bash -n scripts/run_benchmarks.sh
+
+      - name: Build optimized release binary
+        run: cargo build --release --locked
+
+      - name: Execute automated precision, scaling & phase-latency suite
+        run: bash scripts/run_benchmarks.sh
+
+      - name: Upload benchmark scorecard & JSON telemetry
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: smg-benchmark-telemetry-${{ github.sha }}
+          path: |
+            target/benchmarks/benchmark-report.md
+            target/benchmarks/benchmark-metrics.json
+          retention-days: 90

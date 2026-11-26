@@ -11,6 +11,7 @@
 *Traces cross-file taint and guard invariants via an $O(V + E)$ Guard-Set Lattice across 18 source languages & ecosystems + SQL migrations (**17 Tree-sitter AST grammars**: TypeScript, JavaScript, Go, Python, Rust, PHP, Java, C#, Kotlin, Swift, Dart, C, C++, Ruby, Bash/Shell, Terraform/HCL, and Solidity—plus Move's structural parser and `.sql` schema analysis)—alongside isolated Hardware/Firmware (`smg-hw`), Web3 + `revm` Concrete Oracle (`smg-web3`), Post-Quantum Crypto-Agility (`smg-pqc`), and Confidential TEE (`smg-enterprise`) verification—then proves exploitability inside an isolated Cross-OS sandbox (`Linux bwrap`, `macOS sandbox-exec`, `Windows WSL2/Job Object`) with zero AI API cost.*
 
 [![CI](https://github.com/qira-dev/ShellMind-Guard/actions/workflows/ci.yml/badge.svg)](https://github.com/qira-dev/ShellMind-Guard/actions/workflows/ci.yml)
+[![Benchmarks](https://github.com/qira-dev/ShellMind-Guard/actions/workflows/benchmarks.yml/badge.svg)](https://github.com/qira-dev/ShellMind-Guard/actions/workflows/benchmarks.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Rust Edition](https://img.shields.io/badge/Rust-2024_Edition-orange.svg)](Cargo.toml)
 [![Sandbox](https://img.shields.io/badge/Sandbox-Linux_bwrap_%7C_macOS_Seatbelt_%7C_Windows_WSL2-success.svg)](crates/smg-sandbox)
@@ -85,6 +86,51 @@ flowchart TD
     S2 -->|"Static Findings"| S4
     S2 -->|"--boot-cmd"| S3
     S3 -->|"Sandbox: PROVEN / MITIGATED"| S4
+```
+
+### Deep-Dive Pipeline: Formal Memory Typestate, Concurrency & Taint Dataflow
+
+Inside Stage 2, every parsed file is lowered once into a bounded CFG & symbol summary and dispatched across three parallel formal verification engines before priority-ranked deduplication:
+
+```mermaid
+flowchart LR
+    SRC["Source & Specs\n17 Tree-sitter ASTs + Move + SQL\n+ SVD / .ld / Foundry JSON"] --> PARSE["Single-Pass CST & Arena\nCow Borrow · Depth-Capped Walk\nCross-File Import & Header Linker"]
+
+    PARSE --> E_TAINT["1. Guard-Set Lattice & Bitmask Taint\nMonotone Worklist O(V + E)\nAST Dominator Guards + Sink Bitmasks\n2-CFA & Field-Sensitive Points-To"]
+    PARSE --> E_MEM["2. Memory Typestate & Abstract Math\nBranch-Scoped Alloc/Free/UAF\nTnum x WrappedInterval + SparseOctagon\nQF_BV / QF_LIA SMT + WCSD DAG Memo"]
+    PARSE --> E_CONC["3. Concurrency & Lock-Order Graph\nStruct-Qualified Go Mutex (Type::lock)\nRust Sync-Lock Across .await\nISR vs Task spin_lock_irqsave ABBA"]
+
+    E_TAINT --> DEDUP["Canonical Family Deduplicator\nPriority: Proven > Confirmed > Heuristic"]
+    E_MEM --> DEDUP
+    E_CONC --> DEDUP
+
+    DEDUP --> STATIC_OUT["Verified Static Findings\nShortest Unguarded Witness Path"]
+```
+
+### Runtime Race Prover Protocol: 12-Way Last-Byte Sync & 3-Layer State Corroboration
+
+When `--boot-cmd` or `smg replay` is invoked on a concurrency finding (`SMG-RACE-001`), `smg-sandbox` never relies on raw `HTTP 200` counts alone—it aligns final request bytes on an in-process barrier and cross-checks three state oracles:
+
+```mermaid
+sequenceDiagram
+    participant CLI as smg-sandbox Prover
+    participant BAR as tokio::sync::Barrier (12x)
+    participant APP as Sandboxed App (bwrap / Seatbelt / WSL2)
+    participant ORA as WireDiffProxy & State Oracles
+
+    CLI->>APP: Boot service inside isolated net/fs namespace + optional WireDiffProxy
+    par 12 Concurrent Workers
+        CLI->>APP: Connect & write HTTP/1.1 request prefix (N - 1 bytes, holding final byte)
+        CLI->>BAR: bar.wait() until all 12 TCP sockets are primed
+    end
+    BAR-->>CLI: Simultaneous release
+    CLI->>APP: Flush final 1 byte ('}') across all 12 sockets in microsecond window
+    APP->>ORA: Concurrent DB/Redis writes (UPDATE / INSERT / DECR)
+    APP-->>CLI: 12 HTTP responses (status codes + JSON ledger bodies)
+    CLI->>ORA: Evaluate 3 Oracles (Ledger Post-State + WireDiffProxy + DbStateSnapshot)
+    Note over CLI,ORA: Overdraft (<0) or Lost Update (12x amount=80 -> same balance=10) => Sandbox: PROVEN
+    Note over CLI,ORA: Distinct arithmetic steps (920..40, min >= 0) => SerializedSolvent (SuspectUnverified)
+    Note over CLI,ORA: 1x 200 OK + 11x 409/429 Lock Rejections => Sandbox: MITIGATED
 ```
 
 ### Mathematical Formulation: The $O(V + E)$ Guard-Set Lattice
@@ -209,6 +255,7 @@ Every precision and recall figure in ShellMind Guard is backed by an auditable, 
    ```bash
    SMG_ENFORCE_PRECISION_GATE=1 cargo test -p smg-graph --test adversarial_precision_bench -- --nocapture
    ```
+   *(Automated hands-off on every code push, PR, release tag, and weekly schedule via [`.github/workflows/benchmarks.yml`](.github/workflows/benchmarks.yml) and [`scripts/run_benchmarks.sh`](scripts/run_benchmarks.sh), publishing a live Markdown scorecard to the GitHub Actions Job Summary and uploading `benchmark-metrics.json` artifacts with zero manual maintenance.)*
 2. **External Vulnerable & Production Reference Baselines:**
    - **`OWASP/crAPI` (`1,062` files):** Evaluated against **30 known ground-truth flaws across 4 core categories** (`SMG-SQLI-001 = 1`, `SMG-AUTH-001 = 16`, `SMG-CFG-JWT-LOGIC / SMG-SEC-JWT = 7`, `SMG-SEC-KEY = 6` in `services/chatbot/certs/server.key`), verifying `30/30` (`100%` tracked-flaw recall) on every tuning pass.
    - **`expressjs/express` (`lib/*.js` production core):** Evaluated at `--min-confidence confirmed` (`--ci` default gate: `HIGH`/`CRITICAL` non-test findings), verifying **`0` false positives** on clean framework routing/middleware internals.
@@ -582,8 +629,14 @@ ShellMind Guard is organized as a modular, 100% pure-Rust Cargo workspace:
 
 ```text
 ShellMind-Guard/
-├── Cargo.toml                     # Workspace root (Rust 2024 Edition)
+├── Cargo.toml                     # Workspace root (Rust 2024 Edition, `unsafe_code = "forbid"`)
 ├── action.yml                     # Official SHA256-verified composite GitHub Action
+├── .github/workflows/
+│   ├── ci.yml                     # Cross-OS CI matrix (Ubuntu, macOS, Windows + Clippy + Dogfood gate)
+│   ├── benchmarks.yml             # Zero-maintenance precision, O(V+E) scaling & phase-latency CI scorecard
+│   └── release.yml                # Tag-parity check, 5-target release matrix & SLSA provenance attestation
+├── scripts/
+│   └── run_benchmarks.sh          # Reproducible offline precision & phase-latency benchmark runner
 ├── .claude-plugin/
 │   ├── plugin.json                # Claude Code / agent plugin manifest & icon
 │   └── marketplace.json           # GitHub marketplace index (`qira-dev/ShellMind-Guard`)
@@ -645,6 +698,20 @@ Further engineering documentation:
 - [**`CONTRIBUTING.md`**](CONTRIBUTING.md) — Architecture Invariants & Developer Contribution Guide
 - [**`action.yml`**](action.yml) — Official Composite GitHub Action (SHA256-Verified CI Gate & SARIF Export)
 - [**`CHANGELOG.md`**](CHANGELOG.md) — Release History
+
+---
+
+## Contributing & Architecture Invariants
+
+External contributions—new language idioms, framework guards, frontier rules, and false-positive counterexamples—are welcome! Every PR is automatically verified for zero precision/recall regression and zero documentation drift:
+
+1. **Read the Engineering Invariants & 4-Step Rule Protocol:** Follow [**`CONTRIBUTING.md`**](CONTRIBUTING.md) (`O(V + E)` lattice complexity, single-pass `Tree-sitter` + `OnceLock<Regex>`, fail-closed untrusted repo config, paired `TP` + `TN` adversarial safe-twins, and `RULE_CATALOG` sync).
+2. **Run the Local Verification & Benchmark Gate:**
+   ```bash
+   cargo fmt --all -- --check
+   cargo clippy --workspace --all-targets --locked -- -D warnings
+   bash scripts/run_benchmarks.sh
+   ```
 
 ---
 
