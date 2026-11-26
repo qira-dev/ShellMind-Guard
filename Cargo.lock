@@ -3961,7 +3961,7 @@ dependencies = [
 
 [[package]]
 name = "shellmind-guard"
-version = "1.5.0"
+version = "1.5.5"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4076,7 +4076,7 @@ checksum = "149309498a5f7334b12ddae0cad8aba81ce785fe91755068867e017cf98fee46"
 
 [[package]]
 name = "smg-ai"
-version = "1.5.0"
+version = "1.5.5"
 dependencies = [
  "anyhow",
  "reqwest",
@@ -4090,7 +4090,7 @@ dependencies = [
 
 [[package]]
 name = "smg-core"
-version = "1.5.0"
+version = "1.5.5"
 dependencies = [
  "anyhow",
  "blake3",
@@ -4104,7 +4104,7 @@ dependencies = [
 
 [[package]]
 name = "smg-enterprise"
-version = "1.5.0"
+version = "1.5.5"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4121,7 +4121,7 @@ dependencies = [
 
 [[package]]
 name = "smg-graph"
-version = "1.5.0"
+version = "1.5.5"
 dependencies = [
  "anyhow",
  "blake3",
@@ -4153,7 +4153,7 @@ dependencies = [
 
 [[package]]
 name = "smg-hw"
-version = "1.5.0"
+version = "1.5.5"
 dependencies = [
  "anyhow",
  "rayon",
@@ -4170,7 +4170,7 @@ dependencies = [
 
 [[package]]
 name = "smg-pqc"
-version = "1.5.0"
+version = "1.5.5"
 dependencies = [
  "blake3",
  "serde",
@@ -4181,7 +4181,7 @@ dependencies = [
 
 [[package]]
 name = "smg-report"
-version = "1.5.0"
+version = "1.5.5"
 dependencies = [
  "anyhow",
  "blake3",
@@ -4194,7 +4194,7 @@ dependencies = [
 
 [[package]]
 name = "smg-sandbox"
-version = "1.5.0"
+version = "1.5.5"
 dependencies = [
  "anyhow",
  "blake3",
@@ -4211,7 +4211,7 @@ dependencies = [
 
 [[package]]
 name = "smg-tui"
-version = "1.5.0"
+version = "1.5.5"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4230,7 +4230,7 @@ dependencies = [
 
 [[package]]
 name = "smg-web3"
-version = "1.5.0"
+version = "1.5.5"
 dependencies = [
  "anyhow",
  "revm",

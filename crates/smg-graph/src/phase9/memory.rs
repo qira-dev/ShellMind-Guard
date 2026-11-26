@@ -240,6 +240,7 @@ fn has_preceding_bounds_check(preceding_code: &str, len_expr: &str) -> bool {
                     || trimmed.contains(&format!("[{}]", v))
                     || trimmed.contains(&format!(".resize({})", v))
                     || ((trimmed.contains("malloc(")
+                        || trimmed.contains("zalloc(")
                         || trimmed.contains("calloc(")
                         || trimmed.contains("realloc(")
                         || trimmed.contains("alloca("))
@@ -434,18 +435,34 @@ fn scan_c_cpp_function(
         {
             let api = trimmed[m.start()..m.end()].trim_end_matches('(').trim();
             let args = extract_call_args(trimmed, m.start()).unwrap_or_default();
+            let dst_arg = args.first().map(|s| s.trim()).unwrap_or("");
             let src_arg = if api == "gets" {
                 "stdin"
             } else {
-                args.get(1).map(|s| s.as_str()).unwrap_or("")
+                args.get(1).map(|s| s.trim()).unwrap_or("")
             };
             let is_tiny_safe_literal = (api == "strcpy" || api == "strcat")
                 && src_arg.starts_with('"')
                 && src_arg.ends_with('"')
                 && src_arg.len() <= 10;
+            let dst_sized_by_strlen = (api == "strcpy" || api == "strcat")
+                && !dst_arg.is_empty()
+                && !src_arg.is_empty()
+                && {
+                    let prev_start = idx.saturating_sub(8);
+                    let strlen_pat = format!("strlen({})", src_arg);
+                    lines[prev_start..idx].iter().any(|prev| {
+                        prev.contains(dst_arg)
+                            && (prev.contains("malloc(")
+                                || prev.contains("zalloc(")
+                                || prev.contains("calloc(")
+                                || prev.contains("alloca("))
+                            && prev.contains(&strlen_pat)
+                    })
+                };
             let safe_numeric_sprintf =
                 (api == "sprintf" || api == "vsprintf") && !trimmed.contains("%s");
-            if !is_tiny_safe_literal && !safe_numeric_sprintf {
+            if !is_tiny_safe_literal && !dst_sized_by_strlen && !safe_numeric_sprintf {
                 out.push(make_phase9_finding(
                     "SMG-MEM-BOUNDS",
                     "CRITICAL",
@@ -766,22 +783,29 @@ fn walk_rust_unsafe_block_lines(
         || enclosing_fn_code.contains("checked_add")
         || enclosing_fn_code.contains("saturating_");
 
+    let pre_block_end = start_ln.saturating_sub(fn_start_ln).min(fn_lines.len());
+    let mut saw_len = false;
+    let mut saw_cmp = false;
+    for &l in &fn_lines[..pre_block_end] {
+        saw_len |= l.contains(".len()");
+        saw_cmp |= l.contains('<')
+            || l.contains("<=")
+            || l.contains("assert!")
+            || l.contains("assert_eq!")
+            || l.contains(".min(");
+    }
+
     for (idx, raw_line) in block_code.lines().enumerate() {
         let ln = start_ln + idx;
         let trimmed = raw_line.trim();
-        // Only count bounds checks that appear BEFORE (or on) the current unsafe line,
-        // never post-sink lines!
-        let prefix_count = ln
-            .saturating_sub(fn_start_ln)
-            .saturating_add(1)
-            .min(fn_lines.len());
-        let pre_code = fn_lines[..prefix_count].join("\n");
-        let has_bounds_guard = pre_code.contains(".len()")
-            && (pre_code.contains('<')
-                || pre_code.contains("<=")
-                || pre_code.contains("assert!")
-                || pre_code.contains("assert_eq!")
-                || pre_code.contains(".min("));
+        // O(1) cumulative bounds-guard tracking (only lines BEFORE or ON the current unsafe line)
+        saw_len |= raw_line.contains(".len()");
+        saw_cmp |= raw_line.contains('<')
+            || raw_line.contains("<=")
+            || raw_line.contains("assert!")
+            || raw_line.contains("assert_eq!")
+            || raw_line.contains(".min(");
+        let has_bounds_guard = saw_len && saw_cmp;
 
         let mut is_uninit_ub = trimmed.contains("mem::uninitialized(")
             || (trimmed.contains("MaybeUninit::uninit().assume_init(")
@@ -798,9 +822,23 @@ fn walk_rust_unsafe_block_lines(
             && !recv.is_empty()
             && recv.chars().all(|c| c.is_alphanumeric() || c == '_')
             && enclosing_fn_code.contains("MaybeUninit")
-            && enclosing_fn_code.contains("::uninit(")
+            && enclosing_fn_code.lines().any(|l| {
+                let binds_recv = |pat: &str| -> bool {
+                    l.find(pat).is_some_and(|i| {
+                        l[i + pat.len()..]
+                            .chars()
+                            .next()
+                            .is_some_and(|c| matches!(c, ':' | '=' | ' ' | '\t'))
+                    })
+                };
+                l.contains("uninit")
+                    && (binds_recv(&format!("let {}", recv))
+                        || binds_recv(&format!("let mut {}", recv)))
+            })
             && !enclosing_fn_code.contains(&format!("{}.write(", recv))
-            && !enclosing_fn_code.contains(&format!("{}.as_mut_ptr(", recv))
+            && !enclosing_fn_code.contains(&format!("{}.as_mut_ptr", recv))
+            && !enclosing_fn_code.contains(&format!("{}[", recv))
+            && !enclosing_fn_code.contains(&format!("addr_of_mut!({}", recv))
             && !enclosing_fn_code.contains(&format!("&mut {}", recv))
         {
             is_uninit_ub = true;

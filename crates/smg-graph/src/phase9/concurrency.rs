@@ -18,6 +18,7 @@ struct ActiveLock {
     line: usize,
     scope_depth: usize,
     is_manual_unlock: bool,
+    is_shared_read: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -177,6 +178,23 @@ fn norm_lock_name(raw: &str) -> String {
         .trim_start_matches('&')
         .trim()
         .to_ascii_lowercase()
+}
+
+fn norm_lock_name_with_owner(raw: &str, enclosing_type: Option<&str>) -> String {
+    let base = norm_lock_name(raw);
+    if let Some(ty) = enclosing_type
+        && !ty.is_empty()
+        && !base.contains('(')
+        && !base.contains("::")
+        && let Some((recv, field)) = base.split_once('.')
+        && !recv.is_empty()
+        && recv.len() <= 8
+        && recv.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !field.is_empty()
+    {
+        return format!("{}::{}", ty.to_ascii_lowercase(), field);
+    }
+    base
 }
 
 fn is_ignored_stdio_lock(norm: &str) -> bool {
@@ -352,12 +370,14 @@ fn analyze_function_locks(
     out: &mut Vec<LocalStaticFinding>,
 ) {
     let lines: Vec<&str> = f.code.lines().collect();
+    let enclosing_type: Option<String> = sym_opt.as_ref().and_then(|s| s.enclosing_type.clone());
     let fn_has_any_unlock = f.code.contains("unlock(")
         || f.code.contains("Unlock(")
         || f.code.contains("pthread_mutex_unlock(");
     let mut depth = 0usize;
     let mut guards: Vec<ActiveLock> = Vec::new();
     let mut go_deferred_unlocks: HashSet<String> = HashSet::new();
+    let mut branch_unlocked_for_return: HashSet<(String, usize)> = HashSet::new();
 
     for (idx, raw_line) in lines.iter().enumerate() {
         let ln = f.line_start + idx;
@@ -367,6 +387,13 @@ fn analyze_function_locks(
         }
         let low = trimmed.to_ascii_lowercase();
         let (opens, closes) = count_braces_outside_strings(trimmed);
+
+        // If entering an `else` sibling branch (`} else {` or `else {`), pop manual locks
+        // acquired purely inside the preceding `if` branch so mutually exclusive branches never pair.
+        if trimmed.starts_with("} else") || trimmed.starts_with("else {") || trimmed == "else" {
+            let depth_at_else = depth.saturating_sub(if trimmed.starts_with('}') { 1 } else { 0 });
+            guards.retain(|g| g.scope_depth <= depth_at_else);
+        }
 
         // Pre-apply opens if block opens on this statement (e.g. `if cond { return; }` or `{ let g = ...;`)
         let stmt_depth = depth + opens.saturating_sub(closes);
@@ -379,7 +406,10 @@ fn analyze_function_locks(
         // 1. Track explicit Go `defer mu.Unlock()`
         if lang == Language::Go && trimmed.starts_with("defer ") {
             for cap in method_unlock_re().captures_iter(trimmed) {
-                go_deferred_unlocks.insert(norm_lock_name(&cap[1]));
+                go_deferred_unlocks.insert(norm_lock_name_with_owner(
+                    &cap[1],
+                    enclosing_type.as_deref(),
+                ));
             }
         }
 
@@ -487,9 +517,29 @@ fn analyze_function_locks(
             guards.retain(|g| g.norm_name != norm);
         }
         if !trimmed.starts_with("defer ") {
+            let block_exits_soon = (idx..=(idx + 2).min(lines.len().saturating_sub(1)))
+                .take_while(|&k| k == idx || !lines[k].trim().starts_with('}'))
+                .any(|k| {
+                    let t = lines[k].trim();
+                    t.starts_with("return ")
+                        || t == "return"
+                        || t == "return;"
+                        || t.contains(" return ")
+                        || t.starts_with("continue")
+                        || t.starts_with("break")
+                        || t.starts_with("goto ")
+                });
             for cap in method_unlock_re().captures_iter(trimmed) {
-                let norm = norm_lock_name(&cap[1]);
-                guards.retain(|g| g.norm_name != norm);
+                let norm = norm_lock_name_with_owner(&cap[1], enclosing_type.as_deref());
+                let is_inner_early_exit = block_exits_soon
+                    && guards
+                        .iter()
+                        .any(|g| g.norm_name == norm && stmt_depth > g.scope_depth);
+                if is_inner_early_exit {
+                    branch_unlocked_for_return.insert((norm, stmt_depth));
+                } else {
+                    guards.retain(|g| g.norm_name != norm);
+                }
             }
         }
 
@@ -500,8 +550,12 @@ fn analyze_function_locks(
             || trimmed.contains(" return ");
         if is_return_stmt && idx > 0 && idx + 1 < lines.len() {
             for g in &guards {
+                let unlocked_in_branch = branch_unlocked_for_return
+                    .iter()
+                    .any(|(n, d)| n == &g.norm_name && *d <= stmt_depth);
                 if g.is_manual_unlock
                     && fn_has_any_unlock
+                    && !unlocked_in_branch
                     && !(lang == Language::Go && go_deferred_unlocks.contains(&g.norm_name))
                 {
                     out.push(make_phase9_finding(
@@ -545,7 +599,7 @@ fn analyze_function_locks(
         let mut newly_acquired: Vec<ActiveLock> = Vec::new();
         if !is_safe_multilock && !low.contains("try_lock") && !low.contains("std::try_to_lock") {
             for cap in cpp_raii_lock_re().captures_iter(trimmed) {
-                let norm = norm_lock_name(&cap[2]);
+                let norm = norm_lock_name_with_owner(&cap[2], enclosing_type.as_deref());
                 if !norm.is_empty() && !is_ignored_stdio_lock(&norm) {
                     newly_acquired.push(ActiveLock {
                         norm_name: norm,
@@ -553,11 +607,12 @@ fn analyze_function_locks(
                         line: ln,
                         scope_depth: stmt_depth,
                         is_manual_unlock: false,
+                        is_shared_read: trimmed.contains("shared_lock"),
                     });
                 }
             }
             for cap in pthread_lock_re().captures_iter(trimmed) {
-                let norm = norm_lock_name(&cap[1]);
+                let norm = norm_lock_name_with_owner(&cap[1], enclosing_type.as_deref());
                 if !norm.is_empty() && !is_ignored_stdio_lock(&norm) {
                     newly_acquired.push(ActiveLock {
                         norm_name: norm,
@@ -565,6 +620,7 @@ fn analyze_function_locks(
                         line: ln,
                         scope_depth: stmt_depth,
                         is_manual_unlock: true,
+                        is_shared_read: false,
                     });
                 }
             }
@@ -572,7 +628,7 @@ fn analyze_function_locks(
                 let guard_var = cap.get(1).map(|m| m.as_str().to_string());
                 // Skip Rust `let _ = mutex.lock()` (temporary guard dropped immediately at `;`)
                 if lang == Language::Rust && guard_var.as_deref() == Some("_") {
-                    let norm = norm_lock_name(&cap[2]);
+                    let norm = norm_lock_name_with_owner(&cap[2], enclosing_type.as_deref());
                     if !norm.is_empty()
                         && !is_ignored_stdio_lock(&norm)
                         && let Some(sym) = sym_opt.as_deref_mut()
@@ -589,16 +645,18 @@ fn analyze_function_locks(
                 {
                     continue;
                 }
-                let norm = norm_lock_name(raw_recv);
+                let norm = norm_lock_name_with_owner(raw_recv, enclosing_type.as_deref());
                 if !norm.is_empty() && !is_ignored_stdio_lock(&norm) {
                     let manual = matches!(lang, Language::C | Language::Cpp | Language::Go)
                         && guard_var.is_none();
+                    let is_shared_read = matches!(method_name, "rlock" | "RLock" | "read");
                     newly_acquired.push(ActiveLock {
                         norm_name: norm,
                         guard_var,
                         line: ln,
                         scope_depth: stmt_depth,
                         is_manual_unlock: manual,
+                        is_shared_read,
                     });
                 }
             }
@@ -610,8 +668,11 @@ fn analyze_function_locks(
             {
                 sym.locks_acquired.push((acq.norm_name.clone(), ln));
             }
-            // Same-lock re-entry while already held -> self-deadlock
-            if guards.iter().any(|g| g.norm_name == acq.norm_name) {
+            // Same-lock re-entry while already held -> self-deadlock (skip shared read->read RLock)
+            if guards
+                .iter()
+                .any(|g| g.norm_name == acq.norm_name && !(g.is_shared_read && acq.is_shared_read))
+            {
                 out.push(make_phase9_finding(
                     "SMG-ENG-DEADLOCK",
                     "HIGH",
@@ -629,9 +690,12 @@ fn analyze_function_locks(
                 ));
             } else {
                 // Record nested ordered pairs (prev -> new) for global A->B vs B->A cycle solver
+                // Skip pure shared-read pairs (`RLock -> RLock`).
                 if let Some(sym) = sym_opt.as_deref_mut() {
                     for held in &guards {
-                        if held.norm_name != acq.norm_name {
+                        if held.norm_name != acq.norm_name
+                            && !(held.is_shared_read && acq.is_shared_read)
+                        {
                             sym.lock_pairs.push(LockOrderEdge {
                                 first: held.norm_name.clone(),
                                 second: acq.norm_name.clone(),
@@ -647,6 +711,7 @@ fn analyze_function_locks(
         // 7. Pop RAII/block-scoped guards whose brace scope exited on this line (or single-line `{ ... }` blocks)
         let single_line_block = opens > 0 && opens == closes && stmt_depth == depth_after;
         depth = depth_after;
+        branch_unlocked_for_return.retain(|(_, d)| *d <= depth);
         guards.retain(|g| {
             if g.is_manual_unlock {
                 !(is_return_stmt && g.scope_depth > depth)
@@ -660,23 +725,40 @@ fn analyze_function_locks(
 }
 
 fn is_generic_short_lock_name(name: &str) -> bool {
-    matches!(
+    let base_generic = matches!(
         name,
         "m" | "mu"
             | "mtx"
             | "lock"
             | "mutex"
             | "rw"
+            | "rwlock"
             | "guard"
             | "l"
             | "s"
             | "state"
+            | "statelock"
             | "data"
             | "cache"
             | "inner"
             | "store"
             | "pool"
-    )
+    );
+    if base_generic {
+        return true;
+    }
+    if !name.contains("::")
+        && let Some((recv, leaf)) = name.split_once('.')
+        && !recv.is_empty()
+        && recv.len() <= 3
+        && matches!(
+            leaf,
+            "m" | "mu" | "mtx" | "lock" | "mutex" | "rw" | "rwlock" | "l" | "statelock"
+        )
+    {
+        return true;
+    }
+    false
 }
 
 fn scopes_compatible(
@@ -699,11 +781,26 @@ fn scopes_compatible(
     let same_lang_family = ext_a == ext_b
         || (matches!(ext_a, "c" | "h" | "cc" | "cpp" | "cxx" | "hpp")
             && matches!(ext_b, "c" | "h" | "cc" | "cpp" | "cxx" | "hpp"));
-    same_lang_family
-        && lock_a.len() >= 4
-        && lock_b.len() >= 4
-        && !is_generic_short_lock_name(lock_a)
-        && !is_generic_short_lock_name(lock_b)
+    if !same_lang_family
+        || lock_a.len() < 4
+        || lock_b.len() < 4
+        || is_generic_short_lock_name(lock_a)
+        || is_generic_short_lock_name(lock_b)
+    {
+        return false;
+    }
+    if ext_a == "go" && ext_b == "go" {
+        let dir_a = a_edge.file.rsplit_once('/').map(|x| x.0).unwrap_or("");
+        let dir_b = b_edge.file.rsplit_once('/').map(|x| x.0).unwrap_or("");
+        if dir_a == dir_b {
+            return true;
+        }
+        if let (Some((ta, _)), Some((tb, _))) = (lock_a.split_once("::"), lock_b.split_once("::")) {
+            return ta == tb;
+        }
+        return false;
+    }
+    true
 }
 
 /// Global Cross-Function Lock-Order Inversion Solver (`A -> B` and `B -> A` deadlock cycles).

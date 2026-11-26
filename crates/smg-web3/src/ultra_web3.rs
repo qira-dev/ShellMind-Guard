@@ -542,7 +542,15 @@ pub fn analyze_solana_pda_depth_with_ctx(
                 || window.contains("Program<'info,")
                 || window.contains("check_program_account")
                 || window.contains("::ID")
-                || window.contains("::id()");
+                || window.contains("::id()")
+                || window.contains("_PROGRAM_ID")
+                || window.contains("CORE_BRIDGE")
+                || window.contains("TOKEN_PROGRAM_ID")
+                || window.contains("SYSTEM_PROGRAM_ID")
+                || window.contains("check_id(")
+                || window.contains("key() == ")
+                || window.contains(".key == ")
+                || window.contains("pubkey!(");
             if !checks_program {
                 findings.push(mk_web3_finding(
                     "SMG-SOL-ARBITRARY-CPI",
@@ -597,25 +605,37 @@ pub fn analyze_move_ultra_depth(rel_path: &str, source: &str) -> Vec<LocalStatic
 
         // 1. Asset/Vault/Cap struct mistakenly granted `copy` or `drop` ability
         if trimmed.starts_with("struct ") || trimmed.starts_with("public struct ") {
-            let low = trimmed.to_ascii_lowercase();
-            let is_event = low.contains("event");
+            let header = trimmed.split(['{', ';']).next().unwrap_or(trimmed).trim();
+            let (name_part, abilities_part) = header
+                .split_once(" has ")
+                .map(|(l, r)| (l.trim(), r.trim()))
+                .unwrap_or((header, ""));
+            let struct_name = name_part
+                .split_whitespace()
+                .last()
+                .unwrap_or("")
+                .split('<')
+                .next()
+                .unwrap_or("");
+            let name_low = struct_name.to_ascii_lowercase();
+            let is_event = name_low.contains("event");
             let is_sensitive_resource = !is_event
-                && (low.contains("coin")
-                    || low.contains("vault")
-                    || low.contains("treasury")
-                    || low.contains("receipt")
-                    || low.contains("admincap")
-                    || low.contains("hotpotato"));
-            if is_sensitive_resource
-                && (trimmed.contains(" has ")
-                    && (trimmed.contains("copy") || trimmed.contains("drop")))
-            {
+                && (name_low.contains("coin")
+                    || name_low.contains("vault")
+                    || name_low.contains("treasury")
+                    || name_low.contains("receipt")
+                    || name_low.contains("admincap")
+                    || name_low.contains("hotpotato"));
+            let has_copy_or_drop = abilities_part
+                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .any(|tok| matches!(tok, "copy" | "drop"));
+            if is_sensitive_resource && has_copy_or_drop {
                 findings.push(mk_web3_finding(
                     "SMG-MOVE-ABILITY-LEAK",
                     "CRITICAL",
                     format!(
                         "Sensitive Move resource `{}` grants `copy` or `drop` ability (enables duplication or hot-potato bypass)",
-                        trimmed.split('{').next().unwrap_or(trimmed).trim()
+                        header
                     ),
                     rel_path,
                     idx + 1,
@@ -671,8 +691,12 @@ pub fn analyze_move_ultra_depth(rel_path: &str, source: &str) -> Vec<LocalStatic
                     || ty_low.contains("admin_cap")
                     || ty_low.contains("owner_cap")
                     || ty_low.contains("treasury_cap")
+                    || ty_low.contains("decree")
+                    || ty_low.contains("guardian")
                     || ty.ends_with("Cap")
                     || ty.contains("Cap<")
+                    || ty.ends_with("Ticket")
+                    || ty.contains("Ticket<")
             });
             if mutates_treasury && !has_auth_param {
                 findings.push(mk_web3_finding(

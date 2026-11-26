@@ -78,7 +78,7 @@ pub fn scan_protocols_ai_and_workflow(
         for hit in crate::ai_mcp_model::analyze_mcp_tool_poisoning(rel_path, content) {
             push_unique(&mut out, hit);
         }
-        for hit in crate::ai_mcp_model::analyze_model_deserialization_and_ssti(rel_path, content) {
+        for hit in crate::ai_mcp_model::inspect_chat_template_ssti(rel_path, content) {
             push_unique(&mut out, hit);
         }
         return out;
@@ -896,5 +896,54 @@ async function shipOrder(req, db) {
                 .iter()
                 .any(|h| h.rule_id == "SMG-STATE-001")
         );
+    }
+
+    #[test]
+    fn test_vllm_precommit_config_and_benchmarks_calibrated() {
+        let precommit = "repos:\n  - repo: local\n    hooks:\n      - id: forbid-trc\n        entry: forbid trust_remote_code=True\n";
+        let cfg_hits =
+            scan_protocols_ai_and_workflow(".pre-commit-config.yaml", Language::Config, precommit);
+        assert!(
+            cfg_hits.is_empty(),
+            ".pre-commit-config.yaml must produce 0 AI findings: {cfg_hits:?}"
+        );
+
+        let cfg = smg_core::ShellMindGuardConfig::default();
+        let prod_py = "import torch\ndef load(pt_file):\n    return torch.load(pt_file)\n";
+        let bench_py = "import pickle\ndef bench(buf):\n    return pickle.loads(buf)\n";
+        let mk_py = |p: &str, code: &str| smg_core::IndexedFile {
+            abs_path: std::path::PathBuf::from(p),
+            rel_path: p.to_string(),
+            language: Language::Python,
+            size_bytes: code.len() as u64,
+            mtime_ns: 0,
+            blake3_hash: String::new(),
+            cached_bytes: Some(code.as_bytes().to_vec()),
+        };
+        let s_prod = crate::ast::parse_file_ast(
+            &mk_py("vllm/model_executor/model_loader/weight_utils.py", prod_py),
+            &cfg,
+        )
+        .unwrap();
+        let s_bench =
+            crate::ast::parse_file_ast(&mk_py("benchmarks/kernels/bench.py", bench_py), &cfg)
+                .unwrap();
+        let res = crate::lattice::solve_guard_lattice(&[s_prod, s_bench]);
+
+        let prod_hit = res
+            .findings
+            .iter()
+            .find(|f| f.file.ends_with("weight_utils.py") && f.rule_id == "SMG-AI-TORCH-PICKLE")
+            .expect("vllm runtime weight_utils.py torch.load must remain CRITICAL/Confirmed");
+        assert_eq!(prod_hit.severity, "CRITICAL");
+        assert_eq!(prod_hit.confidence, Confidence::Confirmed);
+
+        let bench_hit = res
+            .findings
+            .iter()
+            .find(|f| f.file.ends_with("bench.py") && f.rule_id == "SMG-AI-PICKLE-RCE")
+            .expect("benchmark pickle hit should be downgraded to LOW/Heuristic");
+        assert_eq!(bench_hit.severity, "LOW");
+        assert_eq!(bench_hit.confidence, Confidence::Heuristic);
     }
 }

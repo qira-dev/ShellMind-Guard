@@ -206,8 +206,12 @@ pub struct WcsdResult {
     pub isr_overhead_bytes: u64,
 }
 
-/// Extracts lightweight `FnStackNode` call/frame summaries from a C/C++ source file for WCSD analysis.
-pub fn extract_c_stack_nodes(rel_path: &str, source: &str) -> Vec<FnStackNode> {
+/// Extracts lightweight `FnStackNode` call/frame summaries from an already-parsed C/C++ Tree-sitter AST.
+pub fn extract_c_stack_nodes_from_tree(
+    rel_path: &str,
+    source: &str,
+    tree: &tree_sitter::Tree,
+) -> Vec<FnStackNode> {
     static ARR_RE: OnceLock<Regex> = OnceLock::new();
     let arr_re = ARR_RE.get_or_init(|| {
         Regex::new(r"\b(char|uint8_t|int8_t|uint16_t|int16_t|uint32_t|int32_t|int|uint64_t|int64_t|double|float)\s+[A-Za-z_][A-Za-z0-9_]*\s*\[\s*(\d+)\s*\]")
@@ -217,22 +221,6 @@ pub fn extract_c_stack_nodes(rel_path: &str, source: &str) -> Vec<FnStackNode> {
     let call_re = CALL_RE
         .get_or_init(|| Regex::new(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(").expect("valid c call re"));
 
-    let mut parser = tree_sitter::Parser::new();
-    let is_cpp = rel_path.ends_with(".cpp")
-        || rel_path.ends_with(".cc")
-        || rel_path.ends_with(".cxx")
-        || rel_path.ends_with(".hpp");
-    let lang = if is_cpp {
-        tree_sitter_cpp::LANGUAGE.into()
-    } else {
-        tree_sitter_c::LANGUAGE.into()
-    };
-    if parser.set_language(&lang).is_err() {
-        return Vec::new();
-    }
-    let Some(tree) = parser.parse(source, None) else {
-        return Vec::new();
-    };
     let src = source.as_bytes();
     let mut nodes = Vec::new();
     let mut stack = vec![(tree.root_node(), 0usize)];
@@ -305,104 +293,185 @@ pub fn extract_c_stack_nodes(rel_path: &str, source: &str) -> Vec<FnStackNode> {
     nodes
 }
 
+/// Extracts lightweight `FnStackNode` call/frame summaries from a C/C++ source file for WCSD analysis.
+pub fn extract_c_stack_nodes(rel_path: &str, source: &str) -> Vec<FnStackNode> {
+    let mut parser = tree_sitter::Parser::new();
+    let is_cpp = rel_path.ends_with(".cpp")
+        || rel_path.ends_with(".cc")
+        || rel_path.ends_with(".cxx")
+        || rel_path.ends_with(".hpp");
+    let lang = if is_cpp {
+        tree_sitter_cpp::LANGUAGE.into()
+    } else {
+        tree_sitter_c::LANGUAGE.into()
+    };
+    if parser.set_language(&lang).is_err() {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return Vec::new();
+    };
+    extract_c_stack_nodes_from_tree(rel_path, source, &tree)
+}
+
 /// Computes exact Inter-Procedural Worst-Case Stack Depth (WCSD) across a firmware call graph,
-/// detects unbounded recursion cycles, and adds worst-case ISR nesting overhead.
+/// detects unbounded recursion cycles, and adds worst-case ISR nesting overhead in strict O(V + E).
 pub fn compute_wcsd(
     nodes: &[FnStackNode],
     stack_budget_bytes: u64,
 ) -> (WcsdResult, Vec<LocalStaticFinding>) {
-    let map: HashMap<&str, &FnStackNode> = nodes.iter().map(|n| (n.name.as_str(), n)).collect();
-    let mut memo: HashMap<String, (u64, Vec<String>)> = HashMap::new();
+    let is_embedded = stack_budget_bytes > 0 || nodes.iter().any(|n| n.is_isr);
+    compute_wcsd_for_target(nodes, stack_budget_bytes, is_embedded)
+}
+
+/// Target-aware WCSD solver that gates MISRA C recursion alerts on true embedded firmware targets.
+pub fn compute_wcsd_for_target(
+    nodes: &[FnStackNode],
+    stack_budget_bytes: u64,
+    is_embedded_target: bool,
+) -> (WcsdResult, Vec<LocalStaticFinding>) {
+    let mut same_file_map: HashMap<(&str, &str), usize> = HashMap::with_capacity(nodes.len());
+    let mut unique_global_map: HashMap<&str, Option<usize>> = HashMap::with_capacity(nodes.len());
+    for (idx, n) in nodes.iter().enumerate() {
+        same_file_map
+            .entry((n.rel_path.as_str(), n.name.as_str()))
+            .or_insert(idx);
+        unique_global_map
+            .entry(n.name.as_str())
+            .and_modify(|slot| *slot = None)
+            .or_insert(Some(idx));
+    }
+
+    // Memo entry: (total_bytes, chain, min_valid_depth).
+    // `min_valid_depth == 0` means exact for all callers; `> 0` means truncated at MAX_WCSD_DEPTH
+    // when entered at `min_valid_depth` (reusable in O(1) by any caller at `depth >= min_valid_depth`).
+    let mut memo: Vec<Option<(u64, Vec<usize>, usize)>> = vec![None; nodes.len()];
+    let mut visiting_depth: HashMap<usize, usize> = HashMap::new();
+    let mut reported_cycles: HashSet<usize> = HashSet::new();
     let mut has_recursion = false;
     let mut findings = Vec::new();
+    let mut steps_remaining: usize = 500_000;
 
     const MAX_WCSD_DEPTH: usize = 128;
 
     #[allow(clippy::too_many_arguments)]
-    fn dfs<'a>(
-        name: &'a str,
-        map: &HashMap<&'a str, &'a FnStackNode>,
-        visiting: &mut HashSet<String>,
-        memo: &mut HashMap<String, (u64, Vec<String>)>,
+    fn dfs(
+        node_idx: usize,
+        nodes: &[FnStackNode],
+        same_file_map: &HashMap<(&str, &str), usize>,
+        unique_global_map: &HashMap<&str, Option<usize>>,
+        visiting_depth: &mut HashMap<usize, usize>,
+        memo: &mut [Option<(u64, Vec<usize>, usize)>],
+        reported_cycles: &mut HashSet<usize>,
+        is_embedded_target: bool,
         has_recursion: &mut bool,
         findings: &mut Vec<LocalStaticFinding>,
+        steps_remaining: &mut usize,
         depth: usize,
-    ) -> (u64, Vec<String>, bool) {
-        if depth >= MAX_WCSD_DEPTH {
-            return (0, Vec::new(), false);
+    ) -> (u64, Vec<usize>, Option<usize>, bool) {
+        if depth >= MAX_WCSD_DEPTH || *steps_remaining == 0 {
+            return (0, Vec::new(), None, true);
         }
-        if let Some(cached) = memo.get(name) {
-            return (cached.0, cached.1.clone(), true);
+        if let Some((c_bytes, c_chain, min_valid_depth)) = &memo[node_idx]
+            && depth >= *min_valid_depth
+        {
+            return (*c_bytes, c_chain.clone(), None, *min_valid_depth > 0);
         }
-        let Some(node) = map.get(name) else {
-            return (0, Vec::new(), true);
-        };
-        if !visiting.insert(name.to_string()) {
+        if let Some(&d_anc) = visiting_depth.get(&node_idx) {
             *has_recursion = true;
-            findings.push(LocalStaticFinding {
-                rule_id: "SMG-HW-STACK".into(),
-                severity: "HIGH".into(),
-                title: format!(
-                    "Unbounded recursion cycle detected in embedded firmware function `{}` (worst-case stack depth is infinite)",
-                    node.name
-                ),
-                rel_path: node.rel_path.clone(),
-                line: node.line,
-                symbol: node.name.clone(),
-                sink_kind: SinkKind::MemorySafety,
-                missing_guard: GuardKind::MemoryBounds,
-                confidence: Confidence::Proven,
-                remediation: "Convert recursion to bounded iteration in bare-metal/RTOS firmware (MISRA C Rule 17.2).".into(),
-            });
-            return (0, Vec::new(), false);
+            if is_embedded_target && reported_cycles.insert(node_idx) {
+                let node = &nodes[node_idx];
+                findings.push(LocalStaticFinding {
+                    rule_id: "SMG-HW-STACK".into(),
+                    severity: "HIGH".into(),
+                    title: format!(
+                        "Unbounded recursion cycle detected in embedded firmware function `{}` (worst-case stack depth is infinite)",
+                        node.name
+                    ),
+                    rel_path: node.rel_path.clone(),
+                    line: node.line,
+                    symbol: node.name.clone(),
+                    sink_kind: SinkKind::MemorySafety,
+                    missing_guard: GuardKind::MemoryBounds,
+                    confidence: Confidence::Proven,
+                    remediation: "Convert recursion to bounded iteration in bare-metal/RTOS firmware (MISRA C Rule 17.2).".into(),
+                });
+            }
+            return (0, Vec::new(), Some(d_anc), false);
         }
 
+        *steps_remaining = steps_remaining.saturating_sub(1);
+        visiting_depth.insert(node_idx, depth);
+        let node = &nodes[node_idx];
         let mut best_child = 0u64;
-        let mut best_path = Vec::new();
-        let mut cacheable = true;
+        let mut best_path: Vec<usize> = Vec::new();
+        let mut min_cycle_depth: Option<usize> = None;
+        let mut any_truncated = false;
+
         for callee in &node.callees {
-            let (c_bytes, c_path, c_cacheable) = dfs(
-                callee,
-                map,
-                visiting,
+            let callee_idx_opt = same_file_map
+                .get(&(node.rel_path.as_str(), callee.as_str()))
+                .copied()
+                .or_else(|| unique_global_map.get(callee.as_str()).and_then(|o| *o));
+            let Some(callee_idx) = callee_idx_opt else {
+                continue;
+            };
+            let (c_bytes, c_path, c_cycle_depth, c_trunc) = dfs(
+                callee_idx,
+                nodes,
+                same_file_map,
+                unique_global_map,
+                visiting_depth,
                 memo,
+                reported_cycles,
+                is_embedded_target,
                 has_recursion,
                 findings,
+                steps_remaining,
                 depth + 1,
             );
-            if !c_cacheable {
-                cacheable = false;
+            any_truncated |= c_trunc;
+            if let Some(cd) = c_cycle_depth {
+                min_cycle_depth = Some(min_cycle_depth.map_or(cd, |m| m.min(cd)));
             }
             if c_bytes > best_child {
                 best_child = c_bytes;
                 best_path = c_path;
             }
         }
-        visiting.remove(name);
+        visiting_depth.remove(&node_idx);
 
         let total = node.local_frame_bytes.saturating_add(best_child);
         let mut chain = Vec::with_capacity(1 + best_path.len());
-        chain.push(node.name.clone());
+        chain.push(node_idx);
         chain.extend(best_path);
-        if cacheable {
-            memo.insert(name.to_string(), (total, chain.clone()));
+        // Sound to cache whenever no back-edge reaches strictly above this node's stack depth
+        if min_cycle_depth.is_none_or(|d_anc| d_anc >= depth) {
+            let min_valid_depth = if any_truncated { depth } else { 0 };
+            memo[node_idx] = Some((total, chain.clone(), min_valid_depth));
+            (total, chain, None, any_truncated)
+        } else {
+            (total, chain, min_cycle_depth, any_truncated)
         }
-        (total, chain, cacheable)
     }
 
     let mut worst_task_bytes = 0u64;
-    let mut worst_chain = Vec::new();
+    let mut worst_chain_idx: Vec<usize> = Vec::new();
     let mut worst_isr_bytes = 0u64;
-    let mut visiting = HashSet::new();
 
-    for n in nodes {
-        let (bytes, chain, _) = dfs(
-            &n.name,
-            &map,
-            &mut visiting,
+    for (idx, n) in nodes.iter().enumerate() {
+        let (bytes, chain, _, _) = dfs(
+            idx,
+            nodes,
+            &same_file_map,
+            &unique_global_map,
+            &mut visiting_depth,
             &mut memo,
+            &mut reported_cycles,
+            is_embedded_target,
             &mut has_recursion,
             &mut findings,
+            &mut steps_remaining,
             0,
         );
         if n.is_isr {
@@ -410,16 +479,20 @@ pub fn compute_wcsd(
             worst_isr_bytes = worst_isr_bytes.max(bytes.saturating_add(32));
         } else if bytes > worst_task_bytes {
             worst_task_bytes = bytes;
-            worst_chain = chain;
+            worst_chain_idx = chain;
         }
     }
 
+    let worst_chain: Vec<String> = worst_chain_idx
+        .iter()
+        .map(|&i| nodes[i].name.clone())
+        .collect();
     let worst_case_bytes = worst_task_bytes.saturating_add(worst_isr_bytes);
     if stack_budget_bytes > 0
         && worst_case_bytes > stack_budget_bytes
-        && let Some(entry_name) = worst_chain.first()
-        && let Some(entry_node) = map.get(entry_name.as_str())
+        && let Some(&entry_idx) = worst_chain_idx.first()
     {
+        let entry_node = &nodes[entry_idx];
         findings.push(LocalStaticFinding {
             rule_id: "SMG-HW-STACK".into(),
             severity: "CRITICAL".into(),

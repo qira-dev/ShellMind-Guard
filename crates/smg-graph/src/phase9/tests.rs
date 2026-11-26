@@ -524,3 +524,117 @@ void unsafe_copy(const char *src, size_t user_len) {
         vuln_res.findings
     );
 }
+
+#[test]
+fn test_go_struct_mutex_and_unicode_stego_precision() {
+    // 1. Two unrelated Go structs in different packages with same lock field names => 0 false deadlocks
+    let go_a = r#"
+package alpha
+
+type ServiceA struct { mu sync.Mutex; stateLock sync.Mutex }
+
+func (a *ServiceA) Update() {
+    a.mu.Lock()
+    defer a.mu.Unlock()
+    a.stateLock.Lock()
+    defer a.stateLock.Unlock()
+}
+"#;
+    let go_b = r#"
+package beta
+
+type ServiceB struct { mu sync.Mutex; stateLock sync.Mutex }
+
+func (b *ServiceB) Refresh() {
+    b.stateLock.Lock()
+    defer b.stateLock.Unlock()
+    b.mu.Lock()
+    defer b.mu.Unlock()
+}
+"#;
+    let cross_res = run_inline(&[("pkg/alpha/a.go", go_a), ("pkg/beta/b.go", go_b)]);
+    assert!(
+        !cross_res
+            .findings
+            .iter()
+            .any(|f| f.rule_id == "SMG-ENG-DEADLOCK"),
+        "Unrelated Go structs across packages must not trigger SMG-ENG-DEADLOCK: {:#?}",
+        cross_res.findings
+    );
+
+    // 2. Genuine same-struct Go ABBA cycle MUST still fire CRITICAL SMG-ENG-DEADLOCK
+    let go_same = r#"
+package core
+
+type Core struct { lockA sync.Mutex; lockB sync.Mutex }
+
+func (c *Core) StepOne() {
+    c.lockA.Lock()
+    defer c.lockA.Unlock()
+    c.lockB.Lock()
+    defer c.lockB.Unlock()
+}
+
+func (c *Core) StepTwo() {
+    c.lockB.Lock()
+    defer c.lockB.Unlock()
+    c.lockA.Lock()
+    defer c.lockA.Unlock()
+}
+"#;
+    let same_res = run_inline(&[("pkg/core/core.go", go_same)]);
+    assert!(
+        same_res
+            .findings
+            .iter()
+            .any(|f| f.rule_id == "SMG-ENG-DEADLOCK" && f.severity == "CRITICAL"),
+        "Same-struct Go ABBA cycle must still fire CRITICAL SMG-ENG-DEADLOCK: {:#?}",
+        same_res.findings
+    );
+
+    // 3. Unicode stego: benign `#` comment U+200B & balanced RTL isolates => 0; Trojan RLO & Unicode Tag => PROVEN CRITICAL
+    let benign_py = "# cuda wrapper note\u{200B}\ndef init():\n    return 1\n";
+    assert!(
+        crate::ai_mcp_model::analyze_mcp_tool_poisoning("vllm/cuda_wrapper.py", benign_py)
+            .is_empty()
+    );
+    let benign_rtl = "val label = \"\u{2068}user\u{2069}\"\n";
+    assert!(
+        crate::ai_mcp_model::analyze_mcp_tool_poisoning("app/Strings.kt", benign_rtl).is_empty()
+    );
+    let trojan = "if (access == \"user\u{202E} // admin\") { grant(); }\n";
+    let trojan_hits = crate::ai_mcp_model::analyze_mcp_tool_poisoning("src/auth.js", trojan);
+    assert!(trojan_hits.iter().any(|h| {
+        h.rule_id == "SMG-MCP-UNICODE-STEGO"
+            && h.severity == "CRITICAL"
+            && h.confidence == crate::ast::Confidence::Proven
+    }));
+    let tag_smuggle = "const s = \"hello\u{E0061}world\";\n";
+    let tag_hits = crate::ai_mcp_model::analyze_mcp_tool_poisoning("src/prompt.ts", tag_smuggle);
+    assert!(tag_hits.iter().any(|h| {
+        h.rule_id == "SMG-MCP-UNICODE-STEGO"
+            && h.severity == "CRITICAL"
+            && h.confidence == crate::ast::Confidence::Proven
+    }));
+    let trojan_with_char_and_rtl =
+        "if (ch != 'x' && rtl_flag && access == \"user\u{202E} // admin\") { grant(); }\n";
+    assert!(
+        crate::ai_mcp_model::analyze_mcp_tool_poisoning(
+            "src/i18n/auth.js",
+            trojan_with_char_and_rtl
+        )
+        .iter()
+        .any(|h| h.rule_id == "SMG-MCP-UNICODE-STEGO" && h.severity == "CRITICAL")
+    );
+    let inverted_isolates = "const s = \"\u{2069}admin\u{2066}\";\n";
+    assert!(
+        crate::ai_mcp_model::analyze_mcp_tool_poisoning("src/ui.ts", inverted_isolates)
+            .iter()
+            .any(|h| h.rule_id == "SMG-MCP-UNICODE-STEGO")
+    );
+    let benign_bidi_const = "private static final char RLO = '\u{202E}';\n";
+    assert!(
+        crate::ai_mcp_model::analyze_mcp_tool_poisoning("app/StringUtil.java", benign_bidi_const)
+            .is_empty()
+    );
+}

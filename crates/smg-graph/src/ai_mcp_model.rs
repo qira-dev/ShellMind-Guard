@@ -165,6 +165,20 @@ fn line_mentions_ident(line: &str, ident: &str) -> bool {
 
 /// 1. Indirect Prompt Injection Taint Graph (`RAG/Web/Email -> Prompt -> LLM -> Tool/Exec`).
 pub fn analyze_indirect_prompt_injection(rel_path: &str, source: &str) -> Vec<LocalStaticFinding> {
+    const LLM_SINKS: &[&str] = &[
+        ".completions.create(",
+        ".messages.create(",
+        "generate_content(",
+        "llm.invoke(",
+        "chat_model.invoke(",
+        "agent.run(",
+        "agent_executor.invoke(",
+    ];
+    // Fast O(N) pre-gate: if zero LLM sinks exist in the file, skip comment-stripping & taint pass.
+    if !LLM_SINKS.iter().any(|s| source.contains(s)) {
+        return Vec::new();
+    }
+
     let cleaned = crate::taint::strip_comments_simple(source);
     let lines: Vec<&str> = cleaned.lines().collect();
 
@@ -191,15 +205,6 @@ pub fn analyze_indirect_prompt_injection(rel_path: &str, source: &str) -> Vec<Lo
         "strip_prompt_injection(",
         "wrap_untrusted_data(",
         "xml_escape(",
-    ];
-    const LLM_SINKS: &[&str] = &[
-        ".completions.create(",
-        ".messages.create(",
-        "generate_content(",
-        "llm.invoke(",
-        "chat_model.invoke(",
-        "agent.run(",
-        "agent_executor.invoke(",
     ];
     const TOOL_EXEC_SINKS: &[&str] = &[
         "subprocess.",
@@ -319,36 +324,108 @@ pub fn analyze_mcp_tool_poisoning(rel_path: &str, source: &str) -> Vec<LocalStat
     let lines: Vec<&str> = source.lines().collect();
     let mut findings = Vec::new();
 
-    let is_mcp_ctx = source.contains("mcp")
-        || source.contains("MCP")
-        || source.contains("inputSchema")
-        || source.contains("FastMCP")
+    let low_path = rel_path.replace('\\', "/").to_ascii_lowercase();
+    let is_mcp_ctx = source.contains("FastMCP")
+        || source.contains("McpServer")
+        || source.contains("@mcp.tool")
         || source.contains("@server.tool")
         || source.contains("registerTool")
-        || rel_path.to_ascii_lowercase().contains("mcp");
+        || source.contains("modelcontextprotocol")
+        || (source.contains("inputSchema") && (source.contains("mcp") || source.contains("MCP")))
+        || low_path.ends_with("mcp.json")
+        || low_path.starts_with("mcp/")
+        || low_path.contains("/mcp/")
+        || low_path.contains("mcp_server")
+        || low_path.contains("mcp-server");
 
     let is_json_or_config = {
-        let lp = rel_path.to_ascii_lowercase();
-        lp.ends_with(".json") || lp.ends_with(".yaml") || lp.ends_with(".yml")
+        low_path.ends_with(".json") || low_path.ends_with(".yaml") || low_path.ends_with(".yml")
     };
-    let is_rust = rel_path.to_ascii_lowercase().ends_with(".rs");
+    let is_rust = low_path.ends_with(".rs");
+    let is_bidi_sanitizer_file = low_path.contains("bidi");
 
     // A. Invisible Unicode / Trojan-Source Bidi / Unicode Tags (U+E0000..U+E007F)
-    // Bidi overrides and Unicode Tags are always suspicious; zero-width chars are scoped to
-    // MCP context (and ZWJ/ZWNJ require a stego cluster >= 3 to avoid emoji / Indic-script FPs).
+    // Separate true Trojan-Source / Unicode Tag stego from benign `#`/`//` comments,
+    // emoji ZWJ sequences, standalone 1-char Bidi constants, and balanced W3C RTL isolates.
     for (idx, line) in lines.iter().enumerate() {
-        let has_bidi_or_tag = line.chars().any(|c| {
-            matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
-                || ('\u{E0000}'..='\u{E007F}').contains(&c)
-        });
-        let has_mcp_zw_stego = is_mcp_ctx
-            && (line.contains('\u{200B}')
-                || line
-                    .chars()
-                    .filter(|c| matches!(c, '\u{200B}' | '\u{200C}' | '\u{200D}'))
-                    .count()
-                    >= 3);
-        if has_bidi_or_tag || has_mcp_zw_stego {
+        let trimmed = line.trim();
+        let has_unicode_tag = line
+            .chars()
+            .any(|c| ('\u{E0000}'..='\u{E007F}').contains(&c));
+
+        let mut has_trojan_bidi = false;
+        if !is_bidi_sanitizer_file {
+            // Scrub ONLY standalone 1-codepoint Bidi char/string constants (`'\u{202E}'` or `"\u{202E}"`)
+            // so sanitizer tables do not false-positive while unrelated `'x'` literals never blind the line.
+            let chars: Vec<char> = line.chars().collect();
+            let mut scrubbed = String::with_capacity(line.len());
+            let mut ci = 0usize;
+            while ci < chars.len() {
+                let quote = chars[ci];
+                if (quote == '\'' || quote == '"')
+                    && ci + 2 < chars.len()
+                    && chars[ci + 2] == quote
+                    && matches!(
+                        chars[ci + 1],
+                        '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+                    )
+                {
+                    scrubbed.push(quote);
+                    scrubbed.push('_');
+                    scrubbed.push(quote);
+                    ci += 3;
+                } else {
+                    scrubbed.push(chars[ci]);
+                    ci += 1;
+                }
+            }
+
+            let has_override = scrubbed
+                .chars()
+                .any(|c| matches!(c, '\u{202A}'..='\u{202E}'));
+            let mut iso_depth: i32 = 0;
+            let mut iso_underflow = false;
+            for c in scrubbed.chars() {
+                if matches!(c, '\u{2066}'..='\u{2068}') {
+                    iso_depth += 1;
+                } else if c == '\u{2069}' {
+                    iso_depth -= 1;
+                    if iso_depth < 0 {
+                        iso_underflow = true;
+                        break;
+                    }
+                }
+            }
+            if has_override || iso_underflow || iso_depth != 0 {
+                has_trojan_bidi = true;
+            }
+        }
+
+        let is_pure_comment = !is_json_or_config
+            && (trimmed.starts_with('#') || trimmed.starts_with("//") || trimmed.starts_with('*'));
+        let has_mcp_zw_stego = if is_mcp_ctx && !is_pure_comment {
+            let chars: Vec<char> = line.chars().collect();
+            let mut zw_count = 0usize;
+            for (ci, &c) in chars.iter().enumerate() {
+                if matches!(c, '\u{200B}' | '\u{200C}' | '\u{200D}') {
+                    // Exclude ZWJ/ZWNJ adjacent to emoji or non-Latin scripts (Indic/Arabic/emoji)
+                    let prev_non_ascii = ci > 0
+                        && chars[ci - 1] > '\u{0590}'
+                        && !matches!(chars[ci - 1], '\u{200B}'..='\u{200F}');
+                    let next_non_ascii = ci + 1 < chars.len()
+                        && chars[ci + 1] > '\u{0590}'
+                        && !matches!(chars[ci + 1], '\u{200B}'..='\u{200F}');
+                    if !(c == '\u{200D}' && (prev_non_ascii || next_non_ascii)) {
+                        zw_count += 1;
+                    }
+                }
+            }
+            line.contains('\u{200B}') || zw_count >= 3
+        } else {
+            false
+        };
+
+        if has_unicode_tag || has_trojan_bidi || has_mcp_zw_stego {
             findings.push(mk_ai_finding(
                 "SMG-MCP-UNICODE-STEGO",
                 "CRITICAL",
@@ -439,6 +516,16 @@ pub fn analyze_model_deserialization_and_ssti(
     rel_path: &str,
     source: &str,
 ) -> Vec<LocalStaticFinding> {
+    let has_deser_kw = source.contains("torch.load")
+        || source.contains("pickle.load")
+        || source.contains("dill.load")
+        || source.contains("joblib.load")
+        || source.contains("allow_pickle")
+        || source.contains("trust_remote_code");
+    if !has_deser_kw {
+        return inspect_chat_template_ssti(rel_path, source);
+    }
+
     let cleaned = crate::taint::strip_comments_simple(source);
     let lines: Vec<&str> = cleaned.lines().collect();
     let mut findings = Vec::new();
@@ -496,20 +583,45 @@ pub fn analyze_model_deserialization_and_ssti(
             ));
         }
 
-        // C. HuggingFace `trust_remote_code=True`
-        if trimmed.contains("trust_remote_code=True") {
-            findings.push(mk_ai_finding(
-                "SMG-AI-REMOTE-CODE",
-                "HIGH",
-                "HuggingFace `trust_remote_code=True` executes arbitrary remote Python code from model repository".into(),
-                rel_path,
-                idx + 1,
-                "trust_remote_code",
-                SinkKind::CommandInjection,
-                GuardKind::Auth,
-                Confidence::Confirmed,
-                "Set `trust_remote_code=False` or pin an audited commit revision (`revision=\"<sha>\"`) after reviewing model code.",
-            ));
+        // C. HuggingFace `trust_remote_code=True` (require actual loader call context; skip defs/CLI help)
+        if trimmed.contains("trust_remote_code=True")
+            && !trimmed.starts_with("def ")
+            && !trimmed.starts_with("async def ")
+            && !trimmed.contains("add_argument")
+        {
+            const MODEL_LOADERS: &[&str] = &[
+                "from_pretrained",
+                "AutoModel",
+                "AutoTokenizer",
+                "AutoConfig",
+                "AutoProcessor",
+                "AutoImageProcessor",
+                "pipeline(",
+                "snapshot_download",
+                "load_dataset",
+                "LLM(",
+                "AsyncLLMEngine",
+                "EngineArgs",
+            ];
+            let win_start = idx.saturating_sub(4);
+            let win_end = (idx + 5).min(lines.len());
+            let has_loader_ctx = lines[win_start..win_end]
+                .iter()
+                .any(|l| MODEL_LOADERS.iter().any(|k| l.contains(k)));
+            if has_loader_ctx {
+                findings.push(mk_ai_finding(
+                    "SMG-AI-REMOTE-CODE",
+                    "HIGH",
+                    "HuggingFace `trust_remote_code=True` executes arbitrary remote Python code from model repository".into(),
+                    rel_path,
+                    idx + 1,
+                    "trust_remote_code",
+                    SinkKind::CommandInjection,
+                    GuardKind::Auth,
+                    Confidence::Confirmed,
+                    "Set `trust_remote_code=False` or pin an audited commit revision (`revision=\"<sha>\"`) after reviewing model code.",
+                ));
+            }
         }
     }
 

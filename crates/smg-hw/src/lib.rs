@@ -26,11 +26,36 @@ fn severity_rank(sev: &str) -> u8 {
     }
 }
 
+fn is_embedded_linker_script(text: &str) -> bool {
+    let up = text.to_ascii_uppercase();
+    up.contains("MEMORY")
+        && ["FLASH", "SRAM", "IRAM", "RAM", "ROM"]
+            .iter()
+            .any(|r| up.contains(r))
+}
+
+fn has_disk_hw_spec_files(project_root: &Path) -> bool {
+    collect_hw_spec_files(project_root, 4, 16)
+        .into_iter()
+        .any(|p| {
+            let low = p.to_string_lossy().to_ascii_lowercase();
+            if low.ends_with(".svd") {
+                return true;
+            }
+            fs::read_to_string(&p)
+                .map(|t| is_embedded_linker_script(&t))
+                .unwrap_or(false)
+        })
+}
+
 /// Returns `true` only when a repository actually contains C/C++/Rust firmware/driver indicators,
-/// `.svd`/`.ld` linker/register specs, or `compile_commands.json` — guaranteeing 0ms overhead on pure Web/SaaS repos.
+/// firmware manifests (`Kconfig.zephyr`, `west.yml`, `platformio.ini`, `sdkconfig`), or
+/// `.svd`/embedded `.ld` specs — guaranteeing 0ms overhead on pure Web/SaaS/desktop repos.
 pub fn repo_has_hw_indicators(project_root: &Path, files: &[IndexedFile]) -> bool {
-    if project_root.join("compile_commands.json").exists()
-        || project_root.join("build/compile_commands.json").exists()
+    if project_root.join("Kconfig.zephyr").exists()
+        || project_root.join("west.yml").exists()
+        || project_root.join("platformio.ini").exists()
+        || project_root.join("sdkconfig").exists()
     {
         return true;
     }
@@ -39,8 +64,25 @@ pub fn repo_has_hw_indicators(project_root: &Path, files: &[IndexedFile]) -> boo
     let mut has_rust = false;
     for f in files {
         let low_path = f.rel_path.to_ascii_lowercase();
-        if low_path.ends_with(".ld") || low_path.ends_with(".lds") || low_path.ends_with(".svd") {
+        if low_path.ends_with(".svd") {
             return true;
+        }
+        if low_path.ends_with(".ld") || low_path.ends_with(".lds") {
+            let text_opt = f
+                .cached_bytes
+                .as_deref()
+                .and_then(|b| std::str::from_utf8(b).ok())
+                .map(std::borrow::Cow::Borrowed)
+                .or_else(|| {
+                    fs::read_to_string(&f.abs_path)
+                        .ok()
+                        .map(std::borrow::Cow::Owned)
+                });
+            if let Some(t) = text_opt
+                && is_embedded_linker_script(&t)
+            {
+                return true;
+            }
         }
         match f.language {
             Language::C | Language::Cpp => has_c_cpp = true,
@@ -49,12 +91,12 @@ pub fn repo_has_hw_indicators(project_root: &Path, files: &[IndexedFile]) -> boo
         }
     }
     if !has_c_cpp && !has_rust {
-        return !collect_hw_spec_files(project_root, 4, 1).is_empty();
+        return has_disk_hw_spec_files(project_root);
     }
 
     // Lightweight indicator scan on C/C++/Rust files (comment-stripped) before spinning deeper domains.
-    // Whole-identifier tokens require word boundaries so userspace POSIX structs like
-    // `struct __user_cap_data_struct` (nginx/Linux capabilities) do not trigger firmware mode.
+    // Whole-identifier tokens require word boundaries and exclude generic desktop/stdlib tokens
+    // (`read_volatile`, `write_volatile`, `mmio`) so JIT/ML repos (`wasmtime`, `vllm`) skip `smg-hw`.
     const HW_EXACT_TOKENS: &[&str] = &[
         "__iomem",
         "ioremap",
@@ -65,9 +107,6 @@ pub fn repo_has_hw_indicators(project_root: &Path, files: &[IndexedFile]) -> boo
         "irqreturn_t",
         "request_irq",
         "request_threaded_irq",
-        "read_volatile",
-        "write_volatile",
-        "mmio",
         "flash_write",
         "ota_apply",
         "boot_jump",
@@ -128,7 +167,7 @@ pub fn repo_has_hw_indicators(project_root: &Path, files: &[IndexedFile]) -> boo
             }
         }
     }
-    !collect_hw_spec_files(project_root, 4, 1).is_empty()
+    has_disk_hw_spec_files(project_root)
 }
 
 /// Scans hardware, firmware, kernel driver, and embedded source files cleanly inside `smg-hw`.
@@ -137,65 +176,91 @@ pub fn scan_hardware_repo(
     files: &[IndexedFile],
     force_hw: bool,
 ) -> Vec<LocalStaticFinding> {
+    scan_hardware_repo_with_threads(project_root, files, force_hw, 4)
+}
+
+/// Bounded-concurrency hardware/firmware scanner using zero-copy `Cow<'_, str>` source borrows
+/// and single-pass Tree-sitter parsing per file.
+pub fn scan_hardware_repo_with_threads(
+    project_root: &Path,
+    files: &[IndexedFile],
+    force_hw: bool,
+    max_threads: usize,
+) -> Vec<LocalStaticFinding> {
     if !force_hw && !repo_has_hw_indicators(project_root, files) {
         return Vec::new();
     }
 
-    let mut sources: Vec<(String, Language, String)> = Vec::new();
-    for f in files {
-        if !matches!(f.language, Language::C | Language::Cpp | Language::Rust) {
-            continue;
-        }
-        if smg_core::is_test_source_path(&f.rel_path) {
-            continue;
-        }
-        let text = if let Some(b) = f.cached_bytes.as_deref() {
-            String::from_utf8_lossy(b).into_owned()
-        } else if let Ok(s) = fs::read_to_string(&f.abs_path) {
-            s
-        } else {
-            continue;
-        };
-        sources.push((f.rel_path.clone(), f.language, text));
-    }
+    let target_files: Vec<&IndexedFile> = files
+        .iter()
+        .filter(|f| {
+            matches!(f.language, Language::C | Language::Cpp | Language::Rust)
+                && !smg_core::is_test_source_path(&f.rel_path)
+        })
+        .collect();
 
     let mut raw_findings = Vec::new();
     let mut lock_summaries: Vec<HardwareFunctionLockSummary> = Vec::new();
     let mut stack_nodes: Vec<wcsd_dma::FnStackNode> = Vec::new();
+    let mut has_svd_regions = false;
 
-    if !sources.is_empty() {
-        let c_refs: Vec<(String, &str)> = sources
+    if !target_files.is_empty() {
+        let borrowed_texts: Vec<(&IndexedFile, std::borrow::Cow<'_, str>)> = target_files
             .iter()
-            .map(|(r, _, s)| (r.clone(), s.as_str()))
-            .collect();
-        let ctx = ingest_firmware_context(project_root, &c_refs);
-
-        use rayon::prelude::*;
-        let per_file: Vec<(
-            Vec<LocalStaticFinding>,
-            Vec<HardwareFunctionLockSummary>,
-            Vec<wcsd_dma::FnStackNode>,
-        )> = sources
-            .par_iter()
-            .map(|(rel, lang, content)| {
-                let mut local_findings = Vec::new();
-                let mut local_locks = Vec::new();
-                let mut local_stack_nodes = Vec::new();
-                analyze_hw_file(
-                    rel,
-                    *lang,
-                    content,
-                    &ctx,
-                    &mut local_findings,
-                    &mut local_locks,
-                );
-                if matches!(lang, Language::C | Language::Cpp) {
-                    local_findings.extend(wcsd_dma::analyze_dma_cache_coherency(rel, content));
-                    local_stack_nodes.extend(wcsd_dma::extract_c_stack_nodes(rel, content));
-                }
-                (local_findings, local_locks, local_stack_nodes)
+            .filter_map(|&f| {
+                let text = if let Some(b) = f.cached_bytes.as_deref() {
+                    String::from_utf8_lossy(b)
+                } else if let Ok(s) = fs::read_to_string(&f.abs_path) {
+                    std::borrow::Cow::Owned(s)
+                } else {
+                    return None;
+                };
+                Some((f, text))
             })
             .collect();
+
+        let c_refs: Vec<(String, &str)> = borrowed_texts
+            .iter()
+            .map(|(f, s)| (f.rel_path.clone(), s.as_ref()))
+            .collect();
+        let ctx = ingest_firmware_context(project_root, &c_refs);
+        has_svd_regions = ctx.has_svd_regions();
+
+        use rayon::prelude::*;
+        let run_par = || {
+            borrowed_texts
+                .par_iter()
+                .map(|(f, content)| {
+                    let mut local_findings = Vec::new();
+                    let mut local_locks = Vec::new();
+                    let mut local_stack_nodes = Vec::new();
+                    analyze_hw_file(
+                        &f.rel_path,
+                        f.language,
+                        content.as_ref(),
+                        &ctx,
+                        &mut local_findings,
+                        &mut local_locks,
+                        &mut local_stack_nodes,
+                    );
+                    if matches!(f.language, Language::C | Language::Cpp) {
+                        local_findings.extend(wcsd_dma::analyze_dma_cache_coherency(
+                            &f.rel_path,
+                            content.as_ref(),
+                        ));
+                    }
+                    (local_findings, local_locks, local_stack_nodes)
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let per_file = match rayon::ThreadPoolBuilder::new()
+            .num_threads(max_threads.max(1))
+            .build()
+        {
+            Ok(pool) => pool.install(run_par),
+            Err(_) => run_par(),
+        };
         for (lf, ll, ls) in per_file {
             raw_findings.extend(lf);
             lock_summaries.extend(ll);
@@ -205,6 +270,7 @@ pub fn scan_hardware_repo(
 
     let mut seen_ld_rel_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut min_stack_budget: Option<u64> = None;
+    let mut has_ld_memory_regions = false;
     for f in files {
         let low = f.rel_path.to_ascii_lowercase();
         if (low.ends_with(".ld") || low.ends_with(".lds"))
@@ -220,8 +286,11 @@ pub fn scan_hardware_repo(
                 .trim_start_matches("./")
                 .to_string();
             if seen_ld_rel_paths.insert(norm) {
-                let (_regions, stack_opt, ld_findings) =
+                let (regions, stack_opt, ld_findings) =
                     wcsd_dma::audit_linker_script(&f.rel_path, &text);
+                if !regions.is_empty() {
+                    has_ld_memory_regions = true;
+                }
                 if let Some(s) = stack_opt {
                     min_stack_budget = Some(min_stack_budget.map_or(s, |cur| cur.min(s)));
                 }
@@ -241,7 +310,10 @@ pub fn scan_hardware_repo(
             if seen_ld_rel_paths.insert(norm)
                 && let Ok(text) = fs::read_to_string(&spec_path)
             {
-                let (_regions, stack_opt, ld_findings) = wcsd_dma::audit_linker_script(&rel, &text);
+                let (regions, stack_opt, ld_findings) = wcsd_dma::audit_linker_script(&rel, &text);
+                if !regions.is_empty() {
+                    has_ld_memory_regions = true;
+                }
                 if let Some(s) = stack_opt {
                     min_stack_budget = Some(min_stack_budget.map_or(s, |cur| cur.min(s)));
                 }
@@ -250,8 +322,15 @@ pub fn scan_hardware_repo(
         }
     }
     if !stack_nodes.is_empty() {
-        let (_wcsd, wcsd_findings) =
-            wcsd_dma::compute_wcsd(&stack_nodes, min_stack_budget.unwrap_or(0));
+        let is_embedded_target = min_stack_budget.is_some()
+            || has_ld_memory_regions
+            || has_svd_regions
+            || stack_nodes.iter().any(|n| n.is_isr);
+        let (_wcsd, wcsd_findings) = wcsd_dma::compute_wcsd_for_target(
+            &stack_nodes,
+            min_stack_budget.unwrap_or(0),
+            is_embedded_target,
+        );
         raw_findings.extend(wcsd_findings);
     }
     if !lock_summaries.is_empty() {
@@ -729,6 +808,85 @@ void UART_IRQHandler(void) {
             vuln_hits
         );
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_zephyr_scale_define_storm_and_cyclic_wcsd_under_250ms() {
+        let dir = std::env::temp_dir().join(format!("smg_hw_v151_scale_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+
+        // 1. Desktop JIT/ML repo with read_volatile / mmio / compile_commands.json + non-embedded `.ld`
+        // must NOT trigger smg-hw
+        let _ = fs::write(dir.join("compile_commands.json"), "[]");
+        let _ = fs::write(dir.join("libcrypto.ld"), "VERS_1.0 { global: *; };\n");
+        let jit_rs = mk_mem_file(
+            "crates/wasmtime/src/jit.rs",
+            Language::Rust,
+            "pub unsafe fn load(p: *const u32, mmio: usize) -> u32 { let _ = mmio; core::ptr::read_volatile(p) }\n",
+        );
+        assert!(
+            !repo_has_hw_indicators(&dir, &[jit_rs]),
+            "Desktop Rust/C++ repo with only read_volatile/mmio/compile_commands.json/symbol-version .ld must not trigger smg-hw"
+        );
+        let _ = fs::remove_file(dir.join("compile_commands.json"));
+        let _ = fs::remove_file(dir.join("libcrypto.ld"));
+
+        // 1b. 140-level deep diamond DAG (0 cycles) must complete in < 50ms without exponential blowup
+        let mut dag_nodes = Vec::new();
+        for lvl in 0..140usize {
+            let next_a = format!("d_{}_a", lvl + 1);
+            let next_b = format!("d_{}_b", lvl + 1);
+            let callees = if lvl < 139 {
+                vec![next_a, next_b]
+            } else {
+                Vec::new()
+            };
+            for suffix in ["a", "b"] {
+                dag_nodes.push(wcsd_dma::FnStackNode {
+                    name: format!("d_{lvl}_{suffix}"),
+                    rel_path: "drivers/dag.c".into(),
+                    line: lvl + 1,
+                    local_frame_bytes: 32,
+                    callees: callees.clone(),
+                    is_isr: false,
+                });
+            }
+        }
+        let t_dag = std::time::Instant::now();
+        let (_wcsd, _dag_hits) = wcsd_dma::compute_wcsd_for_target(&dag_nodes, 4096, true);
+        assert!(
+            t_dag.elapsed().as_millis() < 50,
+            "140-level diamond DAG WCSD must complete in < 50ms (got {}ms)",
+            t_dag.elapsed().as_millis()
+        );
+
+        // 2. Synthesize 5,000 `#define` macros + 500 C functions with nested if/else + mutual recursion cycles
+        let mut hdr = String::with_capacity(200_000);
+        for i in 0..5_000usize {
+            use std::fmt::Write;
+            let _ = writeln!(hdr, "#define REG_{i} (0x40000000 + {i} * 4)");
+        }
+        let mut csrc = String::with_capacity(200_000);
+        for i in 0..500usize {
+            use std::fmt::Write;
+            let next = (i + 1) % 500;
+            let _ = writeln!(
+                csrc,
+                "int fn_{i}(int x) {{ int y = REG_0; if (x > 0) {{ y = x + 1; }} else {{ y = x + 2; }} return fn_{next}(y); }}"
+            );
+        }
+        let f_hdr = mk_mem_file("include/soc_regs.h", Language::C, &hdr);
+        let f_c = mk_mem_file("drivers/soc_init.c", Language::C, &csrc);
+
+        let t0 = std::time::Instant::now();
+        let _hits = scan_hardware_repo(&dir, &[f_hdr, f_c], true);
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed.as_millis() < 2_500,
+            "5,000 #defines + 500 cyclic C fns must complete rapidly (got {}ms)",
+            elapsed.as_millis()
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

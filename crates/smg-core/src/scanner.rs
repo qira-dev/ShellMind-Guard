@@ -308,13 +308,30 @@ pub fn is_test_source_path(rel_path: &str) -> bool {
                 | "__tests__"
                 | "spec"
                 | "testdata"
+                | "testing"
+                | "testutil"
+                | "testutils"
+                | "testhelpers"
+                | "test_helpers"
+                | "testcerts"
+                | "test-certs"
+                | "fakecerts"
                 | "mocks"
                 | "mock"
                 | "harnesses"
                 | "harness"
+                | "fuzz"
+                | "corpora"
         )
     });
     has_test_dir
+        || ((fname.ends_with(".pem") || fname.ends_with(".key") || fname.ends_with(".crt"))
+            && (fname.starts_with("test")
+                || fname.contains("-test.")
+                || fname.contains("_test.")
+                || fname.contains("snakeoil")
+                || fname.starts_with("dummy")
+                || fname.starts_with("fake")))
         || matches!(
             fname,
             "test.rs" | "tests.rs" | "test.py" | "tests.py" | "test.js" | "test.ts"

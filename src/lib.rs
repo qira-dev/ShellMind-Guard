@@ -395,6 +395,11 @@ struct ScanCmdArgs {
         help = "Enable Phase 15 Tier-2 deep audit budget (unlocks 2048-block CFG, 64 CHA targets, 256 witness hops)"
     )]
     deep_audit: bool,
+    #[arg(
+        long,
+        help = "Print per-phase wall-clock timing telemetry to stderr (or set SMG_PROFILE_PHASES=1)"
+    )]
+    profile_phases: bool,
     #[arg(long)]
     boot_cmd: Option<String>,
     #[arg(long, default_value_t = 39911)]
@@ -1121,8 +1126,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install ShellMind Guard
         run: |
-          curl -fsSL https://raw.githubusercontent.com/qira-dev/ShellMind-Guard/v1.5.0/install.sh -o install.sh
-          bash install.sh --version v1.5.0
+          curl -fsSL https://raw.githubusercontent.com/qira-dev/ShellMind-Guard/v1.5.5/install.sh -o install.sh
+          bash install.sh --version v1.5.5
           echo "$HOME/.local/bin" >> $GITHUB_PATH
       - name: Run ShellMind Guard 6-Layer Scan (SARIF)
         run: smg scan . --format sarif --sarif shellmind-guard.sarif --ci
@@ -1765,6 +1770,9 @@ pub(crate) fn execute_scan_pipeline_with_wave2(
     execute_scan_pipeline_full(opts, changed_since, include_generated, false, None)
 }
 
+static PROFILE_PHASES_FLAG: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub(crate) fn execute_scan_pipeline_full(
     opts: ScanRunOptions<'_>,
     changed_since: Option<&str>,
@@ -1772,15 +1780,24 @@ pub(crate) fn execute_scan_pipeline_full(
     pqc_compliance: bool,
     cbom_path: Option<&Path>,
 ) -> Result<ScanOutcome> {
+    let profile_phases = PROFILE_PHASES_FLAG.load(std::sync::atomic::Ordering::Relaxed)
+        || std::env::var_os("SMG_PROFILE_PHASES").is_some();
     let t0 = Instant::now();
     let mut cfg = ShellMindGuardConfig::load_trusted_from_dir(opts.path, opts.trust_repo_config)?;
     if opts.deep_audit {
         cfg.scan.deep_audit = true;
     }
+    let t_walk = Instant::now();
     let summary =
         scan_repository_with_options(opts.path, &cfg, &ScanOptions { include_generated })?;
+    let walk_ms = t_walk.elapsed().as_millis();
+
+    let t_sync = Instant::now();
     let mut store = StateStore::open(opts.path)?;
     let (delta, _) = store.sync_files(&summary.files)?;
+    let sync_ms = t_sync.elapsed().as_millis();
+
+    let t_graph = Instant::now();
     let mut graph_res = if let Some(git_ref) = changed_since {
         let changed = collect_git_changed_files(opts.path, git_ref)?;
         let (fallback, res) =
@@ -1797,6 +1814,7 @@ pub(crate) fn execute_scan_pipeline_full(
     } else {
         analyze_codebase_cached(&summary.files, &cfg, &mut store)?
     };
+    let graph_ms = t_graph.elapsed().as_millis();
 
     if opts.deep {
         graph_res
@@ -1804,20 +1822,31 @@ pub(crate) fn execute_scan_pipeline_full(
             .extend(collect_deep_schema_findings(&graph_res));
     }
     #[cfg(feature = "hw")]
-    {
+    let hw_ms: u128 = {
+        let t_hw = Instant::now();
         let force_hw = opts.layers.iter().any(|l| {
             matches!(
                 l.trim().to_ascii_lowercase().as_str(),
                 "hw" | "hardware" | "firmware" | "embedded"
             )
         });
-        let hw_hits = smg_hw::scan_hardware_repo(opts.path, &summary.files, force_hw);
+        let hw_hits = smg_hw::scan_hardware_repo_with_threads(
+            opts.path,
+            &summary.files,
+            force_hw,
+            cfg.scan.max_threads.max(1),
+        );
         smg_graph::append_local_static_findings(&mut graph_res.findings, &hw_hits);
-    }
+        t_hw.elapsed().as_millis()
+    };
+    #[cfg(not(feature = "hw"))]
+    let hw_ms: u128 = 0;
+    let t_ai_art = Instant::now();
     {
         let ai_artifact_hits = smg_graph::scan_repo_ai_model_artifacts(opts.path);
         smg_graph::append_local_static_findings(&mut graph_res.findings, &ai_artifact_hits);
     }
+    let ai_art_ms = t_ai_art.elapsed().as_millis();
     if let Some(gl_cfg) = smg_graph::GitleaksConfig::load(opts.path, None) {
         if !gl_cfg.custom_rules.is_empty() {
             let mut custom_hits = Vec::new();
@@ -1866,7 +1895,8 @@ pub(crate) fn execute_scan_pipeline_full(
         }
     }
     #[cfg(feature = "web3")]
-    {
+    let web3_ms: u128 = {
+        let t_web3 = Instant::now();
         let force_web3 = opts.layers.iter().any(|l| {
             matches!(
                 l.trim().to_ascii_lowercase().as_str(),
@@ -1887,9 +1917,13 @@ pub(crate) fn execute_scan_pipeline_full(
             cfg.scan.deep_audit,
         );
         smg_graph::append_local_static_findings(&mut graph_res.findings, &web3_hits);
-    }
+        t_web3.elapsed().as_millis()
+    };
+    #[cfg(not(feature = "web3"))]
+    let web3_ms: u128 = 0;
     #[cfg(feature = "pqc")]
-    {
+    let pqc_ms: u128 = {
+        let t_pqc = Instant::now();
         let wants_pqc = pqc_compliance
             || cbom_path.is_some()
             || opts.layers.iter().any(|l| {
@@ -1910,14 +1944,29 @@ pub(crate) fn execute_scan_pipeline_full(
                 fs::write(cbom_out, &pqc_res.cbom_json)?;
             }
         }
-    }
+        t_pqc.elapsed().as_millis()
+    };
     #[cfg(not(feature = "pqc"))]
-    {
+    let pqc_ms: u128 = {
         if pqc_compliance || cbom_path.is_some() {
             anyhow::bail!(
                 "This binary was built without `--features pqc`. Recompile with `--features pqc` to use `--compliance pqc` or `--cbom`."
             );
         }
+        0
+    };
+    if profile_phases {
+        eprintln!(
+            "[SMG-PROFILE] walk={}ms sync={}ms graph={}ms hw={}ms web3={}ms pqc={}ms ai_art={}ms total={}ms",
+            walk_ms,
+            sync_ms,
+            graph_ms,
+            hw_ms,
+            web3_ms,
+            pqc_ms,
+            ai_art_ms,
+            t0.elapsed().as_millis()
+        );
     }
     let mut all_findings = graph_res.findings.clone();
 
@@ -2257,6 +2306,7 @@ pub fn run_cli() -> Result<ExitCode> {
                 min_confidence,
                 deep,
                 deep_audit,
+                profile_phases,
                 boot_cmd,
                 port,
                 sync_race,
@@ -2285,6 +2335,7 @@ pub fn run_cli() -> Result<ExitCode> {
                 watch,
             } = *boxed_scan;
             smg_core::set_include_tests(include_tests);
+            PROFILE_PHASES_FLAG.store(profile_phases, std::sync::atomic::Ordering::Relaxed);
             let effective_format = if json { OutputFormat::Json } else { format };
             let min_conf = min_confidence.map(|m| m.to_confidence());
             let run_pqc = match compliance.as_deref().map(|s| s.trim().to_ascii_lowercase()) {

@@ -44,6 +44,7 @@ impl Default for CompileUnitContext {
 #[derive(Debug, Clone, Default)]
 pub struct FirmwareContext {
     pub compile_units: HashMap<String, CompileUnitContext>,
+    pub compile_unit_suffix_index: HashMap<String, String>,
     pub memory_regions: Vec<MemoryRegion>,
     pub global_defines: HashMap<String, i64>,
     pub unresolved_ifdef_files: HashSet<String>,
@@ -51,7 +52,34 @@ pub struct FirmwareContext {
 }
 
 impl FirmwareContext {
+    pub fn rebuild_compile_unit_suffix_index(&mut self) {
+        self.compile_unit_suffix_index.clear();
+        let mut sorted_keys: Vec<&String> = self.compile_units.keys().collect();
+        sorted_keys.sort();
+        for k in sorted_keys {
+            let clean = k.replace('\\', "/");
+            let trimmed = clean.trim_start_matches("./");
+            if let Some(fname) = trimmed.rsplit('/').next()
+                && !fname.is_empty()
+            {
+                self.compile_unit_suffix_index
+                    .entry(fname.to_string())
+                    .or_insert_with(|| k.clone());
+            }
+            let parts: Vec<&str> = trimmed.split('/').collect();
+            if parts.len() >= 2 {
+                let tail2 = format!("{}/{}", parts[parts.len() - 2], parts[parts.len() - 1]);
+                self.compile_unit_suffix_index
+                    .entry(tail2)
+                    .or_insert_with(|| k.clone());
+            }
+        }
+    }
+
     pub fn lookup_compile_unit(&self, rel_path: &str) -> Option<&CompileUnitContext> {
+        if self.compile_units.is_empty() {
+            return None;
+        }
         let norm = rel_path.replace('\\', "/");
         let trimmed = norm.trim_start_matches("./");
         if let Some(cu) = self.compile_units.get(trimmed) {
@@ -59,6 +87,24 @@ impl FirmwareContext {
         }
         if let Some(cu) = self.compile_units.get(&norm) {
             return Some(cu);
+        }
+        if !self.compile_unit_suffix_index.is_empty() {
+            let parts: Vec<&str> = trimmed.split('/').collect();
+            if parts.len() >= 2 {
+                let tail2 = format!("{}/{}", parts[parts.len() - 2], parts[parts.len() - 1]);
+                if let Some(canon) = self.compile_unit_suffix_index.get(&tail2)
+                    && let Some(cu) = self.compile_units.get(canon)
+                {
+                    return Some(cu);
+                }
+            }
+            if let Some(fname) = parts.last()
+                && let Some(canon) = self.compile_unit_suffix_index.get(*fname)
+                && let Some(cu) = self.compile_units.get(canon)
+            {
+                return Some(cu);
+            }
+            return None;
         }
         let suffix = format!("/{trimmed}");
         for (k, cu) in &self.compile_units {
@@ -1054,7 +1100,11 @@ pub fn ingest_firmware_context(
         }
     }
 
+    const MAX_DEFINE_SOURCE_BYTES: usize = 512 * 1024;
+    const MAX_PENDING_DEFINES: usize = 65_536;
+
     let mut pending_defines: Vec<(String, String)> = Vec::new();
+    let mut non_header_sources: Vec<(&String, &str)> = Vec::new();
     for (rel, content) in c_sources {
         let low = rel.to_ascii_lowercase();
         if low.ends_with(".ld") || low.ends_with(".lds") || low.ends_with(".svd") {
@@ -1064,13 +1114,36 @@ pub fn ingest_firmware_context(
             }
             continue;
         }
-        for cap in c_define_expr_re().captures_iter(content) {
-            pending_defines.push((cap[1].to_string(), cap[2].trim().to_string()));
-        }
         if !ctx.has_compile_commands
             && (content.contains("#ifdef ") || content.contains("#if defined("))
         {
             ctx.unresolved_ifdef_files.insert(rel.clone());
+        }
+        if content.len() > MAX_DEFINE_SOURCE_BYTES {
+            continue;
+        }
+        if low.ends_with(".h") || low.ends_with(".hpp") {
+            if pending_defines.len() < MAX_PENDING_DEFINES {
+                for cap in c_define_expr_re().captures_iter(content) {
+                    pending_defines.push((cap[1].to_string(), cap[2].trim().to_string()));
+                    if pending_defines.len() >= MAX_PENDING_DEFINES {
+                        break;
+                    }
+                }
+            }
+        } else {
+            non_header_sources.push((rel, content));
+        }
+    }
+    for (_rel, content) in non_header_sources {
+        if pending_defines.len() >= MAX_PENDING_DEFINES {
+            break;
+        }
+        for cap in c_define_expr_re().captures_iter(content) {
+            pending_defines.push((cap[1].to_string(), cap[2].trim().to_string()));
+            if pending_defines.len() >= MAX_PENDING_DEFINES {
+                break;
+            }
         }
     }
     // Bounded 4-pass fixed-point evaluation for composed `#define` arithmetic & bit-shifts
@@ -1090,6 +1163,7 @@ pub fn ingest_firmware_context(
         }
     }
 
+    ctx.rebuild_compile_unit_suffix_index();
     ctx
 }
 

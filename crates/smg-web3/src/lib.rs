@@ -348,7 +348,36 @@ pub fn scan_web3_repo_with_options(
     }
     all_findings.extend(detect_proxy_storage_collisions(&proxies, &impls));
 
-    // Deterministic deduplication by (rule_id, rel_path, line) retaining highest severity
+    // Deterministic deduplication by canonical defect family `(family, rel_path, line)` so
+    // umbrella (`SMG-WEB3-*`) and deep (`SMG-SOL-*` / `SMG-MOVE-*`) rules never double-fire on one line.
+    fn web3_dedup_family(f: &LocalStaticFinding) -> &str {
+        match f.rule_id.as_str() {
+            "SMG-SOL-ARBITRARY-CPI" => "SOL_CPI",
+            "SMG-WEB3-SOLANA" if f.title.starts_with("Arbitrary CPI target") => "SOL_CPI",
+            "SMG-SOL-PDA-NONCANONICAL" => "SOL_PDA",
+            "SMG-WEB3-SOLANA" if f.title.starts_with("Non-canonical PDA") => "SOL_PDA",
+            "SMG-MOVE-ABILITY-LEAK" => "MOVE_ABILITY",
+            "SMG-WEB3-MOVE"
+                if f.title.contains("declares `drop`/`copy`")
+                    || f.title.contains("declares `copy`/`store`") =>
+            {
+                "MOVE_ABILITY"
+            }
+            "SMG-MOVE-ENTRY-NO-AUTH" => "MOVE_ENTRY_AUTH",
+            "SMG-WEB3-MOVE" if f.title.starts_with("Unprotected Move privileged function") => {
+                "MOVE_ENTRY_AUTH"
+            }
+            other => other,
+        }
+    }
+    fn family_rule_pref(family: &str, rule_id: &str) -> u8 {
+        match (family, rule_id) {
+            ("SOL_CPI", "SMG-SOL-ARBITRARY-CPI") => 2,
+            ("SOL_PDA", "SMG-SOL-PDA-NONCANONICAL") => 2,
+            ("MOVE_ABILITY" | "MOVE_ENTRY_AUTH", "SMG-WEB3-MOVE") => 2,
+            _ => 1,
+        }
+    }
     let conf_rank = |c: Confidence| -> u8 {
         match c {
             Confidence::Proven => 3,
@@ -359,12 +388,18 @@ pub fn scan_web3_repo_with_options(
     let mut best_by_key: HashMap<(String, String, usize), usize> = HashMap::new();
     let mut deduped: Vec<LocalStaticFinding> = Vec::new();
     for f in all_findings {
-        let key = (f.rule_id.clone(), f.rel_path.clone(), f.line);
+        let family = web3_dedup_family(&f).to_string();
+        let key = (family.clone(), f.rel_path.clone(), f.line);
         if let Some(&idx) = best_by_key.get(&key) {
-            let new_key = (severity_rank(&f.severity), conf_rank(f.confidence));
+            let new_key = (
+                severity_rank(&f.severity),
+                conf_rank(f.confidence),
+                family_rule_pref(&family, &f.rule_id),
+            );
             let old_key = (
                 severity_rank(&deduped[idx].severity),
                 conf_rank(deduped[idx].confidence),
+                family_rule_pref(&family, &deduped[idx].rule_id),
             );
             if new_key > old_key {
                 deduped[idx] = f;
@@ -941,6 +976,94 @@ module defi::pool {
                 .iter()
                 .any(|h| h.symbol == "SafeCap" || h.symbol == "SafeReceipt"),
             "Safe Move structs must not be flagged: {move_hits:#?}"
+        );
+    }
+
+    #[test]
+    fn test_wormhole_solana_cpi_and_sui_move_no_double_fire() {
+        let dir = std::env::temp_dir();
+        let mk_mem_file = |rel: &str, lang: Language, code: &str| IndexedFile {
+            abs_path: std::path::PathBuf::from(rel),
+            rel_path: rel.to_string(),
+            language: lang,
+            size_bytes: code.len() as u64,
+            mtime_ns: 0,
+            blake3_hash: String::new(),
+            cached_bytes: Some(code.as_bytes().to_vec()),
+        };
+
+        // 1. Unvalidated invoke_signed must emit EXACTLY 1 finding (SMG-SOL-ARBITRARY-CPI), NOT 2
+        let sol_cpi = r#"
+use anchor_lang::prelude::*;
+use solana_program::program::invoke_signed;
+
+#[derive(Accounts)]
+pub struct SafePda<'info> {
+    #[account(seeds = [b"emitter"], bump)]
+    pub emitter_authority: UncheckedAccount<'info>,
+}
+
+pub fn relay(ix: &solana_program::instruction::Instruction, accs: &[AccountInfo]) -> ProgramResult {
+    invoke_signed(ix, accs, &[])
+}
+"#;
+        let sol_file = mk_mem_file("svm/post_message/src/lib.rs", Language::Rust, sol_cpi);
+        let sol_hits = scan_web3_repo(&dir, &[sol_file], true);
+        let cpi_hits: Vec<_> = sol_hits
+            .iter()
+            .filter(|h| {
+                h.rule_id == "SMG-SOL-ARBITRARY-CPI" || h.title.starts_with("Arbitrary CPI target")
+            })
+            .collect();
+        assert_eq!(
+            cpi_hits.len(),
+            1,
+            "Unvalidated invoke_signed must not double-fire: {cpi_hits:#?}"
+        );
+        assert_eq!(cpi_hits[0].rule_id, "SMG-SOL-ARBITRARY-CPI");
+        assert!(
+            !sol_hits
+                .iter()
+                .any(|h| h.symbol.contains("emitter_authority")),
+            "Anchor PDA #[account(seeds = ...)] must not be flagged as missing Signer: {sol_hits:#?}"
+        );
+
+        // 2. Sui Move public(package) & `FeeCollector has store` => 0 findings; unprotected public entry => 1 finding
+        let move_src = r#"
+module wormhole::fee_collector {
+    public struct FeeCollector has store {
+        balance: u64,
+    }
+
+    public(package) fun withdraw_fee(fc: &mut FeeCollector): u64 {
+        fc.balance
+    }
+
+    public entry fun withdraw_all(vault: &mut FeeCollector) {
+        vault.balance = 0;
+    }
+}
+"#;
+        let move_file = mk_mem_file(
+            "sui/wormhole/sources/fee_collector.move",
+            Language::Move,
+            move_src,
+        );
+        let move_hits = scan_web3_repo(&dir, &[move_file], true);
+        assert!(
+            !move_hits
+                .iter()
+                .any(|h| h.title.contains("FeeCollector") || h.title.contains("withdraw_fee")),
+            "Internal public(package) and `has store` resource must not fire: {move_hits:#?}"
+        );
+        let entry_hits: Vec<_> = move_hits
+            .iter()
+            .filter(|h| h.rule_id == "SMG-WEB3-MOVE" || h.rule_id == "SMG-MOVE-ENTRY-NO-AUTH")
+            .collect();
+        assert_eq!(
+            entry_hits.len(),
+            1,
+            "Unprotected Move entry must emit exactly 1 deduplicated finding: {entry_hits:#?}"
         );
     }
 }

@@ -412,10 +412,15 @@ fn inspect_anchor_accounts_struct(
             .any(|kw| fname_low.contains(kw))
             && fname_low != "program_data";
 
-        let attr_checks_signer =
-            attrs_low.contains("signer") || fn_signers.is_some_and(|s| s.contains(&field_name));
-        let attr_checks_owner =
-            has_anchor_owner_attr(&attrs_low) || fn_owners.is_some_and(|s| s.contains(&field_name));
+        let is_pda_or_pinned = attrs_low.contains("seeds")
+            || attrs_low.contains("address =")
+            || attrs_low.contains("address=");
+        let attr_checks_signer = attrs_low.contains("signer")
+            || is_pda_or_pinned
+            || fn_signers.is_some_and(|s| s.contains(&field_name));
+        let attr_checks_owner = has_anchor_owner_attr(&attrs_low)
+            || is_pda_or_pinned
+            || fn_owners.is_some_and(|s| s.contains(&field_name));
 
         if is_authority_name && !attr_checks_signer {
             findings.push(LocalStaticFinding {
@@ -573,7 +578,7 @@ fn inspect_solana_instruction_fn(
             && !line.contains("\"CpiContext::new(\"")
         {
             let body_lines: Vec<&str> = body.lines().collect();
-            let w_start = idx.saturating_sub(8);
+            let w_start = idx.saturating_sub(15);
             let w_end = (idx + 6).min(body_lines.len());
             let cpi_window = body_lines[w_start..w_end].join("\n");
             let field_validated =
@@ -584,6 +589,14 @@ fn inspect_solana_instruction_fn(
                 && !cpi_window.contains("::ID")
                 && !cpi_window.contains("::id()")
                 && !cpi_window.contains("program_id ==")
+                && !cpi_window.contains("_PROGRAM_ID")
+                && !cpi_window.contains("CORE_BRIDGE")
+                && !cpi_window.contains("TOKEN_PROGRAM_ID")
+                && !cpi_window.contains("SYSTEM_PROGRAM_ID")
+                && !cpi_window.contains("check_id(")
+                && !cpi_window.contains("key() == ")
+                && !cpi_window.contains(".key == ")
+                && !cpi_window.contains("pubkey!(")
             {
                 findings.push(LocalStaticFinding {
                     rule_id: "SMG-WEB3-SOLANA".into(),
@@ -616,8 +629,12 @@ fn has_move_capability_param(params: &str) -> bool {
             || ty_low.contains("capability")
             || ty_low.contains("treasury_cap")
             || ty_low.contains("admin_cap")
+            || ty_low.contains("decree")
+            || ty_low.contains("guardian")
             || ty.ends_with("Cap")
             || ty.contains("Cap<")
+            || ty.ends_with("Ticket")
+            || ty.contains("Ticket<")
         {
             return true;
         }
@@ -804,7 +821,12 @@ pub fn analyze_move_file(rel_path: &str, source: &str) -> Vec<LocalStaticFinding
             continue;
         }
 
-        let is_public_fn = (trimmed.starts_with("public ") || trimmed.starts_with("entry "))
+        let is_internal_move_vis = trimmed.starts_with("public(friend)")
+            || trimmed.starts_with("public(package)")
+            || trimmed.starts_with("public (friend)")
+            || trimmed.starts_with("public (package)");
+        let is_public_fn = !is_internal_move_vis
+            && (trimmed.starts_with("public ") || trimmed.starts_with("entry "))
             && trimmed.contains(" fun ");
         if !is_public_fn {
             i += 1;

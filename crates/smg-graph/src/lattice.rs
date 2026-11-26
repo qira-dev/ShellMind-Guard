@@ -359,7 +359,9 @@ pub fn finding_matches_layer(f: &LatticeFinding, layer: &str) -> bool {
         "crypto" => f.rule_id.starts_with("SMG-CRYPTO-") || f.rule_id == "SMG-CFG-CRYPTO",
         "queue" | "async" | "mq" => f.rule_id.starts_with("SMG-QUEUE-"),
         "api" | "graphql" | "ws" | "websocket" | "grpc" => f.rule_id.starts_with("SMG-API-"),
-        "ai" | "llm" | "agent" | "prompt" => f.rule_id.starts_with("SMG-AI-"),
+        "ai" | "llm" | "agent" | "prompt" => {
+            f.rule_id.starts_with("SMG-AI-") || f.rule_id.starts_with("SMG-MCP-")
+        }
         "oauth" | "pkce" => f.rule_id == "SMG-AUTH-PKCE",
         "smuggle" | "crlf" | "header" => f.rule_id == "SMG-HTTP-SMUGGLE",
         "state" | "workflow" => f.rule_id.starts_with("SMG-STATE-"),
@@ -367,7 +369,11 @@ pub fn finding_matches_layer(f: &LatticeFinding, layer: &str) -> bool {
             f.rule_id.starts_with("SMG-HW-") || f.missing_guard == GuardKind::MemoryBounds
         }
         "web3" | "blockchain" | "smartcontract" | "solidity" | "evm" | "solana" | "move"
-        | "defi" => f.rule_id.starts_with("SMG-WEB3-"),
+        | "defi" => {
+            f.rule_id.starts_with("SMG-WEB3-")
+                || f.rule_id.starts_with("SMG-SOL-")
+                || f.rule_id.starts_with("SMG-MOVE-")
+        }
         "pqc" | "quantum" | "post-quantum" | "cbom" => f.rule_id.starts_with("SMG-PQC-"),
         "5" | "layer5" | "6" | "layer6" | "race" => f.missing_guard == GuardKind::TxLock,
         "concurrency" => matches!(f.missing_guard, GuardKind::TxLock | GuardKind::LockOrdering),
@@ -2418,11 +2424,31 @@ fn is_example_or_benchmark_path(rel_path: &str) -> bool {
     })
 }
 
+fn is_dev_sandbox_or_sample_cert_path(rel_path: &str) -> bool {
+    let low = rel_path.replace('\\', "/").to_ascii_lowercase();
+    let fname = low.rsplit('/').next().unwrap_or(&low);
+    low.split('/').any(|seg| {
+        matches!(
+            seg,
+            "devenv"
+                | "dev-certs"
+                | "demos"
+                | "demo"
+                | "samples"
+                | "sample"
+                | "fixtures"
+                | "fixture"
+        )
+    }) || low.contains("packaging/docker/")
+        || (fname.starts_with("localhost") && (fname.ends_with(".key") || fname.ends_with(".pem")))
+}
+
 fn insert_static_finding(
     best: &mut HashMap<(String, String, String), LatticeFinding>,
     sf: &LocalStaticFinding,
 ) {
-    if smg_core::is_test_source_path(&sf.rel_path) {
+    let is_test_path = smg_core::is_test_source_path(&sf.rel_path);
+    if is_test_path {
         // Suppress dummy test-fixture certificates/keys and non-secret findings inside test trees
         // while keeping real provider credential leaks (`SMG-SEC-AWS`, `SMG-SEC-STRIPE`, etc.) active.
         let is_dummy_test_cert_or_env = matches!(
@@ -2435,7 +2461,8 @@ fn insert_static_finding(
             return;
         }
     }
-    if is_example_or_benchmark_path(&sf.rel_path)
+    let is_ex_or_bench = is_example_or_benchmark_path(&sf.rel_path);
+    if is_ex_or_bench
         && matches!(
             sf.rule_id.as_str(),
             "SMG-ENG-INT" | "SMG-MEM-BOUNDS" | "SMG-ENG-LEAK" | "SMG-SEC-KEY" | "SMG-SEC-ENV"
@@ -2443,9 +2470,25 @@ fn insert_static_finding(
     {
         return;
     }
+    let mut cand_sev = sf.severity.clone();
+    let mut cand_conf = sf.confidence;
+    let mut cand_title = sf.title.clone();
+    if is_test_path && sf.rule_id.starts_with("SMG-SEC-") {
+        cand_sev = "MEDIUM".into();
+        cand_conf = Confidence::Heuristic;
+    } else if sf.rule_id == "SMG-SEC-KEY" && is_dev_sandbox_or_sample_cert_path(&sf.rel_path) {
+        cand_sev = "LOW".into();
+        cand_conf = Confidence::Heuristic;
+        cand_title = "Local development / sample private key block".into();
+    } else if is_ex_or_bench
+        && (sf.rule_id.starts_with("SMG-AI-") || sf.rule_id == "SMG-CMDI-DESER")
+    {
+        cand_sev = "LOW".into();
+        cand_conf = Confidence::Heuristic;
+    }
     let entry_route = format!("{}:{}", sf.rel_path, sf.line);
     let dedup_rule_key = if sf.rule_id.starts_with("SMG-DEP-") {
-        format!("{}#{}", sf.rule_id, sf.title)
+        format!("{}#{}", sf.rule_id, cand_title)
     } else {
         sf.rule_id.clone()
     };
@@ -2453,12 +2496,12 @@ fn insert_static_finding(
     let cand = LatticeFinding {
         id: String::new(),
         rule_id: sf.rule_id.clone(),
-        severity: sf.severity.clone(),
-        title: sf.title.clone(),
+        severity: cand_sev,
+        title: cand_title,
         file: sf.rel_path.clone(),
         line: sf.line,
         status: "SUSPECT_UNGUARDED".into(),
-        confidence: sf.confidence,
+        confidence: cand_conf,
         entry_route,
         sink_kind: sf.sink_kind,
         missing_guard: sf.missing_guard,
@@ -2468,7 +2511,7 @@ fn insert_static_finding(
             line: sf.line,
         }],
         remediation: sf.remediation.clone(),
-        proof_reasons: proof_reasons_for_static_rule(&sf.rule_id, sf.confidence),
+        proof_reasons: proof_reasons_for_static_rule(&sf.rule_id, cand_conf),
     };
     let replace = match best.get(&key) {
         Some(prev) => finding_priority(&cand) > finding_priority(prev),
@@ -4075,6 +4118,64 @@ func handleCharge(w http.ResponseWriter, r *http.Request) {
                 .any(|f| f.rule_id == "SMG-AUTH-001" && f.entry_route.contains("/go/cha-charge")),
             "Go structural interface Charger.Charge() must resolve to StripeCharger.Charge(): {:?}",
             go_iface_res.findings
+        );
+    }
+
+    #[test]
+    fn test_sec_key_dev_vs_crapi_prod_recall() {
+        let cfg = smg_core::ShellMindGuardConfig::default();
+        let mk = |rel: &str, lang: smg_core::Language, code: &str| smg_core::IndexedFile {
+            abs_path: std::path::PathBuf::from(rel),
+            rel_path: rel.to_string(),
+            language: lang,
+            size_bytes: code.len() as u64,
+            mtime_ns: 0,
+            blake3_hash: String::new(),
+            cached_bytes: Some(code.as_bytes().to_vec()),
+        };
+        let pem = concat!(
+            "-----BEGIN ",
+            "RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEAtest\n-----END ",
+            "RSA PRIVATE KEY-----\n"
+        );
+        let s_prod = parse_file_ast(
+            &mk("services/chatbot/certs/server.pem", Language::Config, pem),
+            &cfg,
+        )
+        .unwrap();
+        let s_dev = parse_file_ast(
+            &mk("devenv/docker/blocks/tls/dev.pem", Language::Config, pem),
+            &cfg,
+        )
+        .unwrap();
+        let s_test = parse_file_ast(
+            &mk("pkg/testhelpers/ca-test.pem", Language::Config, pem),
+            &cfg,
+        )
+        .unwrap();
+        let res = solve_guard_lattice(&[s_prod, s_dev, s_test]);
+        let prod_hit = res
+            .findings
+            .iter()
+            .find(|f| f.file == "services/chatbot/certs/server.pem" && f.rule_id == "SMG-SEC-KEY")
+            .expect("crAPI production cert path must retain SMG-SEC-KEY");
+        assert_eq!(prod_hit.severity, "CRITICAL");
+        assert_eq!(prod_hit.confidence, Confidence::Confirmed);
+
+        let dev_hit = res
+            .findings
+            .iter()
+            .find(|f| f.file == "devenv/docker/blocks/tls/dev.pem" && f.rule_id == "SMG-SEC-KEY")
+            .expect("devenv cert path should be downgraded to LOW/Heuristic");
+        assert_eq!(dev_hit.severity, "LOW");
+        assert_eq!(dev_hit.confidence, Confidence::Heuristic);
+
+        assert!(
+            !res.findings
+                .iter()
+                .any(|f| f.file == "pkg/testhelpers/ca-test.pem"),
+            "testhelpers cert fixture must be suppressed: {:?}",
+            res.findings
         );
     }
 }

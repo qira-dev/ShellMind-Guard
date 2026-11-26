@@ -65,7 +65,7 @@ pub(super) const RULES: &[(&str, PackRuleSpec)] = &[
             confidence: Confidence::Confirmed,
             remediation: "Keep `trust_remote_code=False` and pin model revisions to an immutable HuggingFace commit hash.",
             langs: PY_ONLY,
-            line_exempt_any: &[],
+            line_exempt_any: &["def ", "add_argument"],
             file_exempt_any: &[],
             path_require_any: &[],
             symbol: "hf_trust_remote_code",
