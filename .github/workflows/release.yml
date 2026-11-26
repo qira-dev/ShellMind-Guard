@@ -36,12 +36,23 @@ jobs:
         with:
           components: clippy
 
-      - name: Run Clippy & Workspace Tests
+      - name: Run Clippy, Workspace Tests & Permanent Release Benchmark Scorecard
         env:
           SMG_ENFORCE_PRECISION_GATE: "1"
         run: |
           cargo clippy --workspace --all-targets --locked -- -D warnings
           cargo test --workspace --locked
+          cargo build --release --locked
+          bash scripts/run_benchmarks.sh
+
+      - name: Upload permanent release benchmark scorecard
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: smg-release-benchmarks
+          path: |
+            target/benchmarks/benchmark-report.md
+            target/benchmarks/benchmark-metrics.json
 
   build:
     name: Build (${{ matrix.target }})
@@ -153,4 +164,6 @@ jobs:
           files: |
             artifacts/shellmind-guard-*
             artifacts/SHA256SUMS.txt
+            artifacts/benchmark-report.md
+            artifacts/benchmark-metrics.json
           generate_release_notes: true

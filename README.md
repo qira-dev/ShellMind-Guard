@@ -255,57 +255,53 @@ Every precision and recall figure in ShellMind Guard is backed by an auditable, 
    ```bash
    SMG_ENFORCE_PRECISION_GATE=1 cargo test -p smg-graph --test adversarial_precision_bench -- --nocapture
    ```
-   *(Automated hands-off on every code push, PR, release tag, and weekly schedule via [`.github/workflows/benchmarks.yml`](.github/workflows/benchmarks.yml) and [`scripts/run_benchmarks.sh`](scripts/run_benchmarks.sh), publishing a live Markdown scorecard to the GitHub Actions Job Summary and uploading `benchmark-metrics.json` artifacts with zero manual maintenance.)*
+   *(Automated hands-off on every code push, PR, release tag, and weekly schedule via [`.github/workflows/benchmarks.yml`](.github/workflows/benchmarks.yml) and [`scripts/run_benchmarks.sh`](scripts/run_benchmarks.sh): CI artifacts are retained for GitHub Actions' 90-day maximum, while every `v*` release attaches `benchmark-report.md` and `benchmark-metrics.json` **permanently** to GitHub Releases.)*
 2. **External Vulnerable & Production Reference Baselines:**
    - **`OWASP/crAPI` (`1,062` files):** Evaluated against **30 known ground-truth flaws across 4 core categories** (`SMG-SQLI-001 = 1`, `SMG-AUTH-001 = 16`, `SMG-CFG-JWT-LOGIC / SMG-SEC-JWT = 7`, `SMG-SEC-KEY = 6` in `services/chatbot/certs/server.key`), verifying `30/30` (`100%` tracked-flaw recall) on every tuning pass.
    - **`expressjs/express` (`lib/*.js` production core):** Evaluated at `--min-confidence confirmed` (`--ci` default gate: `HIGH`/`CRITICAL` non-test findings), verifying **`0` false positives** on clean framework routing/middleware internals.
 
-| Ground-Truth Suite / Family | Positive Flaws (`TP`) | False Negatives (`FN`) | Safe Adversarial Twins (`TN`) | False Positives (`FP`) | Measured Recall | Measured Precision |
+| Ground-Truth Suite / Rule Family | Positive Flaws (`TP`) | False Negatives (`FN`) | Safe Adversarial Twins (`TN`) | False Positives (`FP`) | Measured Recall | Measured Precision |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **`SQLI` (Parameterized / Allowlist Traps)** | 10 | 0 | 11 | 0 | **100.0%** | **100.0%** |
-| **`CMDI` / `SSTI` / `DESER` (Argv / SafeLoader Traps)** | 12 | 0 | 4 | 0 | **100.0%** | **100.0%** |
-| **`AUTH` & `IDOR` (Dominator / Router-Mount Traps)** | 7 | 0 | 7 | 0 | **100.0%** | **100.0%** |
-| **`AI` / `MCP` & `CICD` / `K8S` (`weights_only` / Pinned SHA)** | 11 | 0 | 8 | 0 | **100.0%** | **100.0%** |
-| **`MEM` / `ENG` / `RACE` (`SELECT FOR UPDATE` / Bounds Traps)** | 6 | 0 | 7 | 0 | **100.0%** | **100.0%** |
-| **`PATH` / `XSS` / `SSRF` (`Clean`+Prefix / `DOMPurify` Traps)** | 7 | 0 | 5 | 0 | **100.0%** | **100.0%** |
-| **`SEC` / `CFG` / `IAC` / `CRYPTO` / `OAUTH` / `STATE` / `QUEUE` / `ZIP` / `DOS` / `API` / `SMUGGLE` / `FE`** | 14 | 0 | 16 | 0 | **100.0%** | **100.0%** |
-| **Total CI Adversarial Corpus (`125` Cases, `25` Families)** | **67** | **0** | **58** | **0** | **100.0%** | **100.0%** |
+| **`SQLI` — Parameterized `$1` / `?` & Allowlist Traps** | 10 | 0 | 11 | 0 | **100.0%** | **100.0%** |
+| **`CMDI` / `SSTI` / `DESER` — Argv Array & `safe_load` Traps** | 12 | 0 | 4 | 0 | **100.0%** | **100.0%** |
+| **`AUTH` & `IDOR` — AST Dominator & Router-Mount Traps** | 7 | 0 | 7 | 0 | **100.0%** | **100.0%** |
+| **`AI` / `MCP` — `weights_only=True` & Balanced-RTL Traps** | 4 | 0 | 3 | 0 | **100.0%** | **100.0%** |
+| **`CICD` & `K8S` — 40-Char SHA Pin & Pod Security Traps** | 7 | 0 | 5 | 0 | **100.0%** | **100.0%** |
+| **`MEM` / `ENG` / `RACE` — `SELECT FOR UPDATE` & Bounds Traps** | 6 | 0 | 7 | 0 | **100.0%** | **100.0%** |
+| **`PATH` / `XSS` / `SSRF` — `Clean`+Prefix & `DOMPurify` Traps** | 7 | 0 | 5 | 0 | **100.0%** | **100.0%** |
+| **`SEC` / `SEC_CFG` / `CFG` / `IAC` — SOPS, KMS & Placeholder Traps** | 7 | 0 | 7 | 0 | **100.0%** | **100.0%** |
+| **`CRYPTO` / `OAUTH` / `STATE` / `QUEUE` / `ZIP` / `DOS` / `API` / `SMUGGLE` / `FE`** | 7 | 0 | 9 | 0 | **100.0%** | **100.0%** |
+| **Total CI Adversarial Corpus (`125` Cases across `25` Families)** | **67** | **0** | **58** | **0** | **100.0%** | **100.0%** |
 | **`OWASP/crAPI` Tracked Multi-Service Baseline (`1,062` files)** | **30 / 30** | **0** | — | — | **100.0%** *(tracked set)* | Audited per release |
 | **`expressjs/express` Production `lib/` (`HIGH`+`CRITICAL`, `Confirmed+`)** | — | — | Production `lib/` | **0** | — | **0 Confirmed+ FPs** |
 
-```mermaid
-xychart-beta
-    title "Adversarial Precision Gate Corpus (125 Cases: 67 True Positives vs 58 Safe Adversarial Twins, 0 FPs)"
-    x-axis ["SQLI", "CMDI", "AUTH+IDOR", "AI+CICD+K8S", "MEM+ENG+RACE", "PATH+XSS+SSRF", "SEC+CFG+IAC+Other"]
-    y-axis "Verified Test Cases" 0 --> 18
-    bar [10, 12, 7, 11, 6, 7, 14]
-    bar [11, 4, 7, 8, 7, 5, 16]
-```
-
 ### 10-Repository Real-World Stress Benchmark (`v1.5.5`)
 
-Cold full-repository static scans (`smg scan <repo> --json`) across 10 major open-source ecosystems (**161,800+ files total**, zero crashes, zero OOMs, `< 1 GiB` peak RSS):
+Cold full-repository static scans (`smg scan <repo> --json`) measured on a 4-Core Linux workstation (NVMe SSD, 15 GiB RAM) across **161,823 source & config files** (`0` crashes, `0` panics, `0` OOMs, `< 1 GiB` peak RSS across all 10 repositories):
 
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/benchmarks-dark.png">
-    <source media="(prefers-color-scheme: light)" srcset="assets/benchmarks-light.png">
-    <img alt="ShellMind Guard v1.5.5 10-Repository Real-World Benchmark Chart" src="assets/benchmarks-light.png" width="100%">
-  </picture>
-</p>
+#### `v1.5.0` → `v1.5.5` Algorithmic Scalability & Precision Deltas
 
-| Repository | Ecosystem / Engine Focus | Files | Cold Scan Time | Peak RSS | Verified `v1.5.5` Telemetry & Highlights |
-| :--- | :--- | ---: | :---: | :---: | :--- |
-| **`OWASP/crAPI`** | Polyglot API (Java/Py/Go/JS) | 1,062 | **2.25 s** | 60.4 MB | `30/30` tracked baseline flaws (`SQLi=1, Auth=16, JWT=7, Key=6`) |
-| **`wormhole-foundation/wormhole`** | Solana / Sui Move / Solidity (`smg-web3`) | 3,392 | **29.29 s** | 180.6 MB | `358` findings (`66` Crit), `0` same-line Solana/CPI duplicates (`web3 = 1.68 s`) |
-| **`openssl/openssl`** | C / Crypto / Memory Typestate | 6,207 | **40.87 s** | 230.4 MB | Deep C buffer/integer/typestate scan (`smg-hw` skipped on desktop `.ld`) |
-| **`bytecodealliance/wasmtime`** | Rust / `unsafe` / JIT | 7,773 | **53.89 s** | 280.2 MB | `smg-hw` skipped automatically on desktop JIT (`0` `SMG-HW-STACK` FPs) |
-| **`hashicorp/vault`** | Go / Secrets / Concurrency | 9,641 | **57.39 s** | 207.3 MB | Struct-qualified Go mutex (`Core::statelock`) & package-scoped cycles |
-| **`signalapp/Signal-Android`** | Java / Kotlin Mobile (`smg-mob`) | 11,481 | **63.71 s** | 378.6 MB | Low-noise mobile storage/IPC/TLS; `0` balanced-RTL Bidi FPs |
-| **`envoyproxy/envoy`** | High-Scale C++ Proxy | 15,336 | **76.16 s** | 416.0 MB | Bounded AST depth caps, only `12` Criticals across 15.3k C++ files |
-| **`grafana/grafana`** | Go + TypeScript/React Monorepo | 25,118 | **89.81 s** | 505.2 MB | Full-stack frontend + backend + config pass; `devenv/` sample keys downgraded |
-| **`vllm-project/vllm`** | Python + CUDA (`smg-ai`, Pickle) | 9,860 | **188.87 s** | 668.0 MB | `hw = 97 ms`; `0` `.pre-commit`/Unicode FPs; `weight_utils.py` `torch.load` `CRITICAL` intact |
-| **`zephyrproject-rtos/zephyr`** | Embedded C / RTOS (`smg-hw`) | **71,953** | **141.32 s** | **991.7 MB** | `smg-hw` completed in **`14.94 s`** (`2,104` findings, **`349` `Static-Proven`**) |
+| Target Repository | Files | `v1.5.0` Baseline | `v1.5.5` Measured | Speedup / Precision Delta | Engineering Root-Cause Fix |
+| :--- | ---: | :--- | :--- | :--- | :--- |
+| **`zephyrproject-rtos/zephyr`** | 71,953 | `> 24m 47s` *(stopped)* | **`141.32 s`** (`hw = 14.94 s`) | **`> 10x` total · `> 100x` `smg-hw`** | Lazy `#define` lookup, `O(P)` lock hash index, `min_valid_depth` WCSD memoization |
+| **`wormhole-foundation/wormhole`** | 3,392 | `55.55 s` (`409` hits / `88` Crit) | **`29.29 s`** (`358` hits / `66` Crit) | **`1.90x` faster · `0` CPI/Move dups** | Canonical defect-family dedup, Anchor PDA & Move `public(package)` scoping |
+| **`vllm-project/vllm`** | 9,860 | `228.51 s` (`smg-hw` ran on CUDA) | **`188.87 s`** (`hw = 97 ms`) | **`1.21x` faster · `0` config/Bidi FPs** | Desktop token filter, `Language::Config` guard, runtime `torch.load` `CRITICAL` kept |
+
+#### Full 10-Repository Cold-Scan Scorecard
+
+| Repository | Ecosystem / Engine Focus | Files | Cold Scan Time | Throughput | Peak RSS | Verified `v1.5.5` Telemetry & Highlights |
+| :--- | :--- | ---: | :---: | :---: | :---: | :--- |
+| **`OWASP/crAPI`** | Polyglot API (Java/Py/Go/JS) | 1,062 | **2.25 s** | 472 files/s | 60.4 MB | `30/30` tracked baseline flaws (`SQLi=1, Auth=16, JWT=7, Key=6`) |
+| **`wormhole-foundation/wormhole`** | Solana / Sui Move / Solidity (`smg-web3`) | 3,392 | **29.29 s** | 116 files/s | 180.6 MB | `358` findings (`66` Crit), `0` same-line Solana/CPI duplicates (`web3 = 1.68 s`) |
+| **`openssl/openssl`** | C / Crypto / Memory Typestate | 6,207 | **40.87 s** | 152 files/s | 230.4 MB | Deep C buffer/integer/typestate scan (`smg-hw` skipped on desktop `.ld`) |
+| **`bytecodealliance/wasmtime`** | Rust / `unsafe` / JIT | 7,773 | **53.89 s** | 144 files/s | 280.2 MB | `smg-hw` skipped automatically on desktop JIT (`0` `SMG-HW-STACK` FPs) |
+| **`hashicorp/vault`** | Go / Secrets / Concurrency | 9,641 | **57.39 s** | 168 files/s | 207.3 MB | Struct-qualified Go mutex (`Core::statelock`) & package-scoped cycles |
+| **`vllm-project/vllm`** | Python + CUDA (`smg-ai`, Pickle) | 9,860 | **188.87 s** | 52 files/s | 668.0 MB | `hw = 97 ms`; `0` `.pre-commit`/Unicode FPs; `weight_utils.py` `torch.load` `CRITICAL` intact |
+| **`signalapp/Signal-Android`** | Java / Kotlin Mobile (`smg-mob`) | 11,481 | **63.71 s** | 180 files/s | 378.6 MB | Low-noise mobile storage/IPC/TLS; `0` balanced-RTL Bidi FPs |
+| **`envoyproxy/envoy`** | High-Scale C++ Proxy | 15,336 | **76.16 s** | 201 files/s | 416.0 MB | Bounded AST depth caps, only `12` Criticals across 15.3k C++ files |
+| **`grafana/grafana`** | Go + TypeScript/React Monorepo | 25,118 | **89.81 s** | 280 files/s | 505.2 MB | Full-stack frontend + backend + config pass; `devenv/` sample keys downgraded |
+| **`zephyrproject-rtos/zephyr`** | Embedded C / RTOS (`smg-hw`) | **71,953** | **141.32 s** | **509 files/s** | **991.7 MB** | `smg-hw` completed in **`14.94 s`** (`2,104` findings, **`349` `Static-Proven`**) |
+| **Aggregate (10 Repositories)** | **6 Security & Frontier Domains** | **161,823** | **743.56 s** | **218 files/s** | **< 1.0 GiB** | **`0` crashes · `0` panics · `0` OOMs · `0` LLM API cost** |
 
 ---
 
