@@ -1,0 +1,125 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 530" width="920" height="530" role="img" aria-label="ShellMind Guard v1.5.5 Terminal Demo">
+  <defs>
+    <linearGradient id="bg-grad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#161b22"/>
+      <stop offset="100%" stop-color="#0d1117"/>
+    </linearGradient>
+    <linearGradient id="bar-grad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#1f6feb" stop-opacity="0.18"/>
+      <stop offset="50%" stop-color="#388bfd" stop-opacity="0.10"/>
+      <stop offset="100%" stop-color="#2ea043" stop-opacity="0.16"/>
+    </linearGradient>
+    <clipPath id="cmd-clip">
+      <rect x="40" y="54" width="0" height="24">
+        <animate attributeName="width" values="0;520;520;0" keyTimes="0;0.14;0.96;1" dur="12s" repeatCount="indefinite"/>
+      </rect>
+    </clipPath>
+  </defs>
+
+  <style>
+    .mono {
+      font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+      font-size: 13px;
+    }
+    .title {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      font-size: 12.5px;
+      font-weight: 600;
+      fill: #8b949e;
+    }
+    .dim { fill: #8b949e; }
+    .fg { fill: #e6edf3; }
+    .cyan { fill: #58a6ff; }
+    .green { fill: #3fb950; }
+    .yellow { fill: #d29922; }
+    .orange { fill: #f0883e; }
+    .red { fill: #ff7b72; }
+    .purple { fill: #d2a8ff; }
+    .bold { font-weight: 700; }
+
+    @keyframes fade1 { 0%, 15% { opacity: 0; } 18%, 95% { opacity: 1; } 100% { opacity: 0; } }
+    @keyframes fade2 { 0%, 20% { opacity: 0; } 23%, 95% { opacity: 1; } 100% { opacity: 0; } }
+    @keyframes fade3 { 0%, 27% { opacity: 0; } 30%, 95% { opacity: 1; } 100% { opacity: 0; } }
+    @keyframes fade4 { 0%, 38% { opacity: 0; } 41%, 95% { opacity: 1; } 100% { opacity: 0; } }
+    @keyframes fade5 { 0%, 48% { opacity: 0; } 51%, 95% { opacity: 1; } 100% { opacity: 0; } }
+    @keyframes blink { 0%, 49% { opacity: 1; } 50%, 100% { opacity: 0; } }
+
+    .s1 { animation: fade1 12s infinite; }
+    .s2 { animation: fade2 12s infinite; }
+    .s3 { animation: fade3 12s infinite; }
+    .s4 { animation: fade4 12s infinite; }
+    .s5 { animation: fade5 12s infinite; }
+    .cursor { animation: blink 1s step-end infinite; }
+  </style>
+
+  <!-- Outer Terminal Window -->
+  <rect x="2" y="2" width="916" height="526" rx="12" fill="url(#bg-grad)" stroke="#30363d" stroke-width="1.5"/>
+
+  <!-- Top Titlebar -->
+  <path d="M 14 2 H 906 A 12 12 0 0 1 918 14 V 38 H 2 V 14 A 12 12 0 0 1 14 2 Z" fill="#161b22"/>
+  <line x1="2" y1="38" x2="918" y2="38" stroke="#30363d" stroke-width="1"/>
+  <circle cx="24" cy="20" r="6" fill="#ff5f56"/>
+  <circle cx="44" cy="20" r="6" fill="#ffbd2e"/>
+  <circle cx="64" cy="20" r="6" fill="#27c93f"/>
+  <text x="460" y="24" text-anchor="middle" class="title">smg — ShellMind Guard v1.5.5 · Multi-File Guard-Set Lattice</text>
+
+  <!-- Command Prompt -->
+  <text x="24" y="70" class="mono bold green">$</text>
+  <g clip-path="url(#cmd-clip)">
+    <text x="40" y="70" class="mono fg">smg scan fixtures/vuln-payment-node <tspan class="cyan">--profile-phases</tspan></text>
+  </g>
+  <rect x="526" y="57" width="8" height="16" rx="1" fill="#58a6ff" class="cursor s1"/>
+
+  <!-- Stage 1: Phase Profile Telemetry -->
+  <g class="s1">
+    <text x="24" y="96" class="mono dim"><tspan class="purple bold">[SMG-PROFILE]</tspan> walk=<tspan class="fg">42ms</tspan> sync=<tspan class="fg">8ms</tspan> graph=<tspan class="fg">84ms</tspan> hw=<tspan class="fg">0ms</tspan> web3=<tspan class="fg">0ms</tspan> pqc=<tspan class="fg">0ms</tspan> ai_art=<tspan class="fg">0ms</tspan> total=<tspan class="green bold">135ms</tspan></text>
+  </g>
+
+  <!-- Stage 2: Scan Summary Banner -->
+  <g class="s2">
+    <rect x="20" y="110" width="880" height="46" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/>
+    <text x="34" y="129" class="mono bold fg">ShellMind Guard Scan <tspan class="dim">|</tspan> <tspan class="cyan">5 files</tspan> <tspan class="dim">(8 symbols, 6 edges, 2 routes)</tspan> <tspan class="dim">|</tspan> <tspan class="green">136ms</tspan></text>
+    <text x="34" y="148" class="mono dim">2 finding(s) detected  |  <tspan class="red bold">CRIT:1</tspan>  <tspan class="orange bold">HIGH:1</tspan>  MED:0  LOW:0  |  <tspan class="purple">[AUTH/IDOR=1 RACE/LOCK=1]</tspan></text>
+  </g>
+
+  <!-- Stage 3: CRITICAL Finding (SMG-RACE-001) -->
+  <g class="s3">
+    <rect x="20" y="168" width="880" height="148" rx="6" fill="#1c1215" stroke="#6e2b2b" stroke-width="1"/>
+    <rect x="32" y="178" width="76" height="18" rx="4" fill="#da3633"/>
+    <text x="70" y="191" text-anchor="middle" class="mono bold fg" style="font-size:11px;">CRITICAL</text>
+    <rect x="114" y="178" width="86" height="18" rx="4" fill="#21262d" stroke="#30363d"/>
+    <text x="157" y="191" text-anchor="middle" class="mono cyan" style="font-size:11px;">CONFIRMED</text>
+    <text x="208" y="191" class="mono bold fg">SMG-RACE-001 <tspan class="dim">→</tspan> Missing tx/lock guard before <tspan class="yellow">`debitBalance`</tspan> <tspan class="red">(Double-Spend)</tspan></text>
+
+    <text x="36" y="213" class="mono dim">Entry: <tspan class="cyan">POST /api/v1/checkout/withdraw</tspan></text>
+    <text x="36" y="232" class="mono dim"><tspan class="purple">[1]</tspan> src/routes/checkout.ts:8   <tspan class="fg">POST /api/v1/checkout/withdraw</tspan>  <tspan class="dim">→</tspan>  <tspan class="purple">[2]</tspan> src/services/ledger.ts:3 <tspan class="fg">processWithdrawal</tspan></text>
+    <text x="36" y="250" class="mono dim"><tspan class="purple">[3]</tspan> src/db/queries.ts:1        <tspan class="yellow bold">debitBalance</tspan></text>
+
+    <rect x="36" y="259" width="848" height="24" rx="4" fill="#0d1117" stroke="#30363d"/>
+    <text x="46" y="275" class="mono"><tspan class="red bold">&gt; 2 │</tspan> <tspan class="fg">const sql = `UPDATE wallets SET balance = balance - ${amount} WHERE user_id = '${userId}'`;</tspan></text>
+
+    <text x="36" y="304" class="mono green">Fix  : <tspan class="fg">Wrap balance mutation in an ACID transaction with </tspan><tspan class="cyan">SELECT ... FOR UPDATE</tspan><tspan class="fg"> or atomic idempotency key.</tspan></text>
+  </g>
+
+  <!-- Stage 4: HIGH Finding (SMG-AUTH-001) -->
+  <g class="s4">
+    <rect x="20" y="328" width="880" height="122" rx="6" fill="#1b1610" stroke="#6e4a1f" stroke-width="1"/>
+    <rect x="32" y="338" width="54" height="18" rx="4" fill="#d29922"/>
+    <text x="59" y="351" text-anchor="middle" class="mono bold" style="font-size:11px; fill:#0d1117;">HIGH</text>
+    <rect x="92" y="338" width="86" height="18" rx="4" fill="#21262d" stroke="#30363d"/>
+    <text x="135" y="351" text-anchor="middle" class="mono cyan" style="font-size:11px;">CONFIRMED</text>
+    <text x="186" y="351" class="mono bold fg">SMG-AUTH-001 <tspan class="dim">→</tspan> Unauthenticated path to BalanceUpdate in <tspan class="yellow">`debitBalance`</tspan></text>
+
+    <text x="36" y="374" class="mono dim">Entry: <tspan class="cyan">POST /api/v1/checkout/withdraw</tspan>  <tspan class="dim">(missing Auth guard across 3-file call chain)</tspan></text>
+    <text x="36" y="394" class="mono dim"><tspan class="purple">[1]</tspan> checkout.ts:8  <tspan class="dim">→</tspan>  <tspan class="purple">[2]</tspan> ledger.ts:3  <tspan class="dim">→</tspan>  <tspan class="purple">[3]</tspan> <tspan class="yellow">queries.ts:1 (debitBalance)</tspan></text>
+    <text x="36" y="416" class="mono green">Fix  : <tspan class="fg">Add authentication middleware (e.g. </tspan><tspan class="cyan">requireAuth</tspan><tspan class="fg"> / JWT check) before invoking this handler.</tspan></text>
+    <text x="36" y="437" class="mono dim">Tip  : Run with <tspan class="cyan">--boot-cmd</tspan> to verify runtime exploitability inside isolated OS sandbox (<tspan class="green">bwrap / Seatbelt / WSL2</tspan>).</text>
+  </g>
+
+  <!-- Stage 5: Footer Benchmark Ribbon -->
+  <g class="s5">
+    <rect x="20" y="464" width="880" height="44" rx="6" fill="url(#bar-grad)" stroke="#30363d" stroke-width="1"/>
+    <text x="36" y="483" class="mono bold green">✓ 10-Repo OSS Verified: <tspan class="fg">161,800+ files · 0 crashes · &lt;1 GiB RSS</tspan></text>
+    <text x="36" y="500" class="mono dim">crAPI <tspan class="fg">2.25s</tspan> · wormhole <tspan class="fg">29.3s</tspan> · envoy <tspan class="fg">76.2s</tspan> · grafana <tspan class="fg">89.8s</tspan> · zephyr (71,953 files) <tspan class="cyan bold">141.3s</tspan> (smg-hw <tspan class="green bold">14.9s</tspan>)</text>
+  </g>
+</svg>

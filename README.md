@@ -20,6 +20,10 @@
 
 [**Architecture**](#system-architecture) · [**6-Layer Engine**](#the-6-layer-universal-verification-engine) · [**Frontier Domains**](#frontier-verification-domains-hw--web3--pqc--enterprise) · [**Quickstart**](#quickstart) · [**GitHub Action**](#1b-github-action-one-line-ci--sarif-security-tab) · [**AI Agent MCP**](#model-context-protocol-shellmind-guard-mcp) · [**Benchmarks**](#verified-performance-benchmarks) · [**Blueprint**](BLUEPRINT.md)
 
+<br>
+
+<img src="assets/demo.svg" alt="ShellMind Guard v1.5.5 Terminal Demo" width="880">
+
 </div>
 
 ---
