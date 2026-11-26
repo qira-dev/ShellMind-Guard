@@ -20,10 +20,6 @@
 
 [**Architecture**](#system-architecture) · [**6-Layer Engine**](#the-6-layer-universal-verification-engine) · [**Frontier Domains**](#frontier-verification-domains-hw--web3--pqc--enterprise) · [**Quickstart**](#quickstart) · [**GitHub Action**](#1b-github-action-one-line-ci--sarif-security-tab) · [**AI Agent MCP**](#model-context-protocol-shellmind-guard-mcp) · [**Benchmarks**](#verified-performance-benchmarks) · [**Blueprint**](BLUEPRINT.md)
 
-<br>
-
-<img src="assets/demo.gif" alt="ShellMind Guard v1.5.5 Multi-Domain Real-World Benchmark Demo" width="900">
-
 </div>
 
 ---
@@ -206,6 +202,14 @@ Measured on a 4-Core Linux workstation (Ubuntu Wayland, 15 GiB RAM, NVMe SSD, 12
 ### 10-Repository Real-World Stress Benchmark (`v1.5.5`)
 
 Cold full-repository static scans (`smg scan <repo> --json`) across 10 major open-source ecosystems (**161,800+ files total**, zero crashes, zero OOMs, `< 1 GiB` peak RSS):
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/benchmarks-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="assets/benchmarks-light.png">
+    <img alt="ShellMind Guard v1.5.5 10-Repository Real-World Benchmark Chart" src="assets/benchmarks-light.png" width="100%">
+  </picture>
+</p>
 
 | Repository | Ecosystem / Engine Focus | Files | Cold Scan Time | Peak RSS | Highlights |
 | :--- | :--- | ---: | :---: | :---: | :--- |
