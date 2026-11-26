@@ -1,0 +1,118 @@
+name: "ShellMind Guard Security Scan"
+description: "Run ShellMind Guard (smg) static security, taint, secrets, IaC, AI/MCP, Web3, and firmware analysis in CI with optional SARIF output."
+author: "qira-dev"
+
+branding:
+  icon: "shield"
+  color: "blue"
+
+inputs:
+  path:
+    description: "Repository directory or path to scan"
+    required: false
+    default: "."
+  version:
+    description: "ShellMind Guard release tag to install (e.g. v1.5.5)"
+    required: false
+    default: "v1.5.5"
+  ci:
+    description: "Enable CI gate mode (non-zero exit when findings meet fail-on threshold)"
+    required: false
+    default: "true"
+  fail-on:
+    description: "Minimum severity to fail CI gate (critical, high, medium, low)"
+    required: false
+    default: "high"
+  layers:
+    description: "Optional comma-separated layers filter (e.g. auth,taint,secrets,ai,web3,hw)"
+    required: false
+    default: ""
+  min-confidence:
+    description: "Optional minimum confidence tier (proven, confirmed, heuristic)"
+    required: false
+    default: ""
+  sarif:
+    description: "Optional path to write SARIF 2.1.0 report (e.g. smg-results.sarif)"
+    required: false
+    default: ""
+  changed-since:
+    description: "Optional git ref for incremental diff scanning (e.g. origin/main)"
+    required: false
+    default: ""
+  profile-phases:
+    description: "Print per-phase wall-clock timing telemetry to stderr (true/false)"
+    required: false
+    default: "false"
+
+outputs:
+  sarif-path:
+    description: "Path to the generated SARIF report (empty if sarif input was not set)"
+    value: ${{ steps.scan.outputs.sarif_path }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install ShellMind Guard
+      shell: bash
+      env:
+        SMG_ACTION_PATH: ${{ github.action_path }}
+        SMG_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        if [[ ! "$SMG_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+          echo "::error::Invalid version tag '$SMG_VERSION'. Expected semantic tag like v1.5.5." >&2
+          exit 2
+        fi
+        bash "${SMG_ACTION_PATH}/install.sh" --version "${SMG_VERSION}"
+        echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
+
+    - name: Run ShellMind Guard Scan
+      id: scan
+      shell: bash
+      env:
+        SMG_PATH: ${{ inputs.path }}
+        SMG_CI: ${{ inputs.ci }}
+        SMG_FAIL_ON: ${{ inputs.fail-on }}
+        SMG_LAYERS: ${{ inputs.layers }}
+        SMG_MIN_CONFIDENCE: ${{ inputs.min-confidence }}
+        SMG_SARIF: ${{ inputs.sarif }}
+        SMG_CHANGED_SINCE: ${{ inputs.changed-since }}
+        SMG_PROFILE: ${{ inputs.profile-phases }}
+      run: |
+        set -euo pipefail
+        export PATH="${HOME}/.local/bin:${PATH}"
+
+        args=("scan" "${SMG_PATH}")
+
+        if [[ "${SMG_CI}" == "true" ]]; then
+          args+=("--ci")
+          if [[ -n "${SMG_FAIL_ON}" ]]; then
+            args+=("--fail-on" "${SMG_FAIL_ON}")
+          fi
+        fi
+
+        if [[ -n "${SMG_LAYERS}" ]]; then
+          args+=("--layers" "${SMG_LAYERS}")
+        fi
+
+        if [[ -n "${SMG_MIN_CONFIDENCE}" ]]; then
+          args+=("--min-confidence" "${SMG_MIN_CONFIDENCE}")
+        fi
+
+        if [[ -n "${SMG_SARIF}" ]]; then
+          args+=("--sarif" "${SMG_SARIF}")
+          echo "sarif_path=${SMG_SARIF}" >> "${GITHUB_OUTPUT}"
+        else
+          echo "sarif_path=" >> "${GITHUB_OUTPUT}"
+        fi
+
+        if [[ -n "${SMG_CHANGED_SINCE}" ]]; then
+          args+=("--changed-since" "${SMG_CHANGED_SINCE}")
+        fi
+
+        if [[ "${SMG_PROFILE}" == "true" ]]; then
+          args+=("--profile-phases")
+        fi
+
+        smg --version
+        smg "${args[@]}"

@@ -18,7 +18,7 @@
 [![MCP Server](https://img.shields.io/badge/MCP-JSON--RPC_2.0_Stdio-purple.svg)](src/mcp.rs)
 [![SARIF](https://img.shields.io/badge/Output-SARIF_2.1.0_%7C_CycloneDX_1.5_%7C_HTML-informational.svg)](crates/smg-report)
 
-[**Architecture**](#system-architecture) · [**6-Layer Engine**](#the-6-layer-universal-verification-engine) · [**Frontier Domains**](#frontier-verification-domains-hw--web3--pqc--enterprise) · [**Quickstart**](#quickstart) · [**AI Agent MCP**](#model-context-protocol-shellmind-guard-mcp) · [**Benchmarks**](#verified-performance-benchmarks) · [**Blueprint**](BLUEPRINT.md)
+[**Architecture**](#system-architecture) · [**6-Layer Engine**](#the-6-layer-universal-verification-engine) · [**Frontier Domains**](#frontier-verification-domains-hw--web3--pqc--enterprise) · [**Quickstart**](#quickstart) · [**GitHub Action**](#1b-github-action-one-line-ci--sarif-security-tab) · [**AI Agent MCP**](#model-context-protocol-shellmind-guard-mcp) · [**Benchmarks**](#verified-performance-benchmarks) · [**Blueprint**](BLUEPRINT.md)
 
 </div>
 
@@ -199,6 +199,23 @@ Measured on a 4-Core Linux workstation (Ubuntu Wayland, 15 GiB RAM, NVMe SSD, 12
 | **Polyglot 6-Layer Suite** | TS + TSX + Go + Python + Dockerfile + `package.json` + `.env` | **19 ms** | **3 ms** | Detects all 14 rule families across all 6 layers |
 | **MCP `shellmind_guard_scan` Tool Call** | JSON-RPC 2.0 `stdio` round-trip | **19 ms** | **4 ms** | Zero LLM token overhead |
 
+### 10-Repository Real-World Stress Benchmark (`v1.5.5`)
+
+Cold full-repository static scans (`smg scan <repo> --json`) across 10 major open-source ecosystems (**161,800+ files total**, zero crashes, zero OOMs, `< 1 GiB` peak RSS):
+
+| Repository | Ecosystem / Engine Focus | Files | Cold Scan Time | Peak RSS | Highlights |
+| :--- | :--- | ---: | :---: | :---: | :--- |
+| **`OWASP/crAPI`** | Polyglot API (Java/Py/Go/JS) | 1,062 | **2.25 s** | 60.4 MB | 100% recall baseline (`SQLi`, `Auth`, `JWT`, `Key`) |
+| **`wormhole-foundation/wormhole`** | Solana / Sui Move / Solidity (`smg-web3`) | 3,392 | **29.29 s** | 180.6 MB | `0` same-line Solana/CPI duplicates (`web3 = 1.68 s`) |
+| **`openssl/openssl`** | C / Crypto / Memory Typestate | 6,207 | **40.87 s** | 230.4 MB | Deep C buffer/integer/typestate scan |
+| **`bytecodealliance/wasmtime`** | Rust / `unsafe` / JIT | 7,773 | **53.89 s** | 280.2 MB | `smg-hw` skipped automatically on desktop JIT |
+| **`hashicorp/vault`** | Go / Secrets / Concurrency | 9,641 | **57.39 s** | 207.3 MB | Struct-qualified Go mutex & package-scoped cycles |
+| **`signalapp/Signal-Android`** | Java / Kotlin Mobile (`smg-mob`) | 11,481 | **63.71 s** | 378.6 MB | Low-noise mobile storage/IPC/TLS verification |
+| **`envoyproxy/envoy`** | High-Scale C++ Proxy | 15,336 | **76.16 s** | 416.0 MB | Bounded AST depth caps, only `12` Criticals |
+| **`grafana/grafana`** | Go + TypeScript/React Monorepo | 25,118 | **89.81 s** | 505.2 MB | Full-stack frontend + backend + config pass |
+| **`vllm-project/vllm`** | Python + CUDA (`smg-ai`, Pickle) | 9,860 | **188.87 s** | 668.0 MB | `0` `.pre-commit`/Unicode FPs; runtime `torch.load` intact |
+| **`zephyrproject-rtos/zephyr`** | Embedded C / RTOS (`smg-hw`) | **71,953** | **141.32 s** | **991.7 MB** | `smg-hw` completed in **`14.94 s`** (`349 PROVEN`) |
+
 ---
 
 ## Quickstart
@@ -213,6 +230,35 @@ curl -fsSL https://raw.githubusercontent.com/qira-dev/ShellMind-Guard/main/insta
 **Windows (PowerShell):**
 ```powershell
 irm https://raw.githubusercontent.com/qira-dev/ShellMind-Guard/main/install.ps1 | iex
+```
+
+### 1b. GitHub Action (One-Line CI & SARIF Security Tab)
+
+Run ShellMind Guard automatically on every push or pull request using the official composite [`action.yml`](action.yml) (verifies release `SHA256SUMS.txt` automatically):
+
+```yaml
+name: ShellMind Guard Security Scan
+on: [push, pull_request]
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  smg:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: qira-dev/ShellMind-Guard@v1.5.5
+        with:
+          path: .
+          ci: true
+          fail-on: high
+          sarif: smg-results.sarif
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: smg-results.sarif
 ```
 
 **Use Standalone CLI (`smg` or `shellmind-guard`) or Load as an AI Coding Plugin (Claude Code / MCP + Skills + Commit Hook):**
@@ -493,6 +539,7 @@ Further engineering documentation:
 - [**`ROADMAP.md`**](ROADMAP.md) — Phase-by-Phase Engineering Milestones & Verification Gates
 - [**`SECURITY.md`**](SECURITY.md) — Sandbox Isolation Model & Vulnerability Disclosure Policy
 - [**`CONTRIBUTING.md`**](CONTRIBUTING.md) — Architecture Invariants & Developer Contribution Guide
+- [**`action.yml`**](action.yml) — Official Composite GitHub Action (SHA256-Verified CI Gate & SARIF Export)
 - [**`CHANGELOG.md`**](CHANGELOG.md) — Release History
 
 ---

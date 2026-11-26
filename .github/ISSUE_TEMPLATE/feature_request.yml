@@ -1,0 +1,34 @@
+name: Feature Request
+description: Suggest a new security rule, language parser, or workflow improvement
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or Use Case
+      description: What security class, language, framework, or workflow gap does this solve?
+      placeholder: e.g. Detect missing auth middleware in Fastify plugin scopes...
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed Design / Expected Behavior
+      description: Share a minimal vulnerable vs. safe code pair if proposing a new rule.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Component / Crate
+      options:
+        - smg-graph (Core SAST / Taint / SMT)
+        - smg-hw (Embedded / Firmware / RTOS)
+        - smg-web3 (Solidity / Solana / Move)
+        - smg-pqc (Post-Quantum / CBOM)
+        - Live Engines (DAST / Proxy / SQLi / Templates / TLS)
+        - CLI / GitHub Action / TUI / MCP
+        - Documentation / Other
+    validations:
+      required: true
