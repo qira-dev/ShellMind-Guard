@@ -11,7 +11,8 @@ pub use advisories::{
 pub use config::{AiConfig, SandboxConfig, ShellMindGuardConfig};
 pub use scanner::{
     IndexedFile, Language, ScanOptions, ScanSummary, has_generated_header, is_generated_file_path,
-    is_test_source_path, scan_repository, scan_repository_metadata_signature,
-    scan_repository_with_options, set_include_tests,
+    is_test_source_path, normalize_rel_path_posix_nfc, scan_repository,
+    scan_repository_metadata_signature, scan_repository_with_options, set_include_tests,
+    strip_utf8_bom,
 };
 pub use store::{DeltaStats, StateStore, StoredFinding};

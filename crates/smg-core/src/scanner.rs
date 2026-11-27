@@ -3,11 +3,43 @@ use anyhow::Result;
 use ignore::WalkBuilder;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Instant, UNIX_EPOCH};
+use unicode_normalization::UnicodeNormalization;
+
+/// Normalizes a relative repository path to canonical POSIX `/` separators and Unicode NFC
+/// so hashing, SARIF URIs, and baselines are bit-for-bit identical across Linux, macOS, and Windows.
+pub fn normalize_rel_path_posix_nfc(raw: &str) -> String {
+    let replaced = raw.replace('\\', "/");
+    let mut trimmed = replaced.as_str();
+    while let Some(rest) = trimmed.strip_prefix("./") {
+        trimmed = rest;
+    }
+    let mut collapsed = String::with_capacity(trimmed.len());
+    let mut prev_slash = false;
+    for ch in trimmed.chars() {
+        if ch == '/' {
+            if !prev_slash {
+                collapsed.push('/');
+            }
+            prev_slash = true;
+        } else {
+            collapsed.push(ch);
+            prev_slash = false;
+        }
+    }
+    collapsed.nfc().collect()
+}
+
+/// Strips a single leading UTF-8 BOM (`U+FEFF`) without shifting line numbers or invalidating
+/// UTF-8 char boundaries.
+pub fn strip_utf8_bom(s: &str) -> &str {
+    s.strip_prefix('\u{FEFF}').unwrap_or(s)
+}
 
 const MAX_TOTAL_CACHED_BYTES: usize = 256 * 1024 * 1024;
 
@@ -191,6 +223,8 @@ pub struct ScanSummary {
     pub total_entries_seen: usize,
     pub source_files_hashed: usize,
     pub skipped_ignored_or_binary: usize,
+    #[serde(default)]
+    pub skipped_non_utf8: usize,
     pub elapsed_ms: u128,
     pub files: Vec<IndexedFile>,
 }
@@ -464,6 +498,7 @@ pub fn scan_repository_with_options(
     let canon_root = fs::canonicalize(root)?;
     let total_seen = AtomicUsize::new(0);
     let skipped = AtomicUsize::new(0);
+    let skipped_non_utf8 = AtomicUsize::new(0);
     let include_tests = effective_include_tests();
 
     let ignore_set: Vec<String> = cfg
@@ -491,7 +526,7 @@ pub fn scan_repository_with_options(
         })
         .build();
 
-    let mut seen_rel: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_rel: BTreeSet<String> = BTreeSet::new();
     for entry in walker.flatten() {
         if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
             continue;
@@ -506,7 +541,7 @@ pub fn scan_repository_with_options(
         if let Some(lang) = Language::from_path(path)
             && let Ok(rel) = path.strip_prefix(&canon_root)
         {
-            let rel_norm = rel.to_string_lossy().replace('\\', "/");
+            let rel_norm = normalize_rel_path_posix_nfc(&rel.to_string_lossy());
             if !opts.include_generated && is_generated_file_path(&rel_norm) {
                 skipped.fetch_add(1, Ordering::Relaxed);
                 continue;
@@ -552,13 +587,17 @@ pub fn scan_repository_with_options(
         }
         let path = entry.path();
         if let Ok(rel) = path.strip_prefix(&canon_root) {
-            let rel_norm = rel.to_string_lossy().replace('\\', "/");
+            let rel_norm = normalize_rel_path_posix_nfc(&rel.to_string_lossy());
             if seen_rel.insert(rel_norm.clone()) {
                 candidate_paths.push((path.to_path_buf(), rel_norm, Language::Config));
                 extra_sens += 1;
             }
         }
     }
+
+    // Phase 1 Determinism: sort candidates canonically by NFC POSIX rel_path before parallel
+    // processing so thread count never alters discovery order or cache-budget selection.
+    candidate_paths.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
 
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(cfg.scan.max_threads)
@@ -567,7 +606,7 @@ pub fn scan_repository_with_options(
     let max_bytes = cfg.scan.max_file_bytes;
     let include_generated = opts.include_generated;
     let cached_budget_used = AtomicUsize::new(0);
-    let files: Vec<IndexedFile> = pool.install(|| {
+    let mut files: Vec<IndexedFile> = pool.install(|| {
         candidate_paths
             .into_par_iter()
             .filter_map(|(abs_path, rel_path, language)| {
@@ -622,6 +661,24 @@ pub fn scan_repository_with_options(
                     skipped.fetch_add(1, Ordering::Relaxed);
                     return None;
                 }
+                // Safely skip non-UTF8 files with an explicit counter (preserving valid UTF-8
+                // Trojan Source Bidi U+202E sequences and sensitive `.env`/`.pem`/`.key` paths).
+                let fname_low = canon_file
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if std::str::from_utf8(&bytes).is_err()
+                    && !is_extra_sensitive_filename(&fname_low)
+                    && !fname_low.ends_with(".pem")
+                    && !fname_low.ends_with(".key")
+                    && !fname_low.ends_with(".p12")
+                    && !fname_low.ends_with(".pfx")
+                {
+                    skipped_non_utf8.fetch_add(1, Ordering::Relaxed);
+                    skipped.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
                 if !include_generated && has_generated_header(&bytes) {
                     skipped.fetch_add(1, Ordering::Relaxed);
                     return None;
@@ -665,10 +722,30 @@ pub fn scan_repository_with_options(
             .collect()
     });
 
+    // Phase 1 Determinism: canonical sort + deterministic symlink-target & case-collision dedup.
+    files.sort_by(|a, b| {
+        a.rel_path
+            .cmp(&b.rel_path)
+            .then_with(|| a.abs_path.cmp(&b.abs_path))
+    });
+    let mut seen_canon: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut seen_lower: BTreeSet<String> = BTreeSet::new();
+    files.retain(|f| {
+        let canon_ok = seen_canon.insert(f.abs_path.clone());
+        let case_ok = seen_lower.insert(f.rel_path.to_ascii_lowercase());
+        if canon_ok && case_ok {
+            true
+        } else {
+            skipped.fetch_add(1, Ordering::Relaxed);
+            false
+        }
+    });
+
     Ok(ScanSummary {
         total_entries_seen: total_seen.load(Ordering::Relaxed),
         source_files_hashed: files.len(),
         skipped_ignored_or_binary: skipped.load(Ordering::Relaxed),
+        skipped_non_utf8: skipped_non_utf8.load(Ordering::Relaxed),
         elapsed_ms: start.elapsed().as_millis(),
         files,
     })

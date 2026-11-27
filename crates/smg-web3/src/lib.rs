@@ -387,7 +387,8 @@ pub fn scan_web3_repo_with_options(
     };
     let mut best_by_key: HashMap<(String, String, usize), usize> = HashMap::new();
     let mut deduped: Vec<LocalStaticFinding> = Vec::new();
-    for f in all_findings {
+    for mut f in all_findings {
+        f.rel_path = smg_core::normalize_rel_path_posix_nfc(&f.rel_path);
         let family = web3_dedup_family(&f).to_string();
         let key = (family.clone(), f.rel_path.clone(), f.line);
         if let Some(&idx) = best_by_key.get(&key) {
@@ -409,6 +410,14 @@ pub fn scan_web3_repo_with_options(
             deduped.push(f);
         }
     }
+    deduped.sort_by(|a, b| {
+        a.rel_path
+            .cmp(&b.rel_path)
+            .then_with(|| a.line.cmp(&b.line))
+            .then_with(|| a.rule_id.cmp(&b.rule_id))
+            .then_with(|| a.symbol.cmp(&b.symbol))
+            .then_with(|| a.title.cmp(&b.title))
+    });
     deduped
 }
 

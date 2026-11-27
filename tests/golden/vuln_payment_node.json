@@ -1,0 +1,131 @@
+{
+  "parsed_files": 5,
+  "symbol_count": 8,
+  "edge_count": 6,
+  "route_entries": 2,
+  "active_domains": [
+    "web"
+  ],
+  "findings": [
+    {
+      "id": "SMG-AUTH-001",
+      "rule_id": "SMG-AUTH-001",
+      "severity": "HIGH",
+      "title": "Unauthenticated path to BalanceUpdate in `debitBalance`",
+      "file": "src/db/queries.ts",
+      "line": 1,
+      "status": "SUSPECT_UNGUARDED",
+      "confidence": "CONFIRMED",
+      "entry_route": "POST /api/v1/checkout/withdraw",
+      "sink_kind": "BalanceUpdate",
+      "missing_guard": "Auth",
+      "witness_path": [
+        {
+          "file": "src/routes/checkout.ts",
+          "symbol": "POST /api/v1/checkout/withdraw",
+          "line": 8
+        },
+        {
+          "file": "src/services/ledger.ts",
+          "symbol": "processWithdrawal",
+          "line": 3
+        },
+        {
+          "file": "src/db/queries.ts",
+          "symbol": "debitBalance",
+          "line": 1
+        }
+      ],
+      "remediation": "Add authentication middleware (e.g. JWT/session check like `requireAuth`) before invoking this handler.",
+      "proof_reasons": [
+        "O(V+E)Lattice",
+        "CFGDominated",
+        "AuthGuardMissing"
+      ]
+    },
+    {
+      "id": "SMG-RACE-001",
+      "rule_id": "SMG-RACE-001",
+      "severity": "CRITICAL",
+      "title": "Missing transaction/lock guard before `debitBalance` (Double-Spend Risk)",
+      "file": "src/db/queries.ts",
+      "line": 1,
+      "status": "SUSPECT_UNGUARDED",
+      "confidence": "CONFIRMED",
+      "entry_route": "POST /api/v1/checkout/withdraw",
+      "sink_kind": "BalanceUpdate",
+      "missing_guard": "TxLock",
+      "witness_path": [
+        {
+          "file": "src/routes/checkout.ts",
+          "symbol": "POST /api/v1/checkout/withdraw",
+          "line": 8
+        },
+        {
+          "file": "src/services/ledger.ts",
+          "symbol": "processWithdrawal",
+          "line": 3
+        },
+        {
+          "file": "src/db/queries.ts",
+          "symbol": "debitBalance",
+          "line": 1
+        }
+      ],
+      "remediation": "Wrap balance/payment operations in an ACID transaction with `SELECT ... FOR UPDATE` or enforce an atomic idempotency key.",
+      "proof_reasons": [
+        "O(V+E)Lattice",
+        "CFGDominated",
+        "TxLockMissing"
+      ]
+    }
+  ],
+  "route_schemas": [
+    {
+      "method": "POST",
+      "path": "/api/v1/checkout/withdraw",
+      "source_file": "server.mjs",
+      "line": 14,
+      "params": [
+        {
+          "name": "userId",
+          "location": "body",
+          "type_hint": "String",
+          "is_financial": false,
+          "has_positive_bound": false
+        },
+        {
+          "name": "amount",
+          "location": "body",
+          "type_hint": "Number",
+          "is_financial": true,
+          "has_positive_bound": false
+        }
+      ],
+      "from_openapi": false
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/checkout/deposit",
+      "source_file": "server.mjs",
+      "line": 28,
+      "params": [
+        {
+          "name": "userId",
+          "location": "body",
+          "type_hint": "String",
+          "is_financial": false,
+          "has_positive_bound": false
+        },
+        {
+          "name": "amount",
+          "location": "body",
+          "type_hint": "Number",
+          "is_financial": true,
+          "has_positive_bound": false
+        }
+      ],
+      "from_openapi": false
+    }
+  ]
+}

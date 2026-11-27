@@ -105,7 +105,9 @@ pub fn scan_pqc_repo(
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
         };
-        for entry in entries.flatten() {
+        let mut sorted_entries: Vec<_> = entries.flatten().collect();
+        sorted_entries.sort_by_key(|e| e.file_name());
+        for entry in sorted_entries {
             if *binary_files_scanned >= 128 {
                 break;
             }
@@ -180,6 +182,17 @@ pub fn scan_pqc_repo(
         &mut binary_files_scanned,
         &mut findings,
     );
+    for f in findings.iter_mut() {
+        f.rel_path = smg_core::normalize_rel_path_posix_nfc(&f.rel_path);
+    }
+    findings.sort_by(|a, b| {
+        a.rel_path
+            .cmp(&b.rel_path)
+            .then_with(|| a.line.cmp(&b.line))
+            .then_with(|| a.rule_id.cmp(&b.rule_id))
+            .then_with(|| a.symbol.cmp(&b.symbol))
+            .then_with(|| a.title.cmp(&b.title))
+    });
     let cbom_json = build_static_cbom_cyclonedx(project_root, &assets, &certificates);
     PqcScanResult {
         findings,

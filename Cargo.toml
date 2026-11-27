@@ -51,6 +51,7 @@ sha2 = "0.10"
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+unicode-normalization = "0.1"
 tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 tree-sitter = "0.25"
 tree-sitter-bash = "0.25"

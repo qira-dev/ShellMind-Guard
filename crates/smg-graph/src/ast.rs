@@ -405,7 +405,7 @@ pub fn parse_file_ast_with_hash(
         blake3::hash(bytes).to_hex().to_string()
     };
     let is_sensitive_path = crate::secrets_config::is_sensitive_env_or_pem(&file.rel_path);
-    let source = match std::str::from_utf8(bytes) {
+    let raw_source = match std::str::from_utf8(bytes) {
         Ok(s) => s,
         Err(_) => {
             if is_sensitive_path {
@@ -421,6 +421,9 @@ pub fn parse_file_ast_with_hash(
             return None;
         }
     };
+    // Phase 1 Determinism: strip leading UTF-8 BOM before Tree-sitter parsing and line/secret
+    // scanning so AST byte offsets match `source` 1-to-1 and line 1 stays exact.
+    let source = smg_core::strip_utf8_bom(raw_source);
     let is_sensitive =
         crate::secrets_config::is_sensitive_env_or_pem_with_content(&file.rel_path, source);
 

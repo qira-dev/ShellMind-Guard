@@ -112,7 +112,8 @@ pub fn to_sarif_json(findings: &[LatticeFinding], verified: &[VerifiedFinding]) 
                 .filter(|s| !s.is_empty())
                 .or_else(|| (!f.file.is_empty()).then_some(f.file.as_str()))
                 .unwrap_or("unknown");
-            let uri = percent_encode_uri_path(raw_file);
+            let norm_raw_file = smg_core::normalize_rel_path_posix_nfc(raw_file);
+            let uri = percent_encode_uri_path(&norm_raw_file);
             let start_line = primary_hop
                 .map(|h| h.line)
                 .filter(|&l| l > 0)
@@ -122,10 +123,11 @@ pub fn to_sarif_json(findings: &[LatticeFinding], verified: &[VerifiedFinding]) 
                 .witness_path
                 .iter()
                 .map(|h| {
+                    let norm_hop_file = smg_core::normalize_rel_path_posix_nfc(&h.file);
                     json!({
                         "location": {
                             "physicalLocation": {
-                                "artifactLocation": { "uri": percent_encode_uri_path(&h.file) },
+                                "artifactLocation": { "uri": percent_encode_uri_path(&norm_hop_file) },
                                 "region": { "startLine": h.line.max(1) }
                             },
                             "message": { "text": format!("Symbol: {}", h.symbol) }
@@ -154,7 +156,6 @@ pub fn to_sarif_json(findings: &[LatticeFinding], verified: &[VerifiedFinding]) 
                 None => format!("[{}/{}] {}", status_tag, conf_tag, f.title),
             };
 
-            let norm_raw_file = raw_file.replace('\\', "/");
             let fingerprint = fnv1a_hex(&format!(
                 "{}|{}|{}|{}",
                 f.rule_id, norm_raw_file, start_line, f.entry_route

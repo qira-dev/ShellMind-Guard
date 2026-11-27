@@ -337,10 +337,11 @@ pub fn scan_hardware_repo_with_threads(
         raw_findings.extend(check_cross_fn_irq_deadlocks(&lock_summaries));
     }
 
-    // Deduplicate on `(rule_id, rel_path, line)` while keeping highest severity
+    // Deduplicate on `(rule_id, rel_path, line)` while keeping highest severity, then sort canonically.
     let mut best_by_key: HashMap<(String, String, usize), usize> = HashMap::new();
     let mut deduped: Vec<LocalStaticFinding> = Vec::new();
-    for f in raw_findings {
+    for mut f in raw_findings {
+        f.rel_path = smg_core::normalize_rel_path_posix_nfc(&f.rel_path);
         let key = (f.rule_id.clone(), f.rel_path.clone(), f.line);
         if let Some(&idx) = best_by_key.get(&key) {
             if severity_rank(&f.severity) > severity_rank(&deduped[idx].severity) {
@@ -351,6 +352,14 @@ pub fn scan_hardware_repo_with_threads(
             deduped.push(f);
         }
     }
+    deduped.sort_by(|a, b| {
+        a.rel_path
+            .cmp(&b.rel_path)
+            .then_with(|| a.line.cmp(&b.line))
+            .then_with(|| a.rule_id.cmp(&b.rule_id))
+            .then_with(|| a.symbol.cmp(&b.symbol))
+            .then_with(|| a.title.cmp(&b.title))
+    });
     deduped
 }
 

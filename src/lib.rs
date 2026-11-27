@@ -1187,7 +1187,13 @@ fn probe_config_from_opts(
 struct BaselineEntry {
     rule_id: String,
     file: String,
+    #[serde(default)]
+    enclosing_symbol: String,
+    #[serde(default)]
+    sink_line_hash: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     entry_route: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     sink_symbol: String,
 }
 
@@ -1197,18 +1203,98 @@ struct BaselineFile {
     entries: Vec<BaselineEntry>,
 }
 
-fn finding_fingerprint(f: &LatticeFinding) -> BaselineEntry {
-    let sink_symbol = f
-        .witness_path
-        .last()
+fn whitespace_normalized_line_hash(line: &str) -> String {
+    let norm = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    blake3::hash(norm.as_bytes()).to_hex().to_string()
+}
+
+fn finding_fingerprint_with_root(
+    canon_root: Option<&Path>,
+    f: &LatticeFinding,
+    file_cache: &mut HashMap<String, Vec<String>>,
+) -> BaselineEntry {
+    let primary_hop = f.witness_path.last().or_else(|| f.witness_path.first());
+    let raw_file = primary_hop
+        .map(|h| h.file.as_str())
+        .filter(|s| !s.is_empty())
+        .or_else(|| (!f.file.is_empty()).then_some(f.file.as_str()))
+        .unwrap_or("");
+    let file = smg_core::normalize_rel_path_posix_nfc(raw_file);
+    let primary_line = primary_hop
+        .map(|h| h.line)
+        .filter(|&l| l > 0)
+        .unwrap_or(f.line);
+    let enclosing_symbol = primary_hop
         .map(|h| h.symbol.clone())
-        .unwrap_or_default();
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| f.entry_route.clone());
+
+    let sink_line_hash = if let Some(root) = canon_root
+        && !file.is_empty()
+        && primary_line > 0
+    {
+        if !file_cache.contains_key(&file) {
+            let loaded = fs::canonicalize(root.join(&file))
+                .ok()
+                .filter(|canon| canon.starts_with(root))
+                .and_then(|canon| fs::read_to_string(canon).ok())
+                .map(|raw| {
+                    smg_core::strip_utf8_bom(&raw)
+                        .lines()
+                        .map(|s| s.to_string())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            file_cache.insert(file.clone(), loaded);
+        }
+        file_cache
+            .get(&file)
+            .and_then(|lines| lines.get(primary_line - 1))
+            .map(|line| whitespace_normalized_line_hash(line))
+            .unwrap_or_else(|| {
+                whitespace_normalized_line_hash(&format!("{}|{}", enclosing_symbol, f.title))
+            })
+    } else {
+        whitespace_normalized_line_hash(&format!("{}|{}", enclosing_symbol, f.title))
+    };
+
     BaselineEntry {
         rule_id: f.rule_id.clone(),
-        file: f.file.clone(),
-        entry_route: f.entry_route.clone(),
-        sink_symbol,
+        file,
+        enclosing_symbol,
+        sink_line_hash,
+        entry_route: String::new(),
+        sink_symbol: String::new(),
     }
+}
+
+fn finding_fingerprint(f: &LatticeFinding) -> BaselineEntry {
+    let mut empty_cache = HashMap::new();
+    finding_fingerprint_with_root(None, f, &mut empty_cache)
+}
+
+fn baseline_entry_matches(
+    baseline_set: &HashSet<BaselineEntry>,
+    v2: &BaselineEntry,
+    f: &LatticeFinding,
+) -> bool {
+    if baseline_set.contains(v2) {
+        return true;
+    }
+    // Backward-compatible matching for v1 baselines lacking `sink_line_hash`.
+    let legacy = BaselineEntry {
+        rule_id: f.rule_id.clone(),
+        file: smg_core::normalize_rel_path_posix_nfc(&f.file),
+        enclosing_symbol: String::new(),
+        sink_line_hash: String::new(),
+        entry_route: f.entry_route.clone(),
+        sink_symbol: f
+            .witness_path
+            .last()
+            .map(|h| h.symbol.clone())
+            .unwrap_or_default(),
+    };
+    baseline_set.contains(&legacy)
 }
 
 fn has_unquoted_comment_before(prefix: &str) -> bool {
@@ -1402,7 +1488,7 @@ fn apply_suppressions_and_baseline(
             .findings
             .iter()
             .filter(|f| f.status != "MITIGATED")
-            .map(finding_fingerprint)
+            .map(|f| finding_fingerprint_with_root(canon_root.as_deref(), f, &mut file_cache))
             .collect();
         entries.sort();
         entries.dedup();
@@ -1412,7 +1498,7 @@ fn apply_suppressions_and_baseline(
             fs::create_dir_all(parent)?;
         }
         let payload = BaselineFile {
-            version: 1,
+            version: 2,
             entries,
         };
         fs::write(wb_path, serde_json::to_string_pretty(&payload)?)?;
@@ -1427,7 +1513,8 @@ fn apply_suppressions_and_baseline(
     if let Some(b_path) = baseline_path {
         let baseline_set = load_baseline_entries(b_path)?;
         outcome.graph.findings.retain(|f| {
-            if baseline_set.contains(&finding_fingerprint(f)) {
+            let fp = finding_fingerprint_with_root(canon_root.as_deref(), f, &mut file_cache);
+            if baseline_entry_matches(&baseline_set, &fp, f) {
                 baseline_suppressed += 1;
                 false
             } else {
@@ -1968,6 +2055,7 @@ pub(crate) fn execute_scan_pipeline_full(
             t0.elapsed().as_millis()
         );
     }
+    smg_graph::canonical_sort_findings(&mut graph_res.findings);
     let mut all_findings = graph_res.findings.clone();
 
     if !opts.layers.is_empty() {

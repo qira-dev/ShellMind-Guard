@@ -1,0 +1,61 @@
+{
+  "parsed_files": 3,
+  "symbol_count": 8,
+  "edge_count": 5,
+  "route_entries": 2,
+  "active_domains": [
+    "system_engine",
+    "web"
+  ],
+  "findings": [
+    {
+      "id": "SMG-AUTH-001",
+      "rule_id": "SMG-AUTH-001",
+      "severity": "HIGH",
+      "title": "Unauthenticated path to AuthMutation in `promote_user_role`",
+      "file": "src/services/account.rs",
+      "line": 3,
+      "status": "SUSPECT_UNGUARDED",
+      "confidence": "CONFIRMED",
+      "entry_route": "POST /api/v1/admin/promote",
+      "sink_kind": "AuthMutation",
+      "missing_guard": "Auth",
+      "witness_path": [
+        {
+          "file": "src/main.rs",
+          "symbol": "POST /api/v1/admin/promote",
+          "line": 5
+        },
+        {
+          "file": "src/services/account.rs",
+          "symbol": "promote_user_role",
+          "line": 3
+        }
+      ],
+      "remediation": "Add authentication middleware (e.g. JWT/session check like `requireAuth`) before invoking this handler.",
+      "proof_reasons": [
+        "O(V+E)Lattice",
+        "CFGDominated",
+        "AuthGuardMissing"
+      ]
+    }
+  ],
+  "route_schemas": [
+    {
+      "method": "POST",
+      "path": "/api/v1/admin/promote",
+      "source_file": "src/main.rs",
+      "line": 5,
+      "params": [],
+      "from_openapi": false
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/account/transfer",
+      "source_file": "src/main.rs",
+      "line": 6,
+      "params": [],
+      "from_openapi": false
+    }
+  ]
+}

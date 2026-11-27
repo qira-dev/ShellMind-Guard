@@ -2194,36 +2194,7 @@ pub fn solve_guard_lattice_with_slice_mode(
             }
         }
     }
-    deduped.sort_by(|a, b| {
-        let ta = if matches!(a.missing_guard, GuardKind::Auth | GuardKind::TxLock) {
-            0u8
-        } else {
-            1u8
-        };
-        let tb = if matches!(b.missing_guard, GuardKind::Auth | GuardKind::TxLock) {
-            0u8
-        } else {
-            1u8
-        };
-        ta.cmp(&tb).then_with(|| {
-            if ta == 0 {
-                a.entry_route
-                    .cmp(&b.entry_route)
-                    .then_with(|| a.rule_id.cmp(&b.rule_id))
-            } else {
-                severity_rank(&a.severity)
-                    .cmp(&severity_rank(&b.severity))
-                    .then_with(|| a.rule_id.cmp(&b.rule_id))
-                    .then_with(|| a.entry_route.cmp(&b.entry_route))
-                    .then_with(|| a.title.cmp(&b.title))
-                    .then_with(|| {
-                        let al = a.witness_path.first().map(|h| h.line).unwrap_or(0);
-                        let bl = b.witness_path.first().map(|h| h.line).unwrap_or(0);
-                        al.cmp(&bl)
-                    })
-            }
-        })
-    });
+    canonical_sort_findings(&mut deduped);
 
     let mut prefix_counts: HashMap<&'static str, usize> = HashMap::new();
     for item in deduped.iter_mut() {
@@ -2245,6 +2216,18 @@ pub fn solve_guard_lattice_with_slice_mode(
         item.id = format!("{}-{:03}", prefix, *c);
     }
 
+    let mut active_domains = active_domains;
+    active_domains.sort();
+    active_domains.dedup();
+    let mut route_schemas = crate::phase10::merge_repo_route_schemas(summaries);
+    route_schemas.sort_by(|a, b| {
+        a.source_file
+            .cmp(&b.source_file)
+            .then_with(|| a.line.cmp(&b.line))
+            .then_with(|| a.method.cmp(&b.method))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+
     GraphAnalysisResult {
         parsed_files: summaries.len(),
         symbol_count: graph.node_count(),
@@ -2252,8 +2235,81 @@ pub fn solve_guard_lattice_with_slice_mode(
         route_entries,
         active_domains,
         findings: deduped,
-        route_schemas: crate::phase10::merge_repo_route_schemas(summaries),
+        route_schemas,
     }
+}
+
+/// Computes a deterministic BLAKE3 digest of a finding's normalized witness trace for canonical tie-breaking.
+pub fn canonical_witness_hash(f: &LatticeFinding) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for h in &f.witness_path {
+        let norm = smg_core::normalize_rel_path_posix_nfc(&h.file);
+        hasher.update(norm.as_bytes());
+        hasher.update(&[0u8]);
+        hasher.update(&(h.line as u64).to_le_bytes());
+        hasher.update(&[0u8]);
+        hasher.update(h.symbol.as_bytes());
+        hasher.update(&[0u8]);
+    }
+    hasher.update(f.title.as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
+/// Normalizes paths (POSIX `/` + Unicode NFC) and sorts findings canonically so 1T vs 16T
+/// scans produce bit-for-bit identical JSON, SARIF, and OpenVEX outputs.
+pub fn canonical_sort_findings(findings: &mut [LatticeFinding]) {
+    for f in findings.iter_mut() {
+        if !f.file.is_empty() {
+            f.file = smg_core::normalize_rel_path_posix_nfc(&f.file);
+        }
+        for h in f.witness_path.iter_mut() {
+            if !h.file.is_empty() {
+                h.file = smg_core::normalize_rel_path_posix_nfc(&h.file);
+            }
+        }
+        if f.file.is_empty()
+            && let Some(primary) = f.witness_path.last().or_else(|| f.witness_path.first())
+        {
+            f.file = primary.file.clone();
+        }
+        if f.line == 0
+            && let Some(primary) = f.witness_path.last().or_else(|| f.witness_path.first())
+        {
+            f.line = primary.line;
+        }
+    }
+    findings.sort_by(|a, b| {
+        let ta = if matches!(a.missing_guard, GuardKind::Auth | GuardKind::TxLock) {
+            0u8
+        } else {
+            1u8
+        };
+        let tb = if matches!(b.missing_guard, GuardKind::Auth | GuardKind::TxLock) {
+            0u8
+        } else {
+            1u8
+        };
+        ta.cmp(&tb).then_with(|| {
+            if ta == 0 {
+                a.entry_route
+                    .cmp(&b.entry_route)
+                    .then_with(|| a.rule_id.cmp(&b.rule_id))
+                    .then_with(|| a.file.cmp(&b.file))
+                    .then_with(|| a.line.cmp(&b.line))
+                    .then_with(|| canonical_witness_hash(a).cmp(&canonical_witness_hash(b)))
+                    .then_with(|| a.title.cmp(&b.title))
+            } else {
+                severity_rank(&a.severity)
+                    .cmp(&severity_rank(&b.severity))
+                    .then_with(|| a.rule_id.cmp(&b.rule_id))
+                    .then_with(|| a.file.cmp(&b.file))
+                    .then_with(|| a.line.cmp(&b.line))
+                    .then_with(|| a.entry_route.cmp(&b.entry_route))
+                    .then_with(|| a.title.cmp(&b.title))
+                    .then_with(|| canonical_witness_hash(a).cmp(&canonical_witness_hash(b)))
+            }
+        })
+    });
 }
 
 fn confidence_rank(c: Confidence) -> u8 {
@@ -2349,9 +2405,19 @@ pub fn append_local_static_findings(
             .entry((f.entry_route.clone(), norm_rule(&f.rule_id).to_string()))
             .or_insert(i);
     }
+    let mut sorted_extra: Vec<&LocalStaticFinding> = extra.iter().collect();
+    sorted_extra.sort_by(|a, b| {
+        smg_core::normalize_rel_path_posix_nfc(&a.rel_path)
+            .cmp(&smg_core::normalize_rel_path_posix_nfc(&b.rel_path))
+            .then_with(|| a.line.cmp(&b.line))
+            .then_with(|| a.rule_id.cmp(&b.rule_id))
+            .then_with(|| a.symbol.cmp(&b.symbol))
+            .then_with(|| a.title.cmp(&b.title))
+    });
     let mut seq = findings.len();
-    for sf in extra {
-        let entry_route = format!("{}:{}", sf.rel_path, sf.line);
+    for sf in sorted_extra {
+        let norm_rel = smg_core::normalize_rel_path_posix_nfc(&sf.rel_path);
+        let entry_route = format!("{}:{}", norm_rel, sf.line);
         let key = (entry_route.clone(), norm_rule(&sf.rule_id).to_string());
         if let Some(&idx) = index_by_key.get(&key) {
             let existing = &mut findings[idx];
@@ -2383,7 +2449,7 @@ pub fn append_local_static_findings(
             rule_id: sf.rule_id.clone(),
             severity: sf.severity.clone(),
             title: sf.title.clone(),
-            file: sf.rel_path.clone(),
+            file: norm_rel.clone(),
             line: sf.line,
             status: if matches!(sf.confidence, Confidence::Proven) {
                 "PROVEN".into()
@@ -2395,7 +2461,7 @@ pub fn append_local_static_findings(
             sink_kind: sf.sink_kind,
             missing_guard: sf.missing_guard,
             witness_path: vec![TraceHop {
-                file: sf.rel_path.clone(),
+                file: norm_rel,
                 symbol: sf.symbol.clone(),
                 line: sf.line,
             }],
@@ -2403,6 +2469,7 @@ pub fn append_local_static_findings(
             proof_reasons: proof_reasons_for_static_rule(&sf.rule_id, sf.confidence),
         });
     }
+    canonical_sort_findings(findings);
 }
 
 fn is_example_or_benchmark_path(rel_path: &str) -> bool {

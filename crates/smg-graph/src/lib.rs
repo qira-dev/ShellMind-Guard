@@ -54,8 +54,8 @@ pub use git_history::{
 pub use gitleaks_config::{GitleaksConfig, has_inline_allow_marker};
 pub use lattice::{
     GraphAnalysisResult, LatticeFinding, RuleHitStat, TraceHop, append_local_static_findings,
-    compute_rule_telemetry, finding_matches_layer, solve_guard_lattice,
-    solve_guard_lattice_with_options, solve_guard_lattice_with_public,
+    canonical_sort_findings, canonical_witness_hash, compute_rule_telemetry, finding_matches_layer,
+    solve_guard_lattice, solve_guard_lattice_with_options, solve_guard_lattice_with_public,
     solve_guard_lattice_with_slice_mode,
 };
 pub use phase10::{ParamTypeHint, RouteParamSpec, RouteSchema, collect_deep_schema_findings};
@@ -132,6 +132,9 @@ fn load_or_parse_summaries_cached(
         store.save_ast_cache(&cfg_hash, &cache_rows)?;
     }
 
+    // Phase 1 Determinism: always sort summaries by normalized `rel_path` so cache hits/misses
+    // and Rayon thread counts feed `solve_guard_lattice` in identical order.
+    all_summaries.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
     Ok(all_summaries)
 }
 
@@ -145,13 +148,14 @@ pub fn analyze_codebase(
         .stack_size(8 * 1024 * 1024)
         .build()?;
 
-    let summaries: Vec<FileAstSummary> = pool.install(|| {
+    let mut summaries: Vec<FileAstSummary> = pool.install(|| {
         files
             .par_iter()
             .filter_map(|f| parse_file_ast(f, cfg))
             .collect()
     });
     langs::hcl::clear_workspace_hcl_vars();
+    summaries.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
 
     Ok(solve_guard_lattice_with_options(
         &summaries,
