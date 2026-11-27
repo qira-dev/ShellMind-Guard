@@ -227,6 +227,33 @@ impl StateStore {
             tx.commit()?;
         }
 
+        // Phase 3 (Q112 / Q132): Auto-migrate `ast_cache` from v1 uncompressed JSON to v2
+        // compact binary `postcard` blobs (`SMG2` magic header) by wiping stale v1 rows cleanly.
+        let cur_ver: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap_or(0);
+        if cur_ver < 2 {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let tx_ver: i64 = tx
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap_or(0);
+            if tx_ver < 2 {
+                tx.execute_batch(
+                    "
+                    DROP TABLE IF EXISTS ast_cache;
+                    CREATE TABLE ast_cache (
+                        rel_path TEXT PRIMARY KEY,
+                        blake3_hash TEXT NOT NULL,
+                        config_hash TEXT NOT NULL,
+                        ast_blob BLOB NOT NULL
+                    );
+                    PRAGMA user_version = 2;
+                    ",
+                )?;
+            }
+            tx.commit()?;
+        }
+
         Ok(Self { conn })
     }
 
@@ -327,31 +354,34 @@ impl StateStore {
         Ok((stats, changed_files))
     }
 
-    /// Loads cached per-file AST JSON blobs keyed by `rel_path` where `blake3_hash` and `config_hash` match.
-    pub fn load_ast_cache(&self, config_hash: &str) -> Result<HashMap<String, (String, String)>> {
+    /// Loads cached per-file compact binary AST blobs (`SMG2` + postcard) keyed by `rel_path`.
+    pub fn load_ast_cache_bytes(
+        &self,
+        config_hash: &str,
+    ) -> Result<HashMap<String, (String, Vec<u8>)>> {
         let mut map = HashMap::new();
         let mut stmt = self.conn.prepare(
-            "SELECT rel_path, blake3_hash, ast_json FROM ast_cache WHERE config_hash = ?1",
+            "SELECT rel_path, blake3_hash, ast_blob FROM ast_cache WHERE config_hash = ?1",
         )?;
         let rows = stmt.query_map(params![config_hash], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
+                r.get::<_, Vec<u8>>(2)?,
             ))
         })?;
         for row in rows {
-            let (rel_path, blake3_hash, ast_json) = row?;
-            map.insert(rel_path, (blake3_hash, ast_json));
+            let (rel_path, blake3_hash, ast_blob) = row?;
+            map.insert(rel_path, (blake3_hash, ast_blob));
         }
         Ok(map)
     }
 
-    /// Persists newly parsed per-file AST JSON summaries into the Two-Phase SQLite cache.
-    pub fn save_ast_cache(
+    /// Persists newly parsed per-file compact binary AST blobs (`SMG2` + postcard).
+    pub fn save_ast_cache_bytes(
         &mut self,
         config_hash: &str,
-        entries: &[(String, String, String)],
+        entries: &[(String, String, Vec<u8>)],
     ) -> Result<()> {
         if entries.is_empty() {
             return Ok(());
@@ -361,15 +391,15 @@ impl StateStore {
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO ast_cache (rel_path, blake3_hash, config_hash, ast_json)
+                "INSERT INTO ast_cache (rel_path, blake3_hash, config_hash, ast_blob)
                  VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT(rel_path) DO UPDATE SET
                    blake3_hash = excluded.blake3_hash,
                    config_hash = excluded.config_hash,
-                   ast_json = excluded.ast_json",
+                   ast_blob = excluded.ast_blob",
             )?;
-            for (rel_path, blake3_hash, ast_json) in entries {
-                stmt.execute(params![rel_path, blake3_hash, config_hash, ast_json])?;
+            for (rel_path, blake3_hash, ast_blob) in entries {
+                stmt.execute(params![rel_path, blake3_hash, config_hash, ast_blob])?;
             }
         }
         tx.commit()?;
@@ -465,17 +495,18 @@ mod tests {
         assert_eq!(c1.len(), 1);
 
         store
-            .save_ast_cache(
+            .save_ast_cache_bytes(
                 "cfg1",
                 &[(
                     "src/app.ts".into(),
                     "abc123".into(),
-                    "{\"rel_path\":\"src/app.ts\",\"imports\":[],\"symbols\":[]}".into(),
+                    b"SMG2\x01\x02\x03".to_vec(),
                 )],
             )
             .unwrap();
-        let loaded = store.load_ast_cache("cfg1").unwrap();
+        let loaded = store.load_ast_cache_bytes("cfg1").unwrap();
         assert_eq!(loaded.get("src/app.ts").unwrap().0, "abc123");
+        assert!(loaded.get("src/app.ts").unwrap().1.starts_with(b"SMG2"));
 
         let (d2, c2) = store.sync_files(&[f1]).unwrap();
         assert_eq!(d2.added_or_modified, 0);

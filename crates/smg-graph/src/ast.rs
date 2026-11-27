@@ -280,6 +280,9 @@ pub struct FileAstSummary {
     /// Phase 12A: Concrete types instantiated in this file (for RTA narrowing).
     #[serde(default)]
     pub instantiated_types: Vec<String>,
+    /// Phase 3 (Q144/Q146): True when Tree-sitter hit syntax `ERROR` nodes or per-file parse timeout.
+    #[serde(default)]
+    pub parse_degraded: bool,
 }
 
 impl SymbolInfo {
@@ -528,8 +531,32 @@ pub fn parse_file_ast_with_hash(
         return None;
     }
 
-    let tree = parser.parse(source, None)?;
+    // Phase 3 (Q144): Per-file 2s Tree-sitter parse timeout preventing algorithmic DoS on pathological inputs.
+    let parse_start = std::time::Instant::now();
+    let parse_limit = std::time::Duration::from_secs(2);
+    let mut progress_cb = |_: &tree_sitter::ParseState| parse_start.elapsed() > parse_limit;
+    let parse_opts = tree_sitter::ParseOptions::new().progress_callback(&mut progress_cb);
+    let src_bytes_ref = source.as_bytes();
+    let Some(tree) = parser.parse_with_options(
+        &mut |offset, _| src_bytes_ref.get(offset..).unwrap_or(&[]),
+        None,
+        Some(parse_opts),
+    ) else {
+        // Graceful timeout degradation: preserve static/secret findings and mark `parse_degraded`.
+        return Some((
+            actual_hash,
+            FileAstSummary {
+                rel_path: file.rel_path.clone(),
+                static_findings,
+                gitignore_lines,
+                is_sensitive_env_or_pem: is_sensitive,
+                parse_degraded: true,
+                ..Default::default()
+            },
+        ));
+    };
     let root = tree.root_node();
+    let parse_degraded = root.has_error();
     let src_bytes = source.as_bytes();
 
     if file.language == Language::Rust {
@@ -665,6 +692,7 @@ pub fn parse_file_ast_with_hash(
             type_impls: call_hier.type_impls,
             di_bindings: call_hier.di_bindings,
             instantiated_types: call_hier.instantiated_types,
+            parse_degraded,
         },
     ))
 }

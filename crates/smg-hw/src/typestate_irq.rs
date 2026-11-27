@@ -79,52 +79,8 @@ impl SmtBackend for PureRustBvSliceSolver {
     }
 }
 
-/// Disjoint-set pointer equivalence classes (Steensgaard O(n * alpha(n)) pass) for DMA/__user aliases.
-#[derive(Default)]
-pub struct PointerAliasUnionFind {
-    parent: Vec<usize>,
-    names: HashMap<String, usize>,
-}
-
-impl PointerAliasUnionFind {
-    pub fn intern(&mut self, name: &str) -> usize {
-        if let Some(&id) = self.names.get(name) {
-            return id;
-        }
-        let id = self.parent.len();
-        self.parent.push(id);
-        self.names.insert(name.to_string(), id);
-        id
-    }
-
-    pub fn find(&mut self, mut x: usize) -> usize {
-        while self.parent[x] != x {
-            self.parent[x] = self.parent[self.parent[x]];
-            x = self.parent[x];
-        }
-        x
-    }
-
-    pub fn union_names(&mut self, a: &str, b: &str) {
-        let ia = self.intern(a);
-        let ib = self.intern(b);
-        let ra = self.find(ia);
-        let rb = self.find(ib);
-        if ra != rb {
-            self.parent[rb] = ra;
-        }
-    }
-
-    pub fn same_alias(&mut self, a: &str, b: &str) -> bool {
-        if a == b {
-            return true;
-        }
-        if let (Some(&ia), Some(&ib)) = (self.names.get(a), self.names.get(b)) {
-            return self.find(ia) == self.find(ib);
-        }
-        false
-    }
-}
+/// Re-exported unified Steensgaard pointer equivalence classes (`Phase 3 / Q71`).
+pub use smg_graph::formal::PointerAliasUnionFind;
 
 #[derive(Debug, Clone)]
 pub struct HardwareFunctionLockSummary {

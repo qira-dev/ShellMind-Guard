@@ -155,6 +155,18 @@ impl SmtVerdict {
     }
 }
 
+static SMT_Z3_OPT_IN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Enables or disables external `z3` subprocess oracle (opt-in `--smt-z3`, default `false`).
+pub fn set_smt_z3_enabled(enabled: bool) {
+    SMT_Z3_OPT_IN.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Returns true only when `--smt-z3` was explicitly requested AND `z3` is available on `PATH`.
+pub fn is_smt_z3_enabled() -> bool {
+    SMT_Z3_OPT_IN.load(std::sync::atomic::Ordering::Relaxed) && is_z3_available()
+}
+
 /// Checks once per process whether `z3` is installed and executable on `PATH`.
 pub fn is_z3_available() -> bool {
     static Z3_OK: OnceLock<bool> = OnceLock::new();

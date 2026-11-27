@@ -6,6 +6,7 @@ pub mod cfa_ssa;
 pub mod cfg;
 pub mod deep_stack;
 pub mod deps;
+pub mod formal;
 pub mod git_history;
 pub mod gitleaks_config;
 pub mod iac_policy;
@@ -73,6 +74,8 @@ pub use subgraph::{
 };
 pub use vex_osv::{AutoVexSymbolIndex, OpenVexStatement, to_openvex_json};
 
+const AST_CACHE_MAGIC: &[u8; 4] = b"SMG2";
+
 fn load_or_parse_summaries_cached(
     files: &[IndexedFile],
     cfg: &ShellMindGuardConfig,
@@ -81,7 +84,7 @@ fn load_or_parse_summaries_cached(
     let cfg_json = serde_json::to_string(&cfg.guards).unwrap_or_default();
     let adv_stamp = smg_core::advisories_db_stamp();
     let versioned_cfg = format!(
-        "v33-phase29-web3-ai-mcp-{}|{}|{}|{}",
+        "v34-p3-postcard-{}|{}|{}|{}",
         env!("CARGO_PKG_VERSION"),
         adv_stamp,
         cfg.scan.deep_audit,
@@ -89,14 +92,16 @@ fn load_or_parse_summaries_cached(
     );
     let cfg_hash = blake3::hash(versioned_cfg.as_bytes()).to_hex().to_string();
 
-    let cached_map = store.load_ast_cache(&cfg_hash)?;
+    let cached_map = store.load_ast_cache_bytes(&cfg_hash)?;
     let mut all_summaries: Vec<FileAstSummary> = Vec::with_capacity(files.len());
     let mut to_parse: Vec<&IndexedFile> = Vec::new();
 
     for f in files {
-        if let Some((old_hash, json_str)) = cached_map.get(&f.rel_path)
+        if let Some((old_hash, blob)) = cached_map.get(&f.rel_path)
             && old_hash == &f.blake3_hash
-            && let Ok(parsed) = serde_json::from_str::<FileAstSummary>(json_str)
+            && blob.starts_with(AST_CACHE_MAGIC)
+            && let Ok(parsed) =
+                postcard::from_bytes::<FileAstSummary>(&blob[AST_CACHE_MAGIC.len()..])
         {
             all_summaries.push(parsed);
             continue;
@@ -122,14 +127,17 @@ fn load_or_parse_summaries_cached(
         });
         langs::hcl::clear_workspace_hcl_vars();
 
-        let mut cache_rows: Vec<(String, String, String)> = Vec::with_capacity(newly_parsed.len());
+        let mut cache_rows: Vec<(String, String, Vec<u8>)> = Vec::with_capacity(newly_parsed.len());
         for (rel_path, hash, summary) in newly_parsed {
-            if let Ok(js) = serde_json::to_string(&summary) {
-                cache_rows.push((rel_path, hash, js));
+            if let Ok(encoded) = postcard::to_allocvec(&summary) {
+                let mut blob = Vec::with_capacity(AST_CACHE_MAGIC.len() + encoded.len());
+                blob.extend_from_slice(AST_CACHE_MAGIC);
+                blob.extend_from_slice(&encoded);
+                cache_rows.push((rel_path, hash, blob));
             }
             all_summaries.push(summary);
         }
-        store.save_ast_cache(&cfg_hash, &cache_rows)?;
+        store.save_ast_cache_bytes(&cfg_hash, &cache_rows)?;
     }
 
     // Phase 1 Determinism: always sort summaries by normalized `rel_path` so cache hits/misses

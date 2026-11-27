@@ -39,6 +39,7 @@ httparse = "1.9"
 ignore = "0.4"
 md-5 = "0.10"
 petgraph = "0.6"
+postcard = { version = "1.1", features = ["alloc"] }
 rayon = "1.10"
 rcgen = "0.13"
 regex = "1"

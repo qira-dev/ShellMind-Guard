@@ -8,6 +8,7 @@ license.workspace = true
 anyhow.workspace = true
 blake3.workspace = true
 petgraph.workspace = true
+postcard.workspace = true
 rayon.workspace = true
 regex = "1"
 serde.workspace = true

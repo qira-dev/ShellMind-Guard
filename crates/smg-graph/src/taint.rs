@@ -4514,7 +4514,7 @@ pub fn analyze_function_taint(
 
     // Phase 15C: Prune mathematically unreachable (SMT UNSAT) dead-path findings.
     if !summary.local_taint_hits.is_empty() || !summary.param_sinks.is_empty() {
-        let use_z3 = crate::smt::is_z3_available();
+        let use_z3 = crate::smt::is_smt_z3_enabled();
         summary
             .local_taint_hits
             .retain(|hit| crate::smt::is_line_reachable(fn_node, src, hit.line, use_z3));
