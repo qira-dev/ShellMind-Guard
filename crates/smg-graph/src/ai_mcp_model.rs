@@ -544,20 +544,27 @@ pub fn analyze_model_deserialization_and_ssti(
             continue;
         }
 
-        // A. `torch.load(...)` without `weights_only=True`
-        if trimmed.contains("torch.load(") && !trimmed.contains("weights_only=True") {
-            findings.push(mk_ai_finding(
-                "SMG-AI-TORCH-PICKLE",
-                "CRITICAL",
-                "Unsafe `torch.load()` without `weights_only=True` allows arbitrary Pickle RCE when loading untrusted model weights".into(),
-                rel_path,
-                idx + 1,
-                "torch.load",
-                SinkKind::CommandInjection,
-                GuardKind::CmdSanitizer,
-                Confidence::Confirmed,
-                "Pass `weights_only=True` to `torch.load()` or migrate model artifacts to `safetensors`.",
-            ));
+        // A. `torch.load(...)` without `weights_only=True` (checks 5-line call window & spaced `=`)
+        if trimmed.contains("torch.load(") {
+            let call_window: String = lines[idx..(idx + 5).min(lines.len())]
+                .join(" ")
+                .to_ascii_lowercase();
+            let has_weights_only_true = call_window.contains("weights_only=true")
+                || call_window.contains("weights_only = true");
+            if !has_weights_only_true {
+                findings.push(mk_ai_finding(
+                    "SMG-AI-TORCH-PICKLE",
+                    "CRITICAL",
+                    "Unsafe `torch.load()` without `weights_only=True` allows arbitrary Pickle RCE when loading untrusted model weights".into(),
+                    rel_path,
+                    idx + 1,
+                    "torch.load",
+                    SinkKind::CommandInjection,
+                    GuardKind::CmdSanitizer,
+                    Confidence::Confirmed,
+                    "Pass `weights_only=True` to `torch.load()` or migrate model artifacts to `safetensors`.",
+                ));
+            }
         }
 
         // B. Direct `pickle.load`/`dill.load`/`cloudpickle.loads`/`joblib.load`
