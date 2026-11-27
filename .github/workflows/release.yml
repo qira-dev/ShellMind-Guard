@@ -108,6 +108,16 @@ jobs:
           AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
         run: cargo build --release --locked --target ${{ matrix.target }}
 
+      - name: Enforce stripped binary size guardrail (<= 16 MiB)
+        if: runner.os != 'Windows'
+        run: |
+          SIZE=$(wc -c < "target/${{ matrix.target }}/release/smg")
+          echo "Stripped smg release binary size: ${SIZE} bytes"
+          if [ "${SIZE}" -gt 16777216 ]; then
+            echo "::error::Binary size ${SIZE} bytes exceeds 16 MiB guardrail!"
+            exit 1
+          fi
+
       - name: Package Unix archive
         if: runner.os != 'Windows'
         run: |

@@ -16,7 +16,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.5.5"
+version = "1.6.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/qira-dev/ShellMind-Guard"
@@ -135,6 +135,14 @@ enterprise = ["dep:smg-enterprise"]
 
 [lints]
 workspace = true
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/shellmind-guard-{ target }{ archive-suffix }"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
 
 [profile.release]
 codegen-units = 1

@@ -91,6 +91,63 @@ pub fn redact_secrets_in_text(input: &str) -> String {
     out
 }
 
+/// Renders a concise GitHub Pull Request Markdown summary containing ONLY high-signal
+/// `Confirmed+` / `Proven` findings with 3-hop witness traces and redacted messages (`Phase 6 / Q53`).
+pub fn to_pr_markdown_summary(findings: &[LatticeFinding], verified: &[VerifiedFinding]) -> String {
+    let ver_map: HashMap<&str, &VerifiedFinding> = verified
+        .iter()
+        .map(|v| (v.finding_id.as_str(), v))
+        .collect();
+    let actionable: Vec<&LatticeFinding> = findings
+        .iter()
+        .filter(|f| {
+            f.status != "MITIGATED"
+                && matches!(f.confidence, Confidence::Confirmed | Confidence::Proven)
+        })
+        .collect();
+    let hidden_heuristic = findings
+        .iter()
+        .filter(|f| f.status != "MITIGATED" && f.confidence == Confidence::Heuristic)
+        .count();
+
+    let mut md = String::new();
+    md.push_str("### ShellMind Guard Security Summary\n\n");
+    if actionable.is_empty() {
+        md.push_str("No `CONFIRMED` or `PROVEN` security findings detected.\n");
+        if hidden_heuristic > 0 {
+            md.push_str(&format!(
+                "\n_{hidden_heuristic} heuristic finding(s) hidden — run `smg scan . --min-confidence heuristic` to inspect._\n"
+            ));
+        }
+        return md;
+    }
+
+    md.push_str("| Severity | Confidence | Rule | Location | Summary |\n");
+    md.push_str("|---|---|---|---|---|\n");
+    for f in actionable.iter().take(25) {
+        let conf = if ver_map
+            .get(f.id.as_str())
+            .is_some_and(|v| matches!(v.status, VerificationStatus::Proven))
+        {
+            "PROVEN"
+        } else {
+            f.confidence.as_str()
+        };
+        let file = smg_core::normalize_rel_path_posix_nfc(&f.file);
+        let title = redact_secrets_in_text(&f.title).replace('|', "\\|");
+        md.push_str(&format!(
+            "| **{}** | `{}` | `{}` | `{}:{}` | {} |\n",
+            f.severity, conf, f.rule_id, file, f.line, title
+        ));
+    }
+    if hidden_heuristic > 0 {
+        md.push_str(&format!(
+            "\n_{hidden_heuristic} heuristic finding(s) collapsed — pass `--min-confidence heuristic` to view all._\n"
+        ));
+    }
+    md
+}
+
 fn fnv1a_hex(s: &str) -> String {
     let mut hash: u64 = 0xcbf29ce484222325;
     for b in s.as_bytes() {
@@ -116,13 +173,13 @@ pub fn to_sarif_json(findings: &[LatticeFinding], verified: &[VerifiedFinding]) 
             rules.push(json!({
                 "id": f.rule_id,
                 "name": f.rule_id,
-                "shortDescription": { "text": f.title },
+                "shortDescription": { "text": redact_secrets_in_text(&f.title) },
                 "help": {
-                    "text": if f.remediation.is_empty() {
-                        f.title.clone()
+                    "text": redact_secrets_in_text(if f.remediation.is_empty() {
+                        &f.title
                     } else {
-                        f.remediation.clone()
-                    }
+                        &f.remediation
+                    })
                 },
                 "properties": {
                     "security-severity": security_severity_score(&f.severity),
@@ -863,5 +920,69 @@ mod tests {
             "pkg:npm/%40scope/pkg@1.2.3"
         );
         assert_eq!(escape_html("a'b\"c<d>"), "a&#39;b&quot;c&lt;d&gt;");
+    }
+
+    #[test]
+    fn test_phase6_sarif_schema_redaction_and_pr_markdown() {
+        let fake_tok = concat!("sk_live_", "51H9xK2L8mNpQ4rStUvWxYz78");
+        let redacted = redact_secrets_in_text(&format!("Found key {fake_tok} in config"));
+        assert!(redacted.contains("sk_live_****Yz78"), "got: {redacted}");
+        assert!(!redacted.contains("51H9xK2L8mNpQ4rStUvWx"));
+
+        let findings = vec![
+            LatticeFinding {
+                id: "SMG-SEC-001".into(),
+                rule_id: "SMG-SEC-STRIPE".into(),
+                severity: "CRITICAL".into(),
+                title: format!("Exposed Stripe key {fake_tok}"),
+                file: "src\\pay.ts".into(),
+                line: 12,
+                status: "SUSPECT_UNGUARDED".into(),
+                confidence: Confidence::Confirmed,
+                entry_route: "src/pay.ts:12".into(),
+                sink_kind: smg_graph::SinkKind::SecretLeak,
+                missing_guard: smg_graph::GuardKind::SecretPolicy,
+                witness_path: vec![smg_graph::TraceHop {
+                    file: "src\\pay.ts".into(),
+                    symbol: "charge".into(),
+                    line: 12,
+                }],
+                remediation: "Rotate key and move to env.".into(),
+                proof_reasons: vec!["ConfirmedSecret".into()],
+            },
+            LatticeFinding {
+                id: "SMG-HEUR-001".into(),
+                rule_id: "SMG-CFG-001".into(),
+                severity: "LOW".into(),
+                title: "Heuristic hint".into(),
+                file: "src/cfg.ts".into(),
+                line: 3,
+                status: "SUSPECT_UNGUARDED".into(),
+                confidence: Confidence::Heuristic,
+                entry_route: "src/cfg.ts:3".into(),
+                sink_kind: smg_graph::SinkKind::Misconfiguration,
+                missing_guard: smg_graph::GuardKind::ConfigPolicy,
+                witness_path: Vec::new(),
+                remediation: "Review config.".into(),
+                proof_reasons: Vec::new(),
+            },
+        ];
+
+        let sarif_str = to_sarif_json(&findings, &[]);
+        assert!(!sarif_str.contains("51H9xK2L8mNpQ4rStUvWx"));
+        let sarif: serde_json::Value = serde_json::from_str(&sarif_str).unwrap();
+        assert_eq!(sarif["version"], "2.1.0");
+        assert_eq!(
+            sarif["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["artifactLocation"]
+                ["uri"],
+            "src/pay.ts"
+        );
+        assert!(sarif["runs"][0]["results"][0]["codeFlows"].is_array());
+
+        let pr_md = to_pr_markdown_summary(&findings, &[]);
+        assert!(pr_md.contains("SMG-SEC-STRIPE"));
+        assert!(pr_md.contains("sk_live_****Yz78"));
+        assert!(!pr_md.contains("SMG-CFG-001"));
+        assert!(pr_md.contains("1 heuristic finding(s) collapsed"));
     }
 }
