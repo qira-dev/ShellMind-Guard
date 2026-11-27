@@ -1240,8 +1240,15 @@ pub fn run_cli() -> Result<ExitCode> {
             let cmd = Cli::command();
             print!("{}", render_shell_completions(&cmd, shell));
         }
-        Commands::Mcp => {
-            mcp::run_stdio_server()?;
+        Commands::Mcp {
+            allow_write,
+            print_config,
+        } => {
+            if let Some(client) = print_config {
+                println!("{}", mcp::render_mcp_client_config(&client)?);
+            } else {
+                mcp::run_stdio_server_with_options(allow_write)?;
+            }
         }
         Commands::Hook { action } => match action {
             HookAction::Install { path } => {

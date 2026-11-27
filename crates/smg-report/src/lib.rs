@@ -47,6 +47,50 @@ fn security_severity_score(sev: &str) -> &'static str {
     }
 }
 
+/// Redacts live credential/secret tokens (`sk_live_...` -> `sk_live_****abcd`) across all
+/// report & terminal outputs (`Phase 4 / Q148`).
+pub fn redact_secrets_in_text(input: &str) -> String {
+    const PREFIXES: &[&str] = &[
+        "sk_live_",
+        "rk_live_",
+        "whsec_",
+        "ghp_",
+        "gho_",
+        "github_pat_",
+        "glpat-",
+        "xoxb-",
+        "xoxp-",
+        "AKIA",
+        "AIza",
+    ];
+    let mut out = input.to_string();
+    for prefix in PREFIXES {
+        let mut search_from = 0usize;
+        while let Some(rel_idx) = out[search_from..].find(prefix) {
+            let start = search_from + rel_idx;
+            let after_prefix = start + prefix.len();
+            let mut end = after_prefix;
+            for (off, ch) in out[after_prefix..].char_indices() {
+                if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-') {
+                    end = after_prefix + off + ch.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            let body_len = end.saturating_sub(after_prefix);
+            if body_len >= 8 && !out[after_prefix..end].contains("****") {
+                let tail_start = end.saturating_sub(4);
+                let masked = format!("{}****{}", prefix, &out[tail_start..end]);
+                out.replace_range(start..end, &masked);
+                search_from = start + masked.len();
+            } else {
+                search_from = end.max(after_prefix);
+            }
+        }
+    }
+    out
+}
+
 fn fnv1a_hex(s: &str) -> String {
     let mut hash: u64 = 0xcbf29ce484222325;
     for b in s.as_bytes() {
@@ -141,7 +185,7 @@ pub fn to_sarif_json(findings: &[LatticeFinding], verified: &[VerifiedFinding]) 
             } else {
                 f.confidence.as_str()
             };
-            let msg = match v_opt {
+            let msg = redact_secrets_in_text(&match v_opt {
                 Some(v) if !f.remediation.is_empty() => format!(
                     "[{}/{}] {} — {} | Fix: {}",
                     status_tag, conf_tag, f.title, v.evidence, f.remediation
@@ -154,7 +198,7 @@ pub fn to_sarif_json(findings: &[LatticeFinding], verified: &[VerifiedFinding]) 
                     )
                 }
                 None => format!("[{}/{}] {}", status_tag, conf_tag, f.title),
-            };
+            });
 
             let fingerprint = fnv1a_hex(&format!(
                 "{}|{}|{}|{}",

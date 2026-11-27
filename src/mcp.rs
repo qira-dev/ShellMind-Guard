@@ -7,7 +7,44 @@ use std::io::{self, BufRead, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2024-11-05", "2025-03-26"];
 const MAX_MCP_LINE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Renders a copy-paste read-only MCP server snippet for popular AI coding clients
+/// (`claude`, `cursor`, `windsurf`, `antigravity`) without mutating user home configs
+/// (`Phase 4 / Q59`).
+pub fn render_mcp_client_config(client: &str) -> Result<String> {
+    let key = client.trim().to_ascii_lowercase();
+    let snippet = match key.as_str() {
+        "claude" | "claude-code" | "cursor" | "windsurf" | "antigravity" => json!({
+            "mcpServers": {
+                "shellmind-guard": {
+                    "command": "smg",
+                    "args": ["mcp"]
+                }
+            }
+        }),
+        other => anyhow::bail!(
+            "Unsupported MCP client '{}'. Supported clients: claude, cursor, windsurf, antigravity",
+            other
+        ),
+    };
+    Ok(serde_json::to_string_pretty(&snippet)?)
+}
+
+fn sanitize_untrusted_snippet(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .filter(|&c| {
+            c == '\n'
+                || c == '\t'
+                || (!c.is_control()
+                    && !matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'))
+        })
+        .take(4096)
+        .collect();
+    format!("<untrusted_source_snippet>\n{cleaned}\n</untrusted_source_snippet>")
+}
 
 fn drain_to_newline<R: BufRead>(reader: &mut R) {
     let mut buf = [0u8; 8192];
@@ -30,9 +67,14 @@ fn drain_to_newline<R: BufRead>(reader: &mut R) {
     }
 }
 
-/// Runs ShellMind Guard's stdio JSON-RPC 2.0 MCP server loop.
-/// Reads newline-delimited requests from `stdin` and writes single-line responses exclusively to `stdout`.
+/// Runs ShellMind Guard's stdio JSON-RPC 2.0 MCP server loop (strictly Read-Only by default).
+#[allow(dead_code)]
 pub fn run_stdio_server() -> Result<()> {
+    run_stdio_server_with_options(false)
+}
+
+/// Runs ShellMind Guard's stdio JSON-RPC 2.0 MCP server loop with explicit write opt-in.
+pub fn run_stdio_server_with_options(allow_write: bool) -> Result<()> {
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut reader = stdin.lock();
@@ -75,7 +117,7 @@ pub fn run_stdio_server() -> Result<()> {
         if trimmed.is_empty() {
             continue;
         }
-        if let Some(resp) = handle_jsonrpc_line(trimmed) {
+        if let Some(resp) = handle_jsonrpc_line_with_options(trimmed, allow_write) {
             let encoded = serde_json::to_string(&resp)?;
             writer.write_all(encoded.as_bytes())?;
             writer.write_all(b"\n")?;
@@ -85,9 +127,15 @@ pub fn run_stdio_server() -> Result<()> {
     Ok(())
 }
 
-/// Processes a single JSON-RPC 2.0 message line.
-/// Returns `None` for notifications (no response required per JSON-RPC 2.0 / MCP spec).
+/// Processes a single JSON-RPC 2.0 message line in default Read-Only mode.
+#[allow(dead_code)]
 pub fn handle_jsonrpc_line(raw: &str) -> Option<Value> {
+    handle_jsonrpc_line_with_options(raw, false)
+}
+
+/// Processes a single JSON-RPC 2.0 message line with explicit `allow_write` policy.
+/// Returns `None` for notifications (no response required per JSON-RPC 2.0 / MCP spec).
+pub fn handle_jsonrpc_line_with_options(raw: &str, allow_write: bool) -> Option<Value> {
     let req: Value = match serde_json::from_str(raw) {
         Ok(v) => v,
         Err(e) => {
@@ -127,22 +175,33 @@ pub fn handle_jsonrpc_line(raw: &str) -> Option<Value> {
     let params = obj.get("params").cloned().unwrap_or_else(|| json!({}));
 
     let resp = match method {
-        "initialize" => json_ok(
-            id,
-            json!({
-                "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": {
-                    "tools": { "listChanged": false }
-                },
-                "serverInfo": {
-                    "name": "shellmind-guard",
-                    "version": env!("CARGO_PKG_VERSION")
-                }
-            }),
-        ),
+        "initialize" => {
+            let requested_ver = params
+                .get("protocolVersion")
+                .and_then(|v| v.as_str())
+                .unwrap_or(PROTOCOL_VERSION);
+            let negotiated = if SUPPORTED_PROTOCOL_VERSIONS.contains(&requested_ver) {
+                requested_ver
+            } else {
+                PROTOCOL_VERSION
+            };
+            json_ok(
+                id,
+                json!({
+                    "protocolVersion": negotiated,
+                    "capabilities": {
+                        "tools": { "listChanged": false }
+                    },
+                    "serverInfo": {
+                        "name": "shellmind-guard",
+                        "version": env!("CARGO_PKG_VERSION")
+                    }
+                }),
+            )
+        }
         "ping" => json_ok(id, json!({})),
-        "tools/list" => json_ok(id, json!({ "tools": tool_definitions() })),
-        "tools/call" => match handle_tool_call(&params) {
+        "tools/list" => json_ok(id, json!({ "tools": tool_definitions(allow_write) })),
+        "tools/call" => match handle_tool_call(&params, allow_write) {
             Ok(result) => json_ok(id, result),
             Err(e) => json_ok(
                 id,
@@ -177,11 +236,16 @@ fn json_error(id: Value, code: i64, message: &str) -> Value {
     })
 }
 
-fn tool_definitions() -> Value {
-    json!([
-        {
+fn tool_definitions(allow_write: bool) -> Value {
+    let mut tools = vec![
+        json!({
             "name": "shellmind_guard_scan",
-            "description": "Scan a repository across ShellMind Guard's deterministic 16-language engine (Secrets, Config/IaC/SQL, Offline OSV Deps, SQL/NoSQL/XSS/CSRF/CMDi/SSTI/Path/SSRF Taint, Auth/IDOR/Race Lattice, Frontend Contract, Engine Deadlocks/Leaks/Memory, Mobile Security, and optional Phase 10 --deep Schema Checks).",
+            "description": "Read-only deterministic multi-language security scan (Secrets, Config/IaC/SQL, Offline OSV Deps, Taint, Auth/IDOR/Race Lattice, Concurrency/Memory, HW, Web3, PQC, AI/MCP).",
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "openWorldHint": false
+            },
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -209,10 +273,15 @@ fn tool_definitions() -> Value {
                     }
                 }
             }
-        },
-        {
+        }),
+        json!({
             "name": "shellmind_guard_explain_finding",
-            "description": "Inspect a specific finding ID (e.g. SMG-RACE-002, SMG-SQLI-001, SMG-FUZZ-001) and return its full cross-file trace hops, source code excerpt, remediation, and replay command.",
+            "description": "Read-only inspection of a specific finding ID (e.g. SMG-RACE-002, SMG-SQLI-001) returning full cross-file trace hops, untrusted-delimited source excerpt, remediation, and replay command.",
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "openWorldHint": false
+            },
             "inputSchema": {
                 "type": "object",
                 "required": ["finding_id"],
@@ -227,10 +296,17 @@ fn tool_definitions() -> Value {
                     }
                 }
             }
-        },
-        {
+        }),
+    ];
+    if allow_write {
+        tools.push(json!({
             "name": "shellmind_guard_init",
-            "description": "Auto-detect project languages and frameworks to generate .shellmind-guard.toml (and optionally .github/workflows/shellmind-guard.yml or .git/hooks/pre-commit).",
+            "description": "Auto-detect project languages and frameworks to generate .shellmind-guard.toml (and optionally .github/workflows/shellmind-guard.yml). Requires --allow-write; git hooks are never installed over MCP.",
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "openWorldHint": false
+            },
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -242,18 +318,15 @@ fn tool_definitions() -> Value {
                         "type": "boolean",
                         "description": "Also generate .github/workflows/shellmind-guard.yml GitHub Actions SARIF workflow"
                     },
-                    "hook": {
-                        "type": "boolean",
-                        "description": "Also install standalone Git pre-commit hook (.git/hooks/pre-commit)"
-                    },
                     "overwrite": {
                         "type": "boolean",
                         "description": "Overwrite existing .shellmind-guard.toml if present (default false)"
                     }
                 }
             }
-        }
-    ])
+        }));
+    }
+    Value::Array(tools)
 }
 
 fn normalize_and_resolve_path(base_cwd: &Path, raw_path: &Path) -> PathBuf {
@@ -341,7 +414,7 @@ fn validate_mcp_target_path(raw_path: &str) -> Result<PathBuf> {
     Ok(canon)
 }
 
-fn handle_tool_call(params: &Value) -> Result<Value> {
+fn handle_tool_call(params: &Value, allow_write: bool) -> Result<Value> {
     let tool_name = params
         .get("name")
         .and_then(|v| v.as_str())
@@ -513,7 +586,9 @@ fn handle_tool_call(params: &Value) -> Result<Value> {
                 })?;
 
             const MAX_EXPLAIN_BYTES: usize = 30 * 1024;
-            let mut source_context = build_minimal_patch_prompt(&root, &finding, None)?;
+            let raw_context = build_minimal_patch_prompt(&root, &finding, None)?;
+            let mut source_context =
+                sanitize_untrusted_snippet(&smg_report::redact_secrets_in_text(&raw_context));
             let mut explain_val = json!({
                 "ok": true,
                 "finding": finding,
@@ -531,7 +606,8 @@ fn handle_tool_call(params: &Value) -> Result<Value> {
                     cut -= 1;
                 }
                 source_context.truncate(cut);
-                source_context.push_str("\n...[truncated to MCP 32 KiB budget]");
+                source_context
+                    .push_str("\n...[truncated to MCP 32 KiB budget]\n</untrusted_source_snippet>");
                 explain_val = json!({
                     "ok": true,
                     "finding": finding,
@@ -544,10 +620,20 @@ fn handle_tool_call(params: &Value) -> Result<Value> {
             explain_val
         }
         "shellmind_guard_init" => {
+            if !allow_write {
+                anyhow::bail!(
+                    "MCP server is running in Read-Only mode by default. Restart with `smg mcp --allow-write` to enable `shellmind_guard_init`."
+                );
+            }
             let root =
                 validate_mcp_target_path(args.get("path").and_then(|v| v.as_str()).unwrap_or("."))?;
             let ci = args.get("ci").and_then(|v| v.as_bool()).unwrap_or(false);
             let hook = args.get("hook").and_then(|v| v.as_bool()).unwrap_or(false);
+            if hook {
+                anyhow::bail!(
+                    "Installing executable `.git/hooks` via MCP is permanently disabled for security. Run `smg hook install` directly in your terminal."
+                );
+            }
             let overwrite = args
                 .get("overwrite")
                 .and_then(|v| v.as_bool())
@@ -588,17 +674,12 @@ fn handle_tool_call(params: &Value) -> Result<Value> {
             } else {
                 None
             };
-            let hook_path = if hook {
-                Some(crate::install_git_hook(&root)?)
-            } else {
-                None
-            };
             json!({
                 "ok": true,
                 "detected": detected,
                 "config_path": config_path.display().to_string(),
                 "ci_workflow_path": ci_path.map(|p| p.display().to_string()),
-                "hook_path": hook_path.map(|p| p.display().to_string()),
+                "hook_path": Value::Null,
             })
         }
         other => anyhow::bail!("Unknown MCP tool `{}`", other),
@@ -658,11 +739,50 @@ mod tests {
         let list_req = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#;
         let list_resp = handle_jsonrpc_line(list_req).expect("tools/list must reply");
         let tools = list_resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 3);
+        assert_eq!(
+            tools.len(),
+            2,
+            "Read-Only MCP must expose only 2 read-only tools"
+        );
         let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
         assert!(names.contains(&"shellmind_guard_scan"));
         assert!(names.contains(&"shellmind_guard_explain_finding"));
-        assert!(names.contains(&"shellmind_guard_init"));
+        assert!(!names.contains(&"shellmind_guard_init"));
+        for t in tools {
+            assert_eq!(t["annotations"]["readOnlyHint"], true);
+        }
+
+        // Write mode explicitly exposes shellmind_guard_init
+        let write_list = handle_jsonrpc_line_with_options(list_req, true).unwrap();
+        assert_eq!(write_list["result"]["tools"].as_array().unwrap().len(), 3);
+
+        // Protocol version negotiation (2025-03-26)
+        let init_2025 = r#"{"jsonrpc":"2.0","id":3,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}"#;
+        let init_2025_resp = handle_jsonrpc_line(init_2025).unwrap();
+        assert_eq!(init_2025_resp["result"]["protocolVersion"], "2025-03-26");
+
+        // Read-Only mode rejects shellmind_guard_init
+        let init_call = r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"shellmind_guard_init","arguments":{"path":"."}}}"#;
+        let ro_err = handle_jsonrpc_line(init_call).unwrap();
+        assert_eq!(ro_err["result"]["isError"], true);
+
+        // Even with allow_write=true, hook=true is permanently refused over MCP
+        let hook_call = r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"shellmind_guard_init","arguments":{"path":".","hook":true}}}"#;
+        let hook_err = handle_jsonrpc_line_with_options(hook_call, true).unwrap();
+        assert_eq!(hook_err["result"]["isError"], true);
+
+        // Copy-paste client config snippet rendering
+        let claude_cfg = render_mcp_client_config("claude").unwrap();
+        assert!(claude_cfg.contains("shellmind-guard") && claude_cfg.contains("\"mcp\""));
+        assert!(render_mcp_client_config("cursor").is_ok());
+        assert!(render_mcp_client_config("windsurf").is_ok());
+        assert!(render_mcp_client_config("antigravity").is_ok());
+        assert!(render_mcp_client_config("unknown-client").is_err());
+
+        // Untrusted snippet framing strips Bidi/control chars
+        let framed = sanitize_untrusted_snippet("ok\u{202E}\x07code");
+        assert!(framed.starts_with("<untrusted_source_snippet>"));
+        assert!(!framed.contains('\u{202E}') && !framed.contains('\x07'));
 
         let bad_json = handle_jsonrpc_line("{not valid json").unwrap();
         assert_eq!(bad_json["error"]["code"], -32700);
@@ -729,14 +849,18 @@ mod tests {
             .unwrap();
         assert!(exp_txt.contains("SELECT * FROM t"));
 
-        // Verify schema consistency (`deep` layer + `hook` init) and SMG-FUZZ-SCHEMA resolution via explain_finding
-        let defs = tool_definitions();
+        // Verify schema consistency (`deep` layer + `hook` permanently removed from MCP init)
+        let defs = tool_definitions(false);
         let tools = defs.as_array().unwrap();
+        assert_eq!(tools.len(), 2);
         let scan_schema_desc = tools[0]["inputSchema"]["properties"]["layers"]["description"]
             .as_str()
             .unwrap();
         assert!(scan_schema_desc.contains("deep"));
-        assert!(tools[2]["inputSchema"]["properties"]["hook"].is_object());
+        let write_defs = tool_definitions(true);
+        let write_tools = write_defs.as_array().unwrap();
+        assert_eq!(write_tools.len(), 3);
+        assert!(!write_tools[2]["inputSchema"]["properties"]["hook"].is_object());
 
         fs::write(
             dir.join("src/pay.ts"),

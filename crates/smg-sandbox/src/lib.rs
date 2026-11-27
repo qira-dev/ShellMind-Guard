@@ -1,7 +1,26 @@
 pub mod bwrap;
 pub mod h2_race_snapshot;
+mod sys_sandbox;
 pub mod verifier;
 pub mod wire_oracle;
+
+/// Detects SPA `200 OK` HTML catchall shells (React/Next/Vue/Vite `index.html` fallbacks)
+/// so dynamic probes never misclassify a generic frontend HTML shell as `Sandbox: PROVEN`
+/// (`Phase 4 / Q145`).
+pub fn is_spa_catchall_html(body: &str, content_type: &str) -> bool {
+    let ct_html = content_type.to_ascii_lowercase().contains("text/html");
+    let head: String = body.chars().take(1024).collect();
+    let low = head.to_ascii_lowercase();
+    let looks_html =
+        low.contains("<!doctype html") || (low.contains("<html") && low.contains("<head"));
+    let spa_markers = low.contains("id=\"root\"")
+        || low.contains("id=\"app\"")
+        || low.contains("id=\"__next\"")
+        || low.contains("window.__next_data__")
+        || low.contains("/static/js/")
+        || low.contains("type=\"module\"");
+    (ct_html && looks_html) || (looks_html && spa_markers)
+}
 
 pub use h2_race_snapshot::{
     DbInvariantVerdict, DbStateSnapshot, H2_CLIENT_PREFACE, H2_FLAG_END_HEADERS,
@@ -78,10 +97,8 @@ fn is_process_dead_or_zombie(pid: u32) -> bool {
     if raw_pid <= 0 {
         return true;
     }
-    // SAFETY: `kill(pid, 0)` only queries signal deliverability for `raw_pid`.
-    let rc = unsafe { libc::kill(raw_pid, 0) };
-    if rc != 0 {
-        return std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+    if !sys_sandbox::unix_pid_exists(raw_pid) {
+        return true;
     }
     // `kill(pid, 0) == 0` succeeds for zombies (`Z`); query `ps` without calling `waitpid`
     // so we never reap another caller's `Child` handle.

@@ -604,8 +604,15 @@ pub(crate) enum Commands {
         #[arg(value_enum)]
         shell: CompletionShell,
     },
-    /// Start stdio JSON-RPC 2.0 MCP server (exposes shellmind_guard_scan, shellmind_guard_explain_finding, shellmind_guard_init)
-    Mcp,
+    /// Start stdio JSON-RPC 2.0 MCP server (Read-Only by default; pass --allow-write for init or --print-config <client>)
+    Mcp {
+        /// Explicitly allow write tool (`shellmind_guard_init`) over MCP (default: strictly read-only)
+        #[arg(long, default_value_t = false)]
+        allow_write: bool,
+        /// Print copy-paste read-only MCP config snippet for a client (`claude`, `cursor`, `windsurf`, `antigravity`)
+        #[arg(long, value_name = "CLIENT")]
+        print_config: Option<String>,
+    },
     /// Manage standalone Git pre-commit hook for zero-AI local protection
     Hook {
         #[command(subcommand)]

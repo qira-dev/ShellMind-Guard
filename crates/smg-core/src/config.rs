@@ -4,6 +4,14 @@ use std::fs;
 use std::path::Path;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CustomRulePackConfig {
+    #[serde(default)]
+    pub names: Vec<String>,
+    #[serde(default)]
+    pub patterns: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ShellMindGuardConfig {
     #[serde(default)]
     pub guards: GuardConfig,
@@ -13,6 +21,15 @@ pub struct ShellMindGuardConfig {
     pub sandbox: SandboxConfig,
     #[serde(default)]
     pub ai: AiConfig,
+    /// Phase 4 (Q161): Safe declarative custom security annotations (never executes shell commands).
+    #[serde(default)]
+    pub custom_guards: CustomRulePackConfig,
+    #[serde(default)]
+    pub custom_sanitizers: CustomRulePackConfig,
+    #[serde(default)]
+    pub custom_sinks: CustomRulePackConfig,
+    #[serde(default)]
+    pub custom_secrets: CustomRulePackConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
