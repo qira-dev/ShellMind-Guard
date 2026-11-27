@@ -1,0 +1,8 @@
+# ShellMind Guard Security Model (`v1.6.0`)
+
+## Core Invariants
+1. **Zero Cloud / Zero Telemetry by Default:** Static analysis, SMT/CDCL solving, offline OSV advisories, SARIF/OpenVEX/CycloneDX export, and `smg mcp` run 100% locally with zero outbound network requests.
+2. **Untrusted Repository Safety:** `.shellmind-guard.toml` in untrusted repositories is parsed strictly via `load_trusted_from_dir(root, false)`, which strips `sandbox.boot_cmd`, `ignore_paths`, and external command hooks. Declarative `[custom_guards]`, `[custom_sanitizers]`, `[custom_sinks]`, and `[custom_secrets]` tables never execute shell commands.
+3. **SSRF & Metadata Immunity (`smg-dynamic::safe_http::SafeHttpClient`):** All live/dynamic engines resolve DNS once, validate every returned IPv4/IPv6 address (unconditionally blocking `169.254.169.254`, IPv4-mapped IPv6 `::ffff:169.254.169.254`, `fe80::/10`, `fd00:ec2::254`, and `100.100.100.200`), pin the TCP connection to the validated IP, and re-validate every HTTP `3xx` redirect hop.
+4. **Pure-Rust Archive & Parser Hardening:** `smg image` uses pure-Rust `flate2` + streaming `tar` with per-entry & cumulative byte budgets (rejecting `..`, symlinks, hardlinks, and temp-file extraction). Tree-sitter parsing enforces a 2-second per-file timeout with graceful `parse_degraded` reporting.
+5. **Memory Safety & Supply Chain:** `#![forbid(unsafe_code)]` is enforced workspace-wide (with low-level OS process liveness syscalls isolated in `crates/smg-sandbox/src/sys_sandbox.rs`). `deny.toml` enforces approved OSS licenses and `crates.io` registry sources, and releases enforce a `<= 16 MiB` stripped binary guardrail alongside `SHA256SUMS.txt` and GitHub Artifact Attestations.
