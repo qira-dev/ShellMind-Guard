@@ -177,12 +177,33 @@ pub fn start_oob_server(listen: SocketAddr, log_path: Option<PathBuf>) -> Result
     let tcp_stop = Arc::clone(&stop);
     let tcp_active = Arc::clone(&active_conns);
     let tcp_thread = thread::spawn(move || {
+        // Phase 2 (Q97): Per-IP sliding-window rate limiter preventing single-peer callback floods.
+        const MAX_OOB_HITS_PER_IP_PER_SEC: usize = 100;
+        let mut ip_window: std::collections::HashMap<
+            std::net::IpAddr,
+            (std::time::Instant, usize),
+        > = std::collections::HashMap::new();
         loop {
             if tcp_stop.load(Ordering::Relaxed) {
                 break;
             }
             match tcp_listener.accept() {
                 Ok((mut stream, peer)) => {
+                    let now = std::time::Instant::now();
+                    let entry = ip_window.entry(peer.ip()).or_insert((now, 0));
+                    if now.duration_since(entry.0) >= Duration::from_secs(1) {
+                        *entry = (now, 1);
+                    } else {
+                        entry.1 = entry.1.saturating_add(1);
+                        if entry.1 > MAX_OOB_HITS_PER_IP_PER_SEC {
+                            drop(stream);
+                            continue;
+                        }
+                    }
+                    if ip_window.len() > 4096 {
+                        ip_window
+                            .retain(|_, (ts, _)| now.duration_since(*ts) < Duration::from_secs(5));
+                    }
                     let prev = tcp_active.fetch_add(1, Ordering::AcqRel);
                     if prev >= MAX_CONCURRENT_TCP_CONNS {
                         tcp_active.fetch_sub(1, Ordering::AcqRel);

@@ -316,6 +316,30 @@ fn handle_connection(stream: &mut TcpStream, ctx: &ConnCtx) -> Result<()> {
 }
 
 fn parse_headers(head: &str) -> Vec<(String, String)> {
+    // Phase 2 (Q93): Prefer strict RFC 9112 parsing via `httparse` so malformed/obs-fold headers
+    // are rejected cleanly before proxy forwarding.
+    let mut raw = head.as_bytes().to_vec();
+    if !raw.ends_with(b"\r\n\r\n") {
+        if raw.ends_with(b"\r\n") {
+            raw.extend_from_slice(b"\r\n");
+        } else {
+            raw.extend_from_slice(b"\r\n\r\n");
+        }
+    }
+    let mut hdr_buf = [httparse::EMPTY_HEADER; 128];
+    let mut req = httparse::Request::new(&mut hdr_buf);
+    if let Ok(httparse::Status::Complete(_)) = req.parse(&raw) {
+        return req
+            .headers
+            .iter()
+            .map(|h| {
+                (
+                    h.name.to_string(),
+                    String::from_utf8_lossy(h.value).trim().to_string(),
+                )
+            })
+            .collect();
+    }
     head.lines()
         .skip(1)
         .filter_map(|line| {

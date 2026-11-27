@@ -25,7 +25,7 @@ static RUSTLS_PROVIDER_INIT: Once = Once::new();
 /// Ensures the `rustls` ring `CryptoProvider` is installed once process-wide
 /// so isolated tests and live-engine invocations never panic with
 /// `No rustls crypto provider is configured`.
-pub(crate) fn ensure_rustls_ring_provider() {
+pub fn ensure_rustls_ring_provider() {
     RUSTLS_PROVIDER_INIT.call_once(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
     });

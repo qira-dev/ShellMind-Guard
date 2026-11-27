@@ -8,6 +8,7 @@ members = [
     "crates/smg-tui",
     "crates/smg-report",
     "crates/smg-ai",
+    "crates/smg-dynamic",
     "crates/smg-hw",
     "crates/smg-web3",
     "crates/smg-pqc",
@@ -33,6 +34,8 @@ anyhow = "1.0"
 base64 = "0.22"
 blake3 = "1.5"
 clap = { version = "4.5", features = ["derive"] }
+flate2 = "1.0"
+httparse = "1.9"
 ignore = "0.4"
 md-5 = "0.10"
 petgraph = "0.6"
@@ -48,6 +51,7 @@ serde_json = "1.0"
 serde_yaml_ng = "0.10"
 sha1 = "0.10"
 sha2 = "0.10"
+tar = "0.4"
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -115,6 +119,7 @@ smg-sandbox = { path = "crates/smg-sandbox" }
 smg-tui = { path = "crates/smg-tui" }
 smg-report = { path = "crates/smg-report" }
 smg-ai = { path = "crates/smg-ai" }
+smg-dynamic = { path = "crates/smg-dynamic" }
 smg-hw = { path = "crates/smg-hw", optional = true }
 smg-web3 = { path = "crates/smg-web3", optional = true }
 smg-pqc = { path = "crates/smg-pqc", optional = true }
@@ -124,7 +129,7 @@ smg-enterprise = { path = "crates/smg-enterprise", optional = true }
 default = ["hw", "web3", "pqc", "enterprise"]
 hw = ["dep:smg-hw"]
 web3 = ["dep:smg-web3"]
-pqc = ["dep:smg-pqc"]
+pqc = ["dep:smg-pqc", "smg-dynamic/pqc"]
 enterprise = ["dep:smg-enterprise"]
 
 [lints]

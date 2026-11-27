@@ -1,9 +1,10 @@
 //! Pure-Rust OCI / Docker container image & rootfs vulnerability scanner (Trivy parity)
 //! plus `.trivyignore` policy parser (with `exp:YYYY-MM-DD` expiry support).
 //!
-//! Zero external tar/compression crates required:
-//! - Parses POSIX USTAR / PAX tar archives directly (512-byte header blocks)
-//! - Transparently decompresses gzipped OCI blobs (`1f 8b`) via system `gzip -dc`
+//! 100% pure-Rust streaming archive inspection (zero external `gzip`/`tar` subprocesses):
+//! - Transparently decompresses gzipped OCI blobs (`1f 8b`) via `flate2::read::GzDecoder`
+//! - Streams POSIX USTAR / PAX / GNU tar entries via `tar::Archive` with per-entry & cumulative
+//!   byte budgets, rejecting `..` / symlink / hardlink escapes with zero temp-file extraction
 //! - Extracts OS identity from `/etc/os-release` (`Debian`, `Ubuntu`, `Alpine`, `Rocky Linux`, `AlmaLinux`, `Red Hat`)
 //! - Parses Debian/Ubuntu `/var/lib/dpkg/status` & Alpine `/lib/apk/db/installed`
 //! - Extracts embedded application lockfiles (`package-lock.json`, `Cargo.lock`, `requirements.txt`, `go.mod`, `go.sum`, `Pipfile.lock`, `composer.lock`, `Gemfile.lock`)
@@ -11,14 +12,14 @@
 //!   (and optionally syncs fresh CVEs via `--online-osv`).
 
 use anyhow::{Context, Result, bail};
+use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
 use smg_core::advisories::{AdvisoryStore, version_matches_range};
 use smg_graph::deps::{ResolvedDependency, extract_resolved_dependencies};
 use std::collections::{BTreeSet, HashSet};
 use std::fs;
-use std::io::Write;
+use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Parsed `.trivyignore` policy file.
@@ -314,7 +315,65 @@ where
 
 const MAX_GUNZIP_BYTES: usize = 256 * 1024 * 1024;
 const MAX_TOTAL_GUNZIP_BYTES: usize = 512 * 1024 * 1024;
+const MAX_TAR_ENTRY_BYTES: usize = 128 * 1024 * 1024;
 const MAX_TAR_NEST_DEPTH: usize = 6;
+
+fn is_safe_tar_entry_path(raw: &str) -> bool {
+    if raw.is_empty() || raw.contains('\0') {
+        return false;
+    }
+    let norm = raw.replace('\\', "/");
+    for seg in norm.split('/') {
+        if seg == ".." {
+            return false;
+        }
+    }
+    true
+}
+
+fn walk_tar_bytes_streaming<F: FnMut(&str, &[u8])>(tar_bytes: &[u8], mut visitor: F) {
+    let mut archive = tar::Archive::new(std::io::Cursor::new(tar_bytes));
+    let Ok(entries) = archive.entries() else {
+        walk_tar_bytes(tar_bytes, visitor);
+        return;
+    };
+    let mut cumulative_read = 0usize;
+    for entry_res in entries {
+        let Ok(entry) = entry_res else {
+            break;
+        };
+        let etype = entry.header().entry_type();
+        // Reject symlinks, hardlinks, device nodes, FIFOs — only inspect regular files.
+        if !etype.is_file() {
+            continue;
+        }
+        let Ok(path) = entry.path() else {
+            continue;
+        };
+        let path_str = path.to_string_lossy().replace('\\', "/");
+        if !is_safe_tar_entry_path(&path_str) {
+            continue;
+        }
+        let remaining = MAX_TOTAL_GUNZIP_BYTES.saturating_sub(cumulative_read);
+        let cap = MAX_TAR_ENTRY_BYTES.min(remaining);
+        if cap == 0 {
+            break;
+        }
+        let mut buf = Vec::new();
+        if entry
+            .take((cap as u64).saturating_add(1))
+            .read_to_end(&mut buf)
+            .is_err()
+        {
+            continue;
+        }
+        if buf.len() > cap {
+            continue;
+        }
+        cumulative_read = cumulative_read.saturating_add(buf.len());
+        visitor(&path_str, &buf);
+    }
+}
 
 fn maybe_gunzip_budgeted(bytes: &[u8], remaining_budget: &mut usize) -> Result<Vec<u8>> {
     if bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b {
@@ -324,48 +383,16 @@ fn maybe_gunzip_budgeted(bytes: &[u8], remaining_budget: &mut usize) -> Result<V
                 "Cumulative OCI gzip decompression budget ({MAX_TOTAL_GUNZIP_BYTES} bytes) exhausted"
             );
         }
-        let mut child = Command::new("gzip")
-            .arg("-dc")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .context(
-                "Failed to spawn `gzip -dc` while decompressing `.tar.gz` OCI layer (ensure `gzip` is installed on PATH)",
-            )?;
-        let writer_handle = child.stdin.take().map(|mut stdin| {
-            let input = bytes.to_vec();
-            std::thread::spawn(move || {
-                let _ = stdin.write_all(&input);
-            })
-        });
+        let decoder = GzDecoder::new(std::io::Cursor::new(bytes));
         let mut out = Vec::new();
-        let mut exceeded = false;
-        if let Some(stdout) = child.stdout.take() {
-            use std::io::Read;
-            let _ = stdout.take((cap + 1) as u64).read_to_end(&mut out);
-            if out.len() > cap {
-                exceeded = true;
-            }
-        }
-        if exceeded {
-            let _ = child.kill();
-            let _ = child.wait();
-            if let Some(h) = writer_handle {
-                let _ = h.join();
-            }
+        decoder
+            .take((cap as u64).saturating_add(1))
+            .read_to_end(&mut out)
+            .context(
+                "Pure-Rust flate2 gzip decompression failed on corrupt or truncated OCI layer",
+            )?;
+        if out.len() > cap {
             bail!("OCI gzip layer exceeded {cap} byte decompression safety cap");
-        }
-        let status = child
-            .wait()
-            .context("Failed waiting on `gzip -dc` subprocess")?;
-        if let Some(h) = writer_handle {
-            let _ = h.join();
-        }
-        if !status.success() {
-            bail!(
-                "`gzip -dc` exited with failure status {status} on corrupt or truncated OCI layer"
-            );
         }
         *remaining_budget = remaining_budget.saturating_sub(out.len());
         return Ok(out);
@@ -466,7 +493,7 @@ fn inspect_layer_tar_depth(
     let mut nested_layers: Vec<(String, Vec<u8>)> = Vec::new();
     let mut whiteouts: Vec<String> = Vec::new();
 
-    walk_tar_bytes(&decompressed, |entry_path, data| {
+    walk_tar_bytes_streaming(&decompressed, |entry_path, data| {
         let norm = entry_path.trim_start_matches("./").trim_start_matches('/');
         if let Some((dir, fname)) = norm.rsplit_once('/') {
             if fname == ".wh..wh..opq" {

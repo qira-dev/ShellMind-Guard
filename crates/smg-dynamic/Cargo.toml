@@ -1,0 +1,37 @@
+[package]
+name = "smg-dynamic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Unified SafeHttpClient, live dynamic engines (proxy/MITM, CDP SPA, SQLi, DAST, templates, OOB, TLS, IDOR, HTTP audit, live verify), OCI pure-Rust scanner, and OSV sync for ShellMind Guard."
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+blake3.workspace = true
+flate2.workspace = true
+httparse.workspace = true
+md-5.workspace = true
+rcgen.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml_ng.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+tar.workspace = true
+tungstenite.workspace = true
+smg-core = { path = "../smg-core" }
+smg-graph = { path = "../smg-graph" }
+smg-tui = { path = "../smg-tui" }
+smg-pqc = { path = "../smg-pqc", optional = true }
+
+[features]
+default = []
+pqc = ["dep:smg-pqc"]
+
+[lints]
+workspace = true

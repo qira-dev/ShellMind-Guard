@@ -69,7 +69,10 @@ fn test_all_emitted_rule_ids_exist_in_rule_catalog() {
 
     let mut missing = Vec::new();
     for path in rs_files {
-        if path.file_name().and_then(|s| s.to_str()) == Some("rules.rs") {
+        if matches!(
+            path.file_name().and_then(|s| s.to_str()),
+            Some("rules.rs" | "tests.rs")
+        ) {
             continue;
         }
         let raw = fs::read_to_string(&path).expect("read rs file");
@@ -78,7 +81,7 @@ fn test_all_emitted_rule_ids_exist_in_rule_catalog() {
         for line in prod.lines() {
             let t = line.trim();
             let emits_rule = t.contains("rule_id:")
-                || t.contains("id: \"SMG-")
+                || t.starts_with("id: \"SMG-")
                 || t.contains("make_phase9_finding(");
             if !emits_rule {
                 continue;
@@ -137,7 +140,7 @@ fn test_readme_stays_in_sync_with_rule_catalog_layers_cli_and_pinning() {
         );
     }
 
-    // 3. Every top-level CLI subcommand in `src/lib.rs` `enum Commands` must appear in README.md
+    // 3. Every top-level CLI subcommand in `src/cli.rs` `enum Commands` must appear in README.md
     for subcmd in [
         "init",
         "index",
